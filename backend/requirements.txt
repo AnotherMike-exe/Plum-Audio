@@ -1,0 +1,14 @@
+# Plum-Audio backend — Python 3.13
+# Sync engine: pin aiosendspin (fast-moving). On bump, run _resources/spike/mesh_smoke.py first.
+aiosendspin==6.0.5
+av>=18,<19            # PyAV — audio encode/resample (glibc wheels on Debian base)
+numpy>=2,<3
+sounddevice>=0.5      # PortAudio player output (needs libportaudio2 in the image)
+
+# REST APIs
+Flask>=3,<4
+flask-cors>=4
+requests>=2.31
+
+# Utility
+aiohttp>=3.9          # transitive via aiosendspin; pinned for clarity

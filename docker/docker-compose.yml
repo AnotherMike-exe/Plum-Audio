@@ -1,0 +1,22 @@
+# Plum-Audio — Binhex-standard compose. Host networking required for mDNS/Avahi + Sendspin discovery.
+services:
+  plum-audio:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    container_name: plum-audio
+    restart: unless-stopped
+    # Host networking: Sendspin WS (8927/8928), mDNS (5353), source ports all need L2 visibility.
+    network_mode: host
+    volumes:
+      - ./app-config:/config      # config, logs, settings.json
+      - ./app-data:/data          # app data
+      - ./app-media:/media        # media (Plexamp etc.)
+    environment:
+      - PUID=1000
+      - PGID=29                   # audio group (RPi standard)
+      - UMASK=002
+      - TZ=America/New_York
+      - DEBUG=false
+    devices:
+      - /dev/snd:/dev/snd         # ALSA audio out
