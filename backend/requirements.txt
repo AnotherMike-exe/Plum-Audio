@@ -3,6 +3,7 @@
 aiosendspin==6.0.5
 av>=18,<19            # PyAV — audio encode/resample (glibc wheels on Debian base)
 numpy>=2,<3
+Pillow>=10            # REQUIRED by aiosendspin's artwork role (server won't import without it)
 sounddevice>=0.5      # PortAudio player output (needs libportaudio2 in the image)
 
 # REST APIs

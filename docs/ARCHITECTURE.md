@@ -189,10 +189,22 @@ stream + clock domain). The orchestrator's job is to present this coherently:
 
 - **API/design tier — DONE (this session).** Source audit confirms live intra-server
   re-routing and first-class cross-server reclaim (§2). This was the primary risk.
-- **Protocol-timing tier — probe on `.201.133`** (see `_resources/spike/`): run a server +
-  programmatic PLAYER client, feed a continuous tone, perform a live group re-route, and
-  confirm the player's WS stays connected (no goodbye/reconnect) and measure the
-  stream-clear→stream-start gap. Distinguishes "live re-route" from "reconnect" empirically.
+- **Protocol-timing tier — `_resources/spike/handoff_probe.py`**: runs a server + a
+  programmatic PLAYER client that renders to the onboard DAC (PortAudio), feeds a continuous
+  tone, performs handoffs, and reports the `stream_end`→`stream_start` gap, WS-disconnect count
+  (live-re-route vs reconnect), and ALSA xruns + jitter-buffer starvations. Runs headless (no
+  speakers); `--no-dac` measures the protocol gap only. **Loopback (dev) results so far**:
+  intra-server re-route is a true **live re-route** — WS stays connected (0 disconnects),
+  sub-ms control gap, and the ~250 ms player buffer lead fully absorbs it → **0 xruns**.
+  Cross-server reclaim is **reconnect-class** (WS drops, ANOTHER_SERVER), ~80 ms control gap in
+  loopback; the player-side reclaim handshake (goodbye-old → attach-new) still needs a proper,
+  race-free implementation (Phase 2). Hardware xrun/gap numbers on `.201.133` still to be taken.
+
+  **Load-bearing lifecycle rule discovered here** (affects all routing code): re-route MUST be
+  `old_group.remove_client(player)` → `new_group.add_client(player)`. A bare `add_client` calls
+  `old_group.stop()`, which would kill the source the player is *leaving* for every other
+  listener. Each source group therefore keeps a stable player member (or the feeder self-heals),
+  and `SourceFeeder` re-acquires its `PushStream` on `StreamStoppedError` rather than dying.
 - **Audible tier — NEXT hardware step (needs user + speakers on two units).** Two-node test:
   `.133` ingests a source into Group A, `.113`'s player joins; then reclaim `.113` to a
   second server / move between groups and **listen** for gap/continuity. Mirrors the
@@ -213,11 +225,21 @@ stream + clock domain). The orchestrator's job is to present this coherently:
 - Port the spike into a real `sendspin_server.py` skeleton.
 
 ### Phase 1 — Single-unit core playback
-1. `sendspin_server.py`: in-process server + one PushStream feeder for the AirPlay FIFO.
-2. `sendspin_player` supervised service → `hw:<card>` out; latency→`static_delay_ms`.
-3. Control-script metadata/artwork → Sendspin roles (retire Snapcast-properties path).
-4. Settings/audio APIs adjusted; supervisord configs; mDNS-off + our discovery.
-5. **Milestone:** AirPlay → one unit → its own speaker, with metadata/art, no resync storm.
+1. ✅ `sendspin_server.py`: in-process server + AirPlay FIFO feeder (self-healing PushStream).
+2. ✅ `sendspin_player.py` supervised service → onboard DAC out; latency→`static_delay_ms`.
+   Server↔player auto-attach glue (dial + re-attach, self-heals across restarts).
+   shairport-sync config + supervisord/Docker wiring.
+3. ✅ AirPlay metadata/artwork → Sendspin metadata/artwork roles (`sources/airplay_metadata.py`,
+   in-process reader on shairport's metadata pipe; the five Snapcast resync guards dropped, not
+   ported). Title/artist/album + 512×512 cover art confirmed live on hardware.
+4. ✅ supervisord + Dockerfile + entrypoint wiring; mDNS-off. (Full settings/audio Flask APIs +
+   GUI deferred — see Phase 3; not required for the single-unit milestone.)
+5. **Milestone — FULLY ACHIEVED ON HARDWARE, IN DOCKER (2026-07, `.201.133`):** real AirPlay
+   from an iPhone → shairport → FIFO → server → player → onboard DAC → speaker, **with live
+   metadata + album art**, **0 xruns, no resync storm**. Runs as one supervisord container
+   (image builds arm64; onboard DAC opens in-container via `--device /dev/snd`). Live re-route
+   ~0.1 ms / 0 xruns; cross-server reclaim reconnect-class (~85 ms gap, ~200 ms audible silence)
+   — Phase-2 mitigation is DISCOVERY pre-connect + `static_delay` buffering.
 
 ### Phase 2 — Mesh (the differentiator)
 6. Mesh orchestrator: peer discovery, state aggregation, routing engine
