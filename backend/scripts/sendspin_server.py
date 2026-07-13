@@ -326,11 +326,14 @@ class PlumSendspinServer:
         client = self.server.get_client(player_id)
         if client is None or not client.is_connected:
             raise KeyError(f"player {player_id!r} not connected")
-        role = client.get_role_state("player", PlayerV1Role)
-        if role is None:
+        # The volume/mute setters live on the active player Role object (roles_by_family), not on
+        # its persistent role *state* (which is what get_role_state returns).
+        roles = [r for r in client.roles_by_family("player") if isinstance(r, PlayerV1Role)]
+        if not roles:
             raise RuntimeError(f"player {player_id!r} has no negotiated player role")
-        role.set_volume(max(0, min(100, volume)))
-        role.set_mute(muted)
+        for role in roles:
+            role.set_volume(max(0, min(100, volume)))
+            role.set_mute(muted)
         logger.info("[vol] player %s -> %d%%%s", player_id, volume, " (muted)" if muted else "")
 
     def preconnect_player(self, player_id: str, player_url: str) -> None:

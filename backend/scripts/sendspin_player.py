@@ -265,12 +265,15 @@ class SendspinPlayer:
         self.renderer.mark_idle()
 
     def _on_server_command(self, payload) -> None:  # noqa: ANN001
-        # Best-effort volume/mute from server commands. Payload shape varies by command; guard
-        # and only touch fields we recognise. (Full command routing is Phase-2 polish.)
-        volume = getattr(payload, "volume", None)
-        muted = getattr(payload, "mute", getattr(payload, "muted", None))
+        # Volume/mute arrive nested: ServerCommandPayload.player -> PlayerCommandPayload(volume, mute).
+        cmd = getattr(payload, "player", None)
+        if cmd is None:
+            return
+        volume = getattr(cmd, "volume", None)
+        muted = getattr(cmd, "mute", None)
         if volume is not None or muted is not None:
             self.renderer.set_volume(volume=volume, muted=muted)
+            logger.info("server volume/mute applied: vol=%s mute=%s", volume, muted)
 
 
 async def main() -> None:

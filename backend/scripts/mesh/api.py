@@ -125,7 +125,10 @@ class MeshApi:
         player_id = body.get("player_id")
         if not player_id or "volume" not in body:
             return web.json_response({"error": "player_id and volume required"}, status=400)
-        await self._router.set_volume(player_id, int(body["volume"]), bool(body.get("muted", False)))
+        try:
+            await self._router.set_volume(player_id, int(body["volume"]), bool(body.get("muted", False)))
+        except (KeyError, RuntimeError) as e:
+            return web.json_response({"error": str(e)}, status=400)
         return web.json_response({"ok": True})
 
     async def _source_start(self, request: web.Request) -> web.Response:
