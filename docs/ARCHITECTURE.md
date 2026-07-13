@@ -274,7 +274,17 @@ stream + clock domain). The orchestrator's job is to present this coherently:
 - **Aggregation:** each unit's `/api/mesh/view` shows both units; peer `host` from the beacon IP; group_ids consistent across the HTTP snapshot poll between hosts.
 - **Cross-server roam:** player ping-ponged 4 hops between units — **~54 ms route API, ~75 ms audible gap, 0 xruns / 0 starvation** through every handoff (better than the ~200 ms in-process estimate).
 - **Four bugs fixed, only reproducible on hardware** (commit `70ff0ed`): (1) `reclaim_client_for_playback` is synchronous, not awaitable; (2) disconnected clients left routing stubs — snapshot now connected-only; (3) reclaim URL must be the player's *own* listener URL (roamed players keep their origin host), now carried in `PlayerState`; (4) the Phase-1 auto-attach supervisor fought roams — `attach_local_player(supervise=not mesh_enabled)`.
-- **Still to validate:** DISCOVERY-preconnect masking of the reclaim gap; multi-concurrent-group contention; roam under live AirPlay (not just a tone).
+- **Still to validate:** DISCOVERY-preconnect masking of the reclaim gap; roam under live AirPlay (not just a tone).
+
+**MULTI-CONCURRENT-GROUP VALIDATED ON HARDWARE (2026-07-13):** item 8 milestone met. Two sources
+active at once on one unit (`airplay` + a runtime-created `spotify` via `POST /api/mesh/source`),
+each anchoring its own group; two players split across them (one local, one roamed cross-server in
+~54 ms) with an idle group coexisting on the other unit; **0 xruns under concurrent load**. Adds
+(commit `77ff59b`): dynamic source create/stop REST, per-player volume/mute (`PlayerV1Role` via
+`roles_by_family`; player applies as render-side gain), idempotent `attach_player`. A 5th
+hardware-only bug fixed (`7e39c47`): the player read volume from the wrong payload level
+(`payload.player.{volume,mute}`). Contention policy: routes idempotent, last-writer-wins player
+placement, source groups persist with 0 players (anchor keeps the feeder alive for instant re-route).
 
 ### Phase 3 — Remaining sources + parity
 10. Spotify / DLNA / Bluetooth / Plexamp feeders (same PushStream pattern).
