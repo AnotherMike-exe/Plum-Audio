@@ -25,15 +25,17 @@ class PlayerState:
     name: str
     connected: bool
     group_id: str | None  # the group it currently renders, if any
+    url: str | None = None  # the player's own LAN listener URL (how any server reclaims it)
 
     def to_dict(self) -> dict:
         return {"player_id": self.player_id, "name": self.name,
-                "connected": self.connected, "group_id": self.group_id}
+                "connected": self.connected, "group_id": self.group_id, "url": self.url}
 
     @classmethod
     def from_dict(cls, d: dict) -> "PlayerState":
         return cls(player_id=d["player_id"], name=d.get("name", d["player_id"]),
-                   connected=bool(d.get("connected", False)), group_id=d.get("group_id"))
+                   connected=bool(d.get("connected", False)), group_id=d.get("group_id"),
+                   url=d.get("url"))
 
 
 @dataclass
@@ -102,9 +104,16 @@ class MeshView:
         return None
 
     def find_player(self, player_id: str) -> tuple[UnitSnapshot, PlayerState] | None:
-        """Locate a player's home unit (the server it is currently connected to)."""
+        """Locate a player's home unit (the server it is currently connected to).
+
+        Prefers a connected entry: during a roam a player can momentarily appear on both its old
+        and new unit, so a connected match always wins over a stale/disconnected one.
+        """
+        fallback: tuple[UnitSnapshot, PlayerState] | None = None
         for u in self.units:
             for p in u.players:
                 if p.player_id == player_id:
-                    return u, p
-        return None
+                    if p.connected:
+                        return u, p
+                    fallback = fallback or (u, p)
+        return fallback

@@ -68,22 +68,26 @@ class Router:
             return True
 
         # Path 2: cross-server reclaim — pull the player from its home unit onto our source.
+        # Reclaim against the player's OWN listener URL (fixed to the host the player process runs
+        # on), not the unit it's currently attached to — after a roam those differ.
         if pfound is None:
             raise RouteError(f"unknown player {player_id!r} (not on any unit)")
-        player_unit = pfound[0]
-        peer = self._require_peer(player_unit.unit_id)
-        return await self._engine.reclaim_remote_player(source_id, player_id, peer.player_url)
+        url = pfound[1].url
+        if not url:
+            raise RouteError(f"no reclaim URL known for player {player_id!r}")
+        return await self._engine.reclaim_remote_player(source_id, player_id, url)
 
     def preconnect(self, player_id: str) -> None:
         """Park a remote player in a DISCOVERY connection for a cheap later route (fast-switch)."""
         pfound = self._view().find_player(player_id)
         if pfound is None:
             raise RouteError(f"unknown player {player_id!r}")
-        player_unit = pfound[0]
+        player_unit, player_state = pfound
         if player_unit.unit_id == self.local_unit_id:
             return  # already local; nothing to pre-connect
-        peer = self._require_peer(player_unit.unit_id)
-        self._engine.preconnect_player(player_id, peer.player_url)
+        if not player_state.url:
+            raise RouteError(f"no reclaim URL known for player {player_id!r}")
+        self._engine.preconnect_player(player_id, player_state.url)
 
     async def unroute_player(self, player_id: str, source_id: str) -> None:
         """Remove a player from a (local) source group."""

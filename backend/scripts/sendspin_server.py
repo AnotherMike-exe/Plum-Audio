@@ -329,26 +329,40 @@ class PlumSendspinServer:
                                     timeout_s: float = 10.0) -> bool:
         """Pull a player from its current (peer) server onto a local source group.
 
-        The cross-server roam primitive: dial the player for PLAYBACK, reclaim it (its old server
-        releases it with GoodbyeReason.ANOTHER_SERVER — the player-side handshake lives in
-        sendspin_player.py), then group it here. Reconnect-class (~200 ms on hardware); a prior
-        preconnect_player() masks most of that. Returns False if the reclaim times out.
+        The cross-server roam primitive. `reclaim_client_for_playback` is SYNCHRONOUS: it dials
+        the player for PLAYBACK and schedules the reclaim timeout, returning whether a URL was
+        available — it does NOT wait for the player to land here. The player then releases its
+        old server with GoodbyeReason.ANOTHER_SERVER (handshake in sendspin_player.py) and
+        reconnects to us. So we register the URL, initiate the reclaim, wait for the player to
+        actually reconnect, then group it. Reconnect-class (~200 ms on hardware); a prior
+        preconnect_player() masks most of that. Returns False if no URL or the player never lands.
         """
         assert self.server is not None
         handle = self.sources.get(source_id)
         if handle is None:
             raise KeyError(f"unknown source {source_id!r}")
         self.server.register_client_url(player_id, player_url)
-        self.server.connect_to_client(
-            player_url, connection_reason=ConnectionReason.PLAYBACK,
-            retry_initial_connection=True)
-        claimed = await self.server.reclaim_client_for_playback(player_id, timeout_s=timeout_s)
-        if not claimed:
+        if not self.server.reclaim_client_for_playback(player_id, timeout_s=timeout_s):
+            logger.warning("[%s] no URL to reclaim player %s", source_id, player_id)
+            return False
+        if not await self._await_client_connected(player_id, timeout_s):
             logger.warning("[%s] reclaim of remote player %s timed out", source_id, player_id)
             return False
         await self.attach_player(source_id, player_id)
         logger.info("[%s] reclaimed remote player %s from %s", source_id, player_id, player_url)
         return True
+
+    async def _await_client_connected(self, player_id: str, timeout_s: float) -> bool:
+        """Poll until a (reclaimed) player has reconnected to this server, or timeout."""
+        assert self.server is not None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while loop.time() < deadline:
+            client = self.server.get_client(player_id)
+            if client is not None and client.is_connected:
+                return True
+            await asyncio.sleep(0.05)
+        return False
 
     def snapshot(self) -> UnitSnapshot:
         """This unit's local view for the mesh aggregator / REST snapshot.
@@ -370,10 +384,15 @@ class PlumSendspinServer:
             for client in self.server.clients:
                 if client.client_id.startswith(ANCHOR_PREFIX):
                     continue  # anchors are group scaffolding, not render endpoints
+                if not client.is_connected:
+                    continue  # a disconnected client isn't a live endpoint here — e.g. a player
+                    # that roamed to a peer leaves a stub; reporting it would make the mesh view
+                    # (and the router's find_player) think the player is still on this unit.
                 players.append(PlayerState(
                     player_id=client.client_id, name=client.name or client.client_id,
-                    connected=client.is_connected,
-                    group_id=client.group.group_id if client.group is not None else None))
+                    connected=True,
+                    group_id=client.group.group_id if client.group is not None else None,
+                    url=self.server.get_client_url(client.client_id)))
 
         return UnitSnapshot(unit_id=self.unit_id, name=self.unit_name, host=None,
                             sources=sources, players=players)
@@ -388,18 +407,38 @@ class PlumSendspinServer:
         reader.start()
         logger.info("[%s] airplay metadata reader started (%s)", source_id, metadata_fifo)
 
-    def attach_local_player(self, source_id: str, player_id: str, player_url: str) -> None:
-        """Auto-attach this unit's own player to a source and keep it attached.
+    def attach_local_player(self, source_id: str, player_id: str, player_url: str,
+                            *, supervise: bool = True) -> None:
+        """Attach this unit's own player to a source, registering its reclaim URL.
 
-        Single-unit glue that replaces the Phase-2 mesh orchestrator for the local case: dial
-        the player (server-dials-player, retrying until it's up), and (re)attach it to the
-        source's group whenever it (re)connects. Self-heals across player restarts — supervisord
-        may start the two processes in any order.
+        Always registers the player's URL so peers can reclaim it. Then, depending on `supervise`:
+          - True  (single-unit / mesh off): keep the player attached to the local source, dialing
+            and re-attaching whenever it (re)connects — self-heals across player/process restarts.
+          - False (mesh on): dial + attach ONCE. The mesh orchestrator owns routing thereafter; a
+            perpetual re-attach would fight cross-server roams (yank the player back the instant a
+            peer reclaims it). Registration still lets peers find and reclaim this player by URL.
         """
         assert self.server is not None
         self.server.register_client_url(player_id, player_url)
-        self._local_player_tasks.append(
-            asyncio.ensure_future(self._supervise_local_player(source_id, player_id, player_url)))
+        coro = (self._supervise_local_player(source_id, player_id, player_url) if supervise
+                else self._attach_local_player_once(source_id, player_id, player_url))
+        self._local_player_tasks.append(asyncio.ensure_future(coro))
+
+    async def _attach_local_player_once(self, source_id: str, player_id: str,
+                                        player_url: str) -> None:
+        """Dial the local player and attach it to its source exactly once (mesh-owned routing).
+
+        Does not re-dial after a later disconnect: when the player roams to a peer it sends
+        GoodbyeReason.ANOTHER_SERVER and the library stops retrying this URL, so there is nothing
+        to fight. Initial connection is still retried (the player may not be up yet at boot).
+        """
+        assert self.server is not None
+        self.server.connect_to_client(
+            player_url, connection_reason=ConnectionReason.PLAYBACK, retry_initial_connection=True)
+        if await self._await_client_connected(player_id, timeout_s=30.0):
+            with contextlib.suppress(Exception):
+                await self.attach_player(source_id, player_id)
+                logger.info("[%s] local player %s attached (mesh-owned)", source_id, player_id)
 
     def _dial_local_player(self, player_url: str) -> None:
         assert self.server is not None
@@ -455,6 +494,8 @@ async def main() -> None:
     local_player_id = os.environ.get("PLUM_LOCAL_PLAYER_ID", f"{unit_id}-player")
     local_player_url = os.environ.get("PLUM_LOCAL_PLAYER_URL", "ws://127.0.0.1:8928/sendspin")
 
+    mesh_enabled = os.environ.get("PLUM_MESH_ENABLED", "1") != "0"
+
     srv = PlumSendspinServer(unit_id, unit_name)
     await srv.start()
     # Phase 1: bring up the AirPlay source immediately. The feeder waits for shairport-sync to
@@ -462,12 +503,15 @@ async def main() -> None:
     srv.start_source("airplay", airplay_fifo)
     srv.start_airplay_metadata("airplay", airplay_meta_fifo)  # metadata/artwork → roles (item 3)
     if local_player_url:
-        srv.attach_local_player("airplay", local_player_id, local_player_url)
+        # With the mesh on, register + attach the local player once and let routing roam it;
+        # the perpetual re-attach supervisor (Phase-1 glue) would fight cross-server reclaims.
+        srv.attach_local_player("airplay", local_player_id, local_player_url,
+                                supervise=not mesh_enabled)
 
     # Phase 2: the mesh (discovery + aggregation + routing + REST). Local playback above stands
     # on its own; the mesh layers cross-unit roaming on top. Disable with PLUM_MESH_ENABLED=0.
     mesh = None
-    if os.environ.get("PLUM_MESH_ENABLED", "1") != "0":
+    if mesh_enabled:
         from mesh.orchestrator import MeshOrchestrator  # local import: avoids an import cycle
         mesh = MeshOrchestrator(
             srv, beacon_port=int(os.environ.get("PLUM_BEACON_PORT", "8929")),
