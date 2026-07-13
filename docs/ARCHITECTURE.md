@@ -268,8 +268,13 @@ stream + clock domain). The orchestrator's job is to present this coherently:
   WSGI would need a 2nd process). `/api/mesh/{snapshot,view,route,unroute,preconnect,volume}`,
   federation-parity, CORS on. `client.py` — aiohttp client (aggregator poll + router delegate).
 - `orchestrator.py` — composes the above around one running server; wired into `sendspin_server` main().
-- **Still to validate on hardware:** real 2-node discovery + cross-server roam gap/xruns; the
-  DISCOVERY-preconnect masking of the ~200 ms reclaim gap; multi-concurrent-group contention.
+
+**TWO-NODE HARDWARE VALIDATION PASSED (2026-07-13, `.201.133` Pi4-02 + `.201.113` PoE-Temp):**
+- **Discovery:** mutual beacon over the real LAN (each unit discovers the other; loopback couldn't test this).
+- **Aggregation:** each unit's `/api/mesh/view` shows both units; peer `host` from the beacon IP; group_ids consistent across the HTTP snapshot poll between hosts.
+- **Cross-server roam:** player ping-ponged 4 hops between units — **~54 ms route API, ~75 ms audible gap, 0 xruns / 0 starvation** through every handoff (better than the ~200 ms in-process estimate).
+- **Four bugs fixed, only reproducible on hardware** (commit `70ff0ed`): (1) `reclaim_client_for_playback` is synchronous, not awaitable; (2) disconnected clients left routing stubs — snapshot now connected-only; (3) reclaim URL must be the player's *own* listener URL (roamed players keep their origin host), now carried in `PlayerState`; (4) the Phase-1 auto-attach supervisor fought roams — `attach_local_player(supervise=not mesh_enabled)`.
+- **Still to validate:** DISCOVERY-preconnect masking of the reclaim gap; multi-concurrent-group contention; roam under live AirPlay (not just a tone).
 
 ### Phase 3 — Remaining sources + parity
 10. Spotify / DLNA / Bluetooth / Plexamp feeders (same PushStream pattern).
