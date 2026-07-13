@@ -464,12 +464,24 @@ async def main() -> None:
     if local_player_url:
         srv.attach_local_player("airplay", local_player_id, local_player_url)
 
+    # Phase 2: the mesh (discovery + aggregation + routing + REST). Local playback above stands
+    # on its own; the mesh layers cross-unit roaming on top. Disable with PLUM_MESH_ENABLED=0.
+    mesh = None
+    if os.environ.get("PLUM_MESH_ENABLED", "1") != "0":
+        from mesh.orchestrator import MeshOrchestrator  # local import: avoids an import cycle
+        mesh = MeshOrchestrator(
+            srv, beacon_port=int(os.environ.get("PLUM_BEACON_PORT", "8929")),
+            api_port=int(os.environ.get("PLUM_MESH_API_PORT", "5001")))
+        await mesh.start()
+
     stop = asyncio.Event()
     try:
         await stop.wait()  # run forever; supervisord manages the process lifecycle
     except asyncio.CancelledError:
         pass
     finally:
+        if mesh is not None:
+            await mesh.stop()
         await srv.stop()
 
 
