@@ -42,7 +42,8 @@ React/TS GUI are **ported** from Plum-Snapcast, not rewritten.
   **Do not "optimize" this back to Alpine.** Multi-arch amd64 + arm64.
 - **Language**: Python 3.13
 - **Sync engine**: `aiosendspin` (**pinned 6.0.5**; fast-moving — pin + smoke-test on bump), PyAV, numpy
-- **APIs**: Flask REST (settings, integrations, audio, mesh)
+- **APIs**: Flask REST (settings, integrations, audio); **mesh API is aiohttp** — it must call
+  the async router/aggregator inside the audio event loop, so WSGI Flask (2nd process) doesn't fit
 - **Audio sources**: shairport-sync (AirPlay), spotifyd (Spotify), gmrender-resurrect (DLNA),
   BlueZ+bluez-alsa (Bluetooth), Plexamp (Debian sidecar)
 - **Infra**: supervisord, Avahi (mDNS), D-Bus, host networking
@@ -72,7 +73,7 @@ React/TS GUI are **ported** from Plum-Snapcast, not rewritten.
 │   │   ├── sync_engine/         # engine seam (base + sendspin impl)
 │   │   ├── mesh/                # orchestrator: discovery, aggregator, router
 │   │   ├── sources/             # per-integration control scripts (metadata→roles)
-│   │   └── apis/                # settings/integrations/audio/mesh Flask APIs
+│   │   └── apis/                # settings/integrations/audio Flask APIs (mesh API lives in mesh/api.py, aiohttp)
 │   └── supervisord/       # process .ini configs
 ├── frontend/src/{components,services,hooks,assets}/
 ├── docker/                # docker-compose.yml + build-and-push.sh
@@ -104,8 +105,9 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
 
 ### Key design patterns
 - **Sendspin WS** (JSON control + binary media) for sync/transport
-- **Flask REST** for settings/integrations/audio/mesh; mesh API keeps parity with the old
-  federation REST surface so the GUI ports with minimal change
+- **Flask REST** for settings/integrations/audio; **aiohttp** for the mesh API (in the audio
+  event loop). The mesh API keeps parity with the old federation REST surface (`/api/mesh/*`:
+  snapshot/view/route/unroute/preconnect/volume) so the GUI ports with minimal change
 - **FIFO** audio transport from source services (single consumer — no tee needed)
 - **Dynamic stream lifecycle**: services run continuously; streams created on activity
 

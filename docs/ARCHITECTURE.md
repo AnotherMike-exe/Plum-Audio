@@ -248,6 +248,29 @@ stream + clock domain). The orchestrator's job is to present this coherently:
 8. Multi-concurrent-group model + contention handling.
 9. **Milestone:** ingest on unit A, route to A+B+C; second independent group on unit B; smooth handoffs.
 
+**Backbone BUILT + single-node-validated (2026-07, branch `feature/phase2-mesh`).**
+`backend/scripts/mesh/` + the engine seam, all logic/HTTP-tested; boots inside `sendspin_server`
+(`PLUM_MESH_ENABLED`, in-process — no new supervisord program):
+- `discovery.py` — UDP broadcast beacon (:8929), TTL peer table. **Not** mDNS (python-zeroconf
+  would bind 5353 → Avahi collision). Peer IP taken from the datagram source; derives peer
+  server/player `ws://` URLs. *Two-node broadcast round-trip pending a 2nd LAN unit (loopback
+  can't validate it).*
+- `model.py` — normalized `UnitSnapshot`/`SourceState`/`PlayerState` + aggregated `MeshView`
+  (`find_source`/`find_player`), JSON wire form. `PlumSendspinServer.snapshot()` supplies the local view.
+- `sync_engine/` — `SyncEngine` ABC refit to the router-facing seam; `SendspinEngine` facade over
+  `PlumSendspinServer` keeps the mesh aiosendspin-free. Adds `reclaim_remote_player()` (cross-server
+  roam) + `preconnect_player()` (DISCOVERY fast-switch) to the server.
+- `aggregator.py` — local snapshot + peers' snapshots (polled via discovery+client) → one `MeshView`;
+  peer `host` filled from the beacon source IP; unreachable peers omitted for the cycle.
+- `router.py` — three paths: intra-server (`attach_local_player`), cross-server (`reclaim_remote_player`),
+  or **delegate to the source's owning unit** (audio never leaves its ingesting unit). Deps injected.
+- `api.py` — **aiohttp** (not Flask: must call the async router/aggregator in the audio event loop;
+  WSGI would need a 2nd process). `/api/mesh/{snapshot,view,route,unroute,preconnect,volume}`,
+  federation-parity, CORS on. `client.py` — aiohttp client (aggregator poll + router delegate).
+- `orchestrator.py` — composes the above around one running server; wired into `sendspin_server` main().
+- **Still to validate on hardware:** real 2-node discovery + cross-server roam gap/xruns; the
+  DISCOVERY-preconnect masking of the ~200 ms reclaim gap; multi-concurrent-group contention.
+
 ### Phase 3 — Remaining sources + parity
 10. Spotify / DLNA / Bluetooth / Plexamp feeders (same PushStream pattern).
 11. Frontend: controller-role WS client, engine-agnostic data service, wire `App.tsx`
