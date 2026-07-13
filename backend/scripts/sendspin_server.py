@@ -52,6 +52,7 @@ from aiosendspin.server.group import SendspinGroup
 from aiosendspin.server.push_stream import PushStream, StreamStoppedError
 from aiosendspin.server.server import ConnectionReason, SendspinServer
 
+from mesh.model import PlayerState, SourceState, UnitSnapshot
 from sources.airplay_metadata import AirplayMetadataReader
 
 logger = logging.getLogger("plum.sendspin_server")
@@ -310,6 +311,72 @@ class PlumSendspinServer:
         if player is not None:
             await handle.group.remove_client(player)
             logger.info("[%s] detached player %s", source_id, player_id)
+
+    def preconnect_player(self, player_id: str, player_url: str) -> None:
+        """Hold a remote player in a DISCOVERY connection so a later route is cheap.
+
+        The idle fast-switch primitive (replaces Plum-Snapcast's auto-switch-service). Dialing
+        with ConnectionReason.DISCOVERY parks the player without claiming it for playback; a
+        subsequent reclaim_remote_player() promotes it to PLAYBACK without a cold connect.
+        """
+        assert self.server is not None
+        self.server.register_client_url(player_id, player_url)
+        self.server.connect_to_client(
+            player_url, connection_reason=ConnectionReason.DISCOVERY,
+            retry_initial_connection=True)
+
+    async def reclaim_remote_player(self, source_id: str, player_id: str, player_url: str,
+                                    timeout_s: float = 10.0) -> bool:
+        """Pull a player from its current (peer) server onto a local source group.
+
+        The cross-server roam primitive: dial the player for PLAYBACK, reclaim it (its old server
+        releases it with GoodbyeReason.ANOTHER_SERVER — the player-side handshake lives in
+        sendspin_player.py), then group it here. Reconnect-class (~200 ms on hardware); a prior
+        preconnect_player() masks most of that. Returns False if the reclaim times out.
+        """
+        assert self.server is not None
+        handle = self.sources.get(source_id)
+        if handle is None:
+            raise KeyError(f"unknown source {source_id!r}")
+        self.server.register_client_url(player_id, player_url)
+        self.server.connect_to_client(
+            player_url, connection_reason=ConnectionReason.PLAYBACK,
+            retry_initial_connection=True)
+        claimed = await self.server.reclaim_client_for_playback(player_id, timeout_s=timeout_s)
+        if not claimed:
+            logger.warning("[%s] reclaim of remote player %s timed out", source_id, player_id)
+            return False
+        await self.attach_player(source_id, player_id)
+        logger.info("[%s] reclaimed remote player %s from %s", source_id, player_id, player_url)
+        return True
+
+    def snapshot(self) -> UnitSnapshot:
+        """This unit's local view for the mesh aggregator / REST snapshot.
+
+        Structural only (sources, grouping, streaming, connected players). `host` is left None —
+        the aggregator fills it from the beacon source IP, the one authority on how peers reach us.
+        """
+        sources: list[SourceState] = []
+        for source_id, handle in self.sources.items():
+            group = handle.group
+            player_ids = [c.client_id for c in group.clients
+                          if not c.client_id.startswith(ANCHOR_PREFIX)]
+            sources.append(SourceState(
+                source_id=source_id, group_id=group.group_id, group_name=group.group_name,
+                streaming=group.has_active_stream, player_ids=player_ids))
+
+        players: list[PlayerState] = []
+        if self.server is not None:
+            for client in self.server.clients:
+                if client.client_id.startswith(ANCHOR_PREFIX):
+                    continue  # anchors are group scaffolding, not render endpoints
+                players.append(PlayerState(
+                    player_id=client.client_id, name=client.name or client.client_id,
+                    connected=client.is_connected,
+                    group_id=client.group.group_id if client.group is not None else None))
+
+        return UnitSnapshot(unit_id=self.unit_id, name=self.unit_name, host=None,
+                            sources=sources, players=players)
 
     def start_airplay_metadata(self, source_id: str, metadata_fifo: str) -> None:
         """Attach the shairport metadata/artwork → Sendspin roles reader to a source's group."""
