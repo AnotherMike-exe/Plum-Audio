@@ -50,6 +50,7 @@ import os
 from aiosendspin.server.audio import AudioFormat
 from aiosendspin.server.group import SendspinGroup
 from aiosendspin.server.push_stream import PushStream, StreamStoppedError
+from aiosendspin.server.roles.player import PlayerV1Role
 from aiosendspin.server.server import ConnectionReason, SendspinServer
 
 from mesh.model import PlayerState, SourceState, UnitSnapshot
@@ -297,7 +298,9 @@ class PlumSendspinServer:
         if handle is None:
             raise KeyError(f"unknown source {source_id!r}")
         player = self.server.get_or_create_client(player_id)
-        if player.group is not None and player.group is not handle.group:
+        if player.group is handle.group:
+            return  # already on this source — idempotent, avoids a redundant re-group
+        if player.group is not None:
             await player.group.remove_client(player)
         await handle.group.add_client(player)
         logger.info("[%s] attached player %s", source_id, player_id)
@@ -311,6 +314,24 @@ class PlumSendspinServer:
         if player is not None:
             await handle.group.remove_client(player)
             logger.info("[%s] detached player %s", source_id, player_id)
+
+    def set_player_volume(self, player_id: str, volume: int, muted: bool) -> None:
+        """Set one player's volume (0-100) and mute — per-client, independent of its group.
+
+        Drives the player's Sendspin volume/mute role commands; the player applies them as
+        render-side gain (AlsaRenderer). Per-client so concurrent groups (and members within a
+        group) each hold their own level.
+        """
+        assert self.server is not None
+        client = self.server.get_client(player_id)
+        if client is None or not client.is_connected:
+            raise KeyError(f"player {player_id!r} not connected")
+        role = client.get_role_state("player", PlayerV1Role)
+        if role is None:
+            raise RuntimeError(f"player {player_id!r} has no negotiated player role")
+        role.set_volume(max(0, min(100, volume)))
+        role.set_mute(muted)
+        logger.info("[vol] player %s -> %d%%%s", player_id, volume, " (muted)" if muted else "")
 
     def preconnect_player(self, player_id: str, player_url: str) -> None:
         """Hold a remote player in a DISCOVERY connection so a later route is cheap.

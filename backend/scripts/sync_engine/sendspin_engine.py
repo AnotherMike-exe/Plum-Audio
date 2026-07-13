@@ -9,13 +9,9 @@ swapped or the pin bumps incompatibly, only this class and PlumSendspinServer ch
 """
 from __future__ import annotations
 
-import logging
-
 from mesh.model import UnitSnapshot
 from sendspin_server import PlumSendspinServer
 from sync_engine.base import SyncEngine
-
-logger = logging.getLogger("plum.sync_engine")
 
 
 class SendspinEngine(SyncEngine):
@@ -41,9 +37,7 @@ class SendspinEngine(SyncEngine):
         self._server.preconnect_player(player_id, player_url)
 
     async def set_player_volume(self, player_id: str, volume: int, muted: bool) -> None:
-        # TODO(Phase 2): drive the player's volume role. Render-side gain already lives in the
-        # player's AlsaRenderer; this wires the control path once the volume API is in the mesh.
-        logger.info("set_player_volume(%s, vol=%d, muted=%s) — not yet wired", player_id, volume, muted)
+        self._server.set_player_volume(player_id, volume, muted)
 
     def snapshot(self) -> UnitSnapshot:
         return self._server.snapshot()
