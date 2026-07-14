@@ -12,6 +12,9 @@ services:
       - ./app-config:/config      # config, logs, settings.json
       - ./app-data:/data          # app data
       - ./app-media:/media        # media (Plexamp etc.)
+      # AirPlay advertising uses the HOST's Avahi/D-Bus (host concerns live on the host).
+      - /var/run/dbus:/var/run/dbus
+      - /var/run/avahi-daemon:/var/run/avahi-daemon
     environment:
       - PUID=1000
       - PGID=29                   # audio group (RPi standard)

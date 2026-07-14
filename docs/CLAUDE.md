@@ -42,7 +42,8 @@ React/TS GUI are **ported** from Plum-Snapcast, not rewritten.
   **Do not "optimize" this back to Alpine.** Multi-arch amd64 + arm64.
 - **Language**: Python 3.13
 - **Sync engine**: `aiosendspin` (**pinned 6.0.5**; fast-moving — pin + smoke-test on bump), PyAV, numpy
-- **APIs**: Flask REST (settings, integrations, audio, mesh)
+- **APIs**: Flask REST (settings, integrations, audio); **mesh API is aiohttp** — it must call
+  the async router/aggregator inside the audio event loop, so WSGI Flask (2nd process) doesn't fit
 - **Audio sources**: shairport-sync (AirPlay), spotifyd (Spotify), gmrender-resurrect (DLNA),
   BlueZ+bluez-alsa (Bluetooth), Plexamp (Debian sidecar)
 - **Infra**: supervisord, Avahi (mDNS), D-Bus, host networking
@@ -72,7 +73,7 @@ React/TS GUI are **ported** from Plum-Snapcast, not rewritten.
 │   │   ├── sync_engine/         # engine seam (base + sendspin impl)
 │   │   ├── mesh/                # orchestrator: discovery, aggregator, router
 │   │   ├── sources/             # per-integration control scripts (metadata→roles)
-│   │   └── apis/                # settings/integrations/audio/mesh Flask APIs
+│   │   └── apis/                # settings/integrations/audio Flask APIs (mesh API lives in mesh/api.py, aiohttp)
 │   └── supervisord/       # process .ini configs
 ├── frontend/src/{components,services,hooks,assets}/
 ├── docker/                # docker-compose.yml + build-and-push.sh
@@ -91,8 +92,10 @@ Every unit runs a Sendspin **server** (owns local audio ingest via in-process `P
 audio between servers (avoids the unmerged `Roles.SOURCE` path). Two tiers:
 1. **Intra-server** re-route → live `group.add_client` / `remove_client` (no reconnect).
 2. **Cross-server** roam → `reclaim_client_for_playback` + `GoodbyeReason.ANOTHER_SERVER`.
-`ConnectionReason.DISCOVERY→PLAYBACK` is the idle-preconnect / fast-switch primitive (replaces
-Plum-Snapcast's hand-built `auto-switch-service.py`).
+Cross-server roam is inaudible: the player never flushes on a roam, so its ~300 ms jitter buffer
+drains through the ~25-55 ms reconnect. **There is no DISCOVERY pre-connect** — a client holds one
+websocket, so a playing player can't be warmed on a 2nd server (and a DISCOVERY dial would steal it).
+Do not reintroduce it; see ARCHITECTURE §2.
 
 ### Audio pipeline
 ```
@@ -104,8 +107,9 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
 
 ### Key design patterns
 - **Sendspin WS** (JSON control + binary media) for sync/transport
-- **Flask REST** for settings/integrations/audio/mesh; mesh API keeps parity with the old
-  federation REST surface so the GUI ports with minimal change
+- **Flask REST** for settings/integrations/audio; **aiohttp** for the mesh API (in the audio
+  event loop). The mesh API keeps parity with the old federation REST surface (`/api/mesh/*`:
+  snapshot/view/route/unroute/volume/source) so the GUI ports with minimal change
 - **FIFO** audio transport from source services (single consumer — no tee needed)
 - **Dynamic stream lifecycle**: services run continuously; streams created on activity
 
@@ -187,7 +191,7 @@ docker exec plum-audio aplay -l
 |---|---|
 | `snapserver` / `snapclient` | in-process `SendspinServer` + Sendspin player |
 | `federation/*` | `backend/scripts/mesh/*` (same concepts, Sendspin protocol) |
-| `auto-switch-service.py` | `ConnectionReason.DISCOVERY→PLAYBACK` + reclaim |
+| `auto-switch-service.py` | `reclaim` (no pre-connect needed — roam is inaudible) |
 | `*-stream-lifecycle-manager.py` | PushStream feeders via `sync_engine/` |
 | AirPlay resync guards | dropped (metadata is out-of-band) |
 | `snapcastService.ts` / `snapcastDataService.ts` | Sendspin controller WS client + engine-agnostic data service |

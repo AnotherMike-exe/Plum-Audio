@@ -1,52 +1,68 @@
 #!/usr/bin/env python3
 """
-Plum-Audio mesh orchestrator — SKELETON (Phase 2).
+Plum-Audio mesh orchestrator — composes the Phase 2 mesh over a running unit.
 
-Maps the app's routing model onto verified aiosendspin primitives:
+Successor to Plum-Snapcast's federation/ package. Wires the five mesh pieces around one
+already-started PlumSendspinServer and owns their lifecycle:
 
-  Intra-server (player already on the ingesting unit's server):
-      await group.add_client(player)           # live re-group, no reconnect
-      await group.remove_client(player)         # back to a solo group
+    SendspinEngine   facade over the local server (keeps the mesh aiosendspin-free)
+    MeshDiscovery    UDP-beacon peer discovery (our own; server mDNS is off)
+    MeshClient       HTTP to peers' mesh APIs (aggregator poll + router delegate)
+    DataAggregator   local snapshot + peers' snapshots -> one MeshView
+    Router           intra / cross-server-reclaim / delegate route selection
+    MeshApi          the REST surface (snapshot for peers, view + route for the GUI)
 
-  Cross-server roam (pull a player from another unit):
-      target_server.connect_to_client(player_url, connection_reason=ConnectionReason.PLAYBACK)
-      target_server.reclaim_client_for_playback(player_id, timeout_s=...)
-      # player leaves its old server with GoodbyeReason.ANOTHER_SERVER
-
-  Idle pre-connect (fast-switch): hold players in ConnectionReason.DISCOVERY so a later
-  route to PLAYBACK is cheap — replaces Plum-Snapcast's auto-switch-service.py.
-
-Successor to federation/: Discovery (peer units), DataAggregator (unified servers/streams/
-players view), Router (execute routes). Port the intent of federation/api.py dedup + remote
-display logic here.
-
-TODO(Phase 2):
-  - Peer discovery (our own; server mDNS is off).
-  - Aggregate multi-unit state into the app Server/Stream/Client/Group types.
-  - Router.route_player / set_volume / control_stream over the SyncEngine seam.
-  - Flask blueprint with parity to the old /api/federation/* routes.
+The wiring is the point: the aggregator fetches peers via the client; the router reads the
+aggregator's view, resolves peer URLs via discovery, and delegates remote-source routes via the
+client; the API drives the router and serves the aggregator. "Servers stay, players roam."
 """
+
 from __future__ import annotations
 
 import logging
 
+from mesh.aggregator import DataAggregator
+from mesh.api import MeshApi
+from mesh.client import MeshClient
+from mesh.discovery import MeshDiscovery
+from mesh.router import Router
+from sendspin_server import PlumSendspinServer
+from sync_engine.sendspin_engine import SendspinEngine
+
 logger = logging.getLogger("plum.mesh")
 
 
-class Discovery:
-    """Discover peer Plum-Audio units on the LAN (server mDNS is off — use our own beacon)."""
-
-
-class DataAggregator:
-    """Unified view of all units' servers, groups, and players for the frontend."""
-
-
-class Router:
-    """Execute routing actions across the mesh via the SyncEngine seam."""
-
-
 class MeshOrchestrator:
-    def __init__(self) -> None:
-        self.discovery = Discovery()
-        self.aggregator = DataAggregator()
-        self.router = Router()
+    def __init__(self, server: PlumSendspinServer, *, beacon_port: int = 8929, api_port: int = 5001) -> None:
+        self.unit_id = server.unit_id
+        self.engine = SendspinEngine(server)
+        self.discovery = MeshDiscovery(
+            server.unit_id,
+            server.unit_name,
+            server_port=server.port,
+            player_port=server.port + 1,
+            beacon_port=beacon_port,
+        )
+        self.client = MeshClient(api_port=api_port)
+        self.aggregator = DataAggregator(server.unit_id, self.engine, self.discovery, self.client.fetch_snapshot)
+        self.router = Router(
+            server.unit_id,
+            self.engine,
+            view_provider=self.aggregator.view,
+            peer_provider=self.discovery.get_peer,
+            delegate=self.client.delegate_route,
+        )
+        self.api = MeshApi(self.engine, self.aggregator, self.router, port=api_port)
+
+    async def start(self) -> None:
+        await self.discovery.start()
+        await self.client.start()
+        await self.aggregator.start()
+        await self.api.start()
+        logger.info("mesh orchestrator up: unit=%s", self.unit_id)
+
+    async def stop(self) -> None:
+        await self.api.stop()
+        await self.aggregator.stop()
+        await self.client.stop()
+        await self.discovery.stop()
