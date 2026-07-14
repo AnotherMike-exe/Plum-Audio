@@ -33,9 +33,6 @@ class SendspinEngine(SyncEngine):
     async def reclaim_remote_player(self, source_id: str, player_id: str, player_url: str) -> bool:
         return await self._server.reclaim_remote_player(source_id, player_id, player_url)
 
-    def preconnect_player(self, player_id: str, player_url: str) -> None:
-        self._server.preconnect_player(player_id, player_url)
-
     async def set_player_volume(self, player_id: str, volume: int, muted: bool) -> None:
         self._server.set_player_volume(player_id, volume, muted)
 

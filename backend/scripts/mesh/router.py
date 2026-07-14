@@ -12,6 +12,11 @@ the router picks one of three paths:
 
 Dependencies are injected as callables (view/peer providers, a delegate for path 3) so the
 router is decoupled from the aggregator/discovery build order and unit-testable in isolation.
+
+There is no pre-connect/fast-switch operation: a Sendspin client holds one websocket, so a
+playing player cannot be warmed on a second server — and the cross-server roam is already
+inaudible (the player's ~300 ms jitter buffer covers the ~25-55 ms reconnect; measured emitted
+silence does not move across a roam). See PlumSendspinServer.reclaim_remote_player.
 """
 from __future__ import annotations
 
@@ -76,18 +81,6 @@ class Router:
         if not url:
             raise RouteError(f"no reclaim URL known for player {player_id!r}")
         return await self._engine.reclaim_remote_player(source_id, player_id, url)
-
-    def preconnect(self, player_id: str) -> None:
-        """Park a remote player in a DISCOVERY connection for a cheap later route (fast-switch)."""
-        pfound = self._view().find_player(player_id)
-        if pfound is None:
-            raise RouteError(f"unknown player {player_id!r}")
-        player_unit, player_state = pfound
-        if player_unit.unit_id == self.local_unit_id:
-            return  # already local; nothing to pre-connect
-        if not player_state.url:
-            raise RouteError(f"no reclaim URL known for player {player_id!r}")
-        self._engine.preconnect_player(player_id, player_state.url)
 
     async def unroute_player(self, player_id: str, source_id: str) -> None:
         """Remove a player from a (local) source group."""

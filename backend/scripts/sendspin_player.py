@@ -96,6 +96,10 @@ class AlsaRenderer:
         self.starved_frames = 0
         self._playing = False       # gates idle silence from being logged as starvation
         self._xrun_since_log = 0
+        # Unconditional silence accounting: every frame we had to pad, whether or not we thought
+        # we were "playing". starved_frames alone hides a gap where stream_end/clear flipped us
+        # idle (e.g. a cross-server roam) — this is the honest measure of audible dropout.
+        self.pad_frames = 0
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -145,6 +149,14 @@ class AlsaRenderer:
         if muted is not None:
             self._muted = muted
 
+    def stats(self) -> str:
+        """Buffer + dropout counters. pad_ms is the true audible silence emitted so far."""
+        with self._lock:
+            buffered = len(self._buf)
+        return (f"[buf={buffered * 1000 // (self._bpf * self.rate)}ms "
+                f"xruns={self.xruns} starv={self.starvations} "
+                f"pad_ms={self.pad_frames * 1000 // self.rate}]")
+
     # -- drain (PortAudio thread) -------------------------------------------
 
     def _callback(self, outdata, frames, time_info, status) -> None:  # noqa: ANN001
@@ -168,6 +180,7 @@ class AlsaRenderer:
             if playing:
                 self.starvations += 1
                 self.starved_frames += (need - take) // self._bpf
+            self.pad_frames += (need - take) // self._bpf
             chunk += b"\x00" * (need - take)
         if muted or gain == 0.0:
             outdata[:] = b"\x00" * need
@@ -230,9 +243,9 @@ class SendspinPlayer:
                     return
             disc = asyncio.Event()
             self.client.add_disconnect_listener(disc.set)
-            logger.info("attached to a server")
+            logger.info("attached to a server %s", self.renderer.stats())
             await disc.wait()
-            logger.info("detached from server")
+            logger.info("detached from server %s", self.renderer.stats())
 
         self._listener = ClientListener(
             client_id=self.player_id, on_connection=on_connection,
@@ -259,9 +272,11 @@ class SendspinPlayer:
         self.renderer.enqueue(pcm)
 
     def _on_stream_clear(self, channels) -> None:  # noqa: ANN001
+        logger.info("stream_clear -> flush (buffered audio discarded) %s", self.renderer.stats())
         self.renderer.flush()
 
     def _on_stream_end(self, channels) -> None:  # noqa: ANN001
+        logger.info("stream_end -> idle %s", self.renderer.stats())
         self.renderer.mark_idle()
 
     def _on_server_command(self, payload) -> None:  # noqa: ANN001

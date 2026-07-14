@@ -12,7 +12,6 @@ Endpoints (parity with the old /api/federation/* surface, so the GUI ports with 
   GET  /api/mesh/view              the aggregated mesh (what the GUI renders)
   POST /api/mesh/route             {player_id, source_id}          route a player onto a source
   POST /api/mesh/unroute           {player_id, source_id}          remove a player from a source
-  POST /api/mesh/preconnect        {player_id}                     DISCOVERY pre-connect (fast switch)
   POST /api/mesh/volume            {player_id, volume, muted}      per-player volume
   POST /api/mesh/source            {source_id, fifo?}              start a local source (a group)
   POST /api/mesh/source/stop       {source_id}                     stop a local source
@@ -65,7 +64,6 @@ class MeshApi:
             web.get("/api/mesh/view", self._view),
             web.post("/api/mesh/route", self._route),
             web.post("/api/mesh/unroute", self._unroute),
-            web.post("/api/mesh/preconnect", self._preconnect),
             web.post("/api/mesh/volume", self._volume),
             web.post("/api/mesh/source", self._source_start),
             web.post("/api/mesh/source/stop", self._source_stop),
@@ -107,17 +105,6 @@ class MeshApi:
         if not player_id or not source_id:
             return web.json_response({"error": "player_id and source_id required"}, status=400)
         await self._router.unroute_player(player_id, source_id)
-        return web.json_response({"ok": True})
-
-    async def _preconnect(self, request: web.Request) -> web.Response:
-        body = await self._json(request)
-        player_id = body.get("player_id")
-        if not player_id:
-            return web.json_response({"error": "player_id required"}, status=400)
-        try:
-            self._router.preconnect(player_id)
-        except RouteError as e:
-            return web.json_response({"error": str(e)}, status=400)
         return web.json_response({"ok": True})
 
     async def _volume(self, request: web.Request) -> web.Response:

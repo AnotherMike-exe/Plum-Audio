@@ -34,11 +34,12 @@ class SyncEngine(ABC):
 
     @abstractmethod
     async def reclaim_remote_player(self, source_id: str, player_id: str, player_url: str) -> bool:
-        """Cross-server roam: pull a player off its peer server onto a local source group."""
+        """Cross-server roam: pull a player off its peer server onto a local source group.
 
-    @abstractmethod
-    def preconnect_player(self, player_id: str, player_url: str) -> None:
-        """Park a remote player in a DISCOVERY connection for a cheap later route."""
+        No DISCOVERY pre-connect counterpart exists: a client holds one websocket, so a playing
+        player cannot be warmed on a second server — and the roam is already inaudible (the
+        player's jitter buffer covers the reconnect). See PlumSendspinServer.reclaim_remote_player.
+        """
 
     @abstractmethod
     async def set_player_volume(self, player_id: str, volume: int, muted: bool) -> None:

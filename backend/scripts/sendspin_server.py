@@ -336,19 +336,6 @@ class PlumSendspinServer:
             role.set_mute(muted)
         logger.info("[vol] player %s -> %d%%%s", player_id, volume, " (muted)" if muted else "")
 
-    def preconnect_player(self, player_id: str, player_url: str) -> None:
-        """Hold a remote player in a DISCOVERY connection so a later route is cheap.
-
-        The idle fast-switch primitive (replaces Plum-Snapcast's auto-switch-service). Dialing
-        with ConnectionReason.DISCOVERY parks the player without claiming it for playback; a
-        subsequent reclaim_remote_player() promotes it to PLAYBACK without a cold connect.
-        """
-        assert self.server is not None
-        self.server.register_client_url(player_id, player_url)
-        self.server.connect_to_client(
-            player_url, connection_reason=ConnectionReason.DISCOVERY,
-            retry_initial_connection=True)
-
     async def reclaim_remote_player(self, source_id: str, player_id: str, player_url: str,
                                     timeout_s: float = 10.0) -> bool:
         """Pull a player from its current (peer) server onto a local source group.
@@ -358,8 +345,20 @@ class PlumSendspinServer:
         available — it does NOT wait for the player to land here. The player then releases its
         old server with GoodbyeReason.ANOTHER_SERVER (handshake in sendspin_player.py) and
         reconnects to us. So we register the URL, initiate the reclaim, wait for the player to
-        actually reconnect, then group it. Reconnect-class (~200 ms on hardware); a prior
-        preconnect_player() masks most of that. Returns False if no URL or the player never lands.
+        actually reconnect, then group it. Returns False if no URL or the player never lands.
+
+        Cost: reconnect-class, ~25-55 ms on hardware — but INAUDIBLE. The player never flushes on
+        a roam (no stream_clear/stream_end fires), so its jitter buffer (~300 ms) keeps feeding the
+        DAC straight through the reconnect: measured pad_ms (emitted silence) does not move across
+        a roam. Seamless as long as reconnect << buffer depth, which holds with ~6x headroom.
+
+        There is deliberately NO DISCOVERY "pre-connect" to warm this path: a SendspinClient holds
+        exactly ONE websocket (attach_websocket raises if already connected), so a player cannot
+        hold a warm connection to a second server while playing on the first. Worse, the server
+        only reports connection_reason in server/hello — which the client sees only AFTER it has
+        attached — so a player cannot even decline a DISCOVERY dial while busy: our on_connection
+        would treat it as a reclaim and yank the player off its current server, causing the very
+        dropout the buffer otherwise prevents. The buffer already masks the gap; nothing to warm.
         """
         assert self.server is not None
         handle = self.sources.get(source_id)
