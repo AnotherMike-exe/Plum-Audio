@@ -276,9 +276,14 @@ stream + clock domain). The orchestrator's job is to present this coherently:
 **TWO-NODE HARDWARE VALIDATION PASSED (2026-07-13, `.201.133` Pi4-02 + `.201.113` PoE-Temp):**
 - **Discovery:** mutual beacon over the real LAN (each unit discovers the other; loopback couldn't test this).
 - **Aggregation:** each unit's `/api/mesh/view` shows both units; peer `host` from the beacon IP; group_ids consistent across the HTTP snapshot poll between hosts.
-- **Cross-server roam:** player ping-ponged 4 hops between units — **~54 ms route API, ~75 ms audible gap, 0 xruns / 0 starvation** through every handoff (better than the ~200 ms in-process estimate).
+- **Cross-server roam:** player ping-ponged 4 hops between units — **~54 ms route API, 0 xruns / 0 starvation** through every handoff. (The ~54 ms is the *protocol* gap; it is INAUDIBLE — see the reclaim-gap resolution below.)
 - **Four bugs fixed, only reproducible on hardware** (commit `70ff0ed`): (1) `reclaim_client_for_playback` is synchronous, not awaitable; (2) disconnected clients left routing stubs — snapshot now connected-only; (3) reclaim URL must be the player's *own* listener URL (roamed players keep their origin host), now carried in `PlayerState`; (4) the Phase-1 auto-attach supervisor fought roams — `attach_local_player(supervise=not mesh_enabled)`.
-- **Still to validate:** roam under live AirPlay (not just a tone).
+
+**RECLAIM-GAP + LIVE-AIRPLAY VALIDATION PASSED (2026-07-14):**
+- **The roam is inaudible.** Instrumented the renderer with unconditional silence accounting (`pad_ms`). Across a cross-server roam the player fires no `stream_clear`/`stream_end`, so its jitter buffer is never flushed and the DAC drains straight through the reconnect — measured `pad_ms` is *unchanged* across detach→attach. The DISCOVERY pre-connect idea was refuted (impossible + unnecessary — commit `de50035`, §2).
+- **Live AirPlay end-to-end:** real shairport-sync PCM ingested (not a tone); **title/artist/album + 512×512 JPEG artwork** flowed to the Sendspin metadata/artwork roles; 0 xruns.
+- **Multi-room:** player-133 + player-113 both joined `.133`'s live-AirPlay group and played it in sync.
+- **Roam off live AirPlay:** player-113 detached holding **435 ms of real AirPlay audio** → reattached with the buffer intact, **`pad_ms` unchanged** (zero audible dropout). The tone-based finding holds for real bursty content.
 
 **MULTI-CONCURRENT-GROUP VALIDATED ON HARDWARE (2026-07-13):** item 8 milestone met. Two sources
 active at once on one unit (`airplay` + a runtime-created `spotify` via `POST /api/mesh/source`),
