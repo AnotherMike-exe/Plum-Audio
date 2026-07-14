@@ -1,7 +1,10 @@
 # CLAUDE.md - Plum-Audio
 
 > **Purpose**: Project memory for Claude Code. Defines rules, workflows, and preferences.
-> **Status**: Greenfield rework of **Plum-Snapcast** — scaffolded 2026-07, build in progress.
+> **Status**: **Phase 2 complete + merged to `main` (2026-07-14)** — single-unit AirPlay and the
+> full mesh (discovery/aggregation/roam/multi-group/per-player volume) are hardware-validated on
+> two Pis, incl. live AirPlay + metadata/artwork + multi-room. **Phase 3 in progress**: remaining
+> sources (Spotify/DLNA/Bluetooth/Plexamp) + the React GUI port.
 
 ## Project Overview
 
@@ -20,7 +23,7 @@ React/TS GUI are **ported** from Plum-Snapcast, not rewritten.
 - React web UI, full-screen visualizer, album-art theming (ported).
 
 ### Project Context
-- **Stage**: Greenfield rework (Phase 0 scaffold complete)
+- **Stage**: Phase 2 (mesh) merged to `main`; Phase 3 (remaining sources + GUI) starting
 - **Team**: Solo developer + AI assistance
 - **Priority**: Correct mesh + audio reliability first; port UI second
 
