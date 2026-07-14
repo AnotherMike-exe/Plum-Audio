@@ -1,0 +1,37 @@
+{
+  "name": "sync-audio-controller",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:ci": "vitest run --coverage",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "colorthief": "^2.6.0",
+    "react": "^19.1.1",
+    "react-colorful": "^5.6.1",
+    "react-dom": "^19.1.1",
+    "react-router-dom": "^7.10.1"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.1.0",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/node": "^22.14.0",
+    "@types/react": "^19.0.1",
+    "@types/react-dom": "^19.0.1",
+    "@vitejs/plugin-react": "^4.3.1",
+    "@vitest/coverage-v8": "^3.1.1",
+    "jsdom": "^26.0.0",
+    "msw": "^2.7.3",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0",
+    "vitest": "^3.1.1"
+  }
+}

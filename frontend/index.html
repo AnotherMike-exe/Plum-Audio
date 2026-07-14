@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sync Audio Controller</title>
+    <style id="base-styles">
+        :root {
+            --bg-primary: #14141d;
+            --bg-secondary: #1f1f2b;
+            --bg-secondary-hover: #2c2c3a;
+            --bg-tertiary: #2a2a36;
+            --bg-tertiary-hover: #333342;
+            --border-color: #363645;
+            --text-primary: #f0f0f0;
+            --text-secondary: #b0b0c0;
+            --text-muted: #808090;
+            --icon-muted: #505060;
+
+            /* Default Accent: Jellyfin Purple */
+            --accent-color: #aa5cc3;
+            --accent-color-hover: #c47de5;
+            --accent-text-color: #ffffff; /* Default white text on accent colors */
+            --control-icon-color: #b0b0c0; /* Default to text-secondary, overridden in album art mode */
+        }
+
+        [data-theme='light'] {
+            --bg-primary: #f0f2f5;
+            --bg-secondary: #ffffff;
+            --bg-secondary-hover: #f9f9f9; /* Lighter hover for white mode */
+            --bg-tertiary: #e9ecef;
+            --bg-tertiary-hover: #e3e6e9; /* Lighter hover for white mode */
+            --border-color: #dee2e6;
+            --text-primary: #181c32;
+            --text-secondary: #5e6278;
+            --text-muted: #7e8299;
+            --icon-muted: #a1a5b7;
+            --control-icon-color: #5e6278; /* Default to text-secondary for light theme */
+        }
+
+        /* Accent Color Overrides */
+        [data-accent='purple'] { --accent-color: #aa5cc3; --accent-color-hover: #c47de5; }
+        [data-accent='blue'] { --accent-color: #3b82f6; --accent-color-hover: #60a5fa; }
+        [data-accent='green'] { --accent-color: #22c55e; --accent-color-hover: #4ade80; }
+        [data-accent='orange'] { --accent-color: #f97316; --accent-color-hover: #fb923c; }
+        [data-accent='red'] { --accent-color: #ef4444; --accent-color-hover: #f87171; }
+        [data-accent='yellow'] { --accent-color: #eab308; --accent-color-hover: #fbbf24; }
+        [data-accent='custom'] { --accent-color: var(--custom-accent-color); --accent-color-hover: var(--custom-accent-color-hover); }
+
+        /* Black & White Monochrome Modes */
+        [data-theme='black'] {
+            --bg-primary: #000000;
+            --bg-secondary: #0a0a0a;
+            --bg-tertiary: #141414;
+            --border-color: #1a1a1a;
+            --text-primary: #ffffff;
+            --text-secondary: #e0e0e0;
+            --text-muted: #a0a0a0;
+            --icon-muted: #808080;
+            --accent-color: #ffffff;
+            --accent-color-hover: #e0e0e0;
+            --accent-text-color: #000000; /* Black text on white accent */
+        }
+
+        /* CRITICAL FIX: Black theme button text override */
+        [data-theme='black'] button,
+        [data-theme='black'] div,
+        [data-theme='black'] span {
+            color: inherit; /* Reset to inherit first */
+        }
+
+        [data-theme='black'] .text-white {
+            color: #ffffff; /* Keep white for non-button text */
+        }
+
+        /* Force black text on white accent buttons in black theme */
+        [data-theme='black'] button.text-white.bg-\[var\(--accent-color\)\],
+        [data-theme='black'] .text-white.bg-\[var\(--accent-color\)\] {
+            color: #000000 !important;
+        }
+
+        [data-theme='black'] button.text-white.bg-\[var\(--accent-color\)\] *,
+        [data-theme='black'] .text-white.bg-\[var\(--accent-color\)\] * {
+            color: #000000 !important;
+        }
+
+        [data-theme='white'] {
+            --bg-primary: #ffffff;
+            --bg-secondary: #f5f5f5;
+            --bg-secondary-hover: #fafafa; /* Much lighter hover */
+            --bg-tertiary: #ebebeb;
+            --bg-tertiary-hover: #f0f0f0; /* Much lighter hover */
+            --border-color: #e0e0e0;
+            --text-primary: #000000;
+            --text-secondary: #1a1a1a;
+            --text-muted: #505050;
+            --icon-muted: #707070;
+            --accent-color: #000000;
+            --accent-color-hover: #1a1a1a;
+            --accent-text-color: #ffffff; /* White text on black accent */
+        }
+
+        /* Smooth color transitions for album art theming */
+        * {
+            transition-property: background-color, border-color, color, fill, stroke;
+            transition-duration: 500ms;
+            transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        /* Preserve existing transition overrides */
+        .transition-all {
+            transition-property: all;
+        }
+
+        /* Don't transition transforms and other properties that should be instant */
+        .transition-none {
+            transition: none !important;
+        }
+
+        .volume-slider {
+            -webkit-appearance: none;
+            appearance: none;
+            background-color: transparent;
+            height: 1rem; /* Set input height to thumb height for proper vertical centering */
+        }
+        .volume-slider::-webkit-slider-runnable-track {
+            height: 0.5rem;
+            border-radius: 0.25rem;
+        }
+        .volume-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 1rem;
+            height: 1rem;
+            background: var(--text-primary);
+            border-radius: 50%;
+            cursor: pointer;
+            margin-top: -3.5px; /* Fine-tune vertical centering */
+        }
+        .volume-slider::-moz-range-track {
+            height: 0.5rem;
+            border-radius: 0.25rem;
+        }
+        .volume-slider::-moz-range-thumb {
+            width: 1rem;
+            height: 1rem;
+            background: var(--text-primary);
+            border: none;
+            border-radius: 50%;
+            cursor: pointer;
+        }
+
+        /* Scrolling text animation */
+        @keyframes scroll-text {
+            0% {
+                transform: translateX(0);
+            }
+            20% {
+                transform: translateX(0);
+            }
+            70% {
+                transform: translateX(calc(-1 * var(--scroll-width) + 100%));
+            }
+            90% {
+                transform: translateX(calc(-1 * var(--scroll-width) + 100%));
+            }
+            100% {
+                transform: translateX(0);
+            }
+        }
+
+        .scrolling-text {
+            display: inline-block;
+            white-space: nowrap;
+            animation: scroll-text 12s ease-in-out infinite;
+            animation-delay: 2s;
+        }
+
+        /* Icon spin animation */
+        @keyframes icon-spin {
+            from {
+                transform: rotate(0deg);
+            }
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        .icon-spin {
+            animation: icon-spin 1s linear infinite;
+        }
+
+        /* Icon color inheritance */
+        .icon {
+            color: var(--icon-muted);
+        }
+
+        .icon svg {
+            width: 100%;
+            height: 100%;
+            fill: currentColor;
+            stroke: currentColor;
+        }
+
+        /* Accent button text color - use this class on buttons with accent background */
+        .accent-button-text,
+        .accent-button-text * {
+            color: var(--accent-text-color) !important;
+        }
+
+        /* Visualizer fade animation */
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+            }
+            to {
+                opacity: 1;
+            }
+        }
+
+        .animate-fadeIn {
+            animation: fadeIn 0.3s ease-in-out;
+        }
+    </style>
+
+    <!-- Load Tailwind CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+
+<link rel="stylesheet" href="/index.css">
+</head>
+  <body class="bg-[var(--bg-primary)] text-[var(--text-primary)] antialiased">
+    <div id="root"></div>
+    <script type="module" src="/index.tsx"></script>
+  </body>
+</html>
