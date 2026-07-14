@@ -92,8 +92,10 @@ Every unit runs a Sendspin **server** (owns local audio ingest via in-process `P
 audio between servers (avoids the unmerged `Roles.SOURCE` path). Two tiers:
 1. **Intra-server** re-route → live `group.add_client` / `remove_client` (no reconnect).
 2. **Cross-server** roam → `reclaim_client_for_playback` + `GoodbyeReason.ANOTHER_SERVER`.
-`ConnectionReason.DISCOVERY→PLAYBACK` is the idle-preconnect / fast-switch primitive (replaces
-Plum-Snapcast's hand-built `auto-switch-service.py`).
+Cross-server roam is inaudible: the player never flushes on a roam, so its ~300 ms jitter buffer
+drains through the ~25-55 ms reconnect. **There is no DISCOVERY pre-connect** — a client holds one
+websocket, so a playing player can't be warmed on a 2nd server (and a DISCOVERY dial would steal it).
+Do not reintroduce it; see ARCHITECTURE §2.
 
 ### Audio pipeline
 ```
@@ -107,7 +109,7 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
 - **Sendspin WS** (JSON control + binary media) for sync/transport
 - **Flask REST** for settings/integrations/audio; **aiohttp** for the mesh API (in the audio
   event loop). The mesh API keeps parity with the old federation REST surface (`/api/mesh/*`:
-  snapshot/view/route/unroute/preconnect/volume) so the GUI ports with minimal change
+  snapshot/view/route/unroute/volume/source) so the GUI ports with minimal change
 - **FIFO** audio transport from source services (single consumer — no tee needed)
 - **Dynamic stream lifecycle**: services run continuously; streams created on activity
 
@@ -189,7 +191,7 @@ docker exec plum-audio aplay -l
 |---|---|
 | `snapserver` / `snapclient` | in-process `SendspinServer` + Sendspin player |
 | `federation/*` | `backend/scripts/mesh/*` (same concepts, Sendspin protocol) |
-| `auto-switch-service.py` | `ConnectionReason.DISCOVERY→PLAYBACK` + reclaim |
+| `auto-switch-service.py` | `reclaim` (no pre-connect needed — roam is inaudible) |
 | `*-stream-lifecycle-manager.py` | PushStream feeders via `sync_engine/` |
 | AirPlay resync guards | dropped (metadata is out-of-band) |
 | `snapcastService.ts` / `snapcastDataService.ts` | Sendspin controller WS client + engine-agnostic data service |

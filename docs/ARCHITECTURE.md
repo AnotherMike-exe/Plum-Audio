@@ -46,7 +46,8 @@ the installed package:
 | `SendspinGroup.add_client()` / `remove_client()` + `_send_group_update_to_clients()` | **Intra-server routing is live control-plane.** Move a player between groups/streams over its existing WS — no reconnect. |
 | `SendspinServer.connect_to_client(url, connection_reason=…)` | **Servers dial players.** A player is addressable (`ws://player:8928/sendspin`); a server initiates the connection to it. |
 | `reclaim_client_for_playback(client_id, timeout_s)` — docstring: *"reclaim clients that disconnected with 'another_server'"* | **Cross-server roaming is first-class.** Contention between servers is a *designed* handoff, not a hack. |
-| `ConnectionReason.{DISCOVERY, PLAYBACK}` | **Two-tier presence.** Hold a player in a lightweight idle (DISCOVERY) connection; upgrade to PLAYBACK when audio routes to it. This *is* the "pre-connect to a silent group, fast-switch" pattern we hand-built for snapcast auto-switch — here it's a library primitive. |
+| `ConnectionReason.{DISCOVERY, PLAYBACK}` | ~~**Two-tier presence.** Hold a player in a lightweight idle (DISCOVERY) connection; upgrade to PLAYBACK when audio routes to it.~~ **❌ REFUTED ON HARDWARE (2026-07-14) — this was a source-reading error.** A `SendspinClient` holds exactly ONE websocket (`attach_websocket` raises if already connected), so a player **cannot** be held on a 2nd server while playing on the 1st. Worse, `connection_reason` is only reported in `server/hello`, which the client sees *after* it attaches — so a player cannot even decline a DISCOVERY dial while busy; it would surrender its current server. Pre-connect is removed. **It is also unnecessary:** the roam is already inaudible (next row). |
+| Player jitter buffer (~300 ms) vs. reconnect (~25–55 ms) | **This is the real gap-masker.** A roam fires no `stream_clear`/`stream_end`, so the buffer is never flushed — the DAC drains straight through the reconnect. Measured: emitted-silence counter (`pad_ms`) is *unchanged* across a roam. ~6× headroom. |
 | `GoodbyeReason.ANOTHER_SERVER` | Explicit protocol reason for a player leaving server A to join server B. |
 | `group.start_stream()` auto-calls `request_client_playback_connection()` for disconnected group members | Multi-server reclaim is wired into the normal "start playing" path. |
 | `Roles = {PLAYER, CONTROLLER, METADATA, ARTWORK, VISUALIZER, COLOR}` | Metadata/artwork/visualizer/color are out-of-band roles — resync storm gone; visualizer feed is native. |
@@ -97,8 +98,9 @@ achieved by **servers dialing/reclaiming players**, not by bridging audio betwee
    format). This is the cheap, common case for units already grouped together.
 2. **Cross-server** (pull a player from another unit): the target server calls
    `connect_to_client(player_url)` → player leaves its current server with
-   `ANOTHER_SERVER` → joins target → `add_client` to the group. Held pre-connected in
-   `DISCOVERY` when idle so the switch is fast.
+   `ANOTHER_SERVER` → joins target → `add_client` to the group. No DISCOVERY pre-connect (a
+   client holds one websocket — see §2); the switch is already inaudible because the player's
+   jitter buffer drains through the reconnect.
 
 **Why this beats the alternative (single master server + audio bridging):** feeding every
 unit's local source into one master server needs inter-unit PCM transport = the unmerged
@@ -131,7 +133,7 @@ metadata):**
 | `snapserver` | in-process `SendspinServer` + per-source `PushStream` feeders |
 | `snapclient` (integrated hw player) | Sendspin player (per unit), `hw:<card>` out |
 | `federation/*` (ws_manager, router, discovery, remote_snapclient_manager, api) | **Mesh orchestrator** — same *concepts* (aggregate N units, route endpoints), new protocol (Sendspin WS + server-dials-player + reclaim) |
-| `auto-switch-service.py` (slave fast-switch) | `ConnectionReason.DISCOVERY→PLAYBACK` + `reclaim` (library primitive) |
+| `auto-switch-service.py` (slave fast-switch) | `reclaim` (library primitive). No pre-connect needed — the roam is inaudible (jitter buffer covers the reconnect); DISCOVERY pre-connect proved impossible (§2) |
 | Browser audio wire protocol (`snapStreamService.ts`, `useBrowserAudioClient.ts`) | `sendspin-js` browser player (if browser playback is kept) |
 | Snapcast JSON-RPC frontend transport (`snapcastService.ts`, `snapcastDataService.ts`) | Sendspin controller-role WS client + engine-agnostic data service |
 
@@ -150,8 +152,8 @@ One supervised Python process tree per unit:
   (one per active local source FIFO), the group/stream lifecycle, metadata/artwork/color/
   visualizer role state. mDNS advertising disabled (we drive by URL); our own discovery.
 - **`sendspin_player`** — the unit's hardware render endpoint (port 8928), `hw:<card>` out.
-  Held in `DISCOVERY` by its home server when idle; reclaimed to whichever server is routing
-  to it. Latency knob → `static_delay_ms`.
+  Connected to exactly one server at a time; reclaimed to whichever server is routing to it.
+  Latency knob → `static_delay_ms`. Its jitter buffer is what makes a roam seamless.
 - **Mesh orchestrator** (successor to `federation/`) — discovers peer units, aggregates their
   server/group/player state into the app's `Server`/`Stream`/`Client`/`Group` types, and
   executes routing (`connect_to_client` / `reclaim` / `group.add_client`) on user action.
@@ -177,7 +179,7 @@ stream + clock domain). The orchestrator's job is to present this coherently:
   one group at a time.
 - **Route action:** "play `<source on unit X>` to `<players P…>`" ⇒ for each player: if
   already on X's server, `group.add_client`; else `connect_to_client`/`reclaim` then
-  `add_client`. Removing = `remove_client` (and drop to DISCOVERY on its home server).
+  `add_client`. Removing = `remove_client` (back to a solo group on its current server).
 - **Contention is defined:** a player can only render one group; routing it elsewhere pulls
   it (that's the `ANOTHER_SERVER` handoff). The GUI shows current group membership per player.
 - **Volume:** per-player volume via player-role command; group volume = delta-preserving
@@ -238,12 +240,14 @@ stream + clock domain). The orchestrator's job is to present this coherently:
    from an iPhone → shairport → FIFO → server → player → onboard DAC → speaker, **with live
    metadata + album art**, **0 xruns, no resync storm**. Runs as one supervisord container
    (image builds arm64; onboard DAC opens in-container via `--device /dev/snd`). Live re-route
-   ~0.1 ms / 0 xruns; cross-server reclaim reconnect-class (~85 ms gap, ~200 ms audible silence)
-   — Phase-2 mitigation is DISCOVERY pre-connect + `static_delay` buffering.
+   ~0.1 ms / 0 xruns; cross-server reclaim reconnect-class (~85 ms protocol gap). **Later
+   corrected (2026-07-14): the reconnect is INAUDIBLE — the player's jitter buffer drains through
+   it, emitting zero silence. The "~200 ms audible silence" estimate and the DISCOVERY-pre-connect
+   mitigation were both wrong; pre-connect is impossible (§2) and unnecessary.**
 
 ### Phase 2 — Mesh (the differentiator)
 6. Mesh orchestrator: peer discovery, state aggregation, routing engine
-   (`connect_to_client`/`reclaim`/`add_client`), DISCOVERY-preconnect idle pool.
+   (`connect_to_client`/`reclaim`/`add_client`). [No DISCOVERY-preconnect pool — refuted, see §2.]
 7. REST surface parity with today's federation API (route, volume, snapshot) for GUI reuse.
 8. Multi-concurrent-group model + contention handling.
 9. **Milestone:** ingest on unit A, route to A+B+C; second independent group on unit B; smooth handoffs.
@@ -259,13 +263,13 @@ stream + clock domain). The orchestrator's job is to present this coherently:
   (`find_source`/`find_player`), JSON wire form. `PlumSendspinServer.snapshot()` supplies the local view.
 - `sync_engine/` — `SyncEngine` ABC refit to the router-facing seam; `SendspinEngine` facade over
   `PlumSendspinServer` keeps the mesh aiosendspin-free. Adds `reclaim_remote_player()` (cross-server
-  roam) + `preconnect_player()` (DISCOVERY fast-switch) to the server.
+  roam) to the server. (`preconnect_player()` existed briefly but was removed — see §2.)
 - `aggregator.py` — local snapshot + peers' snapshots (polled via discovery+client) → one `MeshView`;
   peer `host` filled from the beacon source IP; unreachable peers omitted for the cycle.
 - `router.py` — three paths: intra-server (`attach_local_player`), cross-server (`reclaim_remote_player`),
   or **delegate to the source's owning unit** (audio never leaves its ingesting unit). Deps injected.
 - `api.py` — **aiohttp** (not Flask: must call the async router/aggregator in the audio event loop;
-  WSGI would need a 2nd process). `/api/mesh/{snapshot,view,route,unroute,preconnect,volume}`,
+  WSGI would need a 2nd process). `/api/mesh/{snapshot,view,route,unroute,volume,source}`,
   federation-parity, CORS on. `client.py` — aiohttp client (aggregator poll + router delegate).
 - `orchestrator.py` — composes the above around one running server; wired into `sendspin_server` main().
 
@@ -274,7 +278,7 @@ stream + clock domain). The orchestrator's job is to present this coherently:
 - **Aggregation:** each unit's `/api/mesh/view` shows both units; peer `host` from the beacon IP; group_ids consistent across the HTTP snapshot poll between hosts.
 - **Cross-server roam:** player ping-ponged 4 hops between units — **~54 ms route API, ~75 ms audible gap, 0 xruns / 0 starvation** through every handoff (better than the ~200 ms in-process estimate).
 - **Four bugs fixed, only reproducible on hardware** (commit `70ff0ed`): (1) `reclaim_client_for_playback` is synchronous, not awaitable; (2) disconnected clients left routing stubs — snapshot now connected-only; (3) reclaim URL must be the player's *own* listener URL (roamed players keep their origin host), now carried in `PlayerState`; (4) the Phase-1 auto-attach supervisor fought roams — `attach_local_player(supervise=not mesh_enabled)`.
-- **Still to validate:** DISCOVERY-preconnect masking of the reclaim gap; roam under live AirPlay (not just a tone).
+- **Still to validate:** roam under live AirPlay (not just a tone).
 
 **MULTI-CONCURRENT-GROUP VALIDATED ON HARDWARE (2026-07-13):** item 8 milestone met. Two sources
 active at once on one unit (`airplay` + a runtime-created `spotify` via `POST /api/mesh/source`),
@@ -303,7 +307,7 @@ placement, source groups persist with 0 players (anchor keeps the feeder alive f
 
 | Risk | Sev | Notes |
 |---|---|---|
-| Audible gap on cross-server reclaim (ALSA/PortAudio reinit) | **Med** | Design supports it; measure in §7 audible tier. Mitigate with DISCOVERY pre-connect + `static_delay_ms` buffer. |
+| ~~Audible gap on cross-server reclaim~~ | **RESOLVED** | Measured 2026-07-14: **no audible gap.** The player never flushes on a roam, so its ~300 ms jitter buffer drains through the ~25–55 ms reconnect — emitted-silence counter unchanged. The DISCOVERY-pre-connect mitigation was neither possible nor needed (§2). |
 | `aiosendspin` pin drift | Med | Fast-moving. Pin 6.0.5; smoke test; track releases. |
 | mDNS 5353 collision with our Avahi | Low | Known; disable server mDNS, drive by URL. |
 | Player maturity on `hw:<card>` (PortAudio on Pi) | Med | Validate the `sendspin` player + latency mapping on hardware (Phase 1). |
@@ -320,7 +324,7 @@ placement, source groups persist with 0 players (anchor keeps the feeder alive f
    retire; confirm the roles carry position.
 3. **Do we keep browser audio at all**, or is it a nice-to-have we drop for v1?
 4. **Group persistence** across restarts — do routes survive a unit reboot (re-establish
-   DISCOVERY pre-connects on boot)?
+   routes on boot)?
 5. **Naming**: server_id / player_id scheme for stable identity across reboots and IP changes.
 
 ---
