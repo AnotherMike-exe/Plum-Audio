@@ -11,6 +11,7 @@ All units run the same image, so the mesh API port is homogeneous (no need to ad
 the beacon). Kept deliberately thin — one shared ClientSession, short timeouts (a slow peer must
 not stall the aggregator poll), failures surface as None/False for the caller to tolerate.
 """
+
 from __future__ import annotations
 
 import asyncio

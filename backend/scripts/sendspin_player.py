@@ -7,12 +7,15 @@ or HiFiBerry). Grew out of the validated DacPlayer in _resources/spike/handoff_p
 
 Connection model — "servers dial the player" (the mesh model):
   - The player runs a ClientListener (mDNS OFF — 5353 collides with our Avahi) and waits for a
-    server to dial it (ConnectionReason.DISCOVERY when idle, PLAYBACK when audio routes here).
-  - Its *home* server holds it in DISCOVERY; another unit reclaims it by dialing (the
-    ANOTHER_SERVER handoff). When a new server dials while we're attached to the old one, we
-    release the old connection first, then attach the new — the player half of the reclaim.
+    server to dial it. It holds exactly ONE server connection at a time (SendspinClient allows
+    only one attached websocket) — there is no idle "DISCOVERY pre-connect" to a second server
+    (refuted on hardware; see ARCHITECTURE §2 and sendspin_server.reclaim_remote_player).
+  - Another unit reclaims it by dialing (the ANOTHER_SERVER handoff). When a new server dials
+    while we're attached to the old one, we release the old connection first, then attach the new
+    — the player half of the reclaim. The roam is inaudible: no stream_clear/stream_end fires, so
+    the jitter buffer keeps feeding the DAC straight through the reconnect.
   - PLUM_HOME_SERVER is an optional single-unit bring-up convenience: dial our home server on
-    boot so audio flows before the mesh orchestrator (Phase 2) exists to drive DISCOVERY.
+    boot so audio flows immediately.
 
 Render path:
   server stream --(WS, PCM)--> SendspinClient.audio_chunk --> AlsaRenderer jitter buffer
@@ -26,6 +29,7 @@ drift resampling) is Phase-2 work and is isolated in AlsaRenderer — see TODO t
 
 Runs under supervisord as the `sendspin_player` program.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -50,13 +54,13 @@ except Exception:  # noqa: BLE001 - allows --probe-config / import without PortA
 logger = logging.getLogger("plum.sendspin_player")
 
 DEFAULT_PORT = 8928
-DEFAULT_RATE = 44100          # AirPlay-native; the server resamples other sources to this
+DEFAULT_RATE = 44100  # AirPlay-native; the server resamples other sources to this
 DEFAULT_CHANNELS = 2
 DEFAULT_BITS = 16
-DAC_BLOCK_FRAMES = 480        # PortAudio callback block (~10 ms @ 48k); small → tight xruns
+DAC_BLOCK_FRAMES = 480  # PortAudio callback block (~10 ms @ 48k); small → tight xruns
 DEFAULT_TARGET_BUFFER_MS = 300  # jitter buffer depth we aim to hold ahead of the DAC
-MAX_BUFFER_MS = 2000          # hard cap; drop oldest beyond this if the DAC falls behind
-XRUN_LOG_EVERY = 50           # throttle xrun warnings
+MAX_BUFFER_MS = 2000  # hard cap; drop oldest beyond this if the DAC falls behind
+XRUN_LOG_EVERY = 50  # throttle xrun warnings
 
 
 class AlsaRenderer:
@@ -72,8 +76,7 @@ class AlsaRenderer:
     compute_play_time() matches, inserting silence / resampling to correct clock drift.
     """
 
-    def __init__(self, rate: int, channels: int, bits: int, *, device: str | None,
-                 target_buffer_ms: int) -> None:
+    def __init__(self, rate: int, channels: int, bits: int, *, device: str | None, target_buffer_ms: int) -> None:
         self.rate = rate
         self.channels = channels
         self.bits = bits
@@ -94,7 +97,7 @@ class AlsaRenderer:
         self.xruns = 0
         self.starvations = 0
         self.starved_frames = 0
-        self._playing = False       # gates idle silence from being logged as starvation
+        self._playing = False  # gates idle silence from being logged as starvation
         self._xrun_since_log = 0
         # Unconditional silence accounting: every frame we had to pad, whether or not we thought
         # we were "playing". starved_frames alone hides a gap where stream_end/clear flipped us
@@ -107,12 +110,23 @@ class AlsaRenderer:
         if sd is None:
             raise RuntimeError("sounddevice/PortAudio unavailable — cannot open the DAC")
         self._stream = sd.RawOutputStream(
-            samplerate=self.rate, channels=self.channels, dtype=f"int{self.bits}",
-            blocksize=DAC_BLOCK_FRAMES, device=self.device, callback=self._callback)
+            samplerate=self.rate,
+            channels=self.channels,
+            dtype=f"int{self.bits}",
+            blocksize=DAC_BLOCK_FRAMES,
+            device=self.device,
+            callback=self._callback,
+        )
         self._stream.start()
-        logger.info("DAC open: device=%s %d:%d:%d block=%d target=%dms",
-                    self.device or "default", self.rate, self.bits, self.channels,
-                    DAC_BLOCK_FRAMES, self._target_bytes * 1000 // (self._bpf * self.rate))
+        logger.info(
+            "DAC open: device=%s %d:%d:%d block=%d target=%dms",
+            self.device or "default",
+            self.rate,
+            self.bits,
+            self.channels,
+            DAC_BLOCK_FRAMES,
+            self._target_bytes * 1000 // (self._bpf * self.rate),
+        )
 
     def stop(self) -> None:
         if self._stream is not None:
@@ -130,8 +144,7 @@ class AlsaRenderer:
             if len(self._buf) > self._max_bytes:  # DAC behind → drop oldest to bound latency
                 drop = len(self._buf) - self._max_bytes
                 del self._buf[:drop]
-                logger.warning("jitter buffer over %dms — dropped %d bytes",
-                               MAX_BUFFER_MS, drop)
+                logger.warning("jitter buffer over %dms — dropped %d bytes", MAX_BUFFER_MS, drop)
 
     def flush(self) -> None:
         """Drop buffered audio (server sent stream_clear — discard pending)."""
@@ -153,9 +166,11 @@ class AlsaRenderer:
         """Buffer + dropout counters. pad_ms is the true audible silence emitted so far."""
         with self._lock:
             buffered = len(self._buf)
-        return (f"[buf={buffered * 1000 // (self._bpf * self.rate)}ms "
-                f"xruns={self.xruns} starv={self.starvations} "
-                f"pad_ms={self.pad_frames * 1000 // self.rate}]")
+        return (
+            f"[buf={buffered * 1000 // (self._bpf * self.rate)}ms "
+            f"xruns={self.xruns} starv={self.starvations} "
+            f"pad_ms={self.pad_frames * 1000 // self.rate}]"
+        )
 
     # -- drain (PortAudio thread) -------------------------------------------
 
@@ -185,7 +200,7 @@ class AlsaRenderer:
         if muted or gain == 0.0:
             outdata[:] = b"\x00" * need
         elif gain != 1.0:
-            samples = (np.frombuffer(chunk, dtype="<i2").astype(np.float32) * gain)
+            samples = np.frombuffer(chunk, dtype="<i2").astype(np.float32) * gain
             outdata[:] = np.clip(samples, -32768, 32767).astype("<i2").tobytes()
         else:
             outdata[:] = chunk
@@ -195,22 +210,38 @@ class SendspinPlayer:
     """The unit's roamable render endpoint: a PLAYER-role SendspinClient wired to an
     AlsaRenderer, reachable by servers via a ClientListener (mDNS off)."""
 
-    def __init__(self, player_id: str, player_name: str, *, port: int, renderer: AlsaRenderer,
-                 rate: int, channels: int, bits: int, static_delay_ms: float,
-                 initial_volume: int) -> None:
+    def __init__(
+        self,
+        player_id: str,
+        player_name: str,
+        *,
+        port: int,
+        renderer: AlsaRenderer,
+        rate: int,
+        channels: int,
+        bits: int,
+        static_delay_ms: float,
+        initial_volume: int,
+    ) -> None:
         self.player_id = player_id
         self.port = port
         self.renderer = renderer
 
         support = ClientHelloPlayerSupport(
-            supported_formats=[SupportedAudioFormat(
-                codec=AudioCodec.PCM, channels=channels, sample_rate=rate, bit_depth=bits)],
+            supported_formats=[
+                SupportedAudioFormat(codec=AudioCodec.PCM, channels=channels, sample_rate=rate, bit_depth=bits)
+            ],
             buffer_capacity=self.renderer._max_bytes,  # advertise our real buffer ceiling
-            supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE])
+            supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
+        )
         self.client = SendspinClient(
-            client_id=player_id, client_name=player_name, roles=[Roles.PLAYER],
-            player_support=support, static_delay_ms=static_delay_ms,
-            initial_volume=initial_volume)
+            client_id=player_id,
+            client_name=player_name,
+            roles=[Roles.PLAYER],
+            player_support=support,
+            static_delay_ms=static_delay_ms,
+            initial_volume=initial_volume,
+        )
         renderer.set_volume(volume=initial_volume)
 
         self.client.add_audio_chunk_listener(self._on_audio)
@@ -248,8 +279,8 @@ class SendspinPlayer:
             logger.info("detached from server %s", self.renderer.stats())
 
         self._listener = ClientListener(
-            client_id=self.player_id, on_connection=on_connection,
-            port=self.port, advertise_mdns=False)
+            client_id=self.player_id, on_connection=on_connection, port=self.port, advertise_mdns=False
+        )
         await self._listener.start()
         logger.info("player listening on :%d (id=%s)", self.port, self.player_id)
 
@@ -293,8 +324,8 @@ class SendspinPlayer:
 
 async def main() -> None:
     logging.basicConfig(
-        level=os.environ.get("PLUM_LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+        level=os.environ.get("PLUM_LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
 
     unit_id = os.environ.get("PLUM_UNIT_ID", "unit-local")
     player_id = os.environ.get("PLUM_PLAYER_ID", f"{unit_id}-player")
@@ -311,8 +342,16 @@ async def main() -> None:
 
     renderer = AlsaRenderer(rate, channels, bits, device=device, target_buffer_ms=target_buffer_ms)
     player = SendspinPlayer(
-        player_id, player_name, port=port, renderer=renderer, rate=rate, channels=channels,
-        bits=bits, static_delay_ms=static_delay_ms, initial_volume=initial_volume)
+        player_id,
+        player_name,
+        port=port,
+        renderer=renderer,
+        rate=rate,
+        channels=channels,
+        bits=bits,
+        static_delay_ms=static_delay_ms,
+        initial_volume=initial_volume,
+    )
     await player.start(home_server_url=home_server)
 
     stop = asyncio.Event()

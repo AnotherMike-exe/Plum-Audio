@@ -18,6 +18,7 @@ playing player cannot be warmed on a second server — and the cross-server roam
 inaudible (the player's ~300 ms jitter buffer covers the ~25-55 ms reconnect; measured emitted
 silence does not move across a roam). See PlumSendspinServer.reclaim_remote_player.
 """
+
 from __future__ import annotations
 
 import logging
@@ -40,9 +41,15 @@ class RouteError(Exception):
 
 
 class Router:
-    def __init__(self, local_unit_id: str, engine: SyncEngine, *,
-                 view_provider: ViewProvider, peer_provider: PeerProvider,
-                 delegate: RemoteDelegate | None = None) -> None:
+    def __init__(
+        self,
+        local_unit_id: str,
+        engine: SyncEngine,
+        *,
+        view_provider: ViewProvider,
+        peer_provider: PeerProvider,
+        delegate: RemoteDelegate | None = None,
+    ) -> None:
         self.local_unit_id = local_unit_id
         self._engine = engine
         self._view = view_provider

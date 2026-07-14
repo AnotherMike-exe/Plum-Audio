@@ -11,6 +11,7 @@ The HTTP fetch is injected (`fetch_snapshot`) so the aggregator doesn't hard-dep
 particular client and stays unit-testable. A peer that's discovered but momentarily unreachable
 is simply omitted from this cycle's view — discovery's TTL remains the authority on liveness.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -31,8 +32,15 @@ DEFAULT_INTERVAL_S = 2.0
 
 
 class DataAggregator:
-    def __init__(self, local_unit_id: str, engine: SyncEngine, discovery: MeshDiscovery,
-                 fetch_snapshot: FetchSnapshot, *, interval_s: float = DEFAULT_INTERVAL_S) -> None:
+    def __init__(
+        self,
+        local_unit_id: str,
+        engine: SyncEngine,
+        discovery: MeshDiscovery,
+        fetch_snapshot: FetchSnapshot,
+        *,
+        interval_s: float = DEFAULT_INTERVAL_S,
+    ) -> None:
         self.local_unit_id = local_unit_id
         self._engine = engine
         self._discovery = discovery

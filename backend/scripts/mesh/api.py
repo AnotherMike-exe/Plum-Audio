@@ -19,6 +19,7 @@ Endpoints (parity with the old /api/federation/* surface, so the GUI ports with 
 Sources are local to the unit that ingests them ("servers stay") — /source acts on THIS unit;
 there is no delegation. Multiple sources may run concurrently, each anchoring its own group.
 """
+
 from __future__ import annotations
 
 import logging
@@ -49,8 +50,9 @@ async def _cors(request: web.Request, handler):
 class MeshApi:
     """Serves the mesh REST endpoints backed by the engine, aggregator, and router."""
 
-    def __init__(self, engine: SyncEngine, aggregator: DataAggregator, router: Router,
-                 *, port: int = DEFAULT_API_PORT) -> None:
+    def __init__(
+        self, engine: SyncEngine, aggregator: DataAggregator, router: Router, *, port: int = DEFAULT_API_PORT
+    ) -> None:
         self._engine = engine
         self._agg = aggregator
         self._router = router
@@ -59,16 +61,18 @@ class MeshApi:
 
     async def start(self) -> None:
         app = web.Application(middlewares=[_cors])
-        app.add_routes([
-            web.get("/api/mesh/snapshot", self._snapshot),
-            web.get("/api/mesh/view", self._view),
-            web.post("/api/mesh/route", self._route),
-            web.post("/api/mesh/unroute", self._unroute),
-            web.post("/api/mesh/volume", self._volume),
-            web.post("/api/mesh/source", self._source_start),
-            web.post("/api/mesh/source/stop", self._source_stop),
-            web.route("OPTIONS", "/api/mesh/{tail:.*}", self._options),
-        ])
+        app.add_routes(
+            [
+                web.get("/api/mesh/snapshot", self._snapshot),
+                web.get("/api/mesh/view", self._view),
+                web.post("/api/mesh/route", self._route),
+                web.post("/api/mesh/unroute", self._unroute),
+                web.post("/api/mesh/volume", self._volume),
+                web.post("/api/mesh/source", self._source_start),
+                web.post("/api/mesh/source/stop", self._source_stop),
+                web.route("OPTIONS", "/api/mesh/{tail:.*}", self._options),
+            ]
+        )
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, host="0.0.0.0", port=self.port)

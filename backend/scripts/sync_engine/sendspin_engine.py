@@ -7,6 +7,7 @@ rather than on PlumSendspinServer (and, transitively, aiosendspin) directly. Eve
 1:1 onto a primitive the server already validated on hardware. If the sync library is ever
 swapped or the pin bumps incompatibly, only this class and PlumSendspinServer change.
 """
+
 from __future__ import annotations
 
 from mesh.model import UnitSnapshot

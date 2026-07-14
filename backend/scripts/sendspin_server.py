@@ -40,6 +40,7 @@ TODO(Phase 1+):
   - Metadata/artwork/visualizer role emission from the control scripts (out-of-band).
   - supervisord integration (this module is the `sendspin_server` program).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -94,8 +95,7 @@ class SourceFeeder:
     flip the stream to non-live and loop back to wait for the next writer.
     """
 
-    def __init__(self, source_id: str, fifo_path: str, group: SendspinGroup,
-                 fmt: AudioFormat = DEFAULT_FORMAT) -> None:
+    def __init__(self, source_id: str, fifo_path: str, group: SendspinGroup, fmt: AudioFormat = DEFAULT_FORMAT) -> None:
         self.source_id = source_id
         self.fifo_path = fifo_path
         self.group = group
@@ -147,9 +147,15 @@ class SourceFeeder:
 
     async def run(self) -> None:
         chunk = _chunk_bytes(self.fmt, COMMIT_CHUNK_MS)
-        logger.info("[%s] feeder up: %s @ %d:%d:%d, %d-byte chunks",
-                    self.source_id, self.fifo_path, self.fmt.sample_rate,
-                    self.fmt.bit_depth, self.fmt.channels, chunk)
+        logger.info(
+            "[%s] feeder up: %s @ %d:%d:%d, %d-byte chunks",
+            self.source_id,
+            self.fifo_path,
+            self.fmt.sample_rate,
+            self.fmt.bit_depth,
+            self.fmt.channels,
+            chunk,
+        )
         self._acquire_stream()
         while not self._stop_evt.is_set():
             reader = transport = None
@@ -188,8 +194,7 @@ class SourceFeeder:
                     except StreamStoppedError:
                         # Routing/membership churn stopped our stream — re-acquire and re-push
                         # this same chunk so no audio is dropped.
-                        logger.info("[%s] stream stopped under feeder; re-acquiring",
-                                    self.source_id)
+                        logger.info("[%s] stream stopped under feeder; re-acquiring", self.source_id)
                         await asyncio.sleep(REACQUIRE_BACKOFF_S)
                         self._acquire_stream()
                         with contextlib.suppress(StreamStoppedError):
@@ -200,8 +205,7 @@ class SourceFeeder:
                         await self.ps.sleep_to_limit_buffer(TARGET_BUFFER_US)
 
                 if eof:
-                    logger.info("[%s] FIFO writer closed (session end) — going idle",
-                                self.source_id)
+                    logger.info("[%s] FIFO writer closed (session end) — going idle", self.source_id)
                     return
         finally:
             # Mark the live source paused; the stream/group stay up for the next session.
@@ -258,8 +262,7 @@ class PlumSendspinServer:
             await self.server.close()
             self.server = None
 
-    def start_source(self, source_id: str, fifo_path: str,
-                     fmt: AudioFormat = DEFAULT_FORMAT) -> SourceHandle:
+    def start_source(self, source_id: str, fifo_path: str, fmt: AudioFormat = DEFAULT_FORMAT) -> SourceHandle:
         """Create the source's anchor group and launch its FIFO feeder.
 
         Idempotent: returns the existing handle if the source is already running.
@@ -336,8 +339,9 @@ class PlumSendspinServer:
             role.set_mute(muted)
         logger.info("[vol] player %s -> %d%%%s", player_id, volume, " (muted)" if muted else "")
 
-    async def reclaim_remote_player(self, source_id: str, player_id: str, player_url: str,
-                                    timeout_s: float = 10.0) -> bool:
+    async def reclaim_remote_player(
+        self, source_id: str, player_id: str, player_url: str, timeout_s: float = 10.0
+    ) -> bool:
         """Pull a player from its current (peer) server onto a local source group.
 
         The cross-server roam primitive. `reclaim_client_for_playback` is SYNCHRONOUS: it dials
@@ -396,11 +400,16 @@ class PlumSendspinServer:
         sources: list[SourceState] = []
         for source_id, handle in self.sources.items():
             group = handle.group
-            player_ids = [c.client_id for c in group.clients
-                          if not c.client_id.startswith(ANCHOR_PREFIX)]
-            sources.append(SourceState(
-                source_id=source_id, group_id=group.group_id, group_name=group.group_name,
-                streaming=group.has_active_stream, player_ids=player_ids))
+            player_ids = [c.client_id for c in group.clients if not c.client_id.startswith(ANCHOR_PREFIX)]
+            sources.append(
+                SourceState(
+                    source_id=source_id,
+                    group_id=group.group_id,
+                    group_name=group.group_name,
+                    streaming=group.has_active_stream,
+                    player_ids=player_ids,
+                )
+            )
 
         players: list[PlayerState] = []
         if self.server is not None:
@@ -411,14 +420,17 @@ class PlumSendspinServer:
                     continue  # a disconnected client isn't a live endpoint here — e.g. a player
                     # that roamed to a peer leaves a stub; reporting it would make the mesh view
                     # (and the router's find_player) think the player is still on this unit.
-                players.append(PlayerState(
-                    player_id=client.client_id, name=client.name or client.client_id,
-                    connected=True,
-                    group_id=client.group.group_id if client.group is not None else None,
-                    url=self.server.get_client_url(client.client_id)))
+                players.append(
+                    PlayerState(
+                        player_id=client.client_id,
+                        name=client.name or client.client_id,
+                        connected=True,
+                        group_id=client.group.group_id if client.group is not None else None,
+                        url=self.server.get_client_url(client.client_id),
+                    )
+                )
 
-        return UnitSnapshot(unit_id=self.unit_id, name=self.unit_name, host=None,
-                            sources=sources, players=players)
+        return UnitSnapshot(unit_id=self.unit_id, name=self.unit_name, host=None, sources=sources, players=players)
 
     def start_airplay_metadata(self, source_id: str, metadata_fifo: str) -> None:
         """Attach the shairport metadata/artwork → Sendspin roles reader to a source's group."""
@@ -430,8 +442,7 @@ class PlumSendspinServer:
         reader.start()
         logger.info("[%s] airplay metadata reader started (%s)", source_id, metadata_fifo)
 
-    def attach_local_player(self, source_id: str, player_id: str, player_url: str,
-                            *, supervise: bool = True) -> None:
+    def attach_local_player(self, source_id: str, player_id: str, player_url: str, *, supervise: bool = True) -> None:
         """Attach this unit's own player to a source, registering its reclaim URL.
 
         Always registers the player's URL so peers can reclaim it. Then, depending on `supervise`:
@@ -443,12 +454,14 @@ class PlumSendspinServer:
         """
         assert self.server is not None
         self.server.register_client_url(player_id, player_url)
-        coro = (self._supervise_local_player(source_id, player_id, player_url) if supervise
-                else self._attach_local_player_once(source_id, player_id, player_url))
+        coro = (
+            self._supervise_local_player(source_id, player_id, player_url)
+            if supervise
+            else self._attach_local_player_once(source_id, player_id, player_url)
+        )
         self._local_player_tasks.append(asyncio.ensure_future(coro))
 
-    async def _attach_local_player_once(self, source_id: str, player_id: str,
-                                        player_url: str) -> None:
+    async def _attach_local_player_once(self, source_id: str, player_id: str, player_url: str) -> None:
         """Dial the local player and attach it to its source exactly once (mesh-owned routing).
 
         Does not re-dial after a later disconnect: when the player roams to a peer it sends
@@ -457,7 +470,8 @@ class PlumSendspinServer:
         """
         assert self.server is not None
         self.server.connect_to_client(
-            player_url, connection_reason=ConnectionReason.PLAYBACK, retry_initial_connection=True)
+            player_url, connection_reason=ConnectionReason.PLAYBACK, retry_initial_connection=True
+        )
         if await self._await_client_connected(player_id, timeout_s=30.0):
             with contextlib.suppress(Exception):
                 await self.attach_player(source_id, player_id)
@@ -466,11 +480,13 @@ class PlumSendspinServer:
     def _dial_local_player(self, player_url: str) -> None:
         assert self.server is not None
         self.server.connect_to_client(
-            player_url, connection_reason=ConnectionReason.PLAYBACK,
-            retry_initial_connection=True, retry_indefinitely=True)
+            player_url,
+            connection_reason=ConnectionReason.PLAYBACK,
+            retry_initial_connection=True,
+            retry_indefinitely=True,
+        )
 
-    async def _supervise_local_player(self, source_id: str, player_id: str,
-                                      player_url: str) -> None:
+    async def _supervise_local_player(self, source_id: str, player_id: str, player_url: str) -> None:
         """Dial + (re)attach the local player, self-healing across restarts.
 
         We proactively re-dial while disconnected: a clean player shutdown sends a goodbye, after
@@ -528,17 +544,19 @@ async def main() -> None:
     if local_player_url:
         # With the mesh on, register + attach the local player once and let routing roam it;
         # the perpetual re-attach supervisor (Phase-1 glue) would fight cross-server reclaims.
-        srv.attach_local_player("airplay", local_player_id, local_player_url,
-                                supervise=not mesh_enabled)
+        srv.attach_local_player("airplay", local_player_id, local_player_url, supervise=not mesh_enabled)
 
     # Phase 2: the mesh (discovery + aggregation + routing + REST). Local playback above stands
     # on its own; the mesh layers cross-unit roaming on top. Disable with PLUM_MESH_ENABLED=0.
     mesh = None
     if mesh_enabled:
         from mesh.orchestrator import MeshOrchestrator  # local import: avoids an import cycle
+
         mesh = MeshOrchestrator(
-            srv, beacon_port=int(os.environ.get("PLUM_BEACON_PORT", "8929")),
-            api_port=int(os.environ.get("PLUM_MESH_API_PORT", "5001")))
+            srv,
+            beacon_port=int(os.environ.get("PLUM_BEACON_PORT", "8929")),
+            api_port=int(os.environ.get("PLUM_MESH_API_PORT", "5001")),
+        )
         await mesh.start()
 
     stop = asyncio.Event()

@@ -21,6 +21,7 @@ shairport metadata item format (each item may span several lines; accumulate to 
                   ssnc: mdst/mden=bundle start/end, PICT=cover art, prgr=progress (RTP frames),
                         pend/pfls=stop/flush (clear), pbeg/prsm/paus=play state.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -47,7 +48,7 @@ class AirplayMetadataReader:
         self.group = group
         self.fifo_path = fifo_path
         self.rtp_rate = rtp_rate
-        self._pending: dict[str, str] = {}   # title/artist/album accumulated within a bundle
+        self._pending: dict[str, str] = {}  # title/artist/album accumulated within a bundle
         self._task: asyncio.Task | None = None
         self._stop_evt = asyncio.Event()
         self._warned_no_role = False
@@ -89,8 +90,7 @@ class AirplayMetadataReader:
         fd = os.open(self.fifo_path, os.O_RDONLY | os.O_NONBLOCK)
         pipe = os.fdopen(fd, "rb", buffering=0)
         reader = asyncio.StreamReader(limit=READER_LIMIT)
-        transport, _ = await loop.connect_read_pipe(
-            lambda: asyncio.StreamReaderProtocol(reader), pipe)
+        transport, _ = await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), pipe)
         return reader, transport
 
     async def run(self) -> None:

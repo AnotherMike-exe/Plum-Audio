@@ -12,6 +12,7 @@ unchanged. Keep this structural (who ingests what, which players are grouped whe
 streaming) — now-playing metadata rides its own Sendspin metadata/artwork role to the GUI and is
 deliberately *not* duplicated here.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -28,14 +29,23 @@ class PlayerState:
     url: str | None = None  # the player's own LAN listener URL (how any server reclaims it)
 
     def to_dict(self) -> dict:
-        return {"player_id": self.player_id, "name": self.name,
-                "connected": self.connected, "group_id": self.group_id, "url": self.url}
+        return {
+            "player_id": self.player_id,
+            "name": self.name,
+            "connected": self.connected,
+            "group_id": self.group_id,
+            "url": self.url,
+        }
 
     @classmethod
     def from_dict(cls, d: dict) -> "PlayerState":
-        return cls(player_id=d["player_id"], name=d.get("name", d["player_id"]),
-                   connected=bool(d.get("connected", False)), group_id=d.get("group_id"),
-                   url=d.get("url"))
+        return cls(
+            player_id=d["player_id"],
+            name=d.get("name", d["player_id"]),
+            connected=bool(d.get("connected", False)),
+            group_id=d.get("group_id"),
+            url=d.get("url"),
+        )
 
 
 @dataclass
@@ -45,20 +55,27 @@ class SourceState:
     source_id: str
     group_id: str
     group_name: str
-    streaming: bool                       # feeder is pushing audio right now
+    streaming: bool  # feeder is pushing audio right now
     player_ids: list[str] = field(default_factory=list)  # players attached to this group
 
     def to_dict(self) -> dict:
-        return {"source_id": self.source_id, "group_id": self.group_id,
-                "group_name": self.group_name, "streaming": self.streaming,
-                "player_ids": list(self.player_ids)}
+        return {
+            "source_id": self.source_id,
+            "group_id": self.group_id,
+            "group_name": self.group_name,
+            "streaming": self.streaming,
+            "player_ids": list(self.player_ids),
+        }
 
     @classmethod
     def from_dict(cls, d: dict) -> "SourceState":
-        return cls(source_id=d["source_id"], group_id=d["group_id"],
-                   group_name=d.get("group_name", d["group_id"]),
-                   streaming=bool(d.get("streaming", False)),
-                   player_ids=list(d.get("player_ids", [])))
+        return cls(
+            source_id=d["source_id"],
+            group_id=d["group_id"],
+            group_name=d.get("group_name", d["group_id"]),
+            streaming=bool(d.get("streaming", False)),
+            player_ids=list(d.get("player_ids", [])),
+        )
 
 
 @dataclass
@@ -67,20 +84,28 @@ class UnitSnapshot:
 
     unit_id: str
     name: str
-    host: str | None                      # filled in by the aggregator from the beacon source IP
+    host: str | None  # filled in by the aggregator from the beacon source IP
     sources: list[SourceState] = field(default_factory=list)
     players: list[PlayerState] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        return {"unit_id": self.unit_id, "name": self.name, "host": self.host,
-                "sources": [s.to_dict() for s in self.sources],
-                "players": [p.to_dict() for p in self.players]}
+        return {
+            "unit_id": self.unit_id,
+            "name": self.name,
+            "host": self.host,
+            "sources": [s.to_dict() for s in self.sources],
+            "players": [p.to_dict() for p in self.players],
+        }
 
     @classmethod
     def from_dict(cls, d: dict) -> "UnitSnapshot":
-        return cls(unit_id=d["unit_id"], name=d.get("name", d["unit_id"]), host=d.get("host"),
-                   sources=[SourceState.from_dict(s) for s in d.get("sources", [])],
-                   players=[PlayerState.from_dict(p) for p in d.get("players", [])])
+        return cls(
+            unit_id=d["unit_id"],
+            name=d.get("name", d["unit_id"]),
+            host=d.get("host"),
+            sources=[SourceState.from_dict(s) for s in d.get("sources", [])],
+            players=[PlayerState.from_dict(p) for p in d.get("players", [])],
+        )
 
 
 @dataclass

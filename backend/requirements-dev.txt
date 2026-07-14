@@ -1,0 +1,5 @@
+# Plum-Audio backend — dev/test tooling (not shipped in the image).
+-r requirements.txt
+pytest>=8
+black>=24
+ruff>=0.6

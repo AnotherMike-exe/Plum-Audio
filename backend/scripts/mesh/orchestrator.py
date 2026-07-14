@@ -16,6 +16,7 @@ The wiring is the point: the aggregator fetches peers via the client; the router
 aggregator's view, resolves peer URLs via discovery, and delegates remote-source routes via the
 client; the API drives the router and serves the aggregator. "Servers stay, players roam."
 """
+
 from __future__ import annotations
 
 import logging
@@ -32,21 +33,25 @@ logger = logging.getLogger("plum.mesh")
 
 
 class MeshOrchestrator:
-    def __init__(self, server: PlumSendspinServer, *, beacon_port: int = 8929,
-                 api_port: int = 5001) -> None:
+    def __init__(self, server: PlumSendspinServer, *, beacon_port: int = 8929, api_port: int = 5001) -> None:
         self.unit_id = server.unit_id
         self.engine = SendspinEngine(server)
         self.discovery = MeshDiscovery(
-            server.unit_id, server.unit_name,
-            server_port=server.port, player_port=server.port + 1, beacon_port=beacon_port)
+            server.unit_id,
+            server.unit_name,
+            server_port=server.port,
+            player_port=server.port + 1,
+            beacon_port=beacon_port,
+        )
         self.client = MeshClient(api_port=api_port)
-        self.aggregator = DataAggregator(
-            server.unit_id, self.engine, self.discovery, self.client.fetch_snapshot)
+        self.aggregator = DataAggregator(server.unit_id, self.engine, self.discovery, self.client.fetch_snapshot)
         self.router = Router(
-            server.unit_id, self.engine,
+            server.unit_id,
+            self.engine,
             view_provider=self.aggregator.view,
             peer_provider=self.discovery.get_peer,
-            delegate=self.client.delegate_route)
+            delegate=self.client.delegate_route,
+        )
         self.api = MeshApi(self.engine, self.aggregator, self.router, port=api_port)
 
     async def start(self) -> None:

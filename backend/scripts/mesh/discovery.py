@@ -11,6 +11,7 @@ A beacon carries only identity + ports; the peer's IP is taken from the datagram
 so no in-process IP detection is needed. From (host, ports) the orchestrator derives the peer's
 server URL (ws://host:8927/sendspin) and player URL (ws://host:8928/sendspin) for routing.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -26,7 +27,7 @@ logger = logging.getLogger("plum.mesh.discovery")
 BEACON_PORT = 8929
 BEACON_VERSION = 1
 DEFAULT_INTERVAL_S = 2.0
-DEFAULT_TTL_S = 8.0          # a peer unheard for this long is dropped (≈4 missed beacons)
+DEFAULT_TTL_S = 8.0  # a peer unheard for this long is dropped (≈4 missed beacons)
 BROADCAST_ADDR = "255.255.255.255"
 
 
@@ -64,10 +65,18 @@ class _BeaconProtocol(asyncio.DatagramProtocol):
 class MeshDiscovery:
     """Broadcasts this unit's beacon and maintains a TTL'd table of peer units."""
 
-    def __init__(self, unit_id: str, unit_name: str, *, server_port: int = 8927,
-                 player_port: int = 8928, beacon_port: int = BEACON_PORT,
-                 interval_s: float = DEFAULT_INTERVAL_S, ttl_s: float = DEFAULT_TTL_S,
-                 broadcast_addr: str = BROADCAST_ADDR) -> None:
+    def __init__(
+        self,
+        unit_id: str,
+        unit_name: str,
+        *,
+        server_port: int = 8927,
+        player_port: int = 8928,
+        beacon_port: int = BEACON_PORT,
+        interval_s: float = DEFAULT_INTERVAL_S,
+        ttl_s: float = DEFAULT_TTL_S,
+        broadcast_addr: str = BROADCAST_ADDR,
+    ) -> None:
         self.unit_id = unit_id
         self.unit_name = unit_name
         self.server_port = server_port
@@ -89,8 +98,7 @@ class MeshDiscovery:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)  # not on all platforms
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.bind(("", self.beacon_port))
-        self._transport, _ = await loop.create_datagram_endpoint(
-            lambda: _BeaconProtocol(self._on_datagram), sock=sock)
+        self._transport, _ = await loop.create_datagram_endpoint(lambda: _BeaconProtocol(self._on_datagram), sock=sock)
         self._task = asyncio.ensure_future(self._broadcast_loop())
         logger.info("mesh discovery up: unit=%s beacon=:%d", self.unit_id, self.beacon_port)
 
@@ -121,13 +129,15 @@ class MeshDiscovery:
     # -- beacon encode / decode ---------------------------------------------
 
     def _make_beacon(self) -> bytes:
-        return json.dumps({
-            "v": BEACON_VERSION,
-            "unit_id": self.unit_id,
-            "name": self.unit_name,
-            "server_port": self.server_port,
-            "player_port": self.player_port,
-        }).encode("utf-8")
+        return json.dumps(
+            {
+                "v": BEACON_VERSION,
+                "unit_id": self.unit_id,
+                "name": self.unit_name,
+                "server_port": self.server_port,
+                "player_port": self.player_port,
+            }
+        ).encode("utf-8")
 
     def _on_datagram(self, data: bytes, addr) -> None:  # noqa: ANN001
         try:
