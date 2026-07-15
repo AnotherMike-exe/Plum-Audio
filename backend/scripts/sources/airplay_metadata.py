@@ -52,6 +52,8 @@ class AirplayMetadataReader:
         self._task: asyncio.Task | None = None
         self._stop_evt = asyncio.Event()
         self._warned_no_role = False
+        self._last_title: str | None = None  # to detect track changes at bundle flush
+        self._waiting_for_fresh_prgr = False  # reject stale prgr from the old track after a change
 
     def start(self) -> None:
         if self._task is None:
@@ -167,18 +169,27 @@ class AirplayMetadataReader:
             self._handle_progress(_decode_text(raw_b64))
         elif code == "PICT":
             await self._handle_picture(raw_b64)
-        elif code in ("pend", "pfls"):
-            self._clear()
-            await self._set_artwork(None)
+        elif code in ("pbeg", "prsm"):
+            self._set_playing()  # play begin / resume from source
+        elif code in ("pend", "paus"):
+            self._set_paused()  # play end / pause — freeze the position (do NOT clear metadata/art)
+        # pfls (flush/seek): no state change — a fresh prgr follows and re-anchors the position.
 
     def _flush_bundle(self) -> None:
         role = self._metadata_role()
         if role is None or not self._pending:
             return
         kwargs = {k: v for k, v in self._pending.items() if v}
-        if kwargs:
-            role.update(**kwargs)
-            logger.info("metadata: %s", " · ".join(f"{k}={v}" for k, v in kwargs.items()))
+        if not kwargs:
+            return
+        new_title = kwargs.get("title")
+        if new_title and new_title != self._last_title:
+            # Track changed: shairport may still emit a prgr frame or two for the OLD track before
+            # the new one's timing arrives. Reject those until a fresh frame lands (see _handle_progress).
+            self._last_title = new_title
+            self._waiting_for_fresh_prgr = True
+        role.update(**kwargs)
+        logger.info("metadata: %s", " · ".join(f"{k}={v}" for k, v in kwargs.items()))
 
     def _handle_progress(self, decoded: str) -> None:
         role = self._metadata_role()
@@ -190,7 +201,29 @@ class AirplayMetadataReader:
             return
         position_ms = max(0, (current - start) * 1000 // self.rtp_rate)
         duration_ms = max(0, (end - start) * 1000 // self.rtp_rate)
-        role.update(track_progress=position_ms, track_duration=duration_ms)
+        if self._waiting_for_fresh_prgr:
+            prev = role.metadata
+            prev_dur = prev.track_duration if prev is not None else None
+            fresh = position_ms < 10_000 or (prev_dur is not None and abs(duration_ms - prev_dur) > 10_000)
+            if not fresh:
+                return  # stale frame from the previous track — keep the reset position
+            self._waiting_for_fresh_prgr = False
+        # All three progress fields must be set together or the metadata role emits none of them.
+        # playback_speed 1000 = 1x; the role auto-stamps a timestamp so clients extrapolate position.
+        role.update(track_progress=position_ms, track_duration=duration_ms, playback_speed=1000)
+
+    def _set_playing(self) -> None:
+        """Resume client-side progress extrapolation from the last known position (speed → 1x)."""
+        role = self._metadata_role()
+        if role is not None and role.metadata is not None and role.metadata.track_progress is not None:
+            role.update(playback_speed=1000)
+
+    def _set_paused(self) -> None:
+        """Freeze the reported position where it is (speed → 0) without clearing metadata/artwork."""
+        role = self._metadata_role()
+        if role is not None:
+            with contextlib.suppress(Exception):
+                role.freeze_progress()
 
     async def _handle_picture(self, raw_b64: str) -> None:
         if not raw_b64:

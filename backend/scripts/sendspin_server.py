@@ -48,11 +48,12 @@ import contextlib
 import logging
 import os
 
+from aiosendspin.models.types import has_role_family
 from aiosendspin.server.audio import AudioFormat
 from aiosendspin.server.group import SendspinGroup
 from aiosendspin.server.push_stream import PushStream, StreamStoppedError
 from aiosendspin.server.roles.player import PlayerV1Role
-from aiosendspin.server.server import ConnectionReason, SendspinServer
+from aiosendspin.server.server import ClientAddedEvent, ClientUpdatedEvent, ConnectionReason, SendspinServer
 
 from mesh.model import PlayerState, SourceState, UnitSnapshot
 from sources.airplay_metadata import AirplayMetadataReader
@@ -233,6 +234,7 @@ class PlumSendspinServer:
         self.port = port
         self.server: SendspinServer | None = None
         self.sources: dict[str, SourceHandle] = {}
+        self._primary_source: str | None = None  # source group that controller-only clients join
         self._local_player_tasks: list[asyncio.Task] = []
         self._metadata_readers: list[AirplayMetadataReader] = []
         self._stop_evt = asyncio.Event()
@@ -243,6 +245,9 @@ class PlumSendspinServer:
         # mDNS OFF: SendspinServer always constructs AsyncZeroconf; keep it from advertising
         # (5353 collides with our Avahi). We connect players by explicit URL via the orchestrator.
         await self.server.start_server(port=self.port, advertise_addresses=[], discover_clients=False)
+        # Join controller-only clients (the GUI's metadata/artwork/controller WS) to a source group
+        # so they receive its now-playing state — the server otherwise leaves them in a solo group.
+        self.server.add_event_listener(self._on_server_event)
         logger.info("Sendspin server up: %s (%s) :%d", self.unit_name, self.unit_id, self.port)
 
     async def stop(self) -> None:
@@ -276,6 +281,8 @@ class PlumSendspinServer:
         feeder = SourceFeeder(source_id, fifo_path, group, fmt)
         handle = SourceHandle(source_id, group, feeder)
         self.sources[source_id] = handle
+        if self._primary_source is None:
+            self._primary_source = source_id  # first source: where controller clients get grouped
         feeder.start()
         logger.info("[%s] source started (group=%s)", source_id, group.group_id[:8])
         return handle
@@ -317,6 +324,30 @@ class PlumSendspinServer:
         if player is not None:
             await handle.group.remove_client(player)
             logger.info("[%s] detached player %s", source_id, player_id)
+
+    def _on_server_event(self, _server: SendspinServer, event: object) -> None:
+        """React to client lifecycle events. A controller-only client (the GUI's now-playing WS)
+        connects into its own solo group by default, where it sees no source metadata — join it to
+        the primary source group so its metadata/artwork/playback-state roles receive live state."""
+        if isinstance(event, (ClientAddedEvent, ClientUpdatedEvent)):
+            asyncio.ensure_future(self._maybe_group_controller(event.client_id))
+
+    async def _maybe_group_controller(self, client_id: str) -> None:
+        if self.server is None or self._primary_source is None:
+            return
+        if client_id.startswith(ANCHOR_PREFIX):
+            return  # anchors are group scaffolding, not clients to regroup
+        client = self.server.get_client(client_id)
+        if client is None or not client.is_connected:
+            return
+        if has_role_family("player", client.negotiated_roles):
+            return  # a player — the mesh orchestrator owns its routing, never regroup it here
+        handle = self.sources.get(self._primary_source)
+        if handle is None or client.group is handle.group:
+            return  # unknown source, or already grouped — idempotent
+        with contextlib.suppress(Exception):
+            await handle.group.add_client(client)
+            logger.info("[%s] grouped controller client %s", self._primary_source, client_id)
 
     def set_player_volume(self, player_id: str, volume: int, muted: bool) -> None:
         """Set one player's volume (0-100) and mute — per-client, independent of its group.
@@ -400,7 +431,11 @@ class PlumSendspinServer:
         sources: list[SourceState] = []
         for source_id, handle in self.sources.items():
             group = handle.group
-            player_ids = [c.client_id for c in group.clients if not c.client_id.startswith(ANCHOR_PREFIX)]
+            player_ids = [
+                c.client_id
+                for c in group.clients
+                if not c.client_id.startswith(ANCHOR_PREFIX) and has_role_family("player", c.negotiated_roles)
+            ]
             sources.append(
                 SourceState(
                     source_id=source_id,
@@ -420,6 +455,8 @@ class PlumSendspinServer:
                     continue  # a disconnected client isn't a live endpoint here — e.g. a player
                     # that roamed to a peer leaves a stub; reporting it would make the mesh view
                     # (and the router's find_player) think the player is still on this unit.
+                if not has_role_family("player", client.negotiated_roles):
+                    continue  # controller/display clients (the GUI WS) are grouped for metadata, not players
                 players.append(
                     PlayerState(
                         player_id=client.client_id,
