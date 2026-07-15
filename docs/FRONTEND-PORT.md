@@ -87,7 +87,51 @@ the same validation/proxying.
 - **`App.tsx` is a God component** with anti-flap timing tuned to polling — don't port the grace-period code verbatim; the WS push model makes most of it removable; budget for optimistic-update regressions.
 - **Feature loss for v1**: "Listen in Browser" + audio-reactive visualizer go dark (Snapcast-protocol-specific) until Sendspin exposes a browser PCM stream; server-management UI has no backend. Confirm acceptable.
 
-## Controller-WS unknowns to resolve before slice 3
-The Sendspin **controller role** protocol (subscribe/metadata/playback/position/commands) needs a
-source audit like the server-side one — what messages the controller WS sends/receives, and whether
-`getStreamCapabilities`-equivalent info is available. Do this before wiring `subscribe()`.
+## Controller-WS protocol — AUDITED (aiosendspin 6.0.5)
+
+The GUI's live now-playing + transport channel. Connect a plain WebSocket to **each unit's server
+at `ws://<unit-ip>:8927`** with `client/hello` advertising roles
+`["controller@v1","metadata@v1","artwork@v1"]` (do NOT request `player`/`visualizer` — pulls audio
++ needs support objects). The server pushes current state immediately on join (no polling).
+
+- **Metadata** — `server/state` → `payload.metadata` (`SessionUpdateMetadata`, sent as DIFFS: omitted
+  = unchanged, explicit `null` = cleared): `timestamp`(server µs), `title`, `artist`, `album`,
+  `artwork_url`, `progress{ track_progress /*ms*/, track_duration /*ms; 0=live*/, playback_speed
+  /*×1000; 0=paused*/ }`.
+- **Playback status** — `group/update` → `payload.playback_state` = `"playing"|"paused"|"stopped"` +
+  `group_id`, `group_name`. Authoritative transport state.
+- **Position** — NOT pushed periodically. EXTRAPOLATE client-side:
+  `cur_ms = track_progress + (now_server_us − timestamp)·playback_speed/1e6`, clamp to
+  `[0, track_duration]`; halt when `playback_speed==0` / state≠playing. (Approx `now_server_us` with
+  `Date.now()*1000`; small offset drift only.)
+- **Artwork** — BINARY WS frames, not JSON: 9-byte big-endian header `>Bq` = `[msg_type:1][ts_us:8]`
+  then image bytes; `msg_type` 8–11 = artwork channel 0–3; empty payload = cleared. Decode →
+  `Blob([bytes],{type:'image/jpeg'})` → `URL.createObjectURL`. Request size via `stream/request-format`.
+  (`metadata.artwork_url` is a separate text pointer; our AirPlay path delivers art as binary.)
+- **Capabilities** — `server/state` → `payload.controller.supported_commands: MediaCommand[]` (+
+  `volume`, `muted`, `repeat`, `shuffle`). Drive button enablement from this.
+- **Commands** (client→server) — `client/command` → `payload.controller = { command, volume?, mute? }`.
+  `MediaCommand`: `play pause stop next previous volume mute repeat_off repeat_one repeat_all shuffle
+  unshuffle switch`. `volume` requires `volume` (0–100); `mute` requires `mute`.
+- **⚠ NO SEEK.** There is no seek command in the controller protocol. The scrub bar is **read-only**
+  (display extrapolated position; cannot seek). Product decision needed if seeking is required.
+- **Group-scoped.** A controller acts on its OWN group and only sees that group's state. With one
+  source per server this is a non-issue; `switch` cycles group membership if ever needed.
+
+### Mesh implication (important)
+Metadata/controller/artwork are **per-server** — aiosendspin does NOT aggregate across units. So
+`sendspinDataService` opens **N controller WS (one per unit** from `/api/mesh/view`) and merges
+now-playing client-side. Topology stays REST (`/api/mesh/view`); now-playing is the per-unit WS.
+
+### TS client library
+`@sendspin/sendspin-js` v3.2.0 exists (first-party, Apache-2.0) but is player/audio-oriented (pulls
+`opus-encdec`). The controller+metadata+artwork protocol is small and fully specified above —
+recommend implementing it **directly in TS** (raw WebSocket) to avoid the audio dependency; evaluate
+the lib only if convenient.
+
+### Revised model mapping (with WS)
+- Topology (`/api/mesh/view`): source→Stream (id/name/isPlaying/player_ids), player→Client
+  (id/name/connected/**currentStreamId via group_id match**).
+- Now-playing (per-unit controller WS): fill `Stream.currentTrack` (title/artist/album/art),
+  `Stream.progress` (extrapolated), `Stream.isPlaying` (from `group/update`), `Stream.volume` +
+  capabilities (from `controller` state). Key each WS by unit; map its group_id→source via the view.
