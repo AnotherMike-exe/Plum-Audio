@@ -31,6 +31,12 @@
   "include": [
     "src",
     "tests",
-    "vite-env.d.ts"
+    "vite-env.d.ts",
+    "MeshApp.tsx",
+    "components",
+    "hooks",
+    "utils",
+    "types.ts",
+    "services"
   ]
 }
