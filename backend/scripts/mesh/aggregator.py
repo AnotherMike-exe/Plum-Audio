@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import socket
 from collections.abc import Awaitable, Callable
 
 from mesh.discovery import MeshDiscovery, Peer
@@ -24,6 +25,25 @@ from mesh.model import MeshView, UnitSnapshot
 from sync_engine.base import SyncEngine
 
 logger = logging.getLogger("plum.mesh.aggregator")
+
+
+def _detect_local_host() -> str | None:
+    """This unit's own IP on the default-route interface.
+
+    A unit ignores its own beacon, so it never learns the address peers reach it on — yet the
+    local half of the view must still carry a host, or a GUI bootstrapped against this unit can't
+    open its controller WS / address its REST. The connect-to-TEST-NET trick sends no packets; it
+    just asks the kernel which source IP the default route would use (the wlan0 address peers see).
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("192.0.2.1", 9))  # RFC 5737 TEST-NET-1 — unroutable, never actually contacted
+        return sock.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
 
 # fetch_snapshot(peer) -> the peer's UnitSnapshot.to_dict(), or None if unreachable this cycle.
 FetchSnapshot = Callable[[Peer], Awaitable["dict | None"]]
@@ -46,7 +66,8 @@ class DataAggregator:
         self._discovery = discovery
         self._fetch = fetch_snapshot
         self.interval_s = interval_s
-        self._view = MeshView(units=[engine.snapshot()])
+        self._local_host = _detect_local_host()
+        self._view = MeshView(units=[self._local_snapshot()])
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
@@ -65,9 +86,16 @@ class DataAggregator:
         """The most recently built mesh view (updated each poll cycle)."""
         return self._view
 
+    def _local_snapshot(self) -> UnitSnapshot:
+        """The engine's snapshot, with this unit's own host stamped in (the engine can't know it)."""
+        snap = self._engine.snapshot()
+        if snap.host is None:
+            snap.host = self._local_host
+        return snap
+
     async def refresh(self) -> MeshView:
         """Rebuild the view now: local snapshot + every reachable peer's snapshot."""
-        units: list[UnitSnapshot] = [self._engine.snapshot()]
+        units: list[UnitSnapshot] = [self._local_snapshot()]
         peers = self._discovery.peers()
         results = await asyncio.gather(*(self._fetch_peer(p) for p in peers))
         units.extend(u for u in results if u is not None)
