@@ -8,11 +8,12 @@ exposes both track metadata (Metadata/PlaybackStatus/Position properties) AND tr
 which needed a separate metadata FIFO (airplay_metadata) plus a control remote (airplay_remote) —
 a single class drives both directions for a Spotify source.
 
-Multi-instance naming: each spotifyd instance registers an MPRIS name. The first to start claims
-the base ``org.mpris.MediaPlayer2.spotifyd``; later instances get a PID-suffixed
-``org.mpris.MediaPlayer2.spotifyd.instance<PID>``. We resolve our instance's name from its process
-(pgrep on the instance config filename), preferring the PID-suffixed name and falling back to the
-base. The name is re-resolved lazily on any failure, so a spotifyd restart self-heals.
+Multi-instance naming: each spotifyd instance owns a per-instance well-known bus name and serves the
+standard ``org.mpris.MediaPlayer2[.Player]`` interfaces at ``/org/mpris/MediaPlayer2`` under it. The
+NAME DIFFERS BY spotifyd VERSION: 0.4.x uses ``rs.spotifyd.instance<PID>`` (naturally unique per
+instance — no base-name race); older builds used ``org.mpris.MediaPlayer2.spotifyd[.instance<PID>]``.
+We resolve our instance's PID (pgrep on the instance config filename) and try the version candidates
+in order. The name is re-resolved lazily on any failure, so a spotifyd restart self-heals.
 
 Ported from Plum-Snapcast's spotify-control-script.py, but async on ``dbus-next`` (native to the
 audio event loop) instead of dbus-python + a glib main loop, and emitting to Sendspin metadata/
@@ -39,7 +40,9 @@ from dbus_next.aio import MessageBus
 
 logger = logging.getLogger("plum.spotify_mpris")
 
-MPRIS_BASE_NAME = "org.mpris.MediaPlayer2.spotifyd"
+# spotifyd 0.4.x owns this per-instance name; older builds used org.mpris.MediaPlayer2.spotifyd*.
+SPOTIFYD_NAME_04X = "rs.spotifyd.instance{pid}"
+MPRIS_LEGACY_BASE = "org.mpris.MediaPlayer2.spotifyd"
 MPRIS_PATH = "/org/mpris/MediaPlayer2"
 PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
 PROPS_IFACE = "org.freedesktop.DBus.Properties"
@@ -119,12 +122,13 @@ class SpotifyMpris:
     # -- MPRIS binding -------------------------------------------------------
 
     def _candidate_names(self) -> list[str]:
-        """MPRIS names to try for this instance, most-specific first."""
+        """Bus names to try for this instance, most-specific first (across spotifyd versions)."""
         names: list[str] = []
         pid = _spotifyd_pid(self.instance_id)
         if pid:
-            names.append(f"{MPRIS_BASE_NAME}.instance{pid}")
-        names.append(MPRIS_BASE_NAME)  # base name (instance 1, or single-instance)
+            names.append(SPOTIFYD_NAME_04X.format(pid=pid))  # 0.4.x: rs.spotifyd.instance<PID>
+            names.append(f"{MPRIS_LEGACY_BASE}.instance{pid}")  # legacy PID-suffixed
+        names.append(MPRIS_LEGACY_BASE)  # legacy base name (single-instance / instance 1)
         return names
 
     async def _resolve_player(self):

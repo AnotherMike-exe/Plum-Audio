@@ -77,16 +77,25 @@ class SpotifyEndpointsManager:
         warnings: list[str] = []
         with self._lock:
             settings = self.settings_manager.get_settings()
+            instances: list[spotify_config.SpotifyInstance] = []
             try:
                 instances = spotify_config.render_configs(settings)
                 spotify_config.generate_supervisord(instances)
             except OSError as e:
                 warnings.append(f"config regen skipped: {e}")
                 logger.warning("spotify config regen skipped (off-container?): %s", e)
-            warnings.extend(self._reload_supervisor())
+            warnings.extend(self._reload_supervisor([i.instance_id for i in instances]))
         return warnings
 
-    def _reload_supervisor(self) -> list[str]:
+    def _reload_supervisor(self, enabled_ids: list[str]) -> list[str]:
+        """reread + update to pick up added/removed programs, then RESTART each enabled instance.
+
+        The restart matters: reread/update alone starts new programs and stops removed ones, but an
+        *edited* endpoint's program already exists — so without an explicit restart the running
+        spotifyd keeps its old config (old name + device_id). Restarting respools it onto the freshly
+        rendered config. (This is the spool-down/up the container owns; on the rig, where supervisorctl
+        is absent, this degrades to a warning and the instance is respooled by rerunning run_spotify.sh.)
+        """
         warnings: list[str] = []
         for action in (["reread"], ["update"]):
             try:
@@ -94,6 +103,14 @@ class SpotifyEndpointsManager:
             except (OSError, subprocess.SubprocessError) as e:
                 warnings.append(f"supervisorctl {action[0]} unavailable: {e}")
                 return warnings  # no supervisord here — stop trying
+        for instance_id in enabled_ids:
+            try:
+                subprocess.run(
+                    SUPERVISORCTL + ["restart", f"spotifyd-{instance_id}"],
+                    capture_output=True, text=True, timeout=20, check=False,
+                )
+            except (OSError, subprocess.SubprocessError) as e:
+                warnings.append(f"restart spotifyd-{instance_id} failed: {e}")
         return warnings
 
     # -- CRUD ----------------------------------------------------------------
