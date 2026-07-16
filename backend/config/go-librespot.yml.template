@@ -1,0 +1,29 @@
+# Plum-Audio go-librespot instance template.
+# Rendered per Spotify Connect endpoint by scripts/sources/spotify_config.py into that instance's
+# config dir (go-librespot -config_dir <dir>/config.yml). One go-librespot process per endpoint:
+# pipe backend -> instance FIFO -> in-process feeder -> Sendspin source group. Metadata + transport
+# ride go-librespot's HTTP+WebSocket API on loopback (no D-Bus), read/driven by spotify_golibrespot.py.
+#
+# PCM is s16le / 44100 / stereo (librespot native) to match the feeder's DEFAULT_FORMAT.
+device_name: "SPOTIFY_NAME"
+device_type: speaker
+bitrate: SPOTIFY_BITRATE
+
+audio_backend: pipe
+audio_output_pipe: "/tmp/spotify-INSTANCE_ID-fifo"
+audio_output_pipe_format: s16le
+
+# Spotify Connect discovery. zeroconf_backend=avahi registers via the system Avahi over D-Bus so we
+# do NOT bind mDNS 5353 ourselves (the builtin backend would collide with our Avahi — see CLAUDE.md).
+zeroconf_enabled: true
+zeroconf_port: SPOTIFY_ZEROCONF_PORT
+zeroconf_backend: avahi
+credentials:
+  type: zeroconf
+
+# HTTP + WebSocket control API, loopback only, unique port per instance. spotify_golibrespot.py
+# connects to ws://127.0.0.1:<port>/events for metadata/state and POSTs /player/* for transport.
+server:
+  enabled: true
+  address: 127.0.0.1
+  port: SPOTIFY_API_PORT

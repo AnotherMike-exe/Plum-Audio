@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 """
-Plum-Audio — Spotify Connect multi-instance config generation.
+Plum-Audio — Spotify Connect multi-instance config generation (go-librespot).
 
-Renders one spotifyd.conf per Spotify endpoint (from settings.json integrations.spotify.endpoints)
-and, in the container, the supervisord program sections that run them. One endpoint → one spotifyd
-process → one instance FIFO → one Sendspin source.
+Renders one go-librespot config.yml per Spotify endpoint (from settings.json
+integrations.spotify.endpoints) and, in the container, the supervisord program sections that run
+them. One endpoint → one go-librespot process → one instance FIFO → one Sendspin source, plus a
+loopback HTTP+WebSocket control API per instance (see spotify_golibrespot.py).
 
-Ported from Plum-Snapcast's setup-spotify-multi-instance.sh + generate-spotify-supervisord-config.py,
-collapsed into one importable module. DROPPED from the port: the per-instance fifo-keeper and
-stream-lifecycle-manager processes — in Plum-Audio the in-process SendspinServer feeder owns the
-FIFO read end and the source→group lifecycle, so neither is needed (see the porting map in CLAUDE.md).
+We use go-librespot rather than spotifyd: spotifyd 0.4.x dropped standard MPRIS (its D-Bus interface
+is now only TransferPlayback/volume, no metadata/transport), and it has no arm64 build with full
+MPRIS. go-librespot ships a native arm64 binary and exposes richer metadata/transport over an
+HTTP+WS API — the same "use what the daemon natively provides" approach the original project took
+with spotifyd's then-current MPRIS. DROPPED vs the Plum-Snapcast port: the per-instance fifo-keeper
+and stream-lifecycle-manager (the in-process feeder owns the FIFO + source lifecycle) AND all D-Bus
+(go-librespot needs none).
 
-The MPRIS name-race stagger is preserved: spotifyd instances start sequentially (priority 40, 70,
-100, …) so instance 1 claims the base MPRIS name before instance 2 comes up (later instances then
-get PID-suffixed names — see spotify_mpris.py).
+Each instance gets its own config dir (go-librespot -config_dir), a unique zeroconf port, and a
+unique loopback API port.
 """
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 from dataclasses import dataclass
@@ -27,20 +29,21 @@ logger = logging.getLogger("plum.spotify_config")
 
 # Defaults are container paths (Binhex /app layout); every path is overridable — by argument or the
 # PLUM_SPOTIFY_* env vars — so the Pi rig and tests can point them at a scratch dir.
-DEFAULT_TEMPLATE = os.environ.get("PLUM_SPOTIFY_TEMPLATE", "/app/config/spotifyd.conf.template")
-DEFAULT_CONFIG_DIR = os.environ.get("PLUM_SPOTIFY_CONFIG_DIR", "/app/config")
+DEFAULT_TEMPLATE = os.environ.get("PLUM_SPOTIFY_TEMPLATE", "/app/config/go-librespot.yml.template")
+DEFAULT_CONFIG_ROOT = os.environ.get("PLUM_SPOTIFY_CONFIG_DIR", "/data/go-librespot")
 DEFAULT_SUPERVISOR_OUT = os.environ.get(
     "PLUM_SPOTIFY_SUPERVISOR_OUT", "/app/supervisord/conf.d/spotify-multi-instance.ini"
 )
-DEFAULT_SPOTIFYD_BIN = os.environ.get("PLUM_SPOTIFYD_BIN", "/usr/local/bin/spotifyd")
+DEFAULT_GOLIBRESPOT_BIN = os.environ.get("PLUM_GOLIBRESPOT_BIN", "/usr/local/bin/go-librespot")
 DEFAULT_START_SCRIPT = os.environ.get(
-    "PLUM_SPOTIFY_START_SCRIPT", "/app/scripts/sources/start-spotifyd.sh"
+    "PLUM_SPOTIFY_START_SCRIPT", "/app/scripts/sources/start-spotify.sh"
 )
 
 MAX_ENDPOINTS = 10
 DEFAULT_BITRATE = 320
+API_PORT_BASE = 3678  # go-librespot loopback control API; per-instance = base + (id - 1)
 PRIORITY_BASE = 40
-PRIORITY_STEP = 30  # gap between instances so each claims its MPRIS name before the next starts
+PRIORITY_STEP = 10
 
 
 @dataclass(frozen=True)
@@ -51,20 +54,27 @@ class SpotifyInstance:
     device_name: str
     fifo_path: str
     zeroconf_port: int
-    config_path: str
+    api_port: int
+    config_dir: str
 
     @property
     def source_id(self) -> str:
         return f"spotify-{self.instance_id}"
 
-
-def _device_id(device_name: str) -> str:
-    """Deterministic 40-char Spotify device_id from the endpoint name (stable across restarts)."""
-    return hashlib.sha256(device_name.encode("utf-8")).hexdigest()[:40]
+    @property
+    def api_base(self) -> str:
+        return f"http://127.0.0.1:{self.api_port}"
 
 
 def fifo_path_for(instance_id: str) -> str:
     return f"/tmp/spotify-{instance_id}-fifo"
+
+
+def api_port_for(instance_id: str) -> int:
+    try:
+        return API_PORT_BASE + int(instance_id) - 1
+    except (TypeError, ValueError):
+        return API_PORT_BASE
 
 
 def enabled_endpoints(settings: dict) -> list[dict]:
@@ -74,74 +84,65 @@ def enabled_endpoints(settings: dict) -> list[dict]:
     return [e for e in endpoints[:MAX_ENDPOINTS] if e.get("enabled")]
 
 
-def instances_from_settings(settings: dict, *, config_dir: str = DEFAULT_CONFIG_DIR) -> list[SpotifyInstance]:
+def _instance(endpoint: dict, config_root: str) -> SpotifyInstance:
+    instance_id = str(endpoint.get("id"))
+    return SpotifyInstance(
+        instance_id=instance_id,
+        device_name=endpoint.get("deviceName", f"Plum Audio {instance_id}"),
+        fifo_path=fifo_path_for(instance_id),
+        zeroconf_port=int(endpoint.get("zeroconfPort", 5354)),
+        api_port=api_port_for(instance_id),
+        config_dir=os.path.join(config_root, instance_id),
+    )
+
+
+def instances_from_settings(settings: dict, *, config_root: str = DEFAULT_CONFIG_ROOT) -> list[SpotifyInstance]:
     """Resolve enabled endpoints to SpotifyInstances WITHOUT writing any files.
 
-    Used by the server to decide which Spotify sources to bring up. Config rendering + spotifyd
+    Used by the server to decide which Spotify sources to bring up. Config rendering + go-librespot
     launch are a separate concern (render_configs / supervisord / the Pi rig), so this stays pure.
     """
-    instances: list[SpotifyInstance] = []
-    for endpoint in enabled_endpoints(settings):
-        instance_id = str(endpoint.get("id"))
-        device_name = endpoint.get("deviceName", f"Plum Audio {instance_id}")
-        instances.append(
-            SpotifyInstance(
-                instance_id=instance_id,
-                device_name=device_name,
-                fifo_path=fifo_path_for(instance_id),
-                zeroconf_port=int(endpoint.get("zeroconfPort", 5354)),
-                config_path=os.path.join(config_dir, f"spotifyd-{instance_id}.conf"),
-            )
-        )
-    return instances
+    return [_instance(e, config_root) for e in enabled_endpoints(settings)]
 
 
 def render_configs(
     settings: dict,
     *,
     template_path: str = DEFAULT_TEMPLATE,
-    config_dir: str = DEFAULT_CONFIG_DIR,
+    config_root: str = DEFAULT_CONFIG_ROOT,
 ) -> list[SpotifyInstance]:
-    """Write a spotifyd-<id>.conf for each enabled endpoint; return the instances to bring up."""
+    """Write a config.yml into each enabled endpoint's config dir; return the instances to bring up."""
     spotify = settings.get("integrations", {}).get("spotify", {})
     bitrate = int(spotify.get("bitrate", DEFAULT_BITRATE))
     with open(template_path, encoding="utf-8") as f:
         template = f.read()
 
     instances: list[SpotifyInstance] = []
-    os.makedirs(config_dir, exist_ok=True)
     for endpoint in enabled_endpoints(settings):
-        instance_id = str(endpoint.get("id"))
-        device_name = endpoint.get("deviceName", f"Plum Audio {instance_id}")
-        zeroconf_port = int(endpoint.get("zeroconfPort", 5354))
-        config_path = os.path.join(config_dir, f"spotifyd-{instance_id}.conf")
+        inst = _instance(endpoint, config_root)
+        os.makedirs(inst.config_dir, exist_ok=True)
 
         rendered = (
-            template.replace("SPOTIFY_NAME", device_name)
-            .replace("SPOTIFY_DEVICE_ID", _device_id(device_name))
-            .replace("SPOTIFY_ZEROCONF_PORT", str(zeroconf_port))
+            template.replace("SPOTIFY_NAME", inst.device_name)
+            .replace("SPOTIFY_ZEROCONF_PORT", str(inst.zeroconf_port))
+            .replace("SPOTIFY_API_PORT", str(inst.api_port))
             .replace("SPOTIFY_BITRATE", str(bitrate))
-            .replace("INSTANCE_ID", instance_id)
+            .replace("INSTANCE_ID", inst.instance_id)
         )
-        with open(config_path, "w", encoding="utf-8") as f:
+        with open(os.path.join(inst.config_dir, "config.yml"), "w", encoding="utf-8") as f:
             f.write(rendered)
 
-        instances.append(
-            SpotifyInstance(
-                instance_id=instance_id,
-                device_name=device_name,
-                fifo_path=fifo_path_for(instance_id),
-                zeroconf_port=zeroconf_port,
-                config_path=config_path,
-            )
+        instances.append(inst)
+        logger.info(
+            "rendered go-librespot config %s/config.yml (name=%r zc=%d api=%d)",
+            inst.config_dir, inst.device_name, inst.zeroconf_port, inst.api_port,
         )
-        logger.info("rendered spotifyd config %s (name=%r port=%d)", config_path, device_name, zeroconf_port)
 
     return instances
 
 
 _SUPERVISOR_PROGRAM = """
-[program:spotifyd-{instance_id}]
+[program:spotify-{instance_id}]
 command=/bin/bash {start_script} {instance_id}
 directory=/app
 priority={priority}
@@ -151,9 +152,9 @@ startsecs=10
 startretries=3
 stopasgroup=true
 killasgroup=true
-stdout_logfile=/config/spotifyd-{instance_id}.log
+stdout_logfile=/config/spotify-{instance_id}.log
 stdout_logfile_maxbytes=50MB
-stderr_logfile=/config/spotifyd-{instance_id}_err.log
+stderr_logfile=/config/spotify-{instance_id}_err.log
 stderr_logfile_maxbytes=10MB
 """
 
@@ -164,9 +165,9 @@ def generate_supervisord(
     output_path: str = DEFAULT_SUPERVISOR_OUT,
     start_script: str = DEFAULT_START_SCRIPT,
 ) -> str:
-    """Write the supervisord include with one spotifyd program per instance. Returns the path."""
+    """Write the supervisord include with one go-librespot program per instance. Returns the path."""
     lines = [
-        "# Multi-instance Spotify Connect — generated by spotify_config.generate_supervisord().",
+        "# Multi-instance Spotify Connect (go-librespot) — generated by spotify_config.generate_supervisord().",
         f"# {len(instances)} endpoint(s). Do not edit by hand; rerun after changing endpoints.",
     ]
     for idx, inst in enumerate(instances):

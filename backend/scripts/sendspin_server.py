@@ -67,7 +67,7 @@ from mesh.model import PlayerState, SourceState, UnitSnapshot
 from sources import spotify_config
 from sources.airplay_metadata import AirplayMetadataReader
 from sources.airplay_remote import AirplayRemote
-from sources.spotify_mpris import SpotifyMpris
+from sources.spotify_golibrespot import SpotifyGoLibrespot
 
 logger = logging.getLogger("plum.sendspin_server")
 
@@ -249,7 +249,7 @@ class PlumSendspinServer:
         self._local_player_tasks: list[asyncio.Task] = []
         self._metadata_readers: list[AirplayMetadataReader] = []
         self._airplay_remote: AirplayRemote | None = None  # MPRIS transport control for the AirPlay source
-        self._spotify_monitors: list[SpotifyMpris] = []  # per-instance MPRIS metadata+control monitors
+        self._spotify_monitors: list[SpotifyGoLibrespot] = []  # per-instance go-librespot event monitors
         # Per-source transport remote (has async play/pause/next_track/previous_track). AirPlay's
         # AirplayRemote and each SpotifyMpris both satisfy it, so controller events route by source.
         self._source_remotes: dict[str, object] = {}
@@ -523,21 +523,21 @@ class PlumSendspinServer:
         logger.info("[%s] airplay MPRIS transport control wired", source_id)
 
     async def start_spotify_source(self, instance: spotify_config.SpotifyInstance) -> None:
-        """Bring up a Spotify Connect endpoint as a source: group + feeder + MPRIS metadata/control.
+        """Bring up a Spotify Connect endpoint as a source: group + feeder + go-librespot events/control.
 
-        The feeder waits for spotifyd to open the instance FIFO writer, so starting eagerly is safe
-        even before spotifyd is running. SpotifyMpris serves double duty here — its run() loop pushes
-        metadata/artwork to the group's roles, and it is also registered as the source's transport
-        remote (its play/pause/next/previous drive spotifyd over MPRIS).
+        The feeder waits for go-librespot to open the instance FIFO writer, so starting eagerly is
+        safe even before go-librespot is running. SpotifyGoLibrespot serves double duty — its run()
+        loop pushes metadata/artwork to the group's roles from the WebSocket event stream, and it is
+        also registered as the source's transport remote (play/pause/next/previous POST the HTTP API).
         """
         self.start_source(instance.source_id, instance.fifo_path)
         handle = self.sources[instance.source_id]
-        monitor = SpotifyMpris(handle.group, instance.instance_id)
+        monitor = SpotifyGoLibrespot(handle.group, instance.instance_id, instance.api_base)
         await monitor.connect()
         monitor.start()
         self._spotify_monitors.append(monitor)
         self._wire_transport_control(instance.source_id, monitor)
-        logger.info("[%s] spotify source up (name=%r)", instance.source_id, instance.device_name)
+        logger.info("[%s] spotify source up (name=%r api=%s)", instance.source_id, instance.device_name, instance.api_base)
 
     def _wire_transport_control(self, source_id: str, remote: object) -> None:
         """Advertise transport commands on a source's controller role and route its events to `remote`.
