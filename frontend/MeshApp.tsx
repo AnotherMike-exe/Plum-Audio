@@ -19,8 +19,11 @@ import { StreamSelector } from './components/StreamSelector';
 import { SyncedDevices } from './components/SyncedDevices';
 import { ClientManager } from './components/ClientManager';
 import { Icon } from './components/Icon';
-import { Client, Stream } from './types';
+import { Settings } from './components/Settings';
+import { Client, Settings as SettingsType, Stream } from './types';
 import { Model, SendspinDataService } from './services/sendspinDataService';
+import { settingsService } from './services/settingsService';
+import { useThemeSettings } from './hooks/useThemeSettings';
 
 const service = new SendspinDataService();
 const EMPTY: Model = { servers: [], streams: [], clients: [] };
@@ -47,29 +50,11 @@ const MemoStreamSelector = React.memo(StreamSelector);
 const MemoSyncedDevices = React.memo(SyncedDevices);
 const MemoClientManager = React.memo(ClientManager);
 
-function SettingsPlaceholder({ onClose }: { onClose: () => void }): React.ReactElement {
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
-      <div
-        className="w-full max-w-md bg-[var(--bg-secondary)] rounded-2xl shadow-2xl p-6"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex items-center justify-between border-b border-[var(--border-color)] pb-4 mb-4">
-          <h2 className="text-xl font-semibold text-[var(--accent-color)]">Settings</h2>
-          <button onClick={onClose} className="p-2 rounded-full hover:bg-[var(--bg-secondary-hover)]" aria-label="Close">
-            <Icon name="xmark" />
-          </button>
-        </div>
-        <p className="text-[var(--text-secondary)]">Settings (integrations, audio, visualizer) port in the next slice.</p>
-      </div>
-    </div>
-  );
-}
-
 export default function MeshApp(): React.ReactElement {
   const [model, setModel] = useState<Model>(EMPTY);
   const [selectedStreamId, setSelectedStreamId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settings, setSettings] = useState<SettingsType>(settingsService.getMergedSettings());
 
   useEffect(() => {
     service.start();
@@ -78,6 +63,21 @@ export default function MeshApp(): React.ReactElement {
       unsub();
       service.stop();
     };
+  }, []);
+
+  // Settings: fetch from the config API on mount, then track changes.
+  useEffect(() => {
+    settingsService.init().then(setSettings).catch((err) => {
+      console.error('[Settings] init failed:', err);
+    });
+    const unsub = settingsService.subscribe(setSettings);
+    return () => unsub();
+  }, []);
+
+  useThemeSettings(settings);
+
+  const onSettingsChange = useCallback((next: SettingsType) => {
+    settingsService.updateSettings(next);
   }, []);
 
   // Best default source: real now-playing (title/art) beats merely `streaming`, beats the first.
@@ -258,7 +258,13 @@ export default function MeshApp(): React.ReactElement {
         </div>
       </footer>
 
-      {settingsOpen && <SettingsPlaceholder onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && (
+        <Settings
+          settings={settings}
+          onSettingsChange={onSettingsChange}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
     </div>
   );
 }

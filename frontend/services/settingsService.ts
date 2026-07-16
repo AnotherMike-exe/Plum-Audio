@@ -26,12 +26,13 @@ const DEFAULT_LOCAL_SETTINGS = {
 // Default server settings (should match backend defaults)
 const DEFAULT_SERVER_SETTINGS = {
   version: 1,  // Version for change detection
-  deviceName: 'Plum Snapcast',
-  hostname: 'plum-snapcast',
+  deviceName: 'Plum Audio',
+  hostname: 'plum-audio',
   integrations: {
+    // Endpoints-array shape — must match types.ts Settings['integrations'] and the backend
+    // settings_api.py DEFAULT_SETTINGS.
     airplay: {
-      enabled: true,
-      deviceName: 'Plum Audio',
+      endpoints: [] as Settings['integrations']['airplay']['endpoints'],
     },
     bluetooth: {
       enabled: false,
@@ -41,22 +42,18 @@ const DEFAULT_SERVER_SETTINGS = {
       discoverable: true,
     },
     spotify: {
-      enabled: false,
-      sourceName: 'Spotify',
-      deviceName: 'Plum Audio',
       bitrate: 320 as 96 | 160 | 320,
+      endpoints: [] as Settings['integrations']['spotify']['endpoints'],
     },
     dlna: {
-      enabled: false,
-      sourceName: 'DLNA',
-      deviceName: 'Plum Audio',
+      endpoints: [] as Settings['integrations']['dlna']['endpoints'],
     },
     plexamp: {
       available: false,
       enabled: false,
       sourceName: 'Plexamp',
     },
-    snapcast: true,
+    snapcast: false, // inert; SnapcastTab is dropped from the mesh overlay
     visualizer: DEFAULT_VISUALIZER_SETTINGS,
   },
   federation: {

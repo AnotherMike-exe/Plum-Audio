@@ -3,7 +3,6 @@ import type {Settings as SettingsType} from '../types';
 import {TabBar, type Tab} from './TabBar';
 import {IntegrationsTab} from './settings/IntegrationsTab';
 import {AudioTab} from './settings/AudioTab';
-import {SnapcastTab} from './settings/SnapcastTab';
 import {PlaybackTab} from './settings/PlaybackTab';
 import {ThemeTab} from './settings/ThemeTab';
 import {VisualizerTab} from './settings/VisualizerTab';
@@ -17,18 +16,17 @@ interface SettingsProps {
     initialTab?: string; // Optional initial tab to open
 }
 
+// Phase A: only the functional settings are surfaced. Integrations/Audio/Playback
+// tabs return when their Phase-3 source services exist to control — the render cases
+// below stay wired so re-enabling is just re-adding array entries.
 const tabs: Tab[] = [
-    {id: 'integrations', label: 'Integrations', icon: 'puzzle-piece'},
-    {id: 'audio', label: 'Audio', icon: 'volume-high'},
-    {id: 'playback', label: 'Playback', icon: 'sliders'},
-    {id: 'snapcast', label: 'Snapcast', icon: 'snapcast'},
     {id: 'theme', label: 'Theme', icon: 'palette'},
     {id: 'visualizer', label: 'Visualizer', icon: 'waveform'},
     {id: 'about', label: 'About', icon: 'circle-info'},
 ];
 
 export const Settings: React.FC<SettingsProps> = ({settings, onSettingsChange, onClose, initialTab}) => {
-    const [activeTab, setActiveTab] = useState(initialTab || 'integrations');
+    const [activeTab, setActiveTab] = useState(initialTab || 'theme');
 
     const renderTabContent = () => {
         switch (activeTab) {
@@ -38,8 +36,6 @@ export const Settings: React.FC<SettingsProps> = ({settings, onSettingsChange, o
                 return <AudioTab settings={settings} onSettingsChange={onSettingsChange} />;
             case 'playback':
                 return <PlaybackTab settings={settings} onSettingsChange={onSettingsChange} />;
-            case 'snapcast':
-                return <SnapcastTab settings={settings} onSettingsChange={onSettingsChange} />;
             case 'theme':
                 return <ThemeTab settings={settings} onSettingsChange={onSettingsChange} />;
             case 'visualizer':

@@ -76,6 +76,7 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
         mirror: viz.mirror,
         invert: viz.invert,
         taper: viz.taper,
+        mixedFlip: viz.mixedFlip,
         rotate: viz.rotate,
         rotationSpeed: viz.rotationSpeed,
         rotationDirection: viz.rotationDirection,

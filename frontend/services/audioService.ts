@@ -3,6 +3,8 @@
  * Handles API calls for audio device discovery and configuration
  */
 
+import type { IconName } from '../components/Icon';
+
 const API_BASE = `${window.location.protocol}//${window.location.hostname}:${window.location.port}/api/audio`;
 
 export enum DeviceType {
@@ -213,19 +215,19 @@ export const audioService = {
   /**
    * Get device type icon name
    */
-  getDeviceTypeIcon(type: DeviceType): string {
+  getDeviceTypeIcon(type: DeviceType): IconName {
     switch (type) {
       case DeviceType.BUILTIN_HEADPHONES:
         return 'headphones';
       case DeviceType.BUILTIN_HDMI:
-        return 'tv';
+        return 'desktop';
       case DeviceType.USB:
-        return 'usb';
+        return 'volume-high';
       case DeviceType.HAT:
-        return 'cpu';
+        return 'waveform';
       case DeviceType.OTHER:
       default:
-        return 'speaker';
+        return 'volume-high';
     }
   },
 

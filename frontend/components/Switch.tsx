@@ -7,9 +7,10 @@ interface SwitchProps {
     label: string;
     icon?: string;
     disabled?: boolean;
+    description?: string;
 }
 
-export const Switch: React.FC<SwitchProps> = ({checked, onChange, label, icon, disabled = false}) => {
+export const Switch: React.FC<SwitchProps> = ({checked, onChange, label, icon, disabled = false, description}) => {
     const switchId = `switch-${label.replace(/\s+/g, '-').toLowerCase()}`;
 
     return (
@@ -21,7 +22,12 @@ export const Switch: React.FC<SwitchProps> = ({checked, onChange, label, icon, d
                         <Icon name={icon.replace('fa-', '') as IconName} className="text-lg text-[var(--text-secondary)]" style={{ color: 'inherit' }} aria-hidden />
                     </div>
                 )}
-                <span className="text-base text-[var(--text-secondary)]">{label}</span>
+                <div className="flex flex-col">
+                    <span className="text-base text-[var(--text-secondary)]">{label}</span>
+                    {description && (
+                        <span className="text-xs text-[var(--text-muted)] mt-0.5">{description}</span>
+                    )}
+                </div>
             </div>
             <div className="relative ml-4">
                 <input
