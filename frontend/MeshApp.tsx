@@ -10,7 +10,7 @@
  * this; keeping it separate lets `npm run dev` show a working slice without the 2837-line surgery.
  */
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { NowPlaying } from './components/NowPlaying';
 import { PlayerControls } from './components/PlayerControls';
 import { StreamSelector } from './components/StreamSelector';
@@ -19,6 +19,23 @@ import { Model, SendspinDataService } from './services/sendspinDataService';
 import { Stream } from './types';
 
 const service = new SendspinDataService();
+
+// Memoized transport controls: the parent re-renders ~2x/s (position tick) + on every WS message,
+// but the buttons only depend on id/isPlaying/volume. Skipping their reconciliation on every tick
+// keeps the button DOM stable — otherwise a click landing mid-reconcile is silently dropped.
+const MemoPlayerControls = React.memo(
+  PlayerControls,
+  (a, b) =>
+    a.stream.id === b.stream.id &&
+    a.stream.isPlaying === b.stream.isPlaying &&
+    a.stream.volume === b.stream.volume &&
+    a.volume === b.volume &&
+    a.sourceVolume === b.sourceVolume &&
+    a.onPlayPause === b.onPlayPause &&
+    a.onSkip === b.onSkip &&
+    a.onVolumeChange === b.onVolumeChange &&
+    a.onSourceVolumeChange === b.onSourceVolumeChange,
+);
 
 const EMPTY: Model = { servers: [], streams: [], clients: [] };
 
@@ -35,13 +52,50 @@ export default function MeshApp(): React.ReactElement {
     };
   }, []);
 
-  // Pick a stream to feature: the selection, else the first playing source, else the first.
-  const featured: Stream | undefined = useMemo(() => {
-    if (selectedStreamId) return model.streams.find((s) => s.id === selectedStreamId);
-    return model.streams.find((s) => s.isPlaying) ?? model.streams[0];
+  // Best default source: one with real now-playing (title/art) beats one that's merely `streaming`,
+  // which beats the first source. A paused source still has metadata, so it stays a strong pick.
+  const bestDefault = (streams: Stream[]): Stream | undefined =>
+    streams.find((s) => s.currentTrack.title || s.currentTrack.albumArtUrl) ??
+    streams.find((s) => s.isPlaying) ??
+    streams[0];
+
+  // Keep the featured selection STICKY. Auto-pick only when nothing is selected or the selected
+  // source has vanished — never on a pause. Otherwise pausing (which flips isPlaying to false)
+  // would bounce the view to another unit's idle AirPlay source, dropping art/progress and
+  // leaving the transport buttons pointed at the wrong stream.
+  useEffect(() => {
+    if (selectedStreamId && model.streams.some((s) => s.id === selectedStreamId)) return;
+    const pick = bestDefault(model.streams);
+    setSelectedStreamId(pick ? pick.id : null);
   }, [model.streams, selectedStreamId]);
 
+  const featured: Stream | undefined = useMemo(
+    () => model.streams.find((s) => s.id === selectedStreamId) ?? bestDefault(model.streams),
+    [model.streams, selectedStreamId],
+  );
+
   const caps = featured ? service.getStreamCapabilities(featured.id) : null;
+
+  // Stable handlers (identity never changes) reading the latest featured via a ref, so the memoized
+  // controls don't re-render when only the position tick fires.
+  const featuredRef = useRef(featured);
+  featuredRef.current = featured;
+  const onPlayPause = useCallback(() => {
+    const f = featuredRef.current;
+    if (f) service.controlStream(f.id, f.isPlaying ? 'pause' : 'play');
+  }, []);
+  const onSkip = useCallback((dir: 'next' | 'prev') => {
+    const f = featuredRef.current;
+    if (f) service.controlStream(f.id, dir === 'next' ? 'next' : 'previous');
+  }, []);
+  const onHwVolume = useCallback((v: number) => {
+    const f = featuredRef.current;
+    if (f) service.setStreamVolume(f.id, v);
+  }, []);
+  const onSrcVolume = useCallback((v: number) => {
+    const f = featuredRef.current;
+    if (f) service.setStreamVolume(f.id, v);
+  }, []);
 
   return (
     <div style={{ maxWidth: 720, margin: '0 auto', padding: 16, fontFamily: 'system-ui, sans-serif' }}>
@@ -59,14 +113,14 @@ export default function MeshApp(): React.ReactElement {
             federationEnabled={model.servers.length > 1}
           />
           <NowPlaying stream={featured} canSeek={caps?.canSeek ?? false} />
-          <PlayerControls
+          <MemoPlayerControls
             stream={featured}
             volume={featured.volume ?? 100}
-            onVolumeChange={(v) => service.setStreamVolume(featured.id, v)}
+            onVolumeChange={onHwVolume}
             sourceVolume={featured.volume}
-            onSourceVolumeChange={(v) => service.setStreamVolume(featured.id, v)}
-            onPlayPause={() => service.controlStream(featured.id, featured.isPlaying ? 'pause' : 'play')}
-            onSkip={(dir) => service.controlStream(featured.id, dir === 'next' ? 'next' : 'previous')}
+            onSourceVolumeChange={onSrcVolume}
+            onPlayPause={onPlayPause}
+            onSkip={onSkip}
           />
         </section>
       )}

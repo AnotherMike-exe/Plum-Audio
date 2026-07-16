@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { mapViewToModel, streamId, parseStreamId, MeshView } from '../../../services/sendspinDataService';
-import { NowPlaying, currentPositionMs } from '../../../services/sendspinControllerClient';
+import { NowPlaying, currentPositionMs, SendspinControllerClient } from '../../../services/sendspinControllerClient';
 
 function np(partial: Partial<NowPlaying>): NowPlaying {
   return { groupId: null, groupName: null, playbackState: 'unknown', supportedCommands: [], ...partial };
@@ -54,6 +54,16 @@ describe('mapViewToModel', () => {
     view.units[0].players[0].group_id = 'orphan';
     const m = mapViewToModel(view, new Map(), new Map());
     expect(m.clients[0].currentStreamId).toBeNull();
+  });
+
+  it('treats playbackSpeed 0 as paused (the only out-of-band AirPlay pause signal)', () => {
+    // group playback_state stays 'playing' through a source pause; speed 0 is what flips the UI.
+    const npByGroup = new Map([['gA', np({ groupId: 'gA', playbackState: 'playing', title: 'Rebel Yell', playbackSpeed: 0, trackProgressMs: 137749, trackDurationMs: 288580 })]]);
+    const m = mapViewToModel(VIEW, npByGroup, new Map());
+    const s = m.streams.find((s) => s.id === 'unit-133::airplay')!;
+    expect(s.isPlaying).toBe(false);
+    expect(s.playback!.playback_status).toBe('paused');
+    expect(s.currentTrack.title).toBe('Rebel Yell'); // metadata retained through the pause
   });
 
   it('merges now-playing metadata onto the matching stream', () => {

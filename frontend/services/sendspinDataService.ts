@@ -202,7 +202,12 @@ export class SendspinDataService {
 
   controlStream(federatedStreamId: string, command: ControllerCommand): void {
     const { unitId } = parseStreamId(federatedStreamId);
-    this.controllers.get(unitId)?.send(command);
+    const controller = this.controllers.get(unitId);
+    if (!controller) return;
+    controller.send(command);
+    // Flip the transport button immediately; the AirPlay pause round-trip is multi-second.
+    // applyOptimisticTransport emits through the onUpdate callback → onNowPlaying → npByGroup.
+    if (command === 'play' || command === 'pause') controller.applyOptimisticTransport(command);
   }
 
   setStreamVolume(federatedStreamId: string, volume: number): void {

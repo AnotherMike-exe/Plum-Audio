@@ -62,6 +62,10 @@ export function currentPositionMs(np: NowPlaying, serverClockOffsetUs: number, n
 const ARTWORK_CHANNEL_0 = 8; // binary message types 8..11 = artwork channels 0..3
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
+// How long to hold an optimistic play/pause before letting server state win again. Covers the
+// AirPlay round-trip (buffered audio keeps draining for ~5s, so `pend` lands late); if the command
+// never takes (e.g. the source ignored it), reality reasserts after this window.
+const OPTIMISTIC_HOLD_MS = 8000;
 
 export class SendspinControllerClient {
   readonly unitId: string;
@@ -76,6 +80,13 @@ export class SendspinControllerClient {
   private closed = false;
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // Optimistic transport: after a GUI play/pause, hold this speed until the server confirms it (a
+  // matching speed arrives) or OPTIMISTIC_HOLD_MS elapses. null = no action pending.
+  private optimisticSpeed: number | null = null;
+  private optimisticUntil = 0;
+  // Commands issued while the WS is mid-reconnect: queue and flush once (re)connected + grouped, so
+  // a click during a brief socket blip isn't silently lost. Each carries a timestamp for TTL expiry.
+  private pendingCommands: Array<{ msg: string; at: number }> = [];
 
   constructor(
     unitId: string,
@@ -116,11 +127,34 @@ export class SendspinControllerClient {
 
   /** Send a controller command. `volume` required for 'volume', `mute` for 'mute'. */
   send(command: ControllerCommand, args: { volume?: number; mute?: boolean } = {}): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     const controller: Record<string, unknown> = { command };
     if (command === 'volume') controller.volume = Math.max(0, Math.min(100, args.volume ?? 0));
     if (command === 'mute') controller.mute = !!args.mute;
-    this.ws.send(JSON.stringify({ type: 'client/command', payload: { controller } }));
+    const msg = JSON.stringify({ type: 'client/command', payload: { controller } });
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(msg);
+      return;
+    }
+    // WS mid-reconnect (or briefly closed): queue instead of dropping the click, and kick a
+    // reconnect if the socket is fully closed. flushPending() sends it once (re)connected + grouped.
+    this.pendingCommands.push({ msg, at: Date.now() });
+    while (this.pendingCommands.length > 8) this.pendingCommands.shift();
+    const state = this.ws ? this.ws.readyState : WebSocket.CLOSED;
+    if (!this.closed && (state === WebSocket.CLOSED || this.ws === null)) {
+      if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+      this.open();
+    }
+  }
+
+  private flushPending(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.pendingCommands.length === 0) return;
+    const now = Date.now();
+    const cmds = this.pendingCommands;
+    this.pendingCommands = [];
+    for (const c of cmds) {
+      if (now - c.at <= 5000) this.ws.send(c.msg); // drop commands older than 5s (stale intent)
+    }
   }
 
   // -- internals ----------------------------------------------------------
@@ -145,6 +179,9 @@ export class SendspinControllerClient {
           },
         }),
       );
+      // Flush any commands queued during the reconnect, once the server has had time to re-group us
+      // into the source group (a command sent while still in our solo group would go nowhere).
+      if (this.pendingCommands.length > 0) setTimeout(() => this.flushPending(), 600);
     };
     ws.onmessage = (ev) => this.onMessage(ev);
     ws.onclose = () => this.scheduleReconnect();
@@ -153,12 +190,47 @@ export class SendspinControllerClient {
 
   private scheduleReconnect(): void {
     if (this.closed) return;
-    // On a drop we don't know the current state; reset to unknown so the UI doesn't show stale.
-    this.np = { ...emptyNowPlaying(), groupId: this.np.groupId, groupName: this.np.groupName };
+    this.clearOptimistic(); // don't hold a stale transport guess across a drop
+    // Keep the last-known now-playing through brief blips — a healthy reconnect (server restart,
+    // roam) is sub-second and the reconnected socket re-emits full state, so blanking immediately
+    // makes the GUI flash "disconnected" and drop art/progress mid-pause. Only reset to unknown
+    // after several failed attempts, when the connection is genuinely gone.
+    if (this.reconnectAttempts >= 3) {
+      this.np = { ...emptyNowPlaying(), groupId: this.np.groupId, groupName: this.np.groupName };
+    }
     this.emit();
     const delay = Math.min(RECONNECT_BASE_MS * 2 ** this.reconnectAttempts, RECONNECT_MAX_MS);
     this.reconnectAttempts++;
     this.reconnectTimer = setTimeout(() => this.open(), delay);
+  }
+
+  /**
+   * Optimistically reflect a GUI-initiated transport action before the source round-trips.
+   * AirPlay's pause round-trip (MPRIS → shairport → buffer drain → `pend` → metadata diff) takes
+   * several seconds; reflecting speed locally flips the button instantly. The next real progress
+   * diff refines the anchor. Only touches playback speed/state — never title/art — so a no-op
+   * command self-corrects on the next update rather than blanking anything.
+   */
+  applyOptimisticTransport(command: ControllerCommand): void {
+    if (command === 'pause') {
+      this.np.playbackSpeed = 0;
+      this.optimisticSpeed = 0;
+    } else if (command === 'play') {
+      this.np.playbackSpeed = 1000;
+      this.np.playbackState = 'playing';
+      // Re-anchor so extrapolation resumes from the frozen position, not a stale timestamp.
+      if (this.np.trackProgressMs != null) this.np.timestampUs = Date.now() * 1000 + this.serverClockOffsetUs;
+      this.optimisticSpeed = 1000;
+    } else {
+      return;
+    }
+    this.optimisticUntil = Date.now() + OPTIMISTIC_HOLD_MS;
+    this.emit();
+  }
+
+  private clearOptimistic(): void {
+    this.optimisticSpeed = null;
+    this.optimisticUntil = 0;
   }
 
   private onMessage(ev: MessageEvent): void {
@@ -201,10 +273,26 @@ export class SendspinControllerClient {
       if ('album' in md) this.np.album = md.album ?? undefined;
       if ('artwork_url' in md && !this.artworkObjectUrl) this.np.artworkUrl = md.artwork_url ?? undefined;
       if (md.progress) {
-        this.np.trackProgressMs = md.progress.track_progress;
-        this.np.trackDurationMs = md.progress.track_duration;
-        this.np.playbackSpeed = md.progress.playback_speed;
-        this.np.timestampUs = md.timestamp;
+        const serverSpeed = md.progress.playback_speed;
+        const holding = this.optimisticSpeed != null && this.optimisticUntil > Date.now();
+        if (holding && serverSpeed !== this.optimisticSpeed) {
+          // GUI action hasn't round-tripped to the source yet — hold the button where the user put
+          // it and ignore in-flight frames from the pre-action state (AirPlay keeps sending
+          // speed=1000 for ~5s after a pause). Freeze the position for a held pause; let it advance
+          // for a held play.
+          this.np.playbackSpeed = this.optimisticSpeed as number;
+          if (this.optimisticSpeed !== 0) {
+            this.np.trackProgressMs = md.progress.track_progress;
+            this.np.trackDurationMs = md.progress.track_duration;
+            this.np.timestampUs = md.timestamp;
+          }
+        } else {
+          if (holding) this.clearOptimistic(); // server confirmed the action
+          this.np.trackProgressMs = md.progress.track_progress;
+          this.np.trackDurationMs = md.progress.track_duration;
+          this.np.playbackSpeed = serverSpeed;
+          this.np.timestampUs = md.timestamp;
+        }
       }
       changed = true;
     }
