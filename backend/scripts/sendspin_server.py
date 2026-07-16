@@ -45,6 +45,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
+import json
 import logging
 import os
 
@@ -62,8 +64,10 @@ from aiosendspin.server.roles.player import PlayerV1Role
 from aiosendspin.server.server import ClientAddedEvent, ClientUpdatedEvent, ConnectionReason, SendspinServer
 
 from mesh.model import PlayerState, SourceState, UnitSnapshot
+from sources import spotify_config
 from sources.airplay_metadata import AirplayMetadataReader
 from sources.airplay_remote import AirplayRemote
+from sources.spotify_mpris import SpotifyMpris
 
 logger = logging.getLogger("plum.sendspin_server")
 
@@ -245,6 +249,10 @@ class PlumSendspinServer:
         self._local_player_tasks: list[asyncio.Task] = []
         self._metadata_readers: list[AirplayMetadataReader] = []
         self._airplay_remote: AirplayRemote | None = None  # MPRIS transport control for the AirPlay source
+        self._spotify_monitors: list[SpotifyMpris] = []  # per-instance MPRIS metadata+control monitors
+        # Per-source transport remote (has async play/pause/next_track/previous_track). AirPlay's
+        # AirplayRemote and each SpotifyMpris both satisfy it, so controller events route by source.
+        self._source_remotes: dict[str, object] = {}
         self._stop_evt = asyncio.Event()
 
     async def start(self) -> None:
@@ -263,6 +271,10 @@ class PlumSendspinServer:
         if self._airplay_remote is not None:
             await self._airplay_remote.close()
             self._airplay_remote = None
+        for monitor in self._spotify_monitors:
+            await monitor.stop()
+        self._spotify_monitors.clear()
+        self._source_remotes.clear()
         for reader in self._metadata_readers:
             await reader.stop()
         self._metadata_readers.clear()
@@ -505,22 +517,49 @@ class PlumSendspinServer:
         resulting controller events to the AirPlay sender (phone/Mac) via the MPRIS remote. Volume
         stays the group/render volume for now; source-volume sync is a later step.
         """
+        self._airplay_remote = AirplayRemote()
+        await self._airplay_remote.connect()
+        self._wire_transport_control(source_id, self._airplay_remote)
+        logger.info("[%s] airplay MPRIS transport control wired", source_id)
+
+    async def start_spotify_source(self, instance: spotify_config.SpotifyInstance) -> None:
+        """Bring up a Spotify Connect endpoint as a source: group + feeder + MPRIS metadata/control.
+
+        The feeder waits for spotifyd to open the instance FIFO writer, so starting eagerly is safe
+        even before spotifyd is running. SpotifyMpris serves double duty here — its run() loop pushes
+        metadata/artwork to the group's roles, and it is also registered as the source's transport
+        remote (its play/pause/next/previous drive spotifyd over MPRIS).
+        """
+        self.start_source(instance.source_id, instance.fifo_path)
+        handle = self.sources[instance.source_id]
+        monitor = SpotifyMpris(handle.group, instance.instance_id)
+        await monitor.connect()
+        monitor.start()
+        self._spotify_monitors.append(monitor)
+        self._wire_transport_control(instance.source_id, monitor)
+        logger.info("[%s] spotify source up (name=%r)", instance.source_id, instance.device_name)
+
+    def _wire_transport_control(self, source_id: str, remote: object) -> None:
+        """Advertise transport commands on a source's controller role and route its events to `remote`.
+
+        `remote` must expose async play/pause/next_track/previous_track. The event listener is bound
+        to this source_id so multiple concurrent sources (AirPlay + N Spotify) each reach their own
+        sender.
+        """
         handle = self.sources.get(source_id)
         if handle is None:
             raise KeyError(f"unknown source {source_id!r}")
-        self._airplay_remote = AirplayRemote()
-        await self._airplay_remote.connect()
+        self._source_remotes[source_id] = remote
         controller = handle.group.group_role("controller")
         if controller is not None:
             controller.set_supported_commands(
                 [MediaCommand.PLAY, MediaCommand.PAUSE, MediaCommand.NEXT, MediaCommand.PREVIOUS]
             )
-        handle.group.add_event_listener(self._on_airplay_control_event)
-        logger.info("[%s] airplay MPRIS transport control wired", source_id)
+        handle.group.add_event_listener(functools.partial(self._on_control_event, source_id))
 
-    def _on_airplay_control_event(self, _group: SendspinGroup, event: object) -> None:
-        """Forward a controller transport event to the AirPlay sender via MPRIS (fire-and-forget)."""
-        remote = self._airplay_remote
+    def _on_control_event(self, source_id: str, _group: SendspinGroup, event: object) -> None:
+        """Forward a controller transport event to the source's sender via its remote (fire-and-forget)."""
+        remote = self._source_remotes.get(source_id)
         if remote is None:
             return
         if isinstance(event, ControllerPlayEvent):
@@ -609,6 +648,17 @@ class PlumSendspinServer:
             await asyncio.sleep(1.0)
 
 
+def _load_spotify_instances() -> list[spotify_config.SpotifyInstance]:
+    """Enabled Spotify endpoints from the settings file, or [] if none/unreadable."""
+    settings_file = os.environ.get("PLUM_SETTINGS_FILE", "/data/settings.json")
+    try:
+        with open(settings_file, encoding="utf-8") as f:
+            settings = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return spotify_config.instances_from_settings(settings)
+
+
 async def main() -> None:
     logging.basicConfig(
         level=os.environ.get("PLUM_LOG_LEVEL", "INFO"),
@@ -636,6 +686,12 @@ async def main() -> None:
         # With the mesh on, register + attach the local player once and let routing roam it;
         # the perpetual re-attach supervisor (Phase-1 glue) would fight cross-server reclaims.
         srv.attach_local_player("airplay", local_player_id, local_player_url, supervise=not mesh_enabled)
+
+    # Spotify: bring up a source per enabled Connect endpoint (config-driven, multi-instance). The
+    # feeder waits for spotifyd to open each instance FIFO, so this is safe even if spotifyd isn't
+    # up yet (or isn't installed on a rig). Config rendering + spotifyd launch are supervisord's job.
+    for instance in _load_spotify_instances():
+        await srv.start_spotify_source(instance)
 
     # Phase 2: the mesh (discovery + aggregation + routing + REST). Local playback above stands
     # on its own; the mesh layers cross-unit roaming on top. Disable with PLUM_MESH_ENABLED=0.
