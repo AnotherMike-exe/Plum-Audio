@@ -48,15 +48,22 @@ import contextlib
 import logging
 import os
 
-from aiosendspin.models.types import has_role_family
+from aiosendspin.models.types import MediaCommand, has_role_family
 from aiosendspin.server.audio import AudioFormat
 from aiosendspin.server.group import SendspinGroup
 from aiosendspin.server.push_stream import PushStream, StreamStoppedError
+from aiosendspin.server.roles.controller.events import (
+    ControllerNextEvent,
+    ControllerPauseEvent,
+    ControllerPlayEvent,
+    ControllerPreviousEvent,
+)
 from aiosendspin.server.roles.player import PlayerV1Role
 from aiosendspin.server.server import ClientAddedEvent, ClientUpdatedEvent, ConnectionReason, SendspinServer
 
 from mesh.model import PlayerState, SourceState, UnitSnapshot
 from sources.airplay_metadata import AirplayMetadataReader
+from sources.airplay_remote import AirplayRemote
 
 logger = logging.getLogger("plum.sendspin_server")
 
@@ -237,6 +244,7 @@ class PlumSendspinServer:
         self._primary_source: str | None = None  # source group that controller-only clients join
         self._local_player_tasks: list[asyncio.Task] = []
         self._metadata_readers: list[AirplayMetadataReader] = []
+        self._airplay_remote: AirplayRemote | None = None  # MPRIS transport control for the AirPlay source
         self._stop_evt = asyncio.Event()
 
     async def start(self) -> None:
@@ -252,6 +260,9 @@ class PlumSendspinServer:
 
     async def stop(self) -> None:
         self._stop_evt.set()
+        if self._airplay_remote is not None:
+            await self._airplay_remote.close()
+            self._airplay_remote = None
         for reader in self._metadata_readers:
             await reader.stop()
         self._metadata_readers.clear()
@@ -348,6 +359,14 @@ class PlumSendspinServer:
         with contextlib.suppress(Exception):
             await handle.group.add_client(client)
             logger.info("[%s] grouped controller client %s", self._primary_source, client_id)
+            # A controller joining creates the controller group role; (re)advertise transport
+            # commands on it now so this controller sees play/pause/next/previous as supported.
+            if self._airplay_remote is not None:
+                controller = handle.group.group_role("controller")
+                if controller is not None:
+                    controller.set_supported_commands(
+                        [MediaCommand.PLAY, MediaCommand.PAUSE, MediaCommand.NEXT, MediaCommand.PREVIOUS]
+                    )
 
     def set_player_volume(self, player_id: str, volume: int, muted: bool) -> None:
         """Set one player's volume (0-100) and mute — per-client, independent of its group.
@@ -479,6 +498,40 @@ class PlumSendspinServer:
         reader.start()
         logger.info("[%s] airplay metadata reader started (%s)", source_id, metadata_fifo)
 
+    async def start_airplay_control(self, source_id: str) -> None:
+        """Wire GUI transport commands for an AirPlay source to shairport-sync over MPRIS.
+
+        Advertises play/pause/next/previous on the source group's controller role and forwards the
+        resulting controller events to the AirPlay sender (phone/Mac) via the MPRIS remote. Volume
+        stays the group/render volume for now; source-volume sync is a later step.
+        """
+        handle = self.sources.get(source_id)
+        if handle is None:
+            raise KeyError(f"unknown source {source_id!r}")
+        self._airplay_remote = AirplayRemote()
+        await self._airplay_remote.connect()
+        controller = handle.group.group_role("controller")
+        if controller is not None:
+            controller.set_supported_commands(
+                [MediaCommand.PLAY, MediaCommand.PAUSE, MediaCommand.NEXT, MediaCommand.PREVIOUS]
+            )
+        handle.group.add_event_listener(self._on_airplay_control_event)
+        logger.info("[%s] airplay MPRIS transport control wired", source_id)
+
+    def _on_airplay_control_event(self, _group: SendspinGroup, event: object) -> None:
+        """Forward a controller transport event to the AirPlay sender via MPRIS (fire-and-forget)."""
+        remote = self._airplay_remote
+        if remote is None:
+            return
+        if isinstance(event, ControllerPlayEvent):
+            asyncio.ensure_future(remote.play())
+        elif isinstance(event, ControllerPauseEvent):
+            asyncio.ensure_future(remote.pause())
+        elif isinstance(event, ControllerNextEvent):
+            asyncio.ensure_future(remote.next_track())
+        elif isinstance(event, ControllerPreviousEvent):
+            asyncio.ensure_future(remote.previous_track())
+
     def attach_local_player(self, source_id: str, player_id: str, player_url: str, *, supervise: bool = True) -> None:
         """Attach this unit's own player to a source, registering its reclaim URL.
 
@@ -578,6 +631,7 @@ async def main() -> None:
     # open the FIFO writer, so starting it eagerly is safe.
     srv.start_source("airplay", airplay_fifo)
     srv.start_airplay_metadata("airplay", airplay_meta_fifo)  # metadata/artwork → roles (item 3)
+    await srv.start_airplay_control("airplay")  # play/pause/next/previous → shairport MPRIS → sender
     if local_player_url:
         # With the mesh on, register + attach the local player once and let routing roam it;
         # the perpetual re-attach supervisor (Phase-1 glue) would fight cross-server reclaims.

@@ -11,5 +11,10 @@ Flask>=3,<4
 flask-cors>=4
 requests>=2.31
 
+# AirPlay transport control (Step 2): drive shairport-sync's MPRIS interface on the system D-Bus.
+# asyncio-native (no glib main loop) so it lives in the audio event loop. Needs a system dbus-daemon
+# + backend/config/shairport-sync-dbus.conf policy for the run user to own/send the MPRIS name.
+dbus-next>=0.2.3,<0.3
+
 # Utility
 aiohttp>=3.9          # transitive via aiosendspin; pinned for clarity
