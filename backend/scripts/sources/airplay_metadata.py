@@ -54,6 +54,7 @@ class AirplayMetadataReader:
         self._warned_no_role = False
         self._last_title: str | None = None  # to detect track changes at bundle flush
         self._waiting_for_fresh_prgr = False  # reject stale prgr from the old track after a change
+        self._last_position_ms = 0  # last real prgr position, to freeze at on pause (not extrapolated)
 
     def start(self) -> None:
         if self._task is None:
@@ -184,10 +185,15 @@ class AirplayMetadataReader:
             return
         new_title = kwargs.get("title")
         if new_title and new_title != self._last_title:
-            # Track changed: shairport may still emit a prgr frame or two for the OLD track before
-            # the new one's timing arrives. Reject those until a fresh frame lands (see _handle_progress).
+            # Guard against stale prgr ONLY on a real track change (a previous track existed).
+            # shairport may emit a prgr frame or two for the OLD track before the new one's timing
+            # arrives; reject those until a fresh frame lands (see _handle_progress). But the FIRST
+            # track of a session is legitimately mid-position (the sender can connect partway
+            # through), so its prgr must be accepted — else the anchor never advances past the first
+            # frame and the extrapolated position drifts to 100%.
+            if self._last_title is not None:
+                self._waiting_for_fresh_prgr = True
             self._last_title = new_title
-            self._waiting_for_fresh_prgr = True
         role.update(**kwargs)
         logger.info("metadata: %s", " · ".join(f"{k}={v}" for k, v in kwargs.items()))
 
@@ -201,6 +207,9 @@ class AirplayMetadataReader:
             return
         position_ms = max(0, (current - start) * 1000 // self.rtp_rate)
         duration_ms = max(0, (end - start) * 1000 // self.rtp_rate)
+        logger.debug(
+            "prgr raw=%s -> pos=%d dur=%d wait=%s", decoded, position_ms, duration_ms, self._waiting_for_fresh_prgr
+        )
         if self._waiting_for_fresh_prgr:
             prev = role.metadata
             prev_dur = prev.track_duration if prev is not None else None
@@ -208,6 +217,7 @@ class AirplayMetadataReader:
             if not fresh:
                 return  # stale frame from the previous track — keep the reset position
             self._waiting_for_fresh_prgr = False
+        self._last_position_ms = position_ms
         # All three progress fields must be set together or the metadata role emits none of them.
         # playback_speed 1000 = 1x; the role auto-stamps a timestamp so clients extrapolate position.
         role.update(track_progress=position_ms, track_duration=duration_ms, playback_speed=1000)
@@ -216,14 +226,21 @@ class AirplayMetadataReader:
         """Resume client-side progress extrapolation from the last known position (speed → 1x)."""
         role = self._metadata_role()
         if role is not None and role.metadata is not None and role.metadata.track_progress is not None:
+            logger.info("RESUME speed=1000 (pos=%d)", self._last_position_ms)
             role.update(playback_speed=1000)
 
     def _set_paused(self) -> None:
-        """Freeze the reported position where it is (speed → 0) without clearing metadata/artwork."""
+        """Freeze at the last REAL prgr position (speed → 0), without clearing metadata/artwork.
+
+        Deliberately NOT role.freeze_progress(): that snapshots the *extrapolated* position, which
+        overshoots toward 100% given shairport's sparse prgr and the buffer-drain delay before it
+        reports the pause. Anchoring to the last real prgr position keeps it honest.
+        """
         role = self._metadata_role()
-        if role is not None:
-            with contextlib.suppress(Exception):
-                role.freeze_progress()
+        if role is None or role.metadata is None or role.metadata.track_progress is None:
+            return
+        logger.info("PAUSE freeze at pos=%d", self._last_position_ms)
+        role.update(track_progress=self._last_position_ms, playback_speed=0)
 
     async def _handle_picture(self, raw_b64: str) -> None:
         if not raw_b64:

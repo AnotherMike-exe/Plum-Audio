@@ -98,7 +98,11 @@ export function mapViewToModel(
         albumArtUrl: np?.artworkUrl ?? '',
         duration: np?.trackDurationMs ? np.trackDurationMs / 1000 : 0,
       };
-      const isPlaying = np ? np.playbackState === 'playing' : src.streaming;
+      // A source pauses by dropping playback_speed to 0 on the metadata role (the group's
+      // playback_state stays 'playing'). Treat speed 0 as paused so the transport button + bar
+      // reflect it — this is the only pause signal AirPlay/Spotify give us out-of-band.
+      const paused = np != null && np.playbackSpeed === 0;
+      const isPlaying = np ? np.playbackState === 'playing' && !paused : src.streaming;
       streams.push({
         id: sid,
         serverId: unit.unit_id,
@@ -112,7 +116,7 @@ export function mapViewToModel(
           position: np?.trackProgressMs ?? 0,
           duration: np?.trackDurationMs ?? 0,
           interpolated_position: posMs,
-          playback_status: np ? np.playbackState : 'unknown',
+          playback_status: np ? (paused ? 'paused' : np.playbackState) : 'unknown',
           is_stale: !np,
         },
         volume: np?.volume,
