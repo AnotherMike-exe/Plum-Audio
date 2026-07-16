@@ -16,10 +16,11 @@ interface SettingsProps {
     initialTab?: string; // Optional initial tab to open
 }
 
-// Phase A: only the functional settings are surfaced. Integrations/Audio/Playback
-// tabs return when their Phase-3 source services exist to control — the render cases
-// below stay wired so re-enabling is just re-adding array entries.
+// Phase 3: Integrations is surfaced with only the sources whose backend exists (Spotify today —
+// see the enabledSources prop below). Audio/Playback tabs return when their services land; their
+// render cases stay wired so re-enabling is just re-adding array entries.
 const tabs: Tab[] = [
+    {id: 'integrations', label: 'Integrations', icon: 'puzzle-piece'},
     {id: 'theme', label: 'Theme', icon: 'palette'},
     {id: 'visualizer', label: 'Visualizer', icon: 'waveform'},
     {id: 'about', label: 'About', icon: 'circle-info'},
@@ -31,7 +32,7 @@ export const Settings: React.FC<SettingsProps> = ({settings, onSettingsChange, o
     const renderTabContent = () => {
         switch (activeTab) {
             case 'integrations':
-                return <IntegrationsTab settings={settings} onSettingsChange={onSettingsChange} />;
+                return <IntegrationsTab settings={settings} onSettingsChange={onSettingsChange} enabledSources={['spotify']} />;
             case 'audio':
                 return <AudioTab settings={settings} onSettingsChange={onSettingsChange} />;
             case 'playback':

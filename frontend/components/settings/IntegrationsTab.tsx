@@ -7,6 +7,9 @@ import { Icon } from '../Icon';
 interface IntegrationsTabProps {
   settings: SettingsType;
   onSettingsChange: (newSettings: SettingsType) => void;
+  // Which source sections to show. Omit to show all (default). Phase 3 passes ['spotify'] to
+  // surface only the source whose backend exists; the rest re-appear as their services land.
+  enabledSources?: string[];
 }
 
 type ApplyStatus = 'idle' | 'pending' | 'applying' | 'success' | 'error';
@@ -29,8 +32,10 @@ type SpotifyEndpoint = {
 export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
   settings,
   onSettingsChange,
+  enabledSources,
 }) => {
   const [expandedSection, setExpandedSection] = useState<string | null>(null);
+  const show = (source: string) => !enabledSources || enabledSources.includes(source);
 
   // AirPlay endpoints state
   const [airplayEndpoints, setAirplayEndpoints] = useState<AirPlayEndpoint[]>([]);
@@ -639,6 +644,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
 
       <div className="space-y-4">
         {/* AirPlay */}
+        {show('airplay') && (
         <div className="p-4 bg-[var(--bg-tertiary)] rounded-lg border border-[var(--border-color)]">
           <div className="flex items-start justify-between gap-4">
             {/* Left: Icon */}
@@ -820,8 +826,10 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
             </div>
           )}
         </div>
+        )}
 
         {/* Bluetooth */}
+        {show('bluetooth') && (
         <div className="p-4 bg-[var(--bg-tertiary)] rounded-lg border border-[var(--border-color)]">
           <div className="flex items-start justify-between gap-4">
             {/* Left: Icon */}
@@ -939,6 +947,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
             </div>
           )}
         </div>
+        )}
 
         {/* Spotify Connect */}
         <div className="p-4 bg-[var(--bg-tertiary)] rounded-lg border border-[var(--border-color)]">
@@ -1124,6 +1133,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
         </div>
 
         {/* DLNA/UPnP */}
+        {show('dlna') && (
         <div className="p-4 bg-[var(--bg-tertiary)] rounded-lg border border-[var(--border-color)]">
           <div className="flex items-start justify-between gap-4">
             {/* Left: Icon */}
@@ -1303,8 +1313,10 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
             </div>
           )}
         </div>
+        )}
 
         {/* Plexamp */}
+        {show('plexamp') && (
         <div className={`p-4 bg-[var(--bg-tertiary)] rounded-lg border border-[var(--border-color)] ${!settings.integrations.plexamp.available ? 'opacity-50' : ''}`}>
           <div className="flex items-start justify-between gap-4">
             {/* Left: Icon */}
@@ -1351,6 +1363,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
             </div>
           </div>
         </div>
+        )}
       </div>
 
       <div className="pt-4 mt-6 border-t border-[var(--border-color)]">
