@@ -25,13 +25,17 @@ from dataclasses import dataclass
 
 logger = logging.getLogger("plum.spotify_config")
 
-# Defaults are container paths (Binhex /app layout); every path is overridable so the Pi rig and
-# tests can point them at a scratch dir.
-DEFAULT_TEMPLATE = "/app/config/spotifyd.conf.template"
-DEFAULT_CONFIG_DIR = "/app/config"
-DEFAULT_SUPERVISOR_OUT = "/app/supervisord/conf.d/spotify-multi-instance.ini"
-DEFAULT_SPOTIFYD_BIN = "/usr/local/bin/spotifyd"
-DEFAULT_START_SCRIPT = "/app/scripts/sources/start-spotifyd.sh"
+# Defaults are container paths (Binhex /app layout); every path is overridable — by argument or the
+# PLUM_SPOTIFY_* env vars — so the Pi rig and tests can point them at a scratch dir.
+DEFAULT_TEMPLATE = os.environ.get("PLUM_SPOTIFY_TEMPLATE", "/app/config/spotifyd.conf.template")
+DEFAULT_CONFIG_DIR = os.environ.get("PLUM_SPOTIFY_CONFIG_DIR", "/app/config")
+DEFAULT_SUPERVISOR_OUT = os.environ.get(
+    "PLUM_SPOTIFY_SUPERVISOR_OUT", "/app/supervisord/conf.d/spotify-multi-instance.ini"
+)
+DEFAULT_SPOTIFYD_BIN = os.environ.get("PLUM_SPOTIFYD_BIN", "/usr/local/bin/spotifyd")
+DEFAULT_START_SCRIPT = os.environ.get(
+    "PLUM_SPOTIFY_START_SCRIPT", "/app/scripts/sources/start-spotifyd.sh"
+)
 
 MAX_ENDPOINTS = 10
 DEFAULT_BITRATE = 320

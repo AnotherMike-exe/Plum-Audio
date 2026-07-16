@@ -14,7 +14,8 @@ import os
 from flask import Flask
 from flask_cors import CORS
 
-from settings_api import create_settings_blueprint
+from integrations_api import create_integrations_blueprint
+from settings_api import SettingsManager, create_settings_blueprint
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +23,11 @@ logger = logging.getLogger(__name__)
 def create_app() -> Flask:
     app = Flask(__name__)
     CORS(app)  # blanket CORS — the GUI is served from a different origin (Vite dev / proxy)
-    app.register_blueprint(create_settings_blueprint())
-    # Future: app.register_blueprint(create_integrations_blueprint()), create_audio_blueprint().
+    # One SettingsManager shared across blueprints so settings + integrations read/write the same file.
+    settings_manager = SettingsManager()
+    app.register_blueprint(create_settings_blueprint(settings_manager))
+    app.register_blueprint(create_integrations_blueprint(settings_manager))
+    # Future: create_audio_blueprint() slots in here with the Phase-3 audio-device control.
     return app
 
 
