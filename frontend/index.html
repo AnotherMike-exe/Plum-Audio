@@ -223,11 +223,8 @@
         }
     </style>
 
-    <!-- Load Tailwind CDN -->
-    <script src="https://cdn.tailwindcss.com"></script>
-
-
-<link rel="stylesheet" href="/index.css">
+    <!-- Tailwind is compiled into the bundle (src/index.css + tailwind.config.js), NOT pulled
+         from cdn.tailwindcss.com: units must render with no internet access. -->
 </head>
   <body class="bg-[var(--bg-primary)] text-[var(--text-primary)] antialiased">
     <div id="root"></div>

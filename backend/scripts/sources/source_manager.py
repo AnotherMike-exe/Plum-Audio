@@ -173,7 +173,10 @@ class SourceManagerBase:
                 running.signature = signature
                 await self._kill_daemons(running)
                 await self._spawn_daemons(running)
-            elif any(p.returncode is not None for p in running.procs):
+            elif not running.procs or any(p.returncode is not None for p in running.procs):
+                # No procs at all counts as needing a respawn: a failed launch (binary not
+                # installed yet, config not written yet) leaves the set empty, and without this the
+                # endpoint would sit dead forever with nothing to reap.
                 await self._reap_and_respawn(running)
 
     async def _start_instance(self, instance, signature: tuple) -> None:
@@ -231,15 +234,20 @@ class SourceManagerBase:
                 await asyncio.sleep(spec.settle_s)
 
     async def _reap_and_respawn(self, running: _Running) -> None:
-        """Restart an endpoint's whole daemon set when any member exits.
+        """(Re)start an endpoint's whole daemon set — after an exit, or a launch that never took.
 
         All-or-nothing on purpose: the members are interdependent (a private bus and the daemon
         that registers on it), so reviving one against a stale peer is not a recovery.
         """
-        codes = [p.returncode for p in running.procs]
-        logger.warning("[%s] daemon exited (rc=%s); restarting set", running.instance.source_id, codes)
-        await self._kill_daemons(running)
-        running.next_spawn_at = time.monotonic() + RESPAWN_BACKOFF
+        if running.procs:
+            codes = [p.returncode for p in running.procs]
+            logger.warning("[%s] daemon exited (rc=%s); restarting set", running.instance.source_id, codes)
+            await self._kill_daemons(running)
+            running.next_spawn_at = time.monotonic() + RESPAWN_BACKOFF
+        else:
+            # Nothing ever started (missing binary/config). Retry quietly on the backoff — the
+            # source is up and idle meanwhile, so this self-heals once the dependency appears.
+            logger.debug("[%s] no daemons running; retrying launch", running.instance.source_id)
         await self._spawn_daemons(running)
 
     async def _kill_daemons(self, running: _Running) -> None:
