@@ -19,7 +19,9 @@ Events consumed (go-librespot /events, {"type", "data"}):
   seek {position, duration}                  → re-anchor progress
   volume {value, max}                        → source volume (logged; role wiring later)
 Position/duration are milliseconds (Sendspin roles use ms); the metadata role stamps a timestamp so
-clients extrapolate position between events — we only re-anchor on metadata/seek, freeze on pause.
+clients extrapolate position between events. We re-anchor on metadata/seek AND on every play/pause
+(asking the daemon where it actually is) — a bare speed flip would re-stamp the track's start anchor
+and snap the client's timeline back to 0:00.
 """
 
 from __future__ import annotations
@@ -130,9 +132,9 @@ class SpotifyGoLibrespot:
             if etype == "metadata":
                 await self._apply_track(data)
             elif etype == "playing":
-                self._set_speed(True)
+                await self._apply_speed(True, data)
             elif etype in ("paused", "not_playing", "stopped"):
-                self._set_speed(False)
+                await self._apply_speed(False, data)
             elif etype == "seek":
                 self._anchor_progress(data.get("position"), data.get("duration"))
             elif etype == "volume":
@@ -172,15 +174,49 @@ class SpotifyGoLibrespot:
         # clients extrapolate from here (speed 0 freezes at this anchor).
         role.update(track_progress=max(0, int(position)), track_duration=max(0, int(duration)), playback_speed=speed)
 
-    def _set_speed(self, playing: bool) -> None:
+    async def _apply_speed(self, playing: bool, data: dict | None = None) -> None:
+        """Flip playback speed AND re-anchor progress to the daemon's true position.
+
+        Re-anchoring is the whole point: the metadata role stores one progress anchor and clients
+        extrapolate from its timestamp. go-librespot only reports position on metadata/seek, so the
+        stored anchor is normally the track's start (position ~0). Emitting a bare speed change
+        re-stamps that stale anchor with a fresh timestamp — the client then reads 0:00 on pause and
+        resumes counting from zero. So ask the daemon where it actually is first (the event carries
+        position on some builds; /status always does) and publish the full trio.
+        """
         if playing == self._playing:
             return
         self._playing = playing
         role = self._metadata_role()
         if role is None or role.metadata is None:
             return
-        role.update(playback_speed=1000 if playing else 0)
-        logger.info("[%s] %s", self.instance_id, "playing" if playing else "paused")
+        position, duration = (data or {}).get("position"), (data or {}).get("duration")
+        if position is None or duration is None:
+            position, duration = await self._status_position()
+        if position is not None and duration is not None:
+            self._anchor_progress(position, duration)
+        else:
+            # No position available: freeze at the role's own extrapolated position rather than
+            # re-stamping the stale anchor. Only correct for pause; a resume just resumes.
+            if playing:
+                role.update(playback_speed=1000)
+            else:
+                with contextlib.suppress(Exception):
+                    role.freeze_progress()
+        logger.info("[%s] %s (pos=%s)", self.instance_id, "playing" if playing else "paused", position)
+
+    async def _status_position(self) -> tuple[int | None, int | None]:
+        """(position_ms, duration_ms) for the current track from GET /status, or (None, None)."""
+        await self.connect()
+        assert self._session is not None
+        with contextlib.suppress(Exception):
+            async with self._session.get(f"{self.api_base}/status", timeout=CONTROL_TIMEOUT) as resp:
+                if resp.status != 200:
+                    return None, None
+                status = await resp.json()
+            track = status.get("track") or {}
+            return track.get("position"), track.get("duration")
+        return None, None
 
     async def _set_artwork(self, url: str) -> None:
         role = self._artwork_role()
