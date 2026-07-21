@@ -302,6 +302,44 @@ placement, source groups persist with 0 players (anchor keeps the feeder alive f
 12. Browser audio via `sendspin-js` (if kept). Visualizer over the native visualizer role.
 13. WiFi setup, theming, polish. Hardware soak test across ≥3 units.
 
+**SETTINGS CORE + SPOTIFY SLICE DONE (2026-07, branch `feature/phase3-sources-gui`).**
+
+*Config APIs* — `backend/scripts/apis/` is a Flask host on **:5002** (the mesh API owns :5001 and must
+stay in the audio event loop; see §5). `settings_api.py` (device name/hostname/theme/visualizer,
+versioned, **atomic writes** — the file is a cross-process contract) + `integrations_api.py` (endpoint
+CRUD). GUI: real Settings overlay wired into `MeshApp`, `useThemeSettings` applies theme/accent.
+
+*Spotify = **go-librespot**, not spotifyd* — spotifyd 0.4.x dropped standard MPRIS (only
+TransferPlayback/volume remain) and has no arm64 build with it. go-librespot ships native arm64 and
+exposes richer metadata/transport over a loopback HTTP+WS API, with **no D-Bus at all**. Same house
+rule as always: consume what the daemon natively provides. `zeroconf_backend: avahi` registers Connect
+discovery through the system Avahi, so nothing binds 5353 behind our back.
+
+*Two contracts worth not re-deriving:*
+
+1. **Source manager = one owner, reconciled from `settings.json`.** `sources/spotify_manager.py` polls
+   the settings file inside the audio loop and owns BOTH halves of an endpoint: its Sendspin source
+   (group + feeder + monitor) and its daemon process. Endpoint add/rename/enable/disable/remove apply
+   live, in seconds. The integrations API is therefore **pure persistence** — it runs in a separate
+   Flask process and cannot reach the audio loop, and the dev rig has no supervisord, so a
+   render-then-`supervisorctl` apply step was both unreachable from the right process and divergent
+   between rig and container. New multi-instance sources should copy this shape, not the old one.
+   Order matters on start: source first (its feeder creates the FIFO), then the daemon.
+2. **One controller WS per SOURCE, never per unit.** A Sendspin client holds exactly one websocket and
+   therefore sits in exactly one group, so a per-unit controller only ever observes the source it was
+   grouped into. The GUI opens one controller per source with client id `ctrl:<source_id>:<nonce>`;
+   `_maybe_group_controller` honours that hint (unhinted ids still land on the primary source).
+   Transport advertisement is gated per source on that source having a remote.
+
+*Also fixed here, both latent Phase-2 bugs a second source exposed:* the metadata role stores ONE
+progress anchor and clients extrapolate from its timestamp — a bare `playback_speed` flip re-stamps a
+stale anchor, so play/pause must re-anchor to the daemon's real position; and a peer advertising its
+player as `ws://127.0.0.1:8928` made cross-server reclaim dial *our own* loopback (router now
+substitutes the unit's beacon host — but rigs should still be configured with a LAN player URL).
+
+**Hardware-validated on both Pis:** Spotify audio, metadata, artwork, transport, timeline, live
+endpoint CRUD, and cross-server roam of a Spotify stream.
+
 ### Phase 4 — Cutover
 14. Migrate the two production units (`.200`/`.203`) once ≥3-unit soak passes; freeze the
     Snapcast codebase on a tag for rollback.

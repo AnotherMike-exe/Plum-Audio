@@ -3,8 +3,10 @@
 > **Purpose**: Project memory for Claude Code. Defines rules, workflows, and preferences.
 > **Status**: **Phase 2 complete + merged to `main` (2026-07-14)** — single-unit AirPlay and the
 > full mesh (discovery/aggregation/roam/multi-group/per-player volume) are hardware-validated on
-> two Pis, incl. live AirPlay + metadata/artwork + multi-room. **Phase 3 in progress**: remaining
-> sources (Spotify/DLNA/Bluetooth/Plexamp) + the React GUI port.
+> two Pis, incl. live AirPlay + metadata/artwork + multi-room. **Phase 3 in progress**
+> (`feature/phase3-sources-gui`): settings core + the **Spotify slice are DONE and fully
+> hardware-validated** (audio, metadata/artwork, transport, timeline, live endpoint CRUD, roam).
+> Remaining: multi-endpoint AirPlay, DLNA/Bluetooth/Plexamp, serving the GUI from each unit.
 
 ## Project Overview
 
@@ -45,8 +47,9 @@ React/TS GUI are **ported** from Plum-Snapcast, not rewritten.
   **Do not "optimize" this back to Alpine.** Multi-arch amd64 + arm64.
 - **Language**: Python 3.13
 - **Sync engine**: `aiosendspin` (**pinned 6.0.5**; fast-moving — pin + smoke-test on bump), PyAV, numpy
-- **APIs**: Flask REST (settings, integrations, audio); **mesh API is aiohttp** — it must call
-  the async router/aggregator inside the audio event loop, so WSGI Flask (2nd process) doesn't fit
+- **APIs**: Flask REST on **:5002** (settings, integrations, audio); **mesh API is aiohttp on :5001**
+  — it must call the async router/aggregator inside the audio event loop, so WSGI Flask (2nd
+  process) doesn't fit
 - **Audio sources**: shairport-sync (AirPlay), go-librespot (Spotify), gmrender-resurrect (DLNA),
   BlueZ+bluez-alsa (Bluetooth), Plexamp (Debian sidecar)
 - **Infra**: supervisord, Avahi (mDNS), D-Bus, host networking
@@ -138,7 +141,8 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
 ---
 
 ## Key Ports (planned)
-- Sendspin server: 8927 (per unit) · player: 8928 · mesh/HTTP APIs: 5001+
+- Sendspin server: 8927 (per unit) · player: 8928 · mesh API 5001 (aiohttp) · config API 5002 (Flask)
+- Per-endpoint daemon control APIs on loopback: go-librespot 3678+ (`3678 + id - 1`)
 - AirPlay 5050-5059, Spotify 5354-5363, DLNA 49494-49503, mDNS 5353/udp
 - Frontend: 3000
 - **Requirements**: Layer-2 network for mDNS/Avahi, host networking mode
@@ -174,11 +178,18 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
 ## Common Tasks
 
 ### Adding an audio source
-1. Source service writes PCM → `/tmp/<source>-fifo`.
-2. Register a `PushStream` feeder in `sendspin_server.py`.
-3. Control script emits metadata → Sendspin roles.
-4. supervisord config; integrations API endpoint; frontend Settings.
-5. Test: build → deploy to RPi → verify.
+Multi-instance sources follow the **source-manager** pattern (`sources/spotify_manager.py` is the
+reference; see ARCHITECTURE §8 Phase 3). Do NOT bring back render-config-then-`supervisorctl` from
+the API — that process can't reach the audio loop, and the dev rig has no supervisord.
+1. Daemon writes PCM → `/tmp/<source>-<id>-fifo` (one daemon per endpoint).
+2. `<source>_config.py`: render the daemon config per endpoint; resolve endpoints → instances.
+3. `<source>_manager.py`: poll `settings.json` in the audio loop; reconcile sources + daemon
+   processes (source FIRST so the feeder creates the FIFO, then the daemon). Start it in `main()`.
+4. `<source>_<proto>.py`: daemon events → metadata/artwork roles; register it as the source's
+   transport remote.
+5. Integrations API endpoint (persistence only); surface the card via `enabledSources` in
+   `Settings.tsx`.
+6. Test: deploy to the RPi rig → verify live add/rename/disable/remove → then build the image.
 
 ### Debugging
 ```bash
@@ -202,6 +213,10 @@ docker exec plum-audio aplay -l
 
 Reused ~as-is: source services, endpoint APIs, control-script metadata extraction, settings/
 integrations/audio Flask layer, most GUI components.
+
+**Changed in the port (don't copy the old shape):** spotifyd → **go-librespot** (0.4.x dropped MPRIS);
+per-source supervisord programs + API-driven respool → the **source manager** reconciling from
+`settings.json`; one controller WS per unit → **one per source** (`ctrl:<source_id>:` client id).
 
 ---
 
