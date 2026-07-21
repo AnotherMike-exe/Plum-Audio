@@ -40,6 +40,33 @@ class RouteError(Exception):
     """A route could not be planned (unknown source/player/peer) or executed."""
 
 
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]", "::1")
+
+
+def _reachable_url(url: str | None, unit_host: str | None) -> str | None:
+    """Rewrite a peer player's loopback reclaim URL onto the host we reach that unit at.
+
+    A unit may register its own player as ws://127.0.0.1:8928 (correct for itself, and the
+    natural single-unit default). Dialing that from here would hit OUR loopback — we'd reclaim
+    our own player and then wait for a player that never arrives. The unit's host comes from the
+    beacon source IP, so it is the one authority on how we reach that unit.
+    """
+    if not url or not unit_host:
+        return url
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        return url
+    hostport, slash, path = rest.partition("/")
+    host, colon, port = hostport.rpartition(":")
+    if not colon:  # no port in the URL
+        host, port = hostport, ""
+    if host.lower() not in _LOOPBACK_HOSTS:
+        return url
+    rewritten = f"{scheme}://{unit_host}{colon}{port}{slash}{path}"
+    logger.info("rewrote loopback reclaim URL %s -> %s", url, rewritten)
+    return rewritten
+
+
 class Router:
     def __init__(
         self,
@@ -84,7 +111,7 @@ class Router:
         # on), not the unit it's currently attached to — after a roam those differ.
         if pfound is None:
             raise RouteError(f"unknown player {player_id!r} (not on any unit)")
-        url = pfound[1].url
+        url = _reachable_url(pfound[1].url, pfound[0].host)
         if not url:
             raise RouteError(f"no reclaim URL known for player {player_id!r}")
         return await self._engine.reclaim_remote_player(source_id, player_id, url)
