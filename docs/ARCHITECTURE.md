@@ -340,6 +340,28 @@ substitutes the unit's beacon host — but rigs should still be configured with 
 **Hardware-validated on both Pis:** Spotify audio, metadata, artwork, transport, timeline, live
 endpoint CRUD, and cross-server roam of a Spotify stream.
 
+**MULTI-ENDPOINT AIRPLAY + PER-UNIT GUI (2026-07).**
+
+*AirPlay* is now config-driven and multi-instance on the same manager pattern: N endpoints, each with
+its own shairport-sync process, RAOP/UDP port block, FIFO, metadata pipe and Sendspin source. The
+one non-obvious part is transport: shairport's MPRIS bus name is FIXED, so N instances on the system
+bus fight over it and only the first gets play/pause/next/previous. Each endpoint therefore runs a
+private `dbus-daemon --session` and starts shairport with `mpris_service_bus = "session"` pointed at
+it; `AirplayRemote` connects by bus address. Hardware-verified: both endpoints own MPRIS unopposed.
+`sources/source_manager.py` holds the shared machinery (poll/reconcile/daemon supervision, N daemons
+per endpoint started in order, killed in reverse, respawned as a set since they are interdependent);
+Spotify and AirPlay are thin subclasses and DLNA should be a third. Nothing source-shaped is started
+from env any more — the local player attaches to `PLUM_LOCAL_PLAYER_SOURCE` (default `airplay-1`)
+once its manager brings it up.
+
+*Per-unit GUI*: nginx (in the container, under supervisord — Plum-Audio is one container per unit,
+not app + frontend) serves the built React app from `/app/www` and proxies `/api/mesh` → :5001 and
+`/api/{settings,integrations,audio,playback}` → :5002. Same-origin, so no CORS, no dev proxy, and no
+`VITE_*` host baked in: one build artifact serves every unit. The controller WS is NOT proxied — the
+GUI opens one per source directly at `ws://<unit>:8927`, peers included, which nginx here could
+never front. Tailwind is compiled into the bundle (it was a CDN script — dev-only JIT and an
+internet dependency at page load, untenable on an isolated AV VLAN).
+
 ### Phase 4 — Cutover
 14. Migrate the two production units (`.200`/`.203`) once ≥3-unit soak passes; freeze the
     Snapcast codebase on a tag for rollback.

@@ -6,7 +6,8 @@
 > two Pis, incl. live AirPlay + metadata/artwork + multi-room. **Phase 3 in progress**
 > (`feature/phase3-sources-gui`): settings core + the **Spotify slice are DONE and fully
 > hardware-validated** (audio, metadata/artwork, transport, timeline, live endpoint CRUD, roam).
-> Remaining: multi-endpoint AirPlay, DLNA/Bluetooth/Plexamp, serving the GUI from each unit.
+> **Multi-endpoint AirPlay** (private D-Bus session per endpoint for MPRIS) and the **per-unit
+> nginx GUI** are in and hardware-verified. Remaining: DLNA/Bluetooth/Plexamp, container build.
 
 ## Project Overview
 
@@ -141,10 +142,11 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
 ---
 
 ## Key Ports (planned)
+- Web GUI: **80** (nginx, per unit — serves the built app + proxies the APIs)
 - Sendspin server: 8927 (per unit) · player: 8928 · mesh API 5001 (aiohttp) · config API 5002 (Flask)
 - Per-endpoint daemon control APIs on loopback: go-librespot 3678+ (`3678 + id - 1`)
-- AirPlay 5050-5059, Spotify 5354-5363, DLNA 49494-49503, mDNS 5353/udp
-- Frontend: 3000
+- AirPlay 5050-5059 (+ UDP blocks from 6001, stride 10), Spotify 5354-5363, DLNA 49494-49503,
+  mDNS 5353/udp
 - **Requirements**: Layer-2 network for mDNS/Avahi, host networking mode
 
 ---
@@ -216,7 +218,8 @@ integrations/audio Flask layer, most GUI components.
 
 **Changed in the port (don't copy the old shape):** spotifyd → **go-librespot** (0.4.x dropped MPRIS);
 per-source supervisord programs + API-driven respool → the **source manager** reconciling from
-`settings.json`; one controller WS per unit → **one per source** (`ctrl:<source_id>:` client id).
+`settings.json`; one controller WS per unit → **one per source** (`ctrl:<source_id>:` client id);
+separate frontend container → **nginx inside the unit container**; Tailwind CDN → compiled in.
 
 ---
 
