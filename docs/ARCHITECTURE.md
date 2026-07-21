@@ -117,7 +117,7 @@ concepts port over.
 
 **Reused (source/integration layer is protocol-agnostic — it writes PCM to a FIFO and emits
 metadata):**
-- Integration services: `shairport-sync`, `spotifyd`, `gmrender-resurrect`, `bluealsa`, Plexamp.
+- Integration services: `shairport-sync`, `go-librespot`, `gmrender-resurrect`, `bluealsa`, Plexamp.
 - Multi-instance endpoint APIs + control-script wrapper pattern (`airplay_endpoints_api.py`,
   `spotify_endpoints_api.py`, `dlna_endpoints_api.py`).
 - Metadata/artwork extraction in the control scripts (`airplay-control-script.py` & siblings)

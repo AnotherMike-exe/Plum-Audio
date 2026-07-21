@@ -46,7 +46,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
-import json
 import logging
 import os
 
@@ -68,6 +67,7 @@ from sources import spotify_config
 from sources.airplay_metadata import AirplayMetadataReader
 from sources.airplay_remote import AirplayRemote
 from sources.spotify_golibrespot import SpotifyGoLibrespot
+from sources.spotify_manager import SpotifyManager
 
 logger = logging.getLogger("plum.sendspin_server")
 
@@ -249,10 +249,11 @@ class PlumSendspinServer:
         self._local_player_tasks: list[asyncio.Task] = []
         self._metadata_readers: list[AirplayMetadataReader] = []
         self._airplay_remote: AirplayRemote | None = None  # MPRIS transport control for the AirPlay source
-        self._spotify_monitors: list[SpotifyGoLibrespot] = []  # per-instance go-librespot event monitors
+        self._spotify_monitors: dict[str, SpotifyGoLibrespot] = {}  # source_id -> go-librespot event monitor
         # Per-source transport remote (has async play/pause/next_track/previous_track). AirPlay's
-        # AirplayRemote and each SpotifyMpris both satisfy it, so controller events route by source.
+        # AirplayRemote and each SpotifyGoLibrespot both satisfy it, so controller events route by source.
         self._source_remotes: dict[str, object] = {}
+        self._wired_sources: set[str] = set()  # source_ids whose group already has the control listener
         self._stop_evt = asyncio.Event()
 
     async def start(self) -> None:
@@ -271,7 +272,7 @@ class PlumSendspinServer:
         if self._airplay_remote is not None:
             await self._airplay_remote.close()
             self._airplay_remote = None
-        for monitor in self._spotify_monitors:
+        for monitor in self._spotify_monitors.values():
             await monitor.stop()
         self._spotify_monitors.clear()
         self._source_remotes.clear()
@@ -535,9 +536,18 @@ class PlumSendspinServer:
         monitor = SpotifyGoLibrespot(handle.group, instance.instance_id, instance.api_base)
         await monitor.connect()
         monitor.start()
-        self._spotify_monitors.append(monitor)
+        self._spotify_monitors[instance.source_id] = monitor
         self._wire_transport_control(instance.source_id, monitor)
         logger.info("[%s] spotify source up (name=%r api=%s)", instance.source_id, instance.device_name, instance.api_base)
+
+    async def stop_spotify_source(self, source_id: str) -> None:
+        """Tear down a Spotify source: stop its go-librespot monitor, drop its remote, stop the source."""
+        monitor = self._spotify_monitors.pop(source_id, None)
+        if monitor is not None:
+            await monitor.stop()
+        self._source_remotes.pop(source_id, None)
+        await self.stop_source(source_id)
+        logger.info("[%s] spotify source stopped", source_id)
 
     def _wire_transport_control(self, source_id: str, remote: object) -> None:
         """Advertise transport commands on a source's controller role and route its events to `remote`.
@@ -555,7 +565,11 @@ class PlumSendspinServer:
             controller.set_supported_commands(
                 [MediaCommand.PLAY, MediaCommand.PAUSE, MediaCommand.NEXT, MediaCommand.PREVIOUS]
             )
-        handle.group.add_event_listener(functools.partial(self._on_control_event, source_id))
+        # The source's anchor group persists across stop/start, so only register the listener once —
+        # events dispatch via self._source_remotes[source_id], which we repopulate above on re-add.
+        if source_id not in self._wired_sources:
+            handle.group.add_event_listener(functools.partial(self._on_control_event, source_id))
+            self._wired_sources.add(source_id)
 
     def _on_control_event(self, source_id: str, _group: SendspinGroup, event: object) -> None:
         """Forward a controller transport event to the source's sender via its remote (fire-and-forget)."""
@@ -648,17 +662,6 @@ class PlumSendspinServer:
             await asyncio.sleep(1.0)
 
 
-def _load_spotify_instances() -> list[spotify_config.SpotifyInstance]:
-    """Enabled Spotify endpoints from the settings file, or [] if none/unreadable."""
-    settings_file = os.environ.get("PLUM_SETTINGS_FILE", "/data/settings.json")
-    try:
-        with open(settings_file, encoding="utf-8") as f:
-            settings = json.load(f)
-    except (OSError, ValueError):
-        return []
-    return spotify_config.instances_from_settings(settings)
-
-
 async def main() -> None:
     logging.basicConfig(
         level=os.environ.get("PLUM_LOG_LEVEL", "INFO"),
@@ -687,11 +690,10 @@ async def main() -> None:
         # the perpetual re-attach supervisor (Phase-1 glue) would fight cross-server reclaims.
         srv.attach_local_player("airplay", local_player_id, local_player_url, supervise=not mesh_enabled)
 
-    # Spotify: bring up a source per enabled Connect endpoint (config-driven, multi-instance). The
-    # feeder waits for spotifyd to open each instance FIFO, so this is safe even if spotifyd isn't
-    # up yet (or isn't installed on a rig). Config rendering + spotifyd launch are supervisord's job.
-    for instance in _load_spotify_instances():
-        await srv.start_spotify_source(instance)
+    # Spotify: the manager owns a source + a go-librespot process per enabled Connect endpoint and
+    # reconciles them from settings.json every few seconds, so GUI endpoint edits apply live.
+    spotify = SpotifyManager(srv)
+    spotify.start()
 
     # Phase 2: the mesh (discovery + aggregation + routing + REST). Local playback above stands
     # on its own; the mesh layers cross-unit roaming on top. Disable with PLUM_MESH_ENABLED=0.
@@ -714,6 +716,7 @@ async def main() -> None:
     finally:
         if mesh is not None:
             await mesh.stop()
+        await spotify.stop()  # kills the go-librespot children before the sources go away
         await srv.stop()
 
 

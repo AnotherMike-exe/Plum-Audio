@@ -4,41 +4,31 @@ Plum-Audio — integrations API (Flask blueprint).
 
 Serves /api/integrations/* for the GUI's Integrations settings tab. Phase 3 ships the Spotify
 slice first (it's the first ported source); airplay/dlna/bluetooth/plexamp slices are added here as
-those sources land. Endpoint CRUD persists to the same settings.json the config API owns (via
-SettingsManager), then regenerates the spotifyd configs + supervisord include and, in the container,
-reloads supervisord. Off-container (the Pi rig, no supervisord) it degrades to persist + config
-files only.
+those sources land. Endpoint CRUD is PURE PERSISTENCE: it writes settings.json via the shared SettingsManager and
+returns. Applying the change — rendering go-librespot configs, spawning/killing daemons, and
+bringing the matching Sendspin sources up or down — belongs to sources/spotify_manager.py, which
+reconciles from that same file inside the audio event loop (a separate process from this Flask app)
+and picks edits up within a few seconds. That split is deliberate: this API cannot reach the audio
+loop, and the Pi rig has no supervisord, so one reconciler makes rig and container behave alike.
 
-Ported from Plum-Snapcast's spotify_endpoints_api.py. Changed for the Sendspin model: the apply step
-regenerates via sources.spotify_config (one spotifyd program per instance — no fifo-keeper or
-lifecycle-manager) instead of the old setup shell script.
-
-Live pick-up caveat: the running sendspin_server brings up a Sendspin source per enabled endpoint at
-startup. Adding/removing an endpoint here persists + (re)starts spotifyd, but the running server
-picks up the source set on its next start. Live add/remove is the "integration activity signaling"
-work (deferred).
+Ported from Plum-Snapcast's spotify_endpoints_api.py, minus its config-regen + supervisorctl respool.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import subprocess
 import sys
-import threading
 
 from flask import Blueprint, jsonify, request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/ on path
-from sources import spotify_config  # noqa: E402
-
 from settings_api import SettingsManager  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 VALID_BITRATES = (96, 160, 320)
 MAX_ENDPOINTS = 10
-SUPERVISORCTL = ["supervisorctl", "-c", "/app/supervisord/supervisord.conf"]
 
 
 class SpotifyEndpointsManager:
@@ -46,7 +36,6 @@ class SpotifyEndpointsManager:
 
     def __init__(self, settings_manager: SettingsManager | None = None) -> None:
         self.settings_manager = settings_manager or SettingsManager()
-        self._lock = threading.Lock()  # serialize apply/regeneration
 
     # -- helpers -------------------------------------------------------------
 
@@ -67,51 +56,6 @@ class SpotifyEndpointsManager:
     @staticmethod
     def _next_port(endpoints: list[dict]) -> int:
         return max((e.get("zeroconfPort", 5354) for e in endpoints), default=5353) + 1
-
-    def _apply(self) -> list[str]:
-        """Regenerate spotifyd configs + supervisord include; reload supervisord if present.
-
-        Returns a list of non-fatal warnings (e.g. off-container, where config paths/supervisord
-        aren't available and we persist settings only).
-        """
-        warnings: list[str] = []
-        with self._lock:
-            settings = self.settings_manager.get_settings()
-            instances: list[spotify_config.SpotifyInstance] = []
-            try:
-                instances = spotify_config.render_configs(settings)
-                spotify_config.generate_supervisord(instances)
-            except OSError as e:
-                warnings.append(f"config regen skipped: {e}")
-                logger.warning("spotify config regen skipped (off-container?): %s", e)
-            warnings.extend(self._reload_supervisor([i.instance_id for i in instances]))
-        return warnings
-
-    def _reload_supervisor(self, enabled_ids: list[str]) -> list[str]:
-        """reread + update to pick up added/removed programs, then RESTART each enabled instance.
-
-        The restart matters: reread/update alone starts new programs and stops removed ones, but an
-        *edited* endpoint's program already exists — so without an explicit restart the running
-        spotifyd keeps its old config (old name + device_id). Restarting respools it onto the freshly
-        rendered config. (This is the spool-down/up the container owns; on the rig, where supervisorctl
-        is absent, this degrades to a warning and the instance is respooled by rerunning run_spotify.sh.)
-        """
-        warnings: list[str] = []
-        for action in (["reread"], ["update"]):
-            try:
-                subprocess.run(SUPERVISORCTL + action, capture_output=True, text=True, timeout=15, check=False)
-            except (OSError, subprocess.SubprocessError) as e:
-                warnings.append(f"supervisorctl {action[0]} unavailable: {e}")
-                return warnings  # no supervisord here — stop trying
-        for instance_id in enabled_ids:
-            try:
-                subprocess.run(
-                    SUPERVISORCTL + ["restart", f"spotifyd-{instance_id}"],
-                    capture_output=True, text=True, timeout=20, check=False,
-                )
-            except (OSError, subprocess.SubprocessError) as e:
-                warnings.append(f"restart spotifyd-{instance_id} failed: {e}")
-        return warnings
 
     # -- CRUD ----------------------------------------------------------------
 
@@ -135,8 +79,7 @@ class SpotifyEndpointsManager:
         endpoints.append(endpoint)
         self._save(endpoints, spotify.get("bitrate", 320))
         logger.info("added Spotify endpoint %s", endpoint)
-        return {"success": True, "message": f"Added endpoint '{device_name}'", "endpoint": endpoint,
-                "warnings": self._apply()}
+        return {"success": True, "message": f"Added endpoint '{device_name}'", "endpoint": endpoint}
 
     def update_endpoint(self, endpoint_id: str, device_name: str | None = None, enabled: bool | None = None) -> dict:
         spotify = self._spotify()
@@ -152,8 +95,7 @@ class SpotifyEndpointsManager:
             endpoint["enabled"] = enabled
         self._save(endpoints, spotify.get("bitrate", 320))
         logger.info("updated Spotify endpoint %s: %s", endpoint_id, endpoint)
-        return {"success": True, "message": f"Updated endpoint '{endpoint_id}'", "endpoint": endpoint,
-                "warnings": self._apply()}
+        return {"success": True, "message": f"Updated endpoint '{endpoint_id}'", "endpoint": endpoint}
 
     def remove_endpoint(self, endpoint_id: str) -> dict:
         spotify = self._spotify()
@@ -164,8 +106,7 @@ class SpotifyEndpointsManager:
         endpoints.remove(endpoint)
         self._save(endpoints, spotify.get("bitrate", 320))
         logger.info("removed Spotify endpoint %s", endpoint_id)
-        return {"success": True, "message": f"Removed endpoint '{endpoint.get('deviceName')}'",
-                "warnings": self._apply()}
+        return {"success": True, "message": f"Removed endpoint '{endpoint.get('deviceName')}'"}
 
     def update_bitrate(self, bitrate: int) -> dict:
         if bitrate not in VALID_BITRATES:
@@ -174,8 +115,7 @@ class SpotifyEndpointsManager:
         self._save(spotify.get("endpoints", []) or [], bitrate)
         logger.info("updated Spotify bitrate to %d", bitrate)
         return {"success": True, "message": f"Updated bitrate to {bitrate}",
-                "warning": "Restarts Spotify endpoints; active playback is interrupted.",
-                "warnings": self._apply()}
+                "warning": "Restarts Spotify endpoints; active playback is interrupted."}
 
     def status(self) -> dict:
         spotify = self._spotify()
@@ -193,8 +133,7 @@ class SpotifyEndpointsManager:
         for e in endpoints:
             e["enabled"] = enabled
         self._save(endpoints, spotify.get("bitrate", 320))
-        return {"success": True, "message": f"All Spotify endpoints {'enabled' if enabled else 'disabled'}",
-                "warnings": self._apply()}
+        return {"success": True, "message": f"All Spotify endpoints {'enabled' if enabled else 'disabled'}"}
 
 
 def create_integrations_blueprint(settings_manager: SettingsManager | None = None) -> Blueprint:

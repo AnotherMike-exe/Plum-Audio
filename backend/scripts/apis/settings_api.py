@@ -112,10 +112,19 @@ class SettingsManager:
             self._save_settings(initial_settings)
 
     def _save_settings(self, settings: Dict[str, Any]):
-        """Save settings to the JSON file."""
+        """Save settings to the JSON file, atomically.
+
+        Write-to-temp + os.replace, because this file is a cross-process contract: the audio
+        process's Spotify reconciler and the GUI both read it on a poll, and a truncated
+        in-place rewrite would hand them a torn/empty JSON mid-save.
+        """
         try:
-            with open(self.settings_file, "w") as f:
+            tmp_path = f"{self.settings_file}.tmp"
+            with open(tmp_path, "w") as f:
                 json.dump(settings, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.settings_file)
 
             # Best-effort ownership fix-up in the container (PUID/PGID). Skips cleanly when not root
             # (e.g. running as a plain user on the Pi test rig).

@@ -47,7 +47,7 @@ React/TS GUI are **ported** from Plum-Snapcast, not rewritten.
 - **Sync engine**: `aiosendspin` (**pinned 6.0.5**; fast-moving — pin + smoke-test on bump), PyAV, numpy
 - **APIs**: Flask REST (settings, integrations, audio); **mesh API is aiohttp** — it must call
   the async router/aggregator inside the audio event loop, so WSGI Flask (2nd process) doesn't fit
-- **Audio sources**: shairport-sync (AirPlay), spotifyd (Spotify), gmrender-resurrect (DLNA),
+- **Audio sources**: shairport-sync (AirPlay), go-librespot (Spotify), gmrender-resurrect (DLNA),
   BlueZ+bluez-alsa (Bluetooth), Plexamp (Debian sidecar)
 - **Infra**: supervisord, Avahi (mDNS), D-Bus, host networking
 
