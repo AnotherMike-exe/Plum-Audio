@@ -30,9 +30,11 @@ Design notes (the *why*, learned from the lifecycle audit + handoff probe):
     a commit raises StreamStoppedError — it self-heals across routing/membership churn instead
     of dying. Correct routing is therefore remove_client(old) → add_client(new); a bare
     add_client onto an already-grouped player would stop that player's current source.
-  - Idle = the source service closed its FIFO writer (EOF). We flip set_live_source(False) and
-    loop back to wait for the next writer, keeping the group intact so routing survives across
-    source sessions.
+  - Idle = the source service closed its FIFO writer (EOF), or went quiet past
+    PLUM_SOURCE_IDLE_TIMEOUT. We announce it the way the spec does — `group.stop()` sets
+    playback_state=stopped and pushes a group/update to every client — then loop back to wait
+    for the next writer. A stream exists ONLY while a sender is feeding us; the group and its
+    anchor persist regardless, so routing survives across source sessions.
 
 TODO(Phase 1+):
   - Drive start_source/stop_source from the integration lifecycle (control scripts signalling
@@ -82,8 +84,9 @@ COMMIT_CHUNK_MS = 20  # feeder read/commit cadence — small for low added laten
 TARGET_BUFFER_US = 500_000
 ANCHOR_PREFIX = "src:"  # server-side group anchor client id namespace
 # A source counts as "in use" while audio keeps arriving. Past this gap (or once the writer closes)
-# it goes idle: the GUI drops it from the stream list, though it stays routable and any sender can
-# reconnect to it. Generous by default so a long pause doesn't make a stream vanish mid-listen.
+# it goes idle: we announce group playback_state=stopped, and the GUI drops it from the stream list.
+# The group, feeder and routing all stay up, so any sender can reconnect to it at any time.
+# Generous by default so a long pause doesn't tear a stream down mid-listen.
 SOURCE_IDLE_TIMEOUT_S = float(os.environ.get("PLUM_SOURCE_IDLE_TIMEOUT", "300"))
 CONTROLLER_PREFIX = "ctrl:"  # GUI controller client id namespace: "ctrl:<source_id>:<nonce>"
 REACQUIRE_BACKOFF_S = 0.1  # pause before re-acquiring a stopped stream (avoid hot-looping)
@@ -110,8 +113,14 @@ class SourceFeeder:
     which bounds latency and applies backpressure when a source bursts (shairport fills the
     pipe buffer at session start). Steady-state, the real-time FIFO writer paces us.
 
-    Session model: EOF on the FIFO = the source service closed its writer (session ended). We
-    flip the stream to non-live and loop back to wait for the next writer.
+    Session model: a stream exists only while a sender is actually feeding us. We start one on the
+    first audio (group.start_stream() → playback_state=playing) and stop the group on EOF — the
+    source service closed its writer, i.e. the session ended — or after SOURCE_IDLE_TIMEOUT_S of
+    silence with the pipe still open. `SendspinGroup.stop()` is the spec's way to say "not playing":
+    it announces playback_state=stopped in a group/update to every client and freezes the metadata
+    progress anchor. (`stop_stream()` deliberately does NOT — it keeps clients logically PLAYING for
+    a stream-to-stream transition, which is not our case.) The group and its anchor persist through
+    all of this, so routing survives an idle source and the next session just starts a new stream.
     """
 
     def __init__(self, source_id: str, fifo_path: str, group: SendspinGroup, fmt: AudioFormat = DEFAULT_FORMAT) -> None:
@@ -122,20 +131,18 @@ class SourceFeeder:
         self.ps: PushStream | None = None
         self._task: asyncio.Task | None = None
         self._stop_evt = asyncio.Event()
-        self._last_data_at: float | None = None  # monotonic; None = no writer / session ended
+        self._last_data_at: float | None = None  # monotonic; None = idle (announced as stopped)
 
     @property
     def is_active(self) -> bool:
-        """Is a sender actually using this source right now?
+        """Is a sender actually feeding this source right now?
 
-        True while audio keeps arriving from an open writer. Goes False the moment the writer
-        closes (session end) and after SOURCE_IDLE_TIMEOUT_S of silence with the pipe still open
-        (a sender that stopped without hanging up). Purely informational — the group, feeder and
-        routing all stay up, so the source remains available to reconnect to.
+        Mirrors exactly what we announce on the wire: True between the first audio of a session
+        (playback_state=playing) and the EOF or idle timeout that ends it (playback_state=stopped).
+        The mesh view carries this so the GUI can hide idle sources; it is never a second, separate
+        notion of "playing".
         """
-        if self._last_data_at is None:
-            return False
-        return (time.monotonic() - self._last_data_at) < SOURCE_IDLE_TIMEOUT_S
+        return self._last_data_at is not None
 
     def start(self) -> None:
         if self._task is None:
@@ -189,7 +196,8 @@ class SourceFeeder:
             self.fmt.channels,
             chunk,
         )
-        self._acquire_stream()
+        # No stream until a sender actually feeds us: starting one here would announce
+        # playback_state=playing to every client from boot, for a source nobody is using.
         while not self._stop_evt.is_set():
             reader = transport = None
             try:
@@ -205,48 +213,60 @@ class SourceFeeder:
                     transport.close()
 
     async def _pump(self, reader: asyncio.StreamReader, chunk: int) -> None:
-        """Read fixed chunks and push them until the writer closes (session end) or we stop."""
-        if self.ps is None or self.ps.is_stopped:
-            self._acquire_stream()
-        else:
-            self.ps.set_live_source(True)
-        try:
-            while not self._stop_evt.is_set():
+        """Push audio while a sender feeds us; announce idle when it stops or goes quiet."""
+        while not self._stop_evt.is_set():
+            try:
+                data = await asyncio.wait_for(reader.readexactly(chunk), timeout=SOURCE_IDLE_TIMEOUT_S)
+                eof = False
+            except asyncio.IncompleteReadError as e:
+                data = e.partial  # flush the trailing partial frame(s), then treat as EOF
+                eof = True
+            except asyncio.TimeoutError:
+                # Pipe still open, but the sender has gone quiet for a long time.
+                await self._go_idle("no audio for %.0fs" % SOURCE_IDLE_TIMEOUT_S)
+                continue
+
+            if data:
+                if self.ps is None or self.ps.is_stopped:
+                    self._acquire_stream()  # first audio of a session → playback_state=playing
+                    logger.info("[%s] active: sender feeding us (playback_state=playing)", self.source_id)
+                self._last_data_at = time.monotonic()
+                assert self.ps is not None
+                self.ps.prepare_audio(data, self.fmt)
                 try:
-                    data = await reader.readexactly(chunk)
-                    eof = False
-                except asyncio.IncompleteReadError as e:
-                    data = e.partial  # flush the trailing partial frame(s), then treat as EOF
-                    eof = True
-
-                if data:
-                    self._last_data_at = time.monotonic()
-                    assert self.ps is not None
-                    self.ps.prepare_audio(data, self.fmt)
-                    try:
+                    await self.ps.commit_audio()
+                except StreamStoppedError:
+                    # Routing/membership churn stopped our stream — re-acquire and re-push
+                    # this same chunk so no audio is dropped.
+                    logger.info("[%s] stream stopped under feeder; re-acquiring", self.source_id)
+                    await asyncio.sleep(REACQUIRE_BACKOFF_S)
+                    self._acquire_stream()
+                    with contextlib.suppress(StreamStoppedError):
+                        self.ps.prepare_audio(data, self.fmt)
                         await self.ps.commit_audio()
-                    except StreamStoppedError:
-                        # Routing/membership churn stopped our stream — re-acquire and re-push
-                        # this same chunk so no audio is dropped.
-                        logger.info("[%s] stream stopped under feeder; re-acquiring", self.source_id)
-                        await asyncio.sleep(REACQUIRE_BACKOFF_S)
-                        self._acquire_stream()
-                        with contextlib.suppress(StreamStoppedError):
-                            self.ps.prepare_audio(data, self.fmt)
-                            await self.ps.commit_audio()
-                    else:
-                        # Yield until we're back under the buffer target: real-time pacing.
-                        await self.ps.sleep_to_limit_buffer(TARGET_BUFFER_US)
+                else:
+                    # Yield until we're back under the buffer target: real-time pacing.
+                    await self.ps.sleep_to_limit_buffer(TARGET_BUFFER_US)
 
-                if eof:
-                    logger.info("[%s] FIFO writer closed (session end) — going idle", self.source_id)
-                    self._last_data_at = None
-                    return
-        finally:
-            # Mark the live source paused; the stream/group stay up for the next session.
-            if self.ps is not None:
-                with contextlib.suppress(Exception):
-                    self.ps.set_live_source(False)
+            if eof:
+                await self._go_idle("FIFO writer closed (session end)")
+                return
+
+    async def _go_idle(self, why: str) -> None:
+        """Announce that nothing is playing on this source, per the spec.
+
+        group.stop() sets playback_state=stopped and pushes a group/update to every client (and
+        freezes the metadata progress anchor). Deliberately NOT stop_stream(), which keeps clients
+        logically PLAYING for a stream-to-stream handover. The group survives — its anchor client
+        holds it — so players stay routed here and the next session just starts a new stream.
+        """
+        if self._last_data_at is None and (self.ps is None or self.ps.is_stopped):
+            return  # already idle
+        self._last_data_at = None
+        self.ps = None
+        with contextlib.suppress(Exception):
+            await self.group.stop()
+        logger.info("[%s] idle: %s (announced playback_state=stopped)", self.source_id, why)
 
 
 class SourceHandle:
