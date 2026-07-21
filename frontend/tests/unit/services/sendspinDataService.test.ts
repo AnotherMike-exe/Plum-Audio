@@ -89,6 +89,39 @@ describe('streamId helpers', () => {
   });
 });
 
+describe('unit identity + source state', () => {
+  it('marks the responder\'s own player local BY LISTENER HOST, even after it roams', () => {
+    // player-113 lives on unit-113 but is currently connected to unit-133's server (a roam):
+    // it must still count as unit-113's own player when unit-113 serves the page.
+    const view: MeshView = structuredClone(VIEW);
+    view.local_unit_id = 'unit-113';
+    view.units[0].players.push({
+      player_id: 'player-113', name: 'Player-113', connected: true, group_id: 'gA',
+      url: 'ws://192.0.2.11:8928/sendspin',
+    });
+    const m = mapViewToModel(view, new Map(), new Map());
+    expect(m.localUnitId).toBe('unit-113');
+    expect(m.localPlayerIds).toEqual(['player-113']);
+    expect(m.clients.find((c) => c.id === 'player-133')!.isLocal).toBe(false);
+  });
+
+  it('claims no players when the view does not say who answered', () => {
+    const m = mapViewToModel(VIEW, new Map(), new Map());
+    expect(m.localPlayerIds).toEqual([]);
+    expect(m.clients.every((c) => !c.isLocal)).toBe(true);
+  });
+
+  it('labels a stream with the endpoint device name and carries `active` through', () => {
+    const view: MeshView = structuredClone(VIEW);
+    view.units[0].sources[0].name = 'Kitchen';
+    view.units[0].sources[0].active = true;
+    const m = mapViewToModel(view, new Map(), new Map());
+    expect(m.streams[0].name).toBe('Kitchen');
+    expect(m.streams[0].active).toBe(true);
+    expect(m.streams[1].active).toBe(false); // absent in the wire form = idle
+  });
+});
+
 describe('currentPositionMs extrapolation', () => {
   const base = np({ playbackState: 'playing', trackProgressMs: 10000, trackDurationMs: 300000, playbackSpeed: 1000, timestampUs: 5_000_000 });
 

@@ -62,6 +62,9 @@ export interface Stream {
     progress: number;                // in seconds (legacy, frontend-tracked)
     playback?: PlaybackData;         // Server-provided playback position (preferred)
     volume?: number;                 // Source volume (0-100) from control script
+    // A sender is actively using this source. Idle sources stay routable but drop out of the
+    // stream list, so the picker shows what is in use rather than every configured endpoint.
+    active?: boolean;
 }
 
 export interface Client {
@@ -72,6 +75,7 @@ export interface Client {
     currentStreamId: string | null;
     volume: number; // 0-100
     connected: boolean;
+    isLocal?: boolean;               // this unit's OWN player (the page you are looking at)
 }
 
 export type AccentColor = 'purple' | 'blue' | 'green' | 'orange' | 'red' | 'yellow' | 'custom';

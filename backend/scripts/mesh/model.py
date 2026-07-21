@@ -57,6 +57,12 @@ class SourceState:
     group_name: str
     streaming: bool  # feeder is pushing audio right now
     player_ids: list[str] = field(default_factory=list)  # players attached to this group
+    # Display name = the endpoint's device name ("Kitchen"), so the GUI shows what the user named
+    # in Settings rather than the internal source_id. Follows a rename live.
+    name: str = ""
+    # A sender is actually using this source (audio arrived recently and the writer is still open).
+    # Idle sources stay routable but drop out of the GUI's stream list — see SourceFeeder.is_active.
+    active: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -65,6 +71,8 @@ class SourceState:
             "group_name": self.group_name,
             "streaming": self.streaming,
             "player_ids": list(self.player_ids),
+            "name": self.name,
+            "active": self.active,
         }
 
     @classmethod
@@ -75,6 +83,8 @@ class SourceState:
             group_name=d.get("group_name", d["group_id"]),
             streaming=bool(d.get("streaming", False)),
             player_ids=list(d.get("player_ids", [])),
+            name=d.get("name", "") or d["source_id"],
+            active=bool(d.get("active", False)),
         )
 
 

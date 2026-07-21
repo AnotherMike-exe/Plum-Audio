@@ -18,6 +18,7 @@ Subclasses supply the source-specific parts (see spotify_manager.py / airplay_ma
   daemons(instance)      -> the DaemonSpecs to run for one endpoint, in start order
   start_source(instance) -> bring up the Sendspin source (called BEFORE the daemons)
   stop_source(instance)  -> tear it down (called AFTER the daemons are killed)
+  update_source(instance)-> reflect an edited endpoint on the LIVE source (default: rename it)
 
 The `signature` is whatever forces a daemon respool (name, ports, bitrate…) — never the endpoint id,
 which keys the Sendspin source and must survive an edit.
@@ -106,6 +107,11 @@ class SourceManagerBase:
     async def stop_source(self, instance) -> None:
         raise NotImplementedError
 
+    async def update_source(self, instance) -> None:
+        """Apply an endpoint edit to the running source. The source itself survives an edit (it is
+        keyed on the endpoint id), so only its GUI label needs to follow the new device name."""
+        self.server.set_source_name(instance.source_id, getattr(instance, "device_name", ""))
+
     def fifos(self, instance) -> list[str]:
         """FIFOs to pre-create so a daemon never races an absent pipe. Feeders create theirs too."""
         return []
@@ -164,20 +170,27 @@ class SourceManagerBase:
                     self.render(settings)
 
         for instance_id, (signature, instance) in desired.items():
-            running = self._running.get(instance_id)
-            if running is None:
-                await self._start_instance(instance, signature)
-            elif running.signature != signature:
-                logger.info("[%s:%s] config changed; respooling daemons", self.name, instance_id)
-                running.instance = instance
-                running.signature = signature
-                await self._kill_daemons(running)
-                await self._spawn_daemons(running)
-            elif not running.procs or any(p.returncode is not None for p in running.procs):
-                # No procs at all counts as needing a respawn: a failed launch (binary not
-                # installed yet, config not written yet) leaves the set empty, and without this the
-                # endpoint would sit dead forever with nothing to reap.
-                await self._reap_and_respawn(running)
+            try:
+                await self._reconcile_one(instance_id, signature, instance)
+            except Exception:  # noqa: BLE001 - one bad endpoint must not stall the others
+                logger.exception("[%s:%s] endpoint reconcile failed", self.name, instance_id)
+
+    async def _reconcile_one(self, instance_id: str, signature: tuple, instance) -> None:
+        running = self._running.get(instance_id)
+        if running is None:
+            await self._start_instance(instance, signature)
+        elif running.signature != signature:
+            logger.info("[%s:%s] config changed; respooling daemons", self.name, instance_id)
+            running.instance = instance
+            running.signature = signature
+            await self.update_source(instance)
+            await self._kill_daemons(running)
+            await self._spawn_daemons(running)
+        elif not running.procs or any(p.returncode is not None for p in running.procs):
+            # No procs at all counts as needing a respawn: a failed launch (binary not
+            # installed yet, config not written yet) leaves the set empty, and without this the
+            # endpoint would sit dead forever with nothing to reap.
+            await self._reap_and_respawn(running)
 
     async def _start_instance(self, instance, signature: tuple) -> None:
         """Bring up the Sendspin source, then the daemons that feed it (order matters: FIFO first)."""

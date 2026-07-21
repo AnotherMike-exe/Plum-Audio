@@ -32,6 +32,8 @@ interface WireSource {
   group_name: string | null;
   streaming: boolean;
   player_ids: string[];
+  name?: string;      // endpoint device name ("Kitchen") — what the GUI labels the stream
+  active?: boolean;   // a sender is using it right now (see SourceFeeder.is_active)
 }
 interface WireUnit {
   unit_id: string;
@@ -42,18 +44,31 @@ interface WireUnit {
 }
 export interface MeshView {
   units: WireUnit[];
+  // Which unit answered. A unit serves its own GUI and that page must feature ITSELF, but the
+  // view is identical from every unit — so identity can only come from the responder.
+  local_unit_id?: string;
 }
 
 export interface Model {
   servers: Server[];
   streams: Stream[];
   clients: Client[];
+  /** The unit serving this page, if known (mesh view's local_unit_id). */
+  localUnitId?: string;
+  /** This unit's own player ids — matched by listener host, so a roamed player stays "ours". */
+  localPlayerIds: string[];
 }
 
 /** Federated stream id — a source_id is only unique within its unit. */
 export function streamId(unitId: string, sourceId: string): string {
   return `${unitId}::${sourceId}`;
 }
+/** Host part of a ws:// URL, or null. */
+export function hostOf(url: string): string | null {
+  const m = /^\w+:\/\/([^/:]+)/.exec(url);
+  return m ? m[1] : null;
+}
+
 export function parseStreamId(id: string): { unitId: string; sourceId: string } {
   const i = id.indexOf('::');
   return { unitId: id.slice(0, i), sourceId: id.slice(i + 2) };
@@ -107,8 +122,9 @@ export function mapViewToModel(
         id: sid,
         serverId: unit.unit_id,
         serverName: unit.name,
-        name: src.group_name || src.source_id,
+        name: src.name || src.group_name || src.source_id,
         sourceDevice: src.source_id,
+        active: !!src.active,
         currentTrack: track,
         isPlaying,
         progress: posMs / 1000,
@@ -124,9 +140,16 @@ export function mapViewToModel(
     }
   }
 
+  // "Ours" is decided by the player's own listener host, NOT by which unit currently reports it:
+  // a roamed player is listed by the peer that reclaimed it but is still this unit's speaker.
+  const localHost = view.units.find((u) => u.unit_id === view.local_unit_id)?.host ?? null;
+  const localPlayerIds: string[] = [];
+
   const clients: Client[] = [];
   for (const unit of view.units) {
     for (const p of unit.players) {
+      const isLocal = !!localHost && !!p.url && hostOf(p.url) === localHost;
+      if (isLocal) localPlayerIds.push(p.player_id);
       clients.push({
         id: p.player_id,
         serverId: unit.unit_id,
@@ -135,11 +158,12 @@ export function mapViewToModel(
         currentStreamId: (p.group_id && groupToStream.get(p.group_id)) || null,
         volume: 100, // TODO(backend): per-player volume isn't in the snapshot yet
         connected: p.connected,
+        isLocal,
       });
     }
   }
 
-  return { servers, streams, clients };
+  return { servers, streams, clients, localUnitId: view.local_unit_id, localPlayerIds };
 }
 
 type Listener = (model: Model) => void;

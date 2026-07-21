@@ -2,11 +2,19 @@
  * MeshApp — the Phase-3 ported GUI shell, wired to SendspinDataService.
  *
  * Reproduces the Plum-Snapcast App.tsx layout (two-column card grid: now-playing on the left,
- * other streams/devices on the right, settings in the footer) but adapted to the mesh CONTROLLER
- * model — there is no browser-as-player "myClient", so the left card features the SELECTED source
- * and the device lists are the roamable players grouped by which source they're on. Browser-audio,
- * federation server-CRUD, and the reactive visualizer are dropped for v1 (see docs/FRONTEND-PORT.md);
- * the settings overlay + visualizer port in later slices (the gear opens a placeholder for now).
+ * other streams/devices on the right, settings in the footer), adapted to the mesh model.
+ *
+ * THIS PAGE IS A UNIT. Each unit serves its own GUI, so the left card is always THIS unit — its
+ * name, its player, and the source that player is on — and the right card is everyone else. The
+ * unit never lists itself among "other" devices. `localUnitId`/`localPlayerIds` come from the mesh
+ * view (the responder tells us who it is); a player stays "ours" by its listener host even after it
+ * roams onto a peer's group.
+ *
+ * The source picker is a CONTROL, not a view filter: choosing a source routes this unit's player
+ * there — and with it every player currently sharing its group, so a synced room moves together.
+ * Only sources a sender is actually using are listed (plus whatever we're on); idle ones stay
+ * routable and reappear the moment audio flows. Browser-audio, federation server-CRUD, and the
+ * reactive visualizer are dropped for v1 (see docs/FRONTEND-PORT.md).
  *
  * All interactive sub-trees are memoized with identity-stable array/handler props so the 500ms
  * position tick (which re-renders to advance the progress bar) can't reconcile their DOM mid-click.
@@ -26,7 +34,7 @@ import { settingsService } from './services/settingsService';
 import { useThemeSettings } from './hooks/useThemeSettings';
 
 const service = new SendspinDataService();
-const EMPTY: Model = { servers: [], streams: [], clients: [] };
+const EMPTY: Model = { servers: [], streams: [], clients: [], localPlayerIds: [] };
 const clampVol = (v: number) => Math.max(0, Math.min(100, v));
 
 // Memoized interactive controls: the parent re-renders ~2x/s (position tick) + on every WS message,
@@ -80,23 +88,43 @@ export default function MeshApp(): React.ReactElement {
     settingsService.updateSettings(next);
   }, []);
 
-  // Best default source: real now-playing (title/art) beats merely `streaming`, beats the first.
-  const bestDefault = (streams: Stream[]): Stream | undefined =>
-    streams.find((s) => s.currentTrack.title || s.currentTrack.albumArtUrl) ??
-    streams.find((s) => s.isPlaying) ??
-    streams[0];
+  // This unit, and the player(s) it owns.
+  const localUnit = useMemo(
+    () => model.servers.find((s) => s.id === model.localUnitId),
+    [model.servers, model.localUnitId],
+  );
+  const myPlayers = useMemo(
+    () => model.clients.filter((c) => c.isLocal),
+    [model.clients],
+  );
+  // Where this unit is playing from right now — the authority for what the left card shows.
+  const myStreamId = myPlayers.find((c) => c.currentStreamId)?.currentStreamId ?? null;
 
-  // Sticky, metadata-aware featured selection — re-pick only when nothing is selected or the
-  // selection vanished, never on a pause (which flips isPlaying).
+  // A route takes a moment to land (a cross-server reclaim reconnects the player), so hold the
+  // user's choice until the mesh view catches up; then the view wins again.
   useEffect(() => {
-    if (selectedStreamId && model.streams.some((s) => s.id === selectedStreamId)) return;
-    const pick = bestDefault(model.streams);
-    setSelectedStreamId(pick ? pick.id : null);
-  }, [model.streams, selectedStreamId]);
+    if (selectedStreamId && selectedStreamId === myStreamId) setSelectedStreamId(null);
+  }, [selectedStreamId, myStreamId]);
 
+  // Our stream only counts as "on" while a sender is using it: when the source goes idle (writer
+  // closed, or long silence) the card falls back to the holding state, as the Snapcast build did.
+  // The player STAYS routed there — the moment audio flows again this lights straight back up.
+  const myStream = useMemo(
+    () => model.streams.find((s) => s.id === myStreamId),
+    [model.streams, myStreamId],
+  );
+  const featuredId = selectedStreamId ?? (myStream?.active ? myStream.id : null);
   const featured: Stream | undefined = useMemo(
-    () => model.streams.find((s) => s.id === selectedStreamId) ?? bestDefault(model.streams),
-    [model.streams, selectedStreamId],
+    () => model.streams.find((s) => s.id === featuredId),
+    [model.streams, featuredId],
+  );
+
+  // The PICKER lists only sources a sender is actually using (plus whatever we're on, so a stream
+  // going idle can't yank itself out from under the selection). Device lists still get the full
+  // set — a peer parked on an idle source must stay visible and reachable.
+  const listedStreams = useMemo(
+    () => model.streams.filter((s) => s.active || s.id === featuredId),
+    [model.streams, featuredId],
   );
 
   // Latest featured/model for stable handlers that must read current values without re-binding.
@@ -107,22 +135,24 @@ export default function MeshApp(): React.ReactElement {
 
   // Identity-stable arrays: keep the same reference across position ticks so the memoized device
   // lists only re-render when a client/stream field they show actually changes.
-  const streamsSig = model.streams.map((s) => `${s.id}|${s.name}|${s.isPlaying}|${s.volume ?? ''}`).join(';');
+  const streamsSig = model.streams.map((s) => `${s.id}|${s.name}|${s.isPlaying}|${s.volume ?? ''}|${s.active}`).join(';');
   const clientsSig = model.clients
     .map((c) => `${c.id}|${c.name}|${c.currentStreamId ?? ''}|${c.volume}|${c.connected}`)
     .join(';');
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const stableStreams = useMemo(() => model.streams, [streamsSig]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
+  const stablePickable = useMemo(() => listedStreams, [listedStreams.map((s) => `${s.id}|${s.name}`).join(';')]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const stableClients = useMemo(() => model.clients, [clientsSig]);
 
-  const featuredId = featured?.id ?? null;
+  // Left card = us and whoever is synced with us. Right card = everyone else — never ourselves.
   const syncedClients: Client[] = useMemo(
-    () => stableClients.filter((c) => c.currentStreamId === featuredId),
+    () => stableClients.filter((c) => c.isLocal || (featuredId != null && c.currentStreamId === featuredId)),
     [stableClients, featuredId],
   );
   const otherClients: Client[] = useMemo(
-    () => stableClients.filter((c) => c.currentStreamId !== featuredId),
+    () => stableClients.filter((c) => !c.isLocal && c.currentStreamId !== featuredId),
     [stableClients, featuredId],
   );
 
@@ -140,6 +170,21 @@ export default function MeshApp(): React.ReactElement {
     if (f) service.setStreamVolume(f.id, v);
   }, []);
   const onClientVolume = useCallback((clientId: string, v: number) => service.setVolume(clientId, v), []);
+
+  /** Route this unit — and everyone currently grouped with it — onto the chosen source. */
+  const onSelectStream = useCallback((streamId: string | null) => {
+    setSelectedStreamId(streamId);
+    const m = modelRef.current;
+    const mine = m.clients.filter((c) => c.isLocal);
+    const current = mine.find((c) => c.currentStreamId)?.currentStreamId ?? null;
+    // Whoever shares our group moves with us; a solo unit just moves itself.
+    const group = current ? m.clients.filter((c) => c.currentStreamId === current) : mine;
+    const targets = group.length ? group : mine;
+    for (const c of targets) {
+      if (streamId) void service.routeClient(c.id, streamId);
+      else void service.unrouteClient(c.id);
+    }
+  }, []);
   const onClientStreamChange = useCallback((clientId: string, streamId: string | null) => {
     if (streamId) void service.routeClient(clientId, streamId);
     else void service.unrouteClient(clientId);
@@ -158,7 +203,8 @@ export default function MeshApp(): React.ReactElement {
     if (f) muteStream(f.id);
   }, [muteStream]);
 
-  const serverName = featured?.serverName || 'Plum Audio';
+  // Always this unit's own name — every unit serves its own page.
+  const serverName = localUnit?.name || settings.deviceName || 'Plum Audio';
   const connected = model.servers.length > 0;
   const shouldShowControls = !!featured;
 
@@ -185,9 +231,9 @@ export default function MeshApp(): React.ReactElement {
               </div>
             </div>
             <MemoStreamSelector
-              streams={stableStreams}
+              streams={stablePickable}
               currentStreamId={featuredId}
-              onSelectStream={setSelectedStreamId}
+              onSelectStream={onSelectStream}
               federationEnabled={false}
             />
           </div>
@@ -218,8 +264,10 @@ export default function MeshApp(): React.ReactElement {
           ) : (
             <div className="flex-grow flex flex-col items-center justify-center rounded-lg p-8 h-full min-h-[300px]">
               <Icon name="music" className="text-6xl text-[var(--text-muted)] mb-4" />
-              <h2 className="text-2xl font-semibold text-[var(--text-primary)]">No Source Selected</h2>
-              <p className="text-[var(--text-secondary)] mt-2">Choose a source to begin.</p>
+              <h2 className="text-2xl font-semibold text-[var(--text-primary)]">Nothing Playing</h2>
+              <p className="text-[var(--text-secondary)] mt-2">
+                Start playing to an endpoint, or choose an active source above.
+              </p>
             </div>
           )}
         </div>

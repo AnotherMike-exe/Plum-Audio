@@ -48,6 +48,7 @@ import contextlib
 import functools
 import logging
 import os
+import time
 
 from aiosendspin.models.types import MediaCommand, has_role_family
 from aiosendspin.server.audio import AudioFormat
@@ -80,6 +81,10 @@ COMMIT_CHUNK_MS = 20  # feeder read/commit cadence — small for low added laten
 # required_lead_time (250 ms) + min_buffer (250 ms) with margin, and bounds ingest latency.
 TARGET_BUFFER_US = 500_000
 ANCHOR_PREFIX = "src:"  # server-side group anchor client id namespace
+# A source counts as "in use" while audio keeps arriving. Past this gap (or once the writer closes)
+# it goes idle: the GUI drops it from the stream list, though it stays routable and any sender can
+# reconnect to it. Generous by default so a long pause doesn't make a stream vanish mid-listen.
+SOURCE_IDLE_TIMEOUT_S = float(os.environ.get("PLUM_SOURCE_IDLE_TIMEOUT", "300"))
 CONTROLLER_PREFIX = "ctrl:"  # GUI controller client id namespace: "ctrl:<source_id>:<nonce>"
 REACQUIRE_BACKOFF_S = 0.1  # pause before re-acquiring a stopped stream (avoid hot-looping)
 
@@ -117,6 +122,20 @@ class SourceFeeder:
         self.ps: PushStream | None = None
         self._task: asyncio.Task | None = None
         self._stop_evt = asyncio.Event()
+        self._last_data_at: float | None = None  # monotonic; None = no writer / session ended
+
+    @property
+    def is_active(self) -> bool:
+        """Is a sender actually using this source right now?
+
+        True while audio keeps arriving from an open writer. Goes False the moment the writer
+        closes (session end) and after SOURCE_IDLE_TIMEOUT_S of silence with the pipe still open
+        (a sender that stopped without hanging up). Purely informational — the group, feeder and
+        routing all stay up, so the source remains available to reconnect to.
+        """
+        if self._last_data_at is None:
+            return False
+        return (time.monotonic() - self._last_data_at) < SOURCE_IDLE_TIMEOUT_S
 
     def start(self) -> None:
         if self._task is None:
@@ -201,6 +220,7 @@ class SourceFeeder:
                     eof = True
 
                 if data:
+                    self._last_data_at = time.monotonic()
                     assert self.ps is not None
                     self.ps.prepare_audio(data, self.fmt)
                     try:
@@ -220,6 +240,7 @@ class SourceFeeder:
 
                 if eof:
                     logger.info("[%s] FIFO writer closed (session end) — going idle", self.source_id)
+                    self._last_data_at = None
                     return
         finally:
             # Mark the live source paused; the stream/group stay up for the next session.
@@ -232,10 +253,11 @@ class SourceHandle:
     """A live source: its anchor group + feeder. The group is the routing target the mesh
     orchestrator adds/removes player clients on (remove_client(old) → add_client(new))."""
 
-    def __init__(self, source_id: str, group: SendspinGroup, feeder: SourceFeeder) -> None:
+    def __init__(self, source_id: str, group: SendspinGroup, feeder: SourceFeeder, name: str = "") -> None:
         self.source_id = source_id
         self.group = group
         self.feeder = feeder
+        self.name = name or source_id  # endpoint device name, shown in the GUI; follows a rename
 
 
 class PlumSendspinServer:
@@ -293,7 +315,9 @@ class PlumSendspinServer:
             await self.server.close()
             self.server = None
 
-    def start_source(self, source_id: str, fifo_path: str, fmt: AudioFormat = DEFAULT_FORMAT) -> SourceHandle:
+    def start_source(
+        self, source_id: str, fifo_path: str, fmt: AudioFormat = DEFAULT_FORMAT, *, name: str = ""
+    ) -> SourceHandle:
         """Create the source's anchor group and launch its FIFO feeder.
 
         Idempotent: returns the existing handle if the source is already running.
@@ -305,13 +329,21 @@ class PlumSendspinServer:
         anchor = self.server.get_or_create_client(ANCHOR_PREFIX + source_id)
         group = anchor.group
         feeder = SourceFeeder(source_id, fifo_path, group, fmt)
-        handle = SourceHandle(source_id, group, feeder)
+        handle = SourceHandle(source_id, group, feeder, name=name)
         self.sources[source_id] = handle
         if self._primary_source is None:
             self._primary_source = source_id  # first source: where controller clients get grouped
         feeder.start()
         logger.info("[%s] source started (group=%s)", source_id, group.group_id[:8])
         return handle
+
+    def set_source_name(self, source_id: str, name: str) -> None:
+        """Rename a source's GUI label in place (the user renamed its endpoint in Settings)."""
+        handle = self.sources.get(source_id)
+        if handle is None or not name or handle.name == name:
+            return
+        handle.name = name
+        logger.info("[%s] source renamed to %r", source_id, name)
 
     async def stop_source(self, source_id: str) -> None:
         handle = self.sources.pop(source_id, None)
@@ -494,6 +526,8 @@ class PlumSendspinServer:
                     group_name=group.group_name,
                     streaming=group.has_active_stream,
                     player_ids=player_ids,
+                    name=handle.name,
+                    active=handle.feeder.is_active,
                 )
             )
 
@@ -559,7 +593,7 @@ class PlumSendspinServer:
         exists). Metadata/artwork ride the instance's own metadata pipe; transport rides its own
         private D-Bus session.
         """
-        self.start_source(instance.source_id, instance.fifo_path)
+        self.start_source(instance.source_id, instance.fifo_path, name=instance.device_name)
         self.start_airplay_metadata(instance.source_id, instance.metadata_fifo)
         await self.start_airplay_control(instance.source_id, bus_address=instance.bus_address)
         logger.info(
@@ -586,7 +620,7 @@ class PlumSendspinServer:
         loop pushes metadata/artwork to the group's roles from the WebSocket event stream, and it is
         also registered as the source's transport remote (play/pause/next/previous POST the HTTP API).
         """
-        self.start_source(instance.source_id, instance.fifo_path)
+        self.start_source(instance.source_id, instance.fifo_path, name=instance.device_name)
         handle = self.sources[instance.source_id]
         monitor = SpotifyGoLibrespot(handle.group, instance.instance_id, instance.api_base)
         await monitor.connect()

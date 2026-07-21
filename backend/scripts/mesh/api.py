@@ -90,7 +90,15 @@ class MeshApi:
         return web.json_response(self._engine.snapshot().to_dict())
 
     async def _view(self, _request: web.Request) -> web.Response:
-        return web.json_response(self._agg.view().to_dict())
+        """The aggregated mesh, plus WHICH unit answered.
+
+        A unit serves its own GUI, and that page must feature *itself* — its own player and the
+        source that player is on — not whichever unit happens to sort first. The view is otherwise
+        identical from every unit, so identity has to come from the responder.
+        """
+        payload = self._agg.view().to_dict()
+        payload["local_unit_id"] = self._agg.local_unit_id
+        return web.json_response(payload)
 
     async def _route(self, request: web.Request) -> web.Response:
         body = await self._json(request)
