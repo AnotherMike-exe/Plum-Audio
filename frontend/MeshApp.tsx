@@ -127,6 +127,23 @@ export default function MeshApp(): React.ReactElement {
     [model.streams, featuredId],
   );
 
+  // What each device READS AS. A player parked on a source nobody is streaming to isn't "on
+  // AirPlay" in any sense the user cares about — it's idle, exactly like the left card's holding
+  // state, so show it that way. Routing is untouched underneath (the player stays attached and
+  // relights the moment audio flows); only the label changes. Controls read the RAW model below,
+  // so moving a group still moves everyone actually in it.
+  const activeStreamIds = useMemo(
+    () => new Set(model.streams.filter((s) => s.active).map((s) => s.id)),
+    [model.streams],
+  );
+  const viewClients: Client[] = useMemo(
+    () =>
+      model.clients.map((c) =>
+        c.currentStreamId && !activeStreamIds.has(c.currentStreamId) ? { ...c, currentStreamId: null } : c,
+      ),
+    [model.clients, activeStreamIds],
+  );
+
   // Latest featured/model for stable handlers that must read current values without re-binding.
   const featuredRef = useRef(featured);
   featuredRef.current = featured;
@@ -136,7 +153,7 @@ export default function MeshApp(): React.ReactElement {
   // Identity-stable arrays: keep the same reference across position ticks so the memoized device
   // lists only re-render when a client/stream field they show actually changes.
   const streamsSig = model.streams.map((s) => `${s.id}|${s.name}|${s.isPlaying}|${s.volume ?? ''}|${s.active}`).join(';');
-  const clientsSig = model.clients
+  const clientsSig = viewClients
     .map((c) => `${c.id}|${c.name}|${c.currentStreamId ?? ''}|${c.volume}|${c.connected}`)
     .join(';');
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -144,15 +161,17 @@ export default function MeshApp(): React.ReactElement {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const stablePickable = useMemo(() => listedStreams, [listedStreams.map((s) => `${s.id}|${s.name}`).join(';')]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const stableClients = useMemo(() => model.clients, [clientsSig]);
+  const stableClients = useMemo(() => viewClients, [clientsSig]);
 
   // Left card = us and whoever is synced with us. Right card = everyone else — never ourselves.
+  // Both comparisons guard on featuredId being set: when we're idle it is null, and so is every
+  // idle peer's stream, so an unguarded equality would read "synced with us" and swallow them.
   const syncedClients: Client[] = useMemo(
     () => stableClients.filter((c) => c.isLocal || (featuredId != null && c.currentStreamId === featuredId)),
     [stableClients, featuredId],
   );
   const otherClients: Client[] = useMemo(
-    () => stableClients.filter((c) => !c.isLocal && c.currentStreamId !== featuredId),
+    () => stableClients.filter((c) => !c.isLocal && (featuredId == null || c.currentStreamId !== featuredId)),
     [stableClients, featuredId],
   );
 
