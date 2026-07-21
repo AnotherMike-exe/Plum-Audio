@@ -79,6 +79,7 @@ COMMIT_CHUNK_MS = 20  # feeder read/commit cadence — small for low added laten
 # required_lead_time (250 ms) + min_buffer (250 ms) with margin, and bounds ingest latency.
 TARGET_BUFFER_US = 500_000
 ANCHOR_PREFIX = "src:"  # server-side group anchor client id namespace
+CONTROLLER_PREFIX = "ctrl:"  # GUI controller client id namespace: "ctrl:<source_id>:<nonce>"
 REACQUIRE_BACKOFF_S = 0.1  # pause before re-acquiring a stopped stream (avoid hot-looping)
 
 
@@ -357,6 +358,13 @@ class PlumSendspinServer:
             asyncio.ensure_future(self._maybe_group_controller(event.client_id))
 
     async def _maybe_group_controller(self, client_id: str) -> None:
+        """Join a controller-only client to the source group it asked for (or the primary source).
+
+        A client holds exactly one websocket and therefore sits in exactly one group, so a single
+        controller can only ever see ONE source's now-playing. The GUI opens one controller per
+        source and names it "ctrl:<source_id>:<nonce>"; we honour that request here. Without the
+        hint (any other client id) it lands on the primary source, preserving the Phase-1 behaviour.
+        """
         if self.server is None or self._primary_source is None:
             return
         if client_id.startswith(ANCHOR_PREFIX):
@@ -366,20 +374,30 @@ class PlumSendspinServer:
             return
         if has_role_family("player", client.negotiated_roles):
             return  # a player — the mesh orchestrator owns its routing, never regroup it here
-        handle = self.sources.get(self._primary_source)
+        source_id = self._requested_source(client_id) or self._primary_source
+        handle = self.sources.get(source_id)
         if handle is None or client.group is handle.group:
             return  # unknown source, or already grouped — idempotent
         with contextlib.suppress(Exception):
             await handle.group.add_client(client)
-            logger.info("[%s] grouped controller client %s", self._primary_source, client_id)
+            logger.info("[%s] grouped controller client %s", source_id, client_id)
             # A controller joining creates the controller group role; (re)advertise transport
             # commands on it now so this controller sees play/pause/next/previous as supported.
-            if self._airplay_remote is not None:
+            # Gate on this source having a remote — a source with no transport control (a bare
+            # FIFO) must not claim commands it can't honour.
+            if self._source_remotes.get(source_id) is not None:
                 controller = handle.group.group_role("controller")
                 if controller is not None:
                     controller.set_supported_commands(
                         [MediaCommand.PLAY, MediaCommand.PAUSE, MediaCommand.NEXT, MediaCommand.PREVIOUS]
                     )
+
+    def _requested_source(self, client_id: str) -> str | None:
+        """The source a controller client asked to observe, from a "ctrl:<source_id>:<nonce>" id."""
+        if not client_id.startswith(CONTROLLER_PREFIX):
+            return None
+        requested = client_id[len(CONTROLLER_PREFIX):].split(":", 1)[0]
+        return requested if requested in self.sources else None
 
     def set_player_volume(self, player_id: str, volume: int, muted: bool) -> None:
         """Set one player's volume (0-100) and mute — per-client, independent of its group.

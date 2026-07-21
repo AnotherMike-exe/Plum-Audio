@@ -638,7 +638,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
           Audio Sources
         </h3>
         <p className="text-sm text-[var(--text-muted)] mb-6">
-          Configure audio sources and their settings. Changes require service restart.
+          Configure audio sources and their endpoints. Changes apply within a few seconds — no restart needed.
         </p>
       </div>
 
@@ -1368,7 +1368,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
 
       <div className="pt-4 mt-6 border-t border-[var(--border-color)]">
         <p className="text-xs text-[var(--text-muted)] italic">
-          Note: Changes to integration settings will be applied after service restart.
+          Note: Endpoint changes are picked up by the unit automatically; the endpoint appears or disappears on your sender within a few seconds.
         </p>
       </div>
     </div>

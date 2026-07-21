@@ -4,8 +4,8 @@
  * Replaces Plum-Snapcast's snapcastService + snapcastDataService + federationService +
  * playbackService. Two data planes (see docs/FRONTEND-PORT.md):
  *   - Topology (which units/sources/players/groups exist) — REST poll of GET /api/mesh/view.
- *   - Now-playing (title/artist/album/art/position/transport) — ONE controller WS per unit,
- *     because Sendspin metadata is per-server (no mesh aggregation). Merged client-side.
+ *   - Now-playing (title/artist/album/art/position/transport) — ONE controller WS per SOURCE
+ *     (a client sits in exactly one group, so it sees exactly one source). Merged client-side.
  *
  * Produces the engine-agnostic { servers, streams, clients } model the existing components consume,
  * so App.tsx wires to this instead of the Snapcast/federation services.
@@ -145,7 +145,11 @@ export function mapViewToModel(
 type Listener = (model: Model) => void;
 
 export class SendspinDataService {
-  private controllers = new Map<string, SendspinControllerClient>(); // unitId -> client
+  // Federated stream id ("<unitId>::<sourceId>") -> controller client. ONE PER SOURCE, not per
+  // unit: a Sendspin client holds a single websocket and therefore sits in a single group, so a
+  // per-unit controller would only ever report the one source it happened to be grouped into
+  // (metadata/artwork/transport for every other source on that unit would be invisible).
+  private controllers = new Map<string, SendspinControllerClient>();
   private npByGroup = new Map<string, NowPlaying>();
   private offsetByGroup = new Map<string, number>();
   private unitHosts = new Map<string, string>(); // unitId -> host (for per-unit REST)
@@ -201,8 +205,7 @@ export class SendspinDataService {
   }
 
   controlStream(federatedStreamId: string, command: ControllerCommand): void {
-    const { unitId } = parseStreamId(federatedStreamId);
-    const controller = this.controllers.get(unitId);
+    const controller = this.controllers.get(federatedStreamId);
     if (!controller) return;
     controller.send(command);
     // Flip the transport button immediately; the AirPlay pause round-trip is multi-second.
@@ -211,8 +214,7 @@ export class SendspinDataService {
   }
 
   setStreamVolume(federatedStreamId: string, volume: number): void {
-    const { unitId } = parseStreamId(federatedStreamId);
-    this.controllers.get(unitId)?.send('volume', { volume });
+    this.controllers.get(federatedStreamId)?.send('volume', { volume });
   }
 
   getStreamCapabilities(federatedStreamId: string): {
@@ -222,8 +224,10 @@ export class SendspinDataService {
     canGoNext: boolean;
     canGoPrevious: boolean;
   } {
-    const { sourceId } = parseStreamId(federatedStreamId);
-    const src = this.lastView.units.flatMap((u) => u.sources).find((s) => s.source_id === sourceId);
+    const { unitId, sourceId } = parseStreamId(federatedStreamId);
+    const src = this.lastView.units
+      .find((u) => u.unit_id === unitId)
+      ?.sources.find((s) => s.source_id === sourceId);
     const cmds = (src && this.npByGroup.get(src.group_id)?.supportedCommands) || [];
     return {
       canPlay: cmds.includes('play'),
@@ -251,29 +255,34 @@ export class SendspinDataService {
     this.lastView = view;
     const seen = new Set<string>();
     for (const unit of view.units) {
-      seen.add(unit.unit_id);
       if (unit.host) this.unitHosts.set(unit.unit_id, unit.host);
-      // Open a controller WS to each unit we don't already have one for.
-      if (!this.controllers.has(unit.unit_id) && unit.host) {
-        const c = new SendspinControllerClient(unit.unit_id, unit.host, (uid, np) => this.onNowPlaying(uid, np));
-        this.controllers.set(unit.unit_id, c);
+      if (!unit.host) continue;
+      for (const src of unit.sources) {
+        const key = streamId(unit.unit_id, src.source_id);
+        seen.add(key);
+        if (this.controllers.has(key)) continue;
+        // The "ctrl:<source_id>:" client id tells the unit which source group to join us to.
+        const c = new SendspinControllerClient(unit.unit_id, unit.host, (_uid, np) => this.onNowPlaying(key, np), {
+          clientId: `ctrl:${src.source_id}:${Math.floor(performance.now())}`,
+        });
+        this.controllers.set(key, c);
         c.connect();
       }
     }
-    // Drop controllers for units that vanished from discovery.
-    for (const [uid, c] of this.controllers) {
-      if (!seen.has(uid)) {
+    // Drop controllers for sources (or whole units) that vanished from discovery.
+    for (const [key, c] of this.controllers) {
+      if (!seen.has(key)) {
         c.close();
-        this.controllers.delete(uid);
+        this.controllers.delete(key);
       }
     }
     this.emit();
   }
 
-  private onNowPlaying(unitId: string, np: NowPlaying): void {
+  private onNowPlaying(streamKey: string, np: NowPlaying): void {
     if (np.groupId) {
       this.npByGroup.set(np.groupId, np);
-      const offset = this.controllers.get(unitId)?.clockOffsetUs ?? 0;
+      const offset = this.controllers.get(streamKey)?.clockOffsetUs ?? 0;
       this.offsetByGroup.set(np.groupId, offset);
     }
     this.emit();
