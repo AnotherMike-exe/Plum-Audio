@@ -143,7 +143,10 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
 
 ## Key Ports (planned)
 - Web GUI: **80** (nginx, per unit — serves the built app + proxies the APIs)
-- Sendspin server: 8927 (per unit) · player: 8928 · mesh API 5001 (aiohttp) · config API 5002 (Flask)
+- Sendspin server: 8927 (per unit) · player: 8928 — **all audio, sync, metadata and transport**
+- Mesh API 5001 (aiohttp) · config API 5002 (Flask) — our own surfaces for what the spec does not
+  cover (cross-unit topology/routing, settings/integrations). NOT the old Snapcast/federation
+  layer: nothing of Snapcast's 1780/1704 or `federation/*` remains, only the port numbering.
 - Per-endpoint daemon control APIs on loopback: go-librespot 3678+ (`3678 + id - 1`)
 - AirPlay 5050-5059 (+ UDP blocks from 6001, stride 10), Spotify 5354-5363, DLNA 49494-49503,
   mDNS 5353/udp
@@ -173,6 +176,10 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
   never the unmerged `Roles.SOURCE`.
 - **Metadata off the audio path** — emit to Sendspin metadata/artwork roles, not the stream.
   The five Snapcast resync guards are obsolete here; do not port them.
+- **Announce idle, don't imply it** — a stream exists only while a sender feeds the source. On EOF
+  or `PLUM_SOURCE_IDLE_TIMEOUT` silence call `group.stop()` (playback_state=**stopped** via
+  `group/update`), never `stop_stream()` (which keeps clients logically PLAYING). The spec has no
+  distinct idle/unrouted state — `stopped` is it. Groups/anchors persist, so routing survives.
 - **WiFi/host concerns** (NetworkManager owns `wlan0`) live on the host, not the container (as Plum-Snapcast).
 
 ---

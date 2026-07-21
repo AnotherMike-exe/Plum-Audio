@@ -354,13 +354,33 @@ Spotify and AirPlay are thin subclasses and DLNA should be a third. Nothing sour
 from env any more — the local player attaches to `PLUM_LOCAL_PLAYER_SOURCE` (default `airplay-1`)
 once its manager brings it up.
 
+*Idle is announced, not inferred.* A source's stream exists ONLY while a sender is feeding it:
+first audio → `group.start_stream()` (playback_state=**playing**); EOF on the FIFO (session end) or
+silence past `PLUM_SOURCE_IDLE_TIMEOUT` (default 5 min) → `SendspinGroup.stop()`, which is the spec's
+way to say "not playing" — it sets playback_state=**stopped**, pushes a `group/update` to every
+client, and freezes the metadata progress anchor. (`stop_stream()` deliberately does NOT: it keeps
+clients logically PLAYING across a stream-to-stream handover.) The spec has no separate
+"idle"/"unrouted" state — `stopped` is it. The group and its anchor client persist through all of
+this, so players stay routed to an idle source and the next session simply starts a new stream.
+`SourceState.active` in the mesh view mirrors what we announce; it is not a second opinion.
+
 *Per-unit GUI*: nginx (in the container, under supervisord — Plum-Audio is one container per unit,
 not app + frontend) serves the built React app from `/app/www` and proxies `/api/mesh` → :5001 and
 `/api/{settings,integrations,audio,playback}` → :5002. Same-origin, so no CORS, no dev proxy, and no
 `VITE_*` host baked in: one build artifact serves every unit. The controller WS is NOT proxied — the
 GUI opens one per source directly at `ws://<unit>:8927`, peers included, which nginx here could
 never front. Tailwind is compiled into the bundle (it was a CDN script — dev-only JIT and an
-internet dependency at page load, untenable on an isolated AV VLAN).
+internet dependency at page load, untenable on an isolated AV VLAN). `.env.production` pins the API
+URLs empty: Vite inlines env at BUILD time, so a dev `.env` pointing at one unit gets baked into the
+artifact and every unit's page then renders that unit.
+
+*The page is the unit it is served by.* `/api/mesh/view` carries `local_unit_id` (the view is
+identical from every unit, so identity can only come from the responder), and a player is "ours" by
+its listener host rather than by which unit currently reports it — so it stays ours after a roam.
+The left card is always us (our name, our player, our source); the right card is everyone else and
+never ourselves. The source picker is a CONTROL: choosing a source routes this unit's player there
+along with everyone sharing its group, so a synced room moves together. Only sources with a sender
+on them are listed; idle ones drop out and their devices read as idle, while staying routable.
 
 ### Phase 4 — Cutover
 14. Migrate the two production units (`.200`/`.203`) once ≥3-unit soak passes; freeze the
