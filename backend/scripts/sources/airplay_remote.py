@@ -2,10 +2,14 @@
 """
 Plum-Audio — AirPlay transport/volume remote via shairport-sync's MPRIS interface.
 
-shairport-sync (built --with-mpris-interface) owns ``org.mpris.MediaPlayer2.ShairportSync`` on the
-SYSTEM D-Bus and relays MPRIS Player calls back to the AirPlay sender as DACP — so Play/Pause/Next/
-Previous actually control the phone or Mac that's streaming. Requires a system D-Bus policy letting
-our user own+send the name (see backend/config/shairport-sync-dbus.conf).
+shairport-sync (built --with-mpris-interface) owns ``org.mpris.MediaPlayer2.ShairportSync`` and
+relays MPRIS Player calls back to the AirPlay sender as DACP — so Play/Pause/Next/Previous actually
+control the phone or Mac that's streaming.
+
+The bus name is FIXED, so multi-endpoint AirPlay gives each shairport instance its OWN session bus
+(airplay_manager.py) and this remote connects by `bus_address`; every endpoint then owns the name
+unopposed. With no bus_address we fall back to the system bus (single-instance / legacy), which
+requires a policy letting our user own+send the name (backend/config/shairport-sync-dbus.conf).
 
 Ported from Plum-Snapcast's DBusControl, but async on ``dbus-next`` instead of dbus-python + a glib
 main loop, so it lives natively in the audio event loop. The name is resolved lazily and dropped on
@@ -31,16 +35,26 @@ PROPS_IFACE = "org.freedesktop.DBus.Properties"
 class AirplayRemote:
     """Drives shairport-sync's MPRIS Player interface (transport, and volume for later)."""
 
-    def __init__(self, on_source_volume: Callable[[int], None] | None = None) -> None:
+    def __init__(
+        self,
+        on_source_volume: Callable[[int], None] | None = None,
+        *,
+        bus_address: str | None = None,
+    ) -> None:
+        self._bus_address = bus_address  # None = the system bus (single-instance fallback)
         self._bus: MessageBus | None = None
         self._player = None  # cached Player proxy interface; None = not yet bound / needs re-resolve
         self._on_source_volume = on_source_volume
 
     async def connect(self) -> None:
-        """Connect to the system bus (idempotent). Binding to shairport happens lazily per command."""
+        """Connect to the bus (idempotent). Binding to shairport happens lazily per command."""
         if self._bus is None:
-            self._bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-            logger.info("airplay remote: connected to system D-Bus")
+            if self._bus_address:
+                self._bus = await MessageBus(bus_address=self._bus_address).connect()
+                logger.info("airplay remote: connected to %s", self._bus_address)
+            else:
+                self._bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+                logger.info("airplay remote: connected to system D-Bus")
 
     async def _player_iface(self):
         if self._player is not None:

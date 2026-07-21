@@ -1,0 +1,56 @@
+//
+// Plum-Audio shairport-sync instance template.
+//
+// Rendered per AirPlay endpoint by scripts/sources/airplay_config.py into that endpoint's config
+// dir. One shairport-sync process per endpoint: pipe backend -> instance FIFO -> in-process feeder
+// -> Sendspin source group. Metadata + cover art go out-of-band down a SEPARATE pipe, read by
+// airplay_metadata.py into the metadata/artwork roles — never onto the audio stream (which is why
+// the five Plum-Snapcast resync guards are gone).
+//
+// Transport control rides shairport's MPRIS interface on a PRIVATE session bus, one per endpoint:
+// the MPRIS bus name is fixed, so N instances on the system bus would fight over it and only the
+// first would get transport. airplay_manager.py starts a dbus-daemon per endpoint and points this
+// instance at it via DBUS_SESSION_BUS_ADDRESS. See airplay_remote.py.
+//
+// Placeholders are substituted by airplay_config.render_configs().
+//
+
+general = {
+    name = "PLUM_AP_NAME";
+    output_backend = "pipe";
+    mdns_backend = "avahi";              // advertise via the host's Avahi (no mDNS bind of our own)
+    port = PLUM_AP_PORT;                 // RAOP control port, unique per endpoint
+    udp_port_base = PLUM_AP_UDP_BASE;    // timing/control/audio UDP block, unique per endpoint
+    udp_port_range = 10;
+    drift_tolerance_in_seconds = 0.002;
+    resync_threshold_in_seconds = 0.050;
+    volume_range_db = 60;
+    ignore_volume_control = "no";        // apply the sender's volume to the PCM (source master vol);
+                                         //   Sendspin then applies per-player (per-room) volume.
+    volume_control_profile = "standard";
+    dbus_service_bus = "session";        // private per-endpoint bus (see the header note)
+    mpris_service_bus = "session";
+};
+
+pipe = {
+    name = "/tmp/airplay-PLUM_AP_ID-fifo";   // the feeder creates + reads this
+    audio_backend_buffer_desired_length_in_seconds = 0.2;
+    audio_backend_latency_offset_in_seconds = 0.0;
+};
+
+sessioncontrol = {
+    session_timeout = 20;                // drop the FIFO writer (feeder sees EOF -> idle) after 20s
+    allow_session_interruption = "yes";  // let a new sender take over
+};
+
+metadata = {
+    enabled = "yes";
+    include_cover_art = "yes";
+    cover_art_cache_directory = "/tmp/airplay-PLUM_AP_ID-covers";
+    pipe_name = "/tmp/airplay-PLUM_AP_ID-metadata-fifo";
+    pipe_timeout = 5000;
+};
+
+diagnostics = {
+    log_verbosity = 0;                   // raise to 1-3 on hardware to debug sessions
+};

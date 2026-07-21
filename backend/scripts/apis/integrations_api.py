@@ -2,16 +2,18 @@
 """
 Plum-Audio — integrations API (Flask blueprint).
 
-Serves /api/integrations/* for the GUI's Integrations settings tab. Phase 3 ships the Spotify
-slice first (it's the first ported source); airplay/dlna/bluetooth/plexamp slices are added here as
-those sources land. Endpoint CRUD is PURE PERSISTENCE: it writes settings.json via the shared SettingsManager and
-returns. Applying the change — rendering go-librespot configs, spawning/killing daemons, and
-bringing the matching Sendspin sources up or down — belongs to sources/spotify_manager.py, which
-reconciles from that same file inside the audio event loop (a separate process from this Flask app)
-and picks edits up within a few seconds. That split is deliberate: this API cannot reach the audio
+Serves /api/integrations/* for the GUI's Integrations settings tab. Phase 3 ships AirPlay and
+Spotify (the ported sources); dlna/bluetooth/plexamp slices are added here as those sources land.
+
+Endpoint CRUD is PURE PERSISTENCE: it writes settings.json via the shared SettingsManager and
+returns. Applying the change — rendering daemon configs, spawning/killing daemons, and bringing the
+matching Sendspin sources up or down — belongs to the source managers (sources/*_manager.py), which
+reconcile from that same file inside the audio event loop (a separate process from this Flask app)
+and pick edits up within a few seconds. That split is deliberate: this API cannot reach the audio
 loop, and the Pi rig has no supervisord, so one reconciler makes rig and container behave alike.
 
-Ported from Plum-Snapcast's spotify_endpoints_api.py, minus its config-regen + supervisorctl respool.
+Ported from Plum-Snapcast's {airplay,spotify}_endpoints_api.py, minus their config-regen +
+supervisorctl respool, and with the two sources' near-identical CRUD folded into one base class.
 """
 
 from __future__ import annotations
@@ -23,30 +25,48 @@ import sys
 from flask import Blueprint, jsonify, request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/ on path
+from sources import airplay_config  # noqa: E402
+
 from settings_api import SettingsManager  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 VALID_BITRATES = (96, 160, 320)
 MAX_ENDPOINTS = 10
+MAX_NAME_LEN = 50
 
 
-class SpotifyEndpointsManager:
-    """CRUD for Spotify Connect endpoints, persisted via SettingsManager."""
+class EndpointsManager:
+    """CRUD for one source's endpoint list, persisted via SettingsManager.
+
+    Subclasses supply the per-source bits: which `integrations.<key>` section to write, and which
+    transport fields a new endpoint needs (ports and the like).
+    """
+
+    source_key = ""
 
     def __init__(self, settings_manager: SettingsManager | None = None) -> None:
         self.settings_manager = settings_manager or SettingsManager()
 
+    # -- per-source hooks ----------------------------------------------------
+
+    def _allocate(self, endpoints: list[dict], instance_id: str) -> dict:
+        """Transport fields for a NEW endpoint (ports etc). Default: none."""
+        return {}
+
+    def _extras(self, section: dict) -> dict:
+        """Section-level fields to preserve alongside `endpoints` (e.g. Spotify's bitrate)."""
+        return {}
+
     # -- helpers -------------------------------------------------------------
 
-    def _spotify(self) -> dict:
+    def _section(self) -> dict:
         settings = self.settings_manager.get_settings()
-        return settings.get("integrations", {}).get("spotify", {}) or {}
+        return settings.get("integrations", {}).get(self.source_key, {}) or {}
 
-    def _save(self, endpoints: list[dict], bitrate: int) -> None:
-        self.settings_manager.update_settings(
-            {"integrations": {"spotify": {"bitrate": bitrate, "endpoints": endpoints}}}
-        )
+    def _save(self, endpoints: list[dict], extras: dict | None = None) -> None:
+        payload = {"endpoints": endpoints, **(extras if extras is not None else self._extras(self._section()))}
+        self.settings_manager.update_settings({"integrations": {self.source_key: payload}})
 
     @staticmethod
     def _next_id(endpoints: list[dict]) -> str:
@@ -54,138 +74,182 @@ class SpotifyEndpointsManager:
         return str(max(ids) + 1) if ids else "1"
 
     @staticmethod
-    def _next_port(endpoints: list[dict]) -> int:
-        return max((e.get("zeroconfPort", 5354) for e in endpoints), default=5353) + 1
+    def _valid_name(device_name: str | None) -> bool:
+        return bool(device_name) and len(device_name) <= MAX_NAME_LEN
 
     # -- CRUD ----------------------------------------------------------------
 
     def list_endpoints(self) -> dict:
-        spotify = self._spotify()
-        return {"success": True, "endpoints": spotify.get("endpoints", []) or [], "bitrate": spotify.get("bitrate", 320)}
+        section = self._section()
+        return {"success": True, "endpoints": section.get("endpoints", []) or [], **self._extras(section)}
 
     def add_endpoint(self, device_name: str, enabled: bool = True) -> dict:
-        if not device_name or len(device_name) > 50:
-            return {"success": False, "message": "Invalid device name (must be 1-50 characters)"}
-        spotify = self._spotify()
-        endpoints = spotify.get("endpoints", []) or []
+        if not self._valid_name(device_name):
+            return {"success": False, "message": f"Invalid device name (must be 1-{MAX_NAME_LEN} characters)"}
+        section = self._section()
+        endpoints = section.get("endpoints", []) or []
         if len(endpoints) >= MAX_ENDPOINTS:
-            return {"success": False, "message": f"Maximum of {MAX_ENDPOINTS} Spotify endpoints allowed"}
+            return {"success": False, "message": f"Maximum of {MAX_ENDPOINTS} {self.source_key} endpoints allowed"}
+        instance_id = self._next_id(endpoints)
         endpoint = {
-            "id": self._next_id(endpoints),
+            "id": instance_id,
             "enabled": enabled,
             "deviceName": device_name,
-            "zeroconfPort": self._next_port(endpoints),
+            **self._allocate(endpoints, instance_id),
         }
         endpoints.append(endpoint)
-        self._save(endpoints, spotify.get("bitrate", 320))
-        logger.info("added Spotify endpoint %s", endpoint)
+        self._save(endpoints, self._extras(section))
+        logger.info("added %s endpoint %s", self.source_key, endpoint)
         return {"success": True, "message": f"Added endpoint '{device_name}'", "endpoint": endpoint}
 
     def update_endpoint(self, endpoint_id: str, device_name: str | None = None, enabled: bool | None = None) -> dict:
-        spotify = self._spotify()
-        endpoints = spotify.get("endpoints", []) or []
+        section = self._section()
+        endpoints = section.get("endpoints", []) or []
         endpoint = next((e for e in endpoints if e.get("id") == endpoint_id), None)
         if endpoint is None:
             return {"success": False, "message": f"Endpoint '{endpoint_id}' not found"}
         if device_name is not None:
-            if not device_name or len(device_name) > 50:
-                return {"success": False, "message": "Invalid device name (must be 1-50 characters)"}
+            if not self._valid_name(device_name):
+                return {"success": False, "message": f"Invalid device name (must be 1-{MAX_NAME_LEN} characters)"}
             endpoint["deviceName"] = device_name
         if enabled is not None:
             endpoint["enabled"] = enabled
-        self._save(endpoints, spotify.get("bitrate", 320))
-        logger.info("updated Spotify endpoint %s: %s", endpoint_id, endpoint)
+        self._save(endpoints, self._extras(section))
+        logger.info("updated %s endpoint %s: %s", self.source_key, endpoint_id, endpoint)
         return {"success": True, "message": f"Updated endpoint '{endpoint_id}'", "endpoint": endpoint}
 
     def remove_endpoint(self, endpoint_id: str) -> dict:
-        spotify = self._spotify()
-        endpoints = spotify.get("endpoints", []) or []
+        section = self._section()
+        endpoints = section.get("endpoints", []) or []
         endpoint = next((e for e in endpoints if e.get("id") == endpoint_id), None)
         if endpoint is None:
             return {"success": False, "message": f"Endpoint '{endpoint_id}' not found"}
         endpoints.remove(endpoint)
-        self._save(endpoints, spotify.get("bitrate", 320))
-        logger.info("removed Spotify endpoint %s", endpoint_id)
+        self._save(endpoints, self._extras(section))
+        logger.info("removed %s endpoint %s", self.source_key, endpoint_id)
         return {"success": True, "message": f"Removed endpoint '{endpoint.get('deviceName')}'"}
 
-    def update_bitrate(self, bitrate: int) -> dict:
-        if bitrate not in VALID_BITRATES:
-            return {"success": False, "message": f"Bitrate must be one of {VALID_BITRATES}"}
-        spotify = self._spotify()
-        self._save(spotify.get("endpoints", []) or [], bitrate)
-        logger.info("updated Spotify bitrate to %d", bitrate)
-        return {"success": True, "message": f"Updated bitrate to {bitrate}",
-                "warning": "Restarts Spotify endpoints; active playback is interrupted."}
-
     def status(self) -> dict:
-        spotify = self._spotify()
-        endpoints = spotify.get("endpoints", []) or []
+        section = self._section()
+        endpoints = section.get("endpoints", []) or []
         return {
             "success": True,
             "enabled": any(e.get("enabled") for e in endpoints),
             "endpoints": endpoints,
-            "bitrate": spotify.get("bitrate", 320),
+            **self._extras(section),
         }
 
     def set_all_enabled(self, enabled: bool) -> dict:
-        spotify = self._spotify()
-        endpoints = spotify.get("endpoints", []) or []
+        section = self._section()
+        endpoints = section.get("endpoints", []) or []
         for e in endpoints:
             e["enabled"] = enabled
-        self._save(endpoints, spotify.get("bitrate", 320))
-        return {"success": True, "message": f"All Spotify endpoints {'enabled' if enabled else 'disabled'}"}
+        self._save(endpoints, self._extras(section))
+        return {
+            "success": True,
+            "message": f"All {self.source_key} endpoints {'enabled' if enabled else 'disabled'}",
+        }
 
 
-def create_integrations_blueprint(settings_manager: SettingsManager | None = None) -> Blueprint:
-    """Build the /api/integrations blueprint. Currently the Spotify slice; more sources slot in here."""
-    bp = Blueprint("integrations", __name__, url_prefix="/api/integrations")
-    spotify = SpotifyEndpointsManager(settings_manager)
+class SpotifyEndpointsManager(EndpointsManager):
+    """Spotify Connect endpoints. Extra section field: the shared bitrate."""
+
+    source_key = "spotify"
+
+    def _extras(self, section: dict) -> dict:
+        return {"bitrate": section.get("bitrate", 320)}
+
+    def _allocate(self, endpoints: list[dict], instance_id: str) -> dict:
+        # Zeroconf port: next free above the highest in use (each instance must advertise its own).
+        return {"zeroconfPort": max((e.get("zeroconfPort", 5354) for e in endpoints), default=5353) + 1}
+
+    def update_bitrate(self, bitrate: int) -> dict:
+        if bitrate not in VALID_BITRATES:
+            return {"success": False, "message": f"Bitrate must be one of {VALID_BITRATES}"}
+        section = self._section()
+        self._save(section.get("endpoints", []) or [], {"bitrate": bitrate})
+        logger.info("updated Spotify bitrate to %d", bitrate)
+        return {"success": True, "message": f"Updated bitrate to {bitrate}",
+                "warning": "Restarts Spotify endpoints; active playback is interrupted."}
+
+
+class AirplayEndpointsManager(EndpointsManager):
+    """AirPlay endpoints. Each needs its own RAOP port and UDP port block."""
+
+    source_key = "airplay"
+
+    def _allocate(self, endpoints: list[dict], instance_id: str) -> dict:
+        # Derive from the id so the block matches airplay_config's fallback, then push past anything
+        # already in use (endpoints can be removed and re-added, leaving gaps).
+        port = max(
+            airplay_config.port_for(instance_id),
+            max((e.get("port", 0) for e in endpoints), default=0) + 1,
+        )
+        udp_base = max(
+            airplay_config.udp_port_base_for(instance_id),
+            max((e.get("udpPortBase", 0) for e in endpoints), default=0) + airplay_config.UDP_PORT_STRIDE,
+        )
+        return {"port": port, "udpPortBase": udp_base}
+
+
+def _register_endpoint_routes(bp: Blueprint, source: str, manager: EndpointsManager) -> None:
+    """Wire the shared /<source>/{status,enable,disable,device-name,endpoints[/<id>]} routes."""
 
     def _status_code(result: dict) -> int:
         return 200 if result.get("success") else 400
 
-    @bp.get("/spotify/status")
-    def spotify_status():
-        return jsonify(spotify.status())
+    @bp.get(f"/{source}/status", endpoint=f"{source}_status")
+    def _status():
+        return jsonify(manager.status())
 
-    @bp.post("/spotify/enable")
-    def spotify_enable():
-        return jsonify(spotify.set_all_enabled(True))
+    @bp.post(f"/{source}/enable", endpoint=f"{source}_enable")
+    def _enable():
+        return jsonify(manager.set_all_enabled(True))
 
-    @bp.post("/spotify/disable")
-    def spotify_disable():
-        return jsonify(spotify.set_all_enabled(False))
+    @bp.post(f"/{source}/disable", endpoint=f"{source}_disable")
+    def _disable():
+        return jsonify(manager.set_all_enabled(False))
 
-    @bp.post("/spotify/device-name")
-    def spotify_device_name():
+    @bp.post(f"/{source}/device-name", endpoint=f"{source}_device_name")
+    def _device_name():
         data = request.get_json(silent=True) or {}
-        # Single-name shim: update the first endpoint (multi-instance uses per-endpoint PUT).
-        endpoints = spotify.list_endpoints()["endpoints"]
+        # Single-name shim: update the first endpoint (multi-instance uses the per-endpoint PUT).
+        endpoints = manager.list_endpoints()["endpoints"]
         if not endpoints:
-            return jsonify({"success": False, "message": "No Spotify endpoints configured"}), 400
-        result = spotify.update_endpoint(endpoints[0]["id"], device_name=data.get("deviceName"))
+            return jsonify({"success": False, "message": f"No {source} endpoints configured"}), 400
+        result = manager.update_endpoint(endpoints[0]["id"], device_name=data.get("deviceName"))
         return jsonify(result), _status_code(result)
 
-    @bp.get("/spotify/endpoints")
-    def spotify_list():
-        return jsonify(spotify.list_endpoints())
+    @bp.get(f"/{source}/endpoints", endpoint=f"{source}_list")
+    def _list():
+        return jsonify(manager.list_endpoints())
 
-    @bp.post("/spotify/endpoints")
-    def spotify_add():
+    @bp.post(f"/{source}/endpoints", endpoint=f"{source}_add")
+    def _add():
         data = request.get_json(silent=True) or {}
-        result = spotify.add_endpoint(data.get("deviceName", ""), data.get("enabled", True))
+        result = manager.add_endpoint(data.get("deviceName", ""), data.get("enabled", True))
         return jsonify(result), _status_code(result)
 
-    @bp.put("/spotify/endpoints/<endpoint_id>")
-    def spotify_update(endpoint_id: str):
+    @bp.put(f"/{source}/endpoints/<endpoint_id>", endpoint=f"{source}_update")
+    def _update(endpoint_id: str):
         data = request.get_json(silent=True) or {}
-        result = spotify.update_endpoint(endpoint_id, data.get("deviceName"), data.get("enabled"))
+        result = manager.update_endpoint(endpoint_id, data.get("deviceName"), data.get("enabled"))
         return jsonify(result), _status_code(result)
 
-    @bp.delete("/spotify/endpoints/<endpoint_id>")
-    def spotify_remove(endpoint_id: str):
-        result = spotify.remove_endpoint(endpoint_id)
+    @bp.delete(f"/{source}/endpoints/<endpoint_id>", endpoint=f"{source}_remove")
+    def _remove(endpoint_id: str):
+        result = manager.remove_endpoint(endpoint_id)
         return jsonify(result), _status_code(result)
+
+
+def create_integrations_blueprint(settings_manager: SettingsManager | None = None) -> Blueprint:
+    """Build the /api/integrations blueprint. AirPlay + Spotify today; more sources slot in here."""
+    bp = Blueprint("integrations", __name__, url_prefix="/api/integrations")
+    spotify = SpotifyEndpointsManager(settings_manager)
+    airplay = AirplayEndpointsManager(settings_manager)
+
+    _register_endpoint_routes(bp, "airplay", airplay)
+    _register_endpoint_routes(bp, "spotify", spotify)
 
     @bp.post("/spotify/bitrate")
     def spotify_bitrate():
@@ -195,6 +259,6 @@ def create_integrations_blueprint(settings_manager: SettingsManager | None = Non
         except (TypeError, ValueError):
             return jsonify({"success": False, "message": "bitrate must be an integer"}), 400
         result = spotify.update_bitrate(bitrate)
-        return jsonify(result), _status_code(result)
+        return jsonify(result), 200 if result.get("success") else 400
 
     return bp

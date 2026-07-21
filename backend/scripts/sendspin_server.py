@@ -63,8 +63,9 @@ from aiosendspin.server.roles.player import PlayerV1Role
 from aiosendspin.server.server import ClientAddedEvent, ClientUpdatedEvent, ConnectionReason, SendspinServer
 
 from mesh.model import PlayerState, SourceState, UnitSnapshot
-from sources import spotify_config
+from sources import airplay_config, spotify_config
 from sources.airplay_metadata import AirplayMetadataReader
+from sources.airplay_manager import AirplayManager
 from sources.airplay_remote import AirplayRemote
 from sources.spotify_golibrespot import SpotifyGoLibrespot
 from sources.spotify_manager import SpotifyManager
@@ -248,8 +249,8 @@ class PlumSendspinServer:
         self.sources: dict[str, SourceHandle] = {}
         self._primary_source: str | None = None  # source group that controller-only clients join
         self._local_player_tasks: list[asyncio.Task] = []
-        self._metadata_readers: list[AirplayMetadataReader] = []
-        self._airplay_remote: AirplayRemote | None = None  # MPRIS transport control for the AirPlay source
+        self._metadata_readers: dict[str, AirplayMetadataReader] = {}  # source_id -> shairport pipe reader
+        self._airplay_remotes: dict[str, AirplayRemote] = {}  # source_id -> per-instance MPRIS remote
         self._spotify_monitors: dict[str, SpotifyGoLibrespot] = {}  # source_id -> go-librespot event monitor
         # Per-source transport remote (has async play/pause/next_track/previous_track). AirPlay's
         # AirplayRemote and each SpotifyGoLibrespot both satisfy it, so controller events route by source.
@@ -270,14 +271,14 @@ class PlumSendspinServer:
 
     async def stop(self) -> None:
         self._stop_evt.set()
-        if self._airplay_remote is not None:
-            await self._airplay_remote.close()
-            self._airplay_remote = None
+        for remote in self._airplay_remotes.values():
+            await remote.close()
+        self._airplay_remotes.clear()
         for monitor in self._spotify_monitors.values():
             await monitor.stop()
         self._spotify_monitors.clear()
         self._source_remotes.clear()
-        for reader in self._metadata_readers:
+        for reader in self._metadata_readers.values():
             await reader.stop()
         self._metadata_readers.clear()
         for task in self._local_player_tasks:
@@ -524,22 +525,58 @@ class PlumSendspinServer:
         handle = self.sources.get(source_id)
         if handle is None:
             raise KeyError(f"unknown source {source_id!r}")
+        if source_id in self._metadata_readers:
+            return
         reader = AirplayMetadataReader(handle.group, metadata_fifo)
-        self._metadata_readers.append(reader)
+        self._metadata_readers[source_id] = reader
         reader.start()
         logger.info("[%s] airplay metadata reader started (%s)", source_id, metadata_fifo)
 
-    async def start_airplay_control(self, source_id: str) -> None:
+    async def start_airplay_control(self, source_id: str, *, bus_address: str | None = None) -> None:
         """Wire GUI transport commands for an AirPlay source to shairport-sync over MPRIS.
 
         Advertises play/pause/next/previous on the source group's controller role and forwards the
-        resulting controller events to the AirPlay sender (phone/Mac) via the MPRIS remote. Volume
-        stays the group/render volume for now; source-volume sync is a later step.
+        resulting controller events to the AirPlay sender (phone/Mac) via the MPRIS remote. Each
+        endpoint has its own remote bound to its own session bus (`bus_address`) — the MPRIS name is
+        fixed, so instances would otherwise fight over it on the system bus. Volume stays the
+        group/render volume for now; source-volume sync is a later step.
         """
-        self._airplay_remote = AirplayRemote()
-        await self._airplay_remote.connect()
-        self._wire_transport_control(source_id, self._airplay_remote)
-        logger.info("[%s] airplay MPRIS transport control wired", source_id)
+        remote = AirplayRemote(bus_address=bus_address)
+        # Do NOT connect eagerly: with a private per-endpoint bus, the source comes up BEFORE the
+        # bus daemon (the manager starts us first so the FIFO exists), so the socket may not exist
+        # yet. The remote connects lazily on the first command and re-resolves after a restart.
+        with contextlib.suppress(Exception):
+            await remote.connect()
+        self._airplay_remotes[source_id] = remote
+        self._wire_transport_control(source_id, remote)
+        logger.info("[%s] airplay MPRIS transport control wired (%s)", source_id, bus_address or "system bus")
+
+    async def start_airplay_source(self, instance: airplay_config.AirplayInstance) -> None:
+        """Bring up an AirPlay endpoint as a source: group + feeder + metadata reader + MPRIS control.
+
+        The feeder waits for shairport-sync to open the instance FIFO writer, so starting eagerly is
+        safe even before the daemon is running (the manager starts us first precisely so the FIFO
+        exists). Metadata/artwork ride the instance's own metadata pipe; transport rides its own
+        private D-Bus session.
+        """
+        self.start_source(instance.source_id, instance.fifo_path)
+        self.start_airplay_metadata(instance.source_id, instance.metadata_fifo)
+        await self.start_airplay_control(instance.source_id, bus_address=instance.bus_address)
+        logger.info(
+            "[%s] airplay source up (name=%r port=%d)", instance.source_id, instance.device_name, instance.port
+        )
+
+    async def stop_airplay_source(self, source_id: str) -> None:
+        """Tear down an AirPlay source: metadata reader, MPRIS remote, then the source itself."""
+        reader = self._metadata_readers.pop(source_id, None)
+        if reader is not None:
+            await reader.stop()
+        remote = self._airplay_remotes.pop(source_id, None)
+        if remote is not None:
+            await remote.close()
+        self._source_remotes.pop(source_id, None)
+        await self.stop_source(source_id)
+        logger.info("[%s] airplay source stopped", source_id)
 
     async def start_spotify_source(self, instance: spotify_config.SpotifyInstance) -> None:
         """Bring up a Spotify Connect endpoint as a source: group + feeder + go-librespot events/control.
@@ -633,10 +670,25 @@ class PlumSendspinServer:
         self.server.connect_to_client(
             player_url, connection_reason=ConnectionReason.PLAYBACK, retry_initial_connection=True
         )
-        if await self._await_client_connected(player_id, timeout_s=30.0):
-            with contextlib.suppress(Exception):
-                await self.attach_player(source_id, player_id)
-                logger.info("[%s] local player %s attached (mesh-owned)", source_id, player_id)
+        if not await self._await_client_connected(player_id, timeout_s=30.0):
+            return
+        if not await self._await_source(source_id, timeout_s=30.0):
+            logger.warning("[%s] source never appeared; local player left unattached", source_id)
+            return
+        with contextlib.suppress(Exception):
+            await self.attach_player(source_id, player_id)
+            logger.info("[%s] local player %s attached (mesh-owned)", source_id, player_id)
+
+    async def _await_source(self, source_id: str, timeout_s: float) -> bool:
+        """Poll until a source exists. Sources are brought up asynchronously by their manager, so
+        the home source usually lands a beat after the player connects."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while loop.time() < deadline:
+            if source_id in self.sources:
+                return True
+            await asyncio.sleep(0.2)
+        return False
 
     def _dial_local_player(self, player_url: str) -> None:
         assert self.server is not None
@@ -687,10 +739,9 @@ async def main() -> None:
     )
     unit_id = os.environ.get("PLUM_UNIT_ID", "unit-local")
     unit_name = os.environ.get("PLUM_UNIT_NAME", "Plum Audio")
-    airplay_fifo = os.environ.get("PLUM_AIRPLAY_FIFO", "/tmp/airplay-fifo")
-    airplay_meta_fifo = os.environ.get("PLUM_AIRPLAY_METADATA_FIFO", "/tmp/airplay-metadata-fifo")
-    # Single-unit glue: auto-attach our own player to the AirPlay source. Empty URL disables it
-    # (Phase 2: the mesh orchestrator drives routing instead).
+    # Single-unit glue: auto-attach our own player to this source once it comes up. Empty URL
+    # disables it (Phase 2: the mesh orchestrator drives routing instead).
+    home_source = os.environ.get("PLUM_LOCAL_PLAYER_SOURCE", "airplay-1")
     local_player_id = os.environ.get("PLUM_LOCAL_PLAYER_ID", f"{unit_id}-player")
     local_player_url = os.environ.get("PLUM_LOCAL_PLAYER_URL", "ws://127.0.0.1:8928/sendspin")
 
@@ -698,20 +749,20 @@ async def main() -> None:
 
     srv = PlumSendspinServer(unit_id, unit_name)
     await srv.start()
-    # Phase 1: bring up the AirPlay source immediately. The feeder waits for shairport-sync to
-    # open the FIFO writer, so starting it eagerly is safe.
-    srv.start_source("airplay", airplay_fifo)
-    srv.start_airplay_metadata("airplay", airplay_meta_fifo)  # metadata/artwork → roles (item 3)
-    await srv.start_airplay_control("airplay")  # play/pause/next/previous → shairport MPRIS → sender
+
+    # Sources are config-driven: each manager owns a Sendspin source + the daemon process(es) per
+    # enabled endpoint, reconciled from settings.json every few seconds, so GUI endpoint edits
+    # (add/rename/enable/disable/remove) apply live. Nothing here is started from env any more.
+    managers = [AirplayManager(srv), SpotifyManager(srv)]
+    for manager in managers:
+        manager.start()
+
     if local_player_url:
         # With the mesh on, register + attach the local player once and let routing roam it;
         # the perpetual re-attach supervisor (Phase-1 glue) would fight cross-server reclaims.
-        srv.attach_local_player("airplay", local_player_id, local_player_url, supervise=not mesh_enabled)
-
-    # Spotify: the manager owns a source + a go-librespot process per enabled Connect endpoint and
-    # reconciles them from settings.json every few seconds, so GUI endpoint edits apply live.
-    spotify = SpotifyManager(srv)
-    spotify.start()
+        # The source may not exist yet (its manager is still spinning it up) — attach_local_player
+        # waits for it.
+        srv.attach_local_player(home_source, local_player_id, local_player_url, supervise=not mesh_enabled)
 
     # Phase 2: the mesh (discovery + aggregation + routing + REST). Local playback above stands
     # on its own; the mesh layers cross-unit roaming on top. Disable with PLUM_MESH_ENABLED=0.
@@ -734,7 +785,8 @@ async def main() -> None:
     finally:
         if mesh is not None:
             await mesh.stop()
-        await spotify.stop()  # kills the go-librespot children before the sources go away
+        for manager in managers:
+            await manager.stop()  # kills the source daemons before their sources go away
         await srv.stop()
 
 
