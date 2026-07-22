@@ -190,6 +190,25 @@ export default function MeshApp(): React.ReactElement {
   }, []);
   const onClientVolume = useCallback((clientId: string, v: number) => service.setVolume(clientId, v), []);
 
+  /** Put one speaker on a stream, whichever kind of speaker it is.
+   *  - ours, in the mesh          -> the router (intra-server re-group or cross-server reclaim)
+   *  - ours, held by a foreign server -> dial its own URL back; the router can't see it to reclaim
+   *  - not ours at all            -> adopt (dial) / release (hang up)
+   */
+  const moveClient = useCallback((client: Client, streamId: string | null) => {
+    const url = client.url;
+    if (streamId && url && (client.isForeign || client.foreignServer)) {
+      void service.adoptSpeaker(url, streamId);
+      return;
+    }
+    if (!streamId && client.isForeign && client.currentStreamId) {
+      void service.releaseSpeaker(client.id, client.currentStreamId, url);
+      return;
+    }
+    if (streamId) void service.routeClient(client.id, streamId);
+    else void service.unrouteClient(client.id);
+  }, []);
+
   /** Route this unit — and everyone currently grouped with it — onto the chosen source. */
   const onSelectStream = useCallback((streamId: string | null) => {
     setSelectedStreamId(streamId);
@@ -199,15 +218,12 @@ export default function MeshApp(): React.ReactElement {
     // Whoever shares our group moves with us; a solo unit just moves itself.
     const group = current ? m.clients.filter((c) => c.currentStreamId === current) : mine;
     const targets = group.length ? group : mine;
-    for (const c of targets) {
-      if (streamId) void service.routeClient(c.id, streamId);
-      else void service.unrouteClient(c.id);
-    }
-  }, []);
+    for (const c of targets) moveClient(c, streamId);
+  }, [moveClient]);
   const onClientStreamChange = useCallback((clientId: string, streamId: string | null) => {
-    if (streamId) void service.routeClient(clientId, streamId);
-    else void service.unrouteClient(clientId);
-  }, []);
+    const client = modelRef.current.clients.find((c) => c.id === clientId);
+    if (client) moveClient(client, streamId);
+  }, [moveClient]);
   const adjustStreamVolume = useCallback((streamId: string, dir: 'up' | 'down') => {
     const s = modelRef.current.streams.find((x) => x.id === streamId);
     service.setStreamVolume(streamId, clampVol((s?.volume ?? 100) + (dir === 'up' ? 5 : -5)));

@@ -80,6 +80,10 @@ export interface Client {
     // Assistant, a third-party server, anything. It is still ours physically, it is simply
     // rendering someone else's audio, and the GUI must say so rather than lose the device.
     foreignServer?: { name: string; title?: string; artist?: string };
+    // A Sendspin speaker on the network that is not one of ours — found by mDNS, not by a unit
+    // snapshot. Routing it uses adopt/release (dial its URL) rather than the mesh router.
+    isForeign?: boolean;
+    url?: string;
 }
 
 export type AccentColor = 'purple' | 'blue' | 'green' | 'orange' | 'red' | 'yellow' | 'custom';

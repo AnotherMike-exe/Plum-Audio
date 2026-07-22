@@ -56,6 +56,12 @@ interface WireUnit {
     artist?: string;
   } | null;
 }
+/** GET /api/mesh/neighbourhood — every Sendspin service mDNS can see on this segment. */
+export interface Neighbourhood {
+  players: Array<{ name: string; friendly_name: string; url: string; host: string; port: number; is_own: boolean }>;
+  servers: Array<{ name: string; friendly_name: string; url: string; host: string; port: number; is_own: boolean }>;
+}
+
 export interface MeshView {
   units: WireUnit[];
   // Which unit answered. A unit serves its own GUI and that page must feature ITSELF, but the
@@ -97,6 +103,7 @@ export function mapViewToModel(
   npByGroup: Map<string, NowPlaying>,
   offsetByGroup: Map<string, number>,
   nowMs = Date.now(),
+  neighbourhood?: Neighbourhood | null,
 ): Model {
   const servers: Server[] = [];
   const streams: Stream[] = [];
@@ -173,6 +180,7 @@ export function mapViewToModel(
         volume: 100, // TODO(backend): per-player volume isn't in the snapshot yet
         connected: p.connected,
         isLocal,
+        url: p.url ?? undefined,
       });
     }
   }
@@ -205,6 +213,35 @@ export function mapViewToModel(
       connected: !!lp.attached,
       isLocal,
       foreignServer,
+      url: lp.url,  // how we dial it back: the router can't reclaim what it cannot see
+    });
+  }
+
+  // Speakers the PROTOCOL can see but the mesh cannot: a third-party Sendspin player (a Home
+  // Assistant Voice PE, an ESP32 speaker) advertises itself over mDNS and belongs to no unit's
+  // snapshot, so without this it never appears as somewhere you could send audio. Matched by URL,
+  // because a foreign speaker's mDNS instance name and its Sendspin client_id are different
+  // strings (the Voice PE advertises "home-assistant-voice-…" and connects as its MAC).
+  const knownUrls = new Set(
+    view.units.flatMap((u) => [...u.players.map((p) => p.url), u.local_player?.url]).filter(Boolean) as string[],
+  );
+  // An ADOPTED foreign speaker is in a unit's group like any other player, so flag it by URL —
+  // release needs to know to hang up rather than just re-group it.
+  const foreignUrls = new Set((neighbourhood?.players ?? []).filter((p) => !p.is_own).map((p) => p.url));
+  for (const c of clients) {
+    if (c.url && foreignUrls.has(c.url)) c.isForeign = true;
+  }
+
+  for (const entry of neighbourhood?.players ?? []) {
+    if (entry.is_own || knownUrls.has(entry.url)) continue;
+    clients.push({
+      id: entry.url, // stable, and the thing adopt/release actually needs
+      name: entry.friendly_name || entry.name,
+      currentStreamId: null,
+      volume: 100,
+      connected: true,
+      isForeign: true,
+      url: entry.url,
     });
   }
 
@@ -223,6 +260,7 @@ export class SendspinDataService {
   private offsetByGroup = new Map<string, number>();
   private unitHosts = new Map<string, string>(); // unitId -> host (for per-unit REST)
   private lastView: MeshView = { units: [] };
+  private neighbourhood: Neighbourhood | null = null;
   private listeners = new Set<Listener>();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
@@ -249,7 +287,7 @@ export class SendspinDataService {
   }
 
   snapshot(): Model {
-    return mapViewToModel(this.lastView, this.npByGroup, this.offsetByGroup);
+    return mapViewToModel(this.lastView, this.npByGroup, this.offsetByGroup, Date.now(), this.neighbourhood);
   }
 
   // -- commands -----------------------------------------------------------
@@ -318,6 +356,24 @@ export class SendspinDataService {
     } catch {
       // transient — keep last view; the tick timer still re-emits.
     }
+    try {
+      const res = await fetch(`${MESH_API_BASE}/neighbourhood`);
+      if (res.ok) this.neighbourhood = await res.json();
+    } catch {
+      // discovery is optional; the mesh still renders without it.
+    }
+  }
+
+  /** Pull a foreign Sendspin speaker onto one of our sources (it leaves its own server). */
+  async adoptSpeaker(url: string, federatedStreamId: string): Promise<void> {
+    const { unitId, sourceId } = parseStreamId(federatedStreamId);
+    await this.post(unitId, "/adopt", { url, source_id: sourceId });
+  }
+
+  /** Hand a foreign speaker back to whatever server it came from. */
+  async releaseSpeaker(playerId: string, federatedStreamId: string, url?: string): Promise<void> {
+    const { unitId, sourceId } = parseStreamId(federatedStreamId);
+    await this.post(unitId, "/release", { player_id: playerId, source_id: sourceId, url });
   }
 
   private applyView(view: MeshView): void {
