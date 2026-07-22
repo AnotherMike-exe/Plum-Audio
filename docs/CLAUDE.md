@@ -6,8 +6,11 @@
 > two Pis, incl. live AirPlay + metadata/artwork + multi-room. **Phase 3 in progress**
 > (`feature/phase3-sources-gui`): settings core + the **Spotify slice are DONE and fully
 > hardware-validated** (audio, metadata/artwork, transport, timeline, live endpoint CRUD, roam).
-> **Multi-endpoint AirPlay** (private D-Bus session per endpoint for MPRIS) and the **per-unit
-> nginx GUI** are in and hardware-verified. Remaining: DLNA/Bluetooth/Plexamp, container build.
+> **Multi-endpoint AirPlay** (private D-Bus session per endpoint for MPRIS), the **per-unit nginx
+> GUI**, and **third-party interop** (Sendspin mDNS via Avahi; adopt/release of foreign speakers —
+> proven against Music Assistant + a Home Assistant Voice PE) are in and hardware-verified.
+> Remaining: DLNA/Bluetooth/Plexamp, the container build, and the conformance gaps in
+> docs/SPEC-CONFORMANCE.md.
 
 ## Project Overview
 
@@ -68,6 +71,8 @@ React/TS GUI are **ported** from Plum-Snapcast, not rewritten.
 ├── _resources/           # Dev references (NOT in git); spike/ holds mesh probes
 ├── docs/
 │   ├── ARCHITECTURE.md    # Canonical design + phased plan (READ FIRST)
+│   ├── SPEC-CONFORMANCE.md # Where we stand against the Sendspin spec (interop is the point)
+│   ├── TESTING.md         # Test tiers 1-6 + what is not yet reproducible
 │   ├── CLAUDE.md          # This file (symlinked to root)
 │   ├── DEV-SETUP.md
 │   └── QUICK-REFERENCE.md

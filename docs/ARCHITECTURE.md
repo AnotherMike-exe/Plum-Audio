@@ -366,6 +366,31 @@ until we moved to Server2's `ServiceBrowserPrepare`/`Start` pair.
 `_sendspin._tcp`." Ours is the **server-dialed** direction (reclaim-by-URL requires it), so the
 player refuses an explicit home-server dial while advertising.
 
+**INTEROP PROVEN ON A THIRD PARTY (2026-07-21, VLAN-7 rig: Music Assistant 2.9.9 + a Home Assistant
+Voice PE).** Not a stand-in — real foreign implementations on their own segment:
+- MA discovered our player over mDNS and dialed it **1.0 s** after it began advertising.
+- A speaker claimed by another server stays visible: the player process self-reports
+  `{attached, server_id/name, group, playback_state, title/artist}` to its unit's mesh API
+  (`local_player` in the snapshot), because a unit's server can only see clients attached to
+  *itself*. The GUI renders "→ Music Assistant · <track>" rather than losing the device.
+- `POST /api/mesh/adopt` pulls a FOREIGN speaker onto one of our sources — same primitives as a peer
+  player (dial for PLAYBACK + `group.add_client`), since a foreign speaker is just a player whose URL
+  came from mDNS. `POST /api/mesh/release` hands it back. Release needs FOUR steps and hardware
+  settled it: detach from the group, cancel our dial, **close the live websocket**, forget the
+  registry entry — the first three each looked sufficient and left the speaker ESTABLISHed to us,
+  out of reach of its own server. Only `SendspinConnection.disconnect()` hangs up, and 6.0.5 exposes
+  it solely via a private attribute (upstream ask).
+- The GUI folds `/api/mesh/neighbourhood` into its device list, matching foreign speakers **by URL**:
+  their mDNS instance name and Sendspin client_id differ (the Voice PE advertises
+  `home-assistant-voice-a1b2c3`, connects as its MAC). One mover handles all three cases — ours in
+  the mesh (router), ours held by a foreign server (adopt by URL; the router cannot reclaim what is
+  in no unit's view), and not ours at all (adopt/release).
+- MA as a controller target: accepts controller-role clients, but advertises
+  `supported_commands = [volume, mute, switch]` — **no transport**. Unresolved whether that is
+  state-dependent; re-probe during playback.
+
+Full conformance status: **docs/SPEC-CONFORMANCE.md**. Test strategy: **docs/TESTING.md**.
+
 **KNOWN INTEROP GAP — client-side arbitration.** The spec's multi-server rules are client-side: on a
 second server connecting, a client accepts the handshake, compares `connection_reason`
 (`playback` beats `discovery`), breaks ties with the persistently stored `server_id` of the last

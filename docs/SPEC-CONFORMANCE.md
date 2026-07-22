@@ -1,0 +1,110 @@
+# Sendspin spec conformance — where Plum-Audio stands
+
+> Audited 2026-07-21 against <https://www.sendspin-audio.com/spec/> and `aiosendspin` 6.0.5, with
+> live evidence from the VLAN-7 rig (Music Assistant 2.9.9 + a Home Assistant Voice PE).
+> Interop is the reason we build on this protocol, so this file tracks conformance as a first-class
+> property, not a footnote. See ARCHITECTURE §8 for the design behind each item.
+
+We speak the protocol from **three** places, and they are not equally mature:
+
+| Speaker | Implementation | Conformance |
+|---|---|---|
+| Unit **server** | `aiosendspin` server + `sendspin_server.py` | good — library owns the wire format |
+| Unit **player** | `aiosendspin` client + `sendspin_player.py` | good — library owns hello/time/state |
+| **GUI controller** | hand-written TS (`services/sendspinControllerClient.ts`) | **partial — see gaps** |
+
+The GUI client is hand-written because the browser has no `aiosendspin`. That is where our
+conformance risk lives, and it matters more now: the same client will eventually point at a
+third-party server, which will not be as forgiving as our own.
+
+---
+
+## Discovery — conformant
+
+| Requirement | Status |
+|---|---|
+| Players advertise `_sendspin._tcp` (8928), TXT `path` + optional `name` | ✅ `mesh/avahi.py` via the system Avahi |
+| Servers advertise `_sendspin-server._tcp` (8927), TXT `path` + `name` | ✅ same |
+| Browse both types to find clients/servers | ✅ `mesh/neighbourhood.py` |
+| "Do not manually connect to servers if you are advertising `_sendspin._tcp`" | ✅ the player refuses a home-server dial while advertising |
+
+Evidence: Music Assistant discovered our player and dialed it **1.0 s** after it began advertising.
+
+**Deliberate deviation:** the library's own zeroconf stays off (`advertise_addresses=[],
+discover_clients=False`, `advertise_mdns=False`) because python-zeroconf binds UDP 5353 against the
+host Avahi that AirPlay and Spotify Connect need. We publish the identical records through Avahi
+instead — same wire result, one responder per host.
+
+## Connection lifecycle — conformant, with one known gap
+
+| Requirement | Status |
+|---|---|
+| `client/hello` → `server/hello` handshake | ✅ all three speakers |
+| `client/goodbye` reason `another_server` when switching servers | ✅ `sendspin_player.py` |
+| Server dials clients with `connection_reason` | ✅ always `playback` (we removed the DISCOVERY tier — ARCHITECTURE §2) |
+| **Multi-server arbitration on the client** | ❌ **GAP** |
+
+**The gap:** the spec has the client accept the new handshake, then choose by `connection_reason`
+(`playback` beats `discovery`), tie-breaking on the persisted `server_id` of the last server with
+`playback_state: playing`. Our player implements only the first branch — it always yields to the
+newest dialer — and persists nothing. Plum-to-Plum this is indistinguishable from conformant, since
+we only ever dial `playback`. Against a foreign server running a discovery sweep it is wrong: we
+would hand over a playing speaker.
+
+Not locally fixable. `SendspinClient.server_info` exposes `connection_reason` only *after*
+`attach_websocket`, which refuses a second socket — so "accept both, then decide" cannot be
+expressed. **Upstream item for `aiosendspin`.**
+
+Observed live: our unit's boot-time dial took a speaker back off Music Assistant about a minute
+after MA claimed it. This is the gap, not a theory.
+
+## Playback state — conformant (fixed 2026-07-21)
+
+`group/update.playback_state` is the only way the protocol says "nothing is playing"; there is no
+distinct idle/unrouted state. A stream now exists only while a sender feeds the source: first audio
+→ `start_stream()` (`playing`), EOF or `PLUM_SOURCE_IDLE_TIMEOUT` silence → `group.stop()`
+(`stopped`, pushed to every client, metadata progress frozen). Note `stop_stream()` deliberately
+does NOT announce — it keeps clients logically PLAYING across a handover.
+
+Before this we held a stream from boot and announced `playing` forever, on every source.
+
+## Roles
+
+| Role | Server side | Player | GUI controller |
+|---|---|---|---|
+| player@v1 | ✅ | ✅ PCM, static delay, volume/mute | n/a |
+| metadata@v1 | ✅ emits title/artist/album + progress trio | ✅ consumes (for the self-report) | ⚠️ consumes; see client/time |
+| artwork@v1 | ✅ 512×512 JPEG, channel 0 | n/a | ✅ declares 1 channel, decodes types 8–11 |
+| controller@v1 | ✅ advertises play/pause/next/previous per source | n/a | ⚠️ sends commands; `switch` unimplemented |
+| visualizer@v1 | ❌ not implemented (planned) | ❌ | ❌ |
+| color@v1 | ❌ not implemented | ❌ | ❌ |
+
+## GUI controller client — the open gaps
+
+| Requirement | Status | Consequence |
+|---|---|---|
+| `client/time` sent continuously; clock via the time filter | ❌ we derive an offset from message timestamps | works for progress display today; drifts, and a strict server may treat us as unsynchronized |
+| `client/state` with `state` (REQUIRED) | ❌ never sent | servers cannot know we are synchronized; unknown how third-party servers react |
+| Controller `switch` command | ❌ | cannot cycle a client between group and solo — MA advertises this command |
+| Group volume "preserving relative levels" | ⚠️ naive per-stream volume | group volume changes flatten relative levels |
+| `stream/request-format` | ❌ | cannot renegotiate artwork size at runtime |
+
+None of these break our own stack — our server is lenient with its own GUI. All of them are
+reasons the GUI is not yet safe to point at a foreign server for anything beyond reading state.
+
+## What we learned about Music Assistant (2.9.9)
+
+- Accepts a controller-role client, places it in a real group, pushes group + metadata + controller
+  state. Reports its own session as `connection_reason=discovery`.
+- Advertises `supported_commands = [volume, mute, switch]` — **no transport**. Either MA does not
+  expose transport over the controller role, or `supported_commands` is state-dependent and would
+  include it during playback. **Unresolved — re-probe while MA is playing.**
+- Discovers players by mDNS `_sendspin._tcp`, with manual IP entry as a fallback.
+
+## Deliberate deviations (not gaps)
+
+1. **No DISCOVERY-tier dialing.** A client holds one websocket, so a discovery dial cannot warm a
+   player — it steals it. Removed; the roam is inaudible without it (ARCHITECTURE §2).
+2. **Library mDNS off, Avahi on.** Above.
+3. **The mesh API and discovery beacon are ours, not the protocol's.** Sendspin has no
+   server-to-server anything; cross-unit topology and routing are outside its scope.
