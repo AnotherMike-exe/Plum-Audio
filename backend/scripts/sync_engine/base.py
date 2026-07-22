@@ -47,5 +47,13 @@ class SyncEngine(ABC):
         """Set a player's volume/mute (per-client)."""
 
     @abstractmethod
+    async def adopt_client(self, source_id: str, url: str, player_id: str | None = None) -> bool:
+        """Dial a foreign Sendspin speaker (discovered by mDNS) onto a source. Optional."""
+        raise NotImplementedError
+
+    async def release_client(self, source_id: str, player_id: str, url: str | None = None) -> None:
+        """Hand a foreign speaker back to whatever server had it. Optional."""
+        raise NotImplementedError
+
     def snapshot(self) -> UnitSnapshot:
         """This unit's local structural state for the aggregator / REST snapshot."""

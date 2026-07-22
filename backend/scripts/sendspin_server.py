@@ -52,7 +52,7 @@ import logging
 import os
 import time
 
-from aiosendspin.models.types import MediaCommand, has_role_family
+from aiosendspin.models.types import GoodbyeReason, MediaCommand, has_role_family
 from aiosendspin.server.audio import AudioFormat
 from aiosendspin.server.group import SendspinGroup
 from aiosendspin.server.push_stream import PushStream, StreamStoppedError
@@ -512,6 +512,73 @@ class PlumSendspinServer:
         await self.attach_player(source_id, player_id)
         logger.info("[%s] reclaimed remote player %s from %s", source_id, player_id, player_url)
         return True
+
+    async def adopt_foreign_client(self, source_id: str, url: str, player_id: str | None = None,
+                                   timeout_s: float = 15.0) -> bool:
+        """Dial a Sendspin speaker we did not create and put it on one of our sources.
+
+        A speaker found by mDNS is just a player whose URL came from the neighbourhood instead of a
+        peer snapshot, so this is the same pair of primitives the mesh uses for a peer's player:
+        connect_to_client(PLAYBACK) then group.add_client. Its previous server loses it the spec's
+        way — the client sends goodbye `another_server`. We learn its real client_id from the
+        handshake, so `player_id` is only a hint for URL registration.
+        """
+        assert self.server is not None
+        if source_id not in self.sources:
+            raise KeyError(f"unknown source {source_id!r}")
+        before = {c.client_id for c in self.server.clients}
+        if player_id:
+            self.server.register_client_url(player_id, url)
+        self.server.connect_to_client(url, connection_reason=ConnectionReason.PLAYBACK,
+                                      retry_initial_connection=True)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while loop.time() < deadline:
+            for client in self.server.clients:
+                known = player_id and client.client_id == player_id
+                if (known or client.client_id not in before) and client.is_connected:
+                    if not has_role_family("player", client.negotiated_roles):
+                        continue  # not a render endpoint (a controller connecting for its own reasons)
+                    self.server.register_client_url(client.client_id, url)
+                    await self.attach_player(source_id, client.client_id)
+                    logger.info("[%s] adopted foreign speaker %s (%s)", source_id, client.client_id, url)
+                    return True
+            await asyncio.sleep(0.1)
+        logger.warning("[%s] foreign speaker at %s never connected", source_id, url)
+        return False
+
+    async def release_foreign_client(self, source_id: str, player_id: str, url: str | None = None) -> None:
+        """Hand a foreign speaker back: leave the group, cancel our dial, and drop the connection.
+
+        Three steps, all needed. detach leaves our group; disconnect_from_client only cancels the
+        server-initiated connection task for that URL, which by itself leaves the speaker sitting
+        connected to us and unavailable to its own server; remove_client is what actually closes it
+        out and forgets it. Verified on a real third-party speaker — without the last step it stayed
+        connected and Music Assistant could not take it back.
+        """
+        await self.detach_player(source_id, player_id)
+        if self.server is not None:
+            target = url or self.server.get_client_url(player_id)
+            if target:
+                with contextlib.suppress(Exception):
+                    self.server.disconnect_from_client(target)  # cancel OUR dial, so we don't re-take it
+            client = self.server.get_client(player_id)
+            if client is not None:
+                # Actually hang up. Neither disconnect_from_client (which only cancels our dial's
+                # bookkeeping) nor remove_client (registry only) nor detach_connection (internal
+                # state) closes the live websocket — verified on hardware: the speaker stayed
+                # ESTABLISHed to us and out of reach of its own server. SendspinConnection.disconnect
+                # is the only thing that does, and 6.0.5 exposes it only via a private attribute.
+                # TODO(upstream): ask aiosendspin for a public "hang up on this client".
+                conn = getattr(client, "_connection", None)
+                if conn is not None:
+                    with contextlib.suppress(Exception):
+                        await conn.disconnect(retry_connection=False)
+                with contextlib.suppress(Exception):
+                    client.detach_connection(GoodbyeReason.USER_REQUEST)
+            with contextlib.suppress(Exception):
+                await self.server.remove_client(player_id)
+        logger.info("[%s] released foreign speaker %s", source_id, player_id)
 
     async def _await_client_connected(self, player_id: str, timeout_s: float) -> bool:
         """Poll until a (reclaimed) player has reconnected to this server, or timeout."""

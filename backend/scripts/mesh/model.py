@@ -71,7 +71,9 @@ class SourceState:
             "group_name": self.group_name,
             "streaming": self.streaming,
             "player_ids": list(self.player_ids),
-            "name": self.name,
+            # Never emit an empty label: a source with no endpoint name falls back to its id, which
+            # also keeps to_dict/from_dict a stable round trip.
+            "name": self.name or self.source_id,
             "active": self.active,
         }
 

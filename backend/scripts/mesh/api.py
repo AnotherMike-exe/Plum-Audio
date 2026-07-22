@@ -12,6 +12,8 @@ Endpoints (parity with the old /api/federation/* surface, so the GUI ports with 
   GET  /api/mesh/view              the aggregated mesh (what the GUI renders)
   GET  /api/mesh/neighbourhood     Sendspin servers/players on this segment, via mDNS (interop)
   POST /api/mesh/player-state      our own speaker's self-report (where it is attached, what plays)
+  POST /api/mesh/adopt             dial a FOREIGN Sendspin speaker (mDNS URL) onto one of our sources
+  POST /api/mesh/release           hand it back to whatever server it came from
   POST /api/mesh/route             {player_id, source_id}          route a player onto a source
   POST /api/mesh/unroute           {player_id, source_id}          remove a player from a source
   POST /api/mesh/volume            {player_id, volume, muted}      per-player volume
@@ -71,6 +73,8 @@ class MeshApi:
                 web.get("/api/mesh/view", self._view),
                 web.get("/api/mesh/neighbourhood", self._neighbours),
                 web.post("/api/mesh/player-state", self._player_state),
+                web.post("/api/mesh/adopt", self._adopt),
+                web.post("/api/mesh/release", self._release),
                 web.post("/api/mesh/route", self._route),
                 web.post("/api/mesh/unroute", self._unroute),
                 web.post("/api/mesh/volume", self._volume),
@@ -117,6 +121,38 @@ class MeshApi:
         """
         body = await self._json(request)
         self._agg.set_local_player_state(body)
+        return web.json_response({"ok": True})
+
+    async def _adopt(self, request: web.Request) -> web.Response:
+        """Pull a FOREIGN Sendspin speaker onto one of our sources.
+
+        A speaker discovered by mDNS is just a player whose URL came from the neighbourhood rather
+        than from a peer's snapshot, so this is the same primitive pair the mesh already uses for a
+        peer's player: dial it for PLAYBACK, then add it to the source's group. The speaker leaves
+        whatever server had it the spec's way (client/goodbye another_server) — that is how the
+        protocol is meant to work, and it is what makes a third-party speaker usable as one of ours.
+        """
+        body = await self._json(request)
+        url, source_id = body.get("url"), body.get("source_id")
+        player_id = body.get("player_id")
+        if not url or not source_id:
+            return web.json_response({"error": "url and source_id required"}, status=400)
+        try:
+            ok = await self._engine.adopt_client(source_id, url, player_id=player_id)
+        except Exception as e:  # noqa: BLE001 - report the failure rather than 500-ing
+            logger.exception("adopt failed")
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response({"ok": bool(ok)})
+
+    async def _release(self, request: web.Request) -> web.Response:
+        """Let a foreign speaker go: drop it from the group and hang up, so its own server can
+        take it back (Music Assistant re-dials on its next discovery/playback)."""
+        body = await self._json(request)
+        url, source_id = body.get("url"), body.get("source_id")
+        player_id = body.get("player_id")
+        if not player_id or not source_id:
+            return web.json_response({"error": "player_id and source_id required"}, status=400)
+        await self._engine.release_client(source_id, player_id, url=url)
         return web.json_response({"ok": True})
 
     async def _neighbours(self, _request: web.Request) -> web.Response:
