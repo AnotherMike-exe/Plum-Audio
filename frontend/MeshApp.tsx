@@ -287,6 +287,29 @@ export default function MeshApp(): React.ReactElement {
               <p className="text-[var(--text-secondary)] mt-2">
                 Start playing to an endpoint, or choose an active source above.
               </p>
+              {/* Our own speaker still has a story to tell while we're idle — above all when some
+                  other Sendspin server has claimed it. Without this the holding state renders no
+                  device list at all and the speaker silently disappears from its own unit's page. */}
+              {myPlayers.length > 0 && (
+                <div className="mt-8 w-full max-w-md space-y-2">
+                  {myPlayers.map((p) => (
+                    <div key={p.id} className="flex items-center justify-between gap-3 p-3 rounded-lg bg-[var(--bg-tertiary)]">
+                      <span className="font-semibold truncate">{p.name}</span>
+                      <span className="text-sm text-[var(--text-secondary)] truncate text-right">
+                        {p.foreignServer ? (
+                          <>
+                            <Icon name="tower-broadcast" className="mr-2 text-[var(--text-muted)]" />
+                            {p.foreignServer.name}
+                            {p.foreignServer.title ? ` · ${p.foreignServer.title}` : ''}
+                          </>
+                        ) : (
+                          'Idle'
+                        )}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </div>
