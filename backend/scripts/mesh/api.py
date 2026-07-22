@@ -11,6 +11,7 @@ Endpoints (parity with the old /api/federation/* surface, so the GUI ports with 
   GET  /api/mesh/snapshot          this unit's local state (peers poll this to aggregate)
   GET  /api/mesh/view              the aggregated mesh (what the GUI renders)
   GET  /api/mesh/neighbourhood     Sendspin servers/players on this segment, via mDNS (interop)
+  POST /api/mesh/player-state      our own speaker's self-report (where it is attached, what plays)
   POST /api/mesh/route             {player_id, source_id}          route a player onto a source
   POST /api/mesh/unroute           {player_id, source_id}          remove a player from a source
   POST /api/mesh/volume            {player_id, volume, muted}      per-player volume
@@ -69,6 +70,7 @@ class MeshApi:
                 web.get("/api/mesh/snapshot", self._snapshot),
                 web.get("/api/mesh/view", self._view),
                 web.get("/api/mesh/neighbourhood", self._neighbours),
+                web.post("/api/mesh/player-state", self._player_state),
                 web.post("/api/mesh/route", self._route),
                 web.post("/api/mesh/unroute", self._unroute),
                 web.post("/api/mesh/volume", self._volume),
@@ -91,7 +93,10 @@ class MeshApi:
     # -- handlers ------------------------------------------------------------
 
     async def _snapshot(self, _request: web.Request) -> web.Response:
-        return web.json_response(self._engine.snapshot().to_dict())
+        # The aggregator's local snapshot, not the raw engine one: it stamps our host and carries
+        # our speaker's self-report, both of which peers need (a claimed speaker is invisible to
+        # the server it left, so its own report is the only way its unit can still describe it).
+        return web.json_response(self._agg.local_snapshot().to_dict())
 
     async def _view(self, _request: web.Request) -> web.Response:
         """The aggregated mesh, plus WHICH unit answered.
@@ -103,6 +108,16 @@ class MeshApi:
         payload = self._agg.view().to_dict()
         payload["local_unit_id"] = self._agg.local_unit_id
         return web.json_response(payload)
+
+    async def _player_state(self, request: web.Request) -> web.Response:
+        """Our own player process reporting where it is attached and what it is playing.
+
+        A speaker claimed by another server is, by definition, not attached to us — so the local
+        server can no longer see it and the GUI would just lose it. The speaker tells us instead.
+        """
+        body = await self._json(request)
+        self._agg.set_local_player_state(body)
+        return web.json_response({"ok": True})
 
     async def _neighbours(self, _request: web.Request) -> web.Response:
         """Every Sendspin server and player mDNS can see on this segment, ours flagged.

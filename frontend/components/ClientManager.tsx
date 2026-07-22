@@ -246,7 +246,20 @@ export const ClientManager: React.FC<ClientManagerProps> = ({
                         {idleClients.map(client => (
                             <div key={client.id}
                                  className="flex items-center justify-between gap-3 p-2 rounded-lg hover:bg-[var(--bg-tertiary-hover)]">
-                                <span className="font-semibold truncate flex-1">{client.name}</span>
+                                {/* A speaker claimed by a server outside our mesh (Music Assistant,
+                                    any third-party Sendspin server) is not idle — say where it went
+                                    and what it is playing. Join Stream still pulls it back. */}
+                                <span className="truncate flex-1">
+                                    <span className="font-semibold">{client.name}</span>
+                                    {client.foreignServer && (
+                                        <span className="block text-xs text-[var(--text-secondary)] truncate">
+                                            <Icon name="tower-broadcast" className="mr-1 text-[var(--text-muted)]" />
+                                            {client.foreignServer.name}
+                                            {client.foreignServer.title ? ` · ${client.foreignServer.title}` : ''}
+                                            {client.foreignServer.artist ? ` — ${client.foreignServer.artist}` : ''}
+                                        </span>
+                                    )}
+                                </span>
                                 <button
                                     onClick={() => onStreamChange(client.id, myClientStreamId)}
                                     disabled={!myClientStreamId}

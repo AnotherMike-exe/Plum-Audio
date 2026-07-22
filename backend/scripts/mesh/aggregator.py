@@ -62,12 +62,13 @@ class DataAggregator:
         interval_s: float = DEFAULT_INTERVAL_S,
     ) -> None:
         self.local_unit_id = local_unit_id
+        self._local_player_state: dict | None = None  # our speaker's self-report (see model)
         self._engine = engine
         self._discovery = discovery
         self._fetch = fetch_snapshot
         self.interval_s = interval_s
         self._local_host = _detect_local_host()
-        self._view = MeshView(units=[self._local_snapshot()])
+        self._view = MeshView(units=[self.local_snapshot()])
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
@@ -86,16 +87,24 @@ class DataAggregator:
         """The most recently built mesh view (updated each poll cycle)."""
         return self._view
 
-    def _local_snapshot(self) -> UnitSnapshot:
+    def set_local_player_state(self, state: dict) -> None:
+        """Record our own speaker's self-report (pushed by the player process)."""
+        self._local_player_state = state
+
+    def local_snapshot(self) -> UnitSnapshot:
         """The engine's snapshot, with this unit's own host stamped in (the engine can't know it)."""
         snap = self._engine.snapshot()
         if snap.host is None:
             snap.host = self._local_host
+        # The engine only knows clients attached to ITS server; our speaker may be attached to
+        # someone else's (a peer, Music Assistant, any Sendspin server). Its self-report travels
+        # with the snapshot so every unit's GUI can still show where it went and what it's playing.
+        snap.local_player = self._local_player_state
         return snap
 
     async def refresh(self) -> MeshView:
         """Rebuild the view now: local snapshot + every reachable peer's snapshot."""
-        units: list[UnitSnapshot] = [self._local_snapshot()]
+        units: list[UnitSnapshot] = [self.local_snapshot()]
         peers = self._discovery.peers()
         results = await asyncio.gather(*(self._fetch_peer(p) for p in peers))
         units.extend(u for u in results if u is not None)

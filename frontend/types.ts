@@ -76,6 +76,10 @@ export interface Client {
     volume: number; // 0-100
     connected: boolean;
     isLocal?: boolean;               // this unit's OWN player (the page you are looking at)
+    // Set when this speaker has been claimed by a Sendspin server outside our mesh — Music
+    // Assistant, a third-party server, anything. It is still ours physically, it is simply
+    // rendering someone else's audio, and the GUI must say so rather than lose the device.
+    foreignServer?: { name: string; title?: string; artist?: string };
 }
 
 export type AccentColor = 'purple' | 'blue' | 'green' | 'orange' | 'red' | 'yellow' | 'custom';

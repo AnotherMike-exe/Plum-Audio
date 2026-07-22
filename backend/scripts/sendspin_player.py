@@ -106,6 +106,59 @@ class AlsaRenderer:
         # idle (e.g. a cross-server roam) — this is the honest measure of audible dropout.
         self.pad_frames = 0
 
+    # -- self-report ---------------------------------------------------------
+
+    def _on_group_update(self, payload) -> None:
+        state = getattr(payload, "playback_state", None)
+        self._state["group_id"] = getattr(payload, "group_id", None)
+        self._state["group_name"] = getattr(payload, "group_name", None)
+        self._state["playback_state"] = getattr(state, "value", state)
+
+    def _on_metadata(self, payload) -> None:
+        md = getattr(payload, "metadata", None)
+        if md is None:
+            return
+        for field in ("title", "artist", "album"):
+            value = getattr(md, field, None)
+            if value is not None:
+                self._state[field] = value
+
+    def _snapshot_state(self) -> dict:
+        info = self.client.server_info
+        attached = self.client.connected and info is not None
+        state = {
+            "player_id": self.player_id,
+            "name": self.player_name,
+            "url": f"ws://{self._host_hint()}:{self.port}/sendspin",
+            "attached": bool(attached),
+        }
+        if attached and info is not None:
+            reason = getattr(info.connection_reason, "value", info.connection_reason)
+            state.update(
+                server_id=info.server_id, server_name=info.name, connection_reason=reason,
+                group_id=self._state.get("group_id"), group_name=self._state.get("group_name"),
+                playback_state=self._state.get("playback_state"),
+                title=self._state.get("title"), artist=self._state.get("artist"),
+                album=self._state.get("album"),
+            )
+        return state
+
+    @staticmethod
+    def _host_hint() -> str:
+        from mesh.avahi import local_ip
+
+        return local_ip() or "127.0.0.1"
+
+    async def _report_loop(self) -> None:
+        """Push our state to this unit's mesh API. Best-effort: the audio path never waits on it."""
+        import aiohttp
+
+        async with aiohttp.ClientSession() as session:
+            while True:
+                with contextlib.suppress(Exception):
+                    await session.post(self.report_url, json=self._snapshot_state(), timeout=aiohttp.ClientTimeout(total=3))
+                await asyncio.sleep(3.0)
+
     # -- lifecycle -----------------------------------------------------------
 
     def start(self) -> None:
@@ -240,7 +293,9 @@ class SendspinPlayer:
         self.client = SendspinClient(
             client_id=player_id,
             client_name=player_name,
-            roles=[Roles.PLAYER],
+            # METADATA too: a claimed speaker must be able to say WHAT it is playing, not just that
+            # it left. That is the whole point of the self-report below.
+            roles=[Roles.PLAYER, Roles.METADATA],
             player_support=support,
             static_delay_ms=static_delay_ms,
             initial_volume=initial_volume,
@@ -254,6 +309,69 @@ class SendspinPlayer:
 
         self._listener: ClientListener | None = None
         self._avahi: AvahiClient | None = None  # mDNS advert (system Avahi), see start()
+        # Self-report: what THIS speaker thinks is happening, pushed to the local mesh API.
+        # Without it a speaker claimed by another server simply vanishes from our GUI — the local
+        # server can only report clients attached to itself, and a claimed player is attached
+        # elsewhere by definition. Any Sendspin server can take this speaker (that is the point of
+        # the standard), so the GUI has to learn about it from the speaker itself.
+        self._state: dict = {"attached": False}
+        self._report_task: asyncio.Task | None = None
+        self.report_url = os.environ.get("PLUM_PLAYER_STATE_URL", "http://127.0.0.1:5001/api/mesh/player-state")
+        self.client.add_group_update_listener(self._on_group_update)
+        self.client.add_metadata_listener(self._on_metadata)
+
+    # -- self-report ---------------------------------------------------------
+
+    def _on_group_update(self, payload) -> None:
+        state = getattr(payload, "playback_state", None)
+        self._state["group_id"] = getattr(payload, "group_id", None)
+        self._state["group_name"] = getattr(payload, "group_name", None)
+        self._state["playback_state"] = getattr(state, "value", state)
+
+    def _on_metadata(self, payload) -> None:
+        md = getattr(payload, "metadata", None)
+        if md is None:
+            return
+        for field in ("title", "artist", "album"):
+            value = getattr(md, field, None)
+            if value is not None:
+                self._state[field] = value
+
+    def _snapshot_state(self) -> dict:
+        info = self.client.server_info
+        attached = self.client.connected and info is not None
+        state = {
+            "player_id": self.player_id,
+            "name": self.player_name,
+            "url": f"ws://{self._host_hint()}:{self.port}/sendspin",
+            "attached": bool(attached),
+        }
+        if attached and info is not None:
+            reason = getattr(info.connection_reason, "value", info.connection_reason)
+            state.update(
+                server_id=info.server_id, server_name=info.name, connection_reason=reason,
+                group_id=self._state.get("group_id"), group_name=self._state.get("group_name"),
+                playback_state=self._state.get("playback_state"),
+                title=self._state.get("title"), artist=self._state.get("artist"),
+                album=self._state.get("album"),
+            )
+        return state
+
+    @staticmethod
+    def _host_hint() -> str:
+        from mesh.avahi import local_ip
+
+        return local_ip() or "127.0.0.1"
+
+    async def _report_loop(self) -> None:
+        """Push our state to this unit's mesh API. Best-effort: the audio path never waits on it."""
+        import aiohttp
+
+        async with aiohttp.ClientSession() as session:
+            while True:
+                with contextlib.suppress(Exception):
+                    await session.post(self.report_url, json=self._snapshot_state(), timeout=aiohttp.ClientTimeout(total=3))
+                await asyncio.sleep(3.0)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -287,6 +405,8 @@ class SendspinPlayer:
         )
         await self._listener.start()
         logger.info("player listening on :%d (id=%s)", self.port, self.player_id)
+        if self.report_url:
+            self._report_task = asyncio.ensure_future(self._report_loop())
 
         # Advertise ourselves the way the spec says a server-dialed client should: _sendspin._tcp,
         # port 8928, TXT path + name. Published through the system Avahi rather than aiosendspin's
@@ -316,6 +436,11 @@ class SendspinPlayer:
                     logger.info("dialed home server %s", home_server_url)
 
     async def stop(self) -> None:
+        if self._report_task is not None:
+            self._report_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._report_task
+            self._report_task = None
         if self._avahi is not None:
             with contextlib.suppress(Exception):
                 await self._avahi.close()

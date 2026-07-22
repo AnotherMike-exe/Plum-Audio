@@ -41,6 +41,20 @@ interface WireUnit {
   host: string | null;
   sources: WireSource[];
   players: WirePlayer[];
+  /** This unit's own speaker, as the player process itself reports it (mesh POST player-state).
+   *  `players` can only list clients attached to THAT unit's server, so a speaker claimed by
+   *  anyone else — a peer, Music Assistant — is absent there and would vanish from the GUI. */
+  local_player?: {
+    player_id: string;
+    name?: string;
+    url?: string;
+    attached?: boolean;
+    server_id?: string;
+    server_name?: string;
+    playback_state?: string;
+    title?: string;
+    artist?: string;
+  } | null;
 }
 export interface MeshView {
   units: WireUnit[];
@@ -161,6 +175,37 @@ export function mapViewToModel(
         isLocal,
       });
     }
+  }
+
+  // Fold in each unit's self-reported speaker. Two jobs: keep a speaker visible when the server
+  // it left can no longer see it, and name the server that took it.
+  const unitIds = new Set(view.units.map((u) => u.unit_id));
+  for (const unit of view.units) {
+    const lp = unit.local_player;
+    if (!lp?.player_id) continue;
+    const claimedByOutsider = !!lp.attached && !!lp.server_id && !unitIds.has(lp.server_id);
+    const foreignServer = claimedByOutsider
+      ? { name: lp.server_name || lp.server_id!, title: lp.title, artist: lp.artist }
+      : undefined;
+    const existing = clients.find((c) => c.id === lp.player_id);
+    if (existing) {
+      if (foreignServer) existing.foreignServer = foreignServer;
+      continue;
+    }
+    // Not listed by any unit: it is attached elsewhere (or nowhere). Synthesize it from the report.
+    const isLocal = !!localHost && !!lp.url && hostOf(lp.url) === localHost;
+    if (isLocal) localPlayerIds.push(lp.player_id);
+    clients.push({
+      id: lp.player_id,
+      serverId: unit.unit_id,
+      serverName: unit.name,
+      name: lp.name || lp.player_id,
+      currentStreamId: null,
+      volume: 100,
+      connected: !!lp.attached,
+      isLocal,
+      foreignServer,
+    });
   }
 
   return { servers, streams, clients, localUnitId: view.local_unit_id, localPlayerIds };

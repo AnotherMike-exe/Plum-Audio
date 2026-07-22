@@ -97,6 +97,11 @@ class UnitSnapshot:
     host: str | None  # filled in by the aggregator from the beacon source IP
     sources: list[SourceState] = field(default_factory=list)
     players: list[PlayerState] = field(default_factory=list)
+    # This unit's OWN speaker, as reported by the player process itself (mesh/api player-state).
+    # `players` above can only list clients attached to THIS server, so a speaker claimed by
+    # another server — a peer unit, Music Assistant, any Sendspin server — would otherwise just
+    # disappear. The self-report is how the GUI keeps seeing it, and learns what it is playing.
+    local_player: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -105,6 +110,7 @@ class UnitSnapshot:
             "host": self.host,
             "sources": [s.to_dict() for s in self.sources],
             "players": [p.to_dict() for p in self.players],
+            "local_player": self.local_player,
         }
 
     @classmethod
@@ -115,6 +121,7 @@ class UnitSnapshot:
             host=d.get("host"),
             sources=[SourceState.from_dict(s) for s in d.get("sources", [])],
             players=[PlayerState.from_dict(p) for p in d.get("players", [])],
+            local_player=d.get("local_player"),
         )
 
 
