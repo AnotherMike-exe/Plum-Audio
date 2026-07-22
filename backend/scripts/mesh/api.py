@@ -10,6 +10,7 @@ audio Flask APIs (config CRUD, no loop affinity) stay separate — this endpoint
 Endpoints (parity with the old /api/federation/* surface, so the GUI ports with little change):
   GET  /api/mesh/snapshot          this unit's local state (peers poll this to aggregate)
   GET  /api/mesh/view              the aggregated mesh (what the GUI renders)
+  GET  /api/mesh/neighbourhood     Sendspin servers/players on this segment, via mDNS (interop)
   POST /api/mesh/route             {player_id, source_id}          route a player onto a source
   POST /api/mesh/unroute           {player_id, source_id}          remove a player from a source
   POST /api/mesh/volume            {player_id, volume, muted}      per-player volume
@@ -51,11 +52,13 @@ class MeshApi:
     """Serves the mesh REST endpoints backed by the engine, aggregator, and router."""
 
     def __init__(
-        self, engine: SyncEngine, aggregator: DataAggregator, router: Router, *, port: int = DEFAULT_API_PORT
+        self, engine: SyncEngine, aggregator: DataAggregator, router: Router, *,
+        port: int = DEFAULT_API_PORT, neighbourhood=None,
     ) -> None:
         self._engine = engine
         self._agg = aggregator
         self._router = router
+        self._neighbourhood = neighbourhood
         self.port = port
         self._runner: web.AppRunner | None = None
 
@@ -65,6 +68,7 @@ class MeshApi:
             [
                 web.get("/api/mesh/snapshot", self._snapshot),
                 web.get("/api/mesh/view", self._view),
+                web.get("/api/mesh/neighbourhood", self._neighbours),
                 web.post("/api/mesh/route", self._route),
                 web.post("/api/mesh/unroute", self._unroute),
                 web.post("/api/mesh/volume", self._volume),
@@ -99,6 +103,17 @@ class MeshApi:
         payload = self._agg.view().to_dict()
         payload["local_unit_id"] = self._agg.local_unit_id
         return web.json_response(payload)
+
+    async def _neighbours(self, _request: web.Request) -> web.Response:
+        """Every Sendspin server and player mDNS can see on this segment, ours flagged.
+
+        The mesh view covers PLUM units (they answer /api/mesh/snapshot); this covers the wider
+        Sendspin network — a Music Assistant server, a third-party speaker — which has no mesh API
+        and is reachable only by the protocol itself.
+        """
+        if self._neighbourhood is None:
+            return web.json_response({"players": [], "servers": []})
+        return web.json_response(self._neighbourhood.to_dict())
 
     async def _route(self, request: web.Request) -> web.Response:
         body = await self._json(request)

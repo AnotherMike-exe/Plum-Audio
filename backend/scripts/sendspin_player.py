@@ -51,6 +51,8 @@ try:
 except Exception:  # noqa: BLE001 - allows --probe-config / import without PortAudio present
     sd = None
 
+from mesh.avahi import CLIENT_SERVICE, AvahiClient
+
 logger = logging.getLogger("plum.sendspin_player")
 
 DEFAULT_PORT = 8928
@@ -224,6 +226,7 @@ class SendspinPlayer:
         initial_volume: int,
     ) -> None:
         self.player_id = player_id
+        self.player_name = player_name  # friendly name; also the mDNS TXT `name`
         self.port = port
         self.renderer = renderer
 
@@ -250,10 +253,11 @@ class SendspinPlayer:
         self.client.add_server_command_listener(self._on_server_command)
 
         self._listener: ClientListener | None = None
+        self._avahi: AvahiClient | None = None  # mDNS advert (system Avahi), see start()
 
     # -- lifecycle -----------------------------------------------------------
 
-    async def start(self, home_server_url: str | None = None) -> None:
+    async def start(self, home_server_url: str | None = None, *, advertise: bool = True) -> None:
         self.renderer.start()
 
         async def on_connection(ws) -> None:
@@ -284,13 +288,38 @@ class SendspinPlayer:
         await self._listener.start()
         logger.info("player listening on :%d (id=%s)", self.port, self.player_id)
 
+        # Advertise ourselves the way the spec says a server-dialed client should: _sendspin._tcp,
+        # port 8928, TXT path + name. Published through the system Avahi rather than aiosendspin's
+        # own zeroconf, which would bind 5353 against the host daemon (see mesh/avahi.py). This is
+        # what lets ANY Sendspin server — a peer unit, Music Assistant, anything — find this
+        # speaker without being told about it.
+        if advertise:
+            self._avahi = AvahiClient()
+            await self._avahi.publish(
+                self.player_id, CLIENT_SERVICE, self.port,
+                {"path": "/sendspin", "name": self.player_name},
+            )
+
         if home_server_url:
-            # Single-unit bring-up: dial our home server so it can route to us immediately.
-            with contextlib.suppress(Exception):
-                await self.client.connect(home_server_url)
-                logger.info("dialed home server %s", home_server_url)
+            # Spec: "Do not manually connect to servers if you are advertising _sendspin._tcp."
+            # A client picks ONE direction; ours is server-dialed (the mesh reclaims players by
+            # URL, which requires it). So an explicit home-server dial is only honoured with
+            # advertising off — single-unit bring-up, or a deliberately client-initiated setup.
+            if advertise:
+                logger.warning(
+                    "ignoring home server %s: we advertise %s, so servers dial us (spec)",
+                    home_server_url, CLIENT_SERVICE,
+                )
+            else:
+                with contextlib.suppress(Exception):
+                    await self.client.connect(home_server_url)
+                    logger.info("dialed home server %s", home_server_url)
 
     async def stop(self) -> None:
+        if self._avahi is not None:
+            with contextlib.suppress(Exception):
+                await self._avahi.close()
+            self._avahi = None
         with contextlib.suppress(Exception):
             await self.client.disconnect()
         if self._listener is not None:

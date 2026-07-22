@@ -828,6 +828,7 @@ async def main() -> None:
             srv,
             beacon_port=int(os.environ.get("PLUM_BEACON_PORT", "8929")),
             api_port=int(os.environ.get("PLUM_MESH_API_PORT", "5001")),
+            local_player_id=local_player_id,
         )
         await mesh.start()
 
