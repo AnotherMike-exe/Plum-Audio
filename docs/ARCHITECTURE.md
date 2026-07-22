@@ -340,6 +340,43 @@ substitutes the unit's beacon host — but rigs should still be configured with 
 **Hardware-validated on both Pis:** Spotify audio, metadata, artwork, transport, timeline, live
 endpoint CRUD, and cross-server roam of a Spotify stream.
 
+**INTEROP: WE ARE A PEER ON A STANDARD NETWORK (2026-07).** Standing on a spec is the point — a unit
+must serve audio from its own integrations, render audio from *any* Sendspin server (ours, Music
+Assistant, a third party), and put a GUI over both. Two things were in the way, both now fixed:
+
+*Discovery.* Sendspin discovery is mDNS with two service types in opposite directions — players
+advertise `_sendspin._tcp` (8928), servers advertise `_sendspin-server._tcp` (8927), TXT `path` +
+optional `name`. We had BOTH switched off, because aiosendspin's python-zeroconf binds UDP 5353 and
+the host Avahi owns it (and Avahi is not optional: it advertises AirPlay and Spotify Connect). So no
+third-party server could find our speakers and we could see nothing but ourselves. `mesh/avahi.py`
+registers and browses the same records through the system Avahi over D-Bus — same wire result, one
+responder per host, the way go-librespot does it. `mesh/neighbourhood.py` publishes our server
+record, watches both types, and serves `GET /api/mesh/neighbourhood`. Note the division of labour:
+the **mesh view** covers Plum units (they answer `/api/mesh/snapshot`); the **neighbourhood** covers
+the wider Sendspin network, which has no mesh API and is reachable only by the protocol itself. mDNS
+is link-local, so this sees one L2 segment.
+
+Two hardware-only lessons: Avahi resolves once per interface AND family (one player arrives as
+loopback, link-local v6, docker0 and the real LAN address — addresses are merged per instance and
+ranked, since a docker0-only advert is what made spotifyd unreachable earlier), and
+`ServiceBrowserNew` announces before D-Bus signal handlers can attach, so cached entries were missed
+until we moved to Server2's `ServiceBrowserPrepare`/`Start` pair.
+
+*Direction.* The spec forbids mixing: "Do not manually connect to servers if you are advertising
+`_sendspin._tcp`." Ours is the **server-dialed** direction (reclaim-by-URL requires it), so the
+player refuses an explicit home-server dial while advertising.
+
+**KNOWN INTEROP GAP — client-side arbitration.** The spec's multi-server rules are client-side: on a
+second server connecting, a client accepts the handshake, compares `connection_reason`
+(`playback` beats `discovery`), breaks ties with the persistently stored `server_id` of the last
+server that had `playback_state: playing`, and sends `client/goodbye` reason `another_server` to the
+loser. Our player implements only the first branch — it always yields to the newest dialer — and
+persists nothing. Harmless in a Plum-only mesh (we only ever dial `playback`, having removed the
+DISCOVERY tier per §2), but a foreign server running a discovery sweep would take a playing speaker
+off us. Not locally fixable: `SendspinClient.server_info` exposes `connection_reason` only after
+`attach_websocket`, which refuses a second socket — "accept both, then decide" needs an aiosendspin
+change. Track as an upstream item.
+
 **MULTI-ENDPOINT AIRPLAY + PER-UNIT GUI (2026-07).**
 
 *AirPlay* is now config-driven and multi-instance on the same manager pattern: N endpoints, each with

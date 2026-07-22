@@ -172,6 +172,10 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
 - **Pin `aiosendspin`** (6.0.5). On any bump, run `_resources/spike/mesh_smoke.py` first.
 - **`SendspinServer` always binds mDNS (UDP 5353)** → collides with our Avahi. Start with
   `start_server(advertise_addresses=[], discover_clients=False)`; drive connections by URL.
+- **Sendspin mDNS goes through the system Avahi** (`mesh/avahi.py`, D-Bus), never our own responder:
+  players advertise `_sendspin._tcp`, servers `_sendspin-server._tcp`. This is what makes us
+  discoverable by Music Assistant and other third-party Sendspin servers — do not disable it.
+  A client picks ONE direction: while advertising, we are server-dialed and must not dial out.
 - **Ingest via in-process `PushStream`** (`prepare_audio` + `commit_audio` + `set_live_source`),
   never the unmerged `Roles.SOURCE`.
 - **Metadata off the audio path** — emit to Sendspin metadata/artwork roles, not the stream.
