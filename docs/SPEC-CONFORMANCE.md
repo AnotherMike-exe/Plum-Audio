@@ -11,11 +11,13 @@ We speak the protocol from **three** places, and they are not equally mature:
 |---|---|---|
 | Unit **server** | `aiosendspin` server + `sendspin_server.py` | good — library owns the wire format |
 | Unit **player** | `aiosendspin` client + `sendspin_player.py` | good — library owns hello/time/state |
-| **GUI controller** | hand-written TS (`services/sendspinControllerClient.ts`) | **partial — see gaps** |
+| **GUI controller** | hand-written TS (`services/sendspinControllerClient.ts`) | good — client/time + client/state added 2026-07-23; two minor items remain |
 
-The GUI client is hand-written because the browser has no `aiosendspin`. That is where our
-conformance risk lives, and it matters more now: the same client will eventually point at a
-third-party server, which will not be as forgiving as our own.
+The GUI client is hand-written because the browser has no `aiosendspin`. It now implements the
+REQUIRED clock sync and state reporting; the remaining items are quality-of-life, not conformance
+blockers. Verified on hardware (2026-07-23): the shipped build sends client/hello, continuous
+client/time (adaptive cadence), and client/state{synchronized}, and our server replies with
+server/time and accepts the state.
 
 ---
 
@@ -73,9 +75,9 @@ Before this we held a stream from boot and announced `playing` forever, on every
 | Role | Server side | Player | GUI controller |
 |---|---|---|---|
 | player@v1 | ✅ | ✅ PCM, static delay, volume/mute | n/a |
-| metadata@v1 | ✅ emits title/artist/album + progress trio | ✅ consumes (for the self-report) | ⚠️ consumes; see client/time |
+| metadata@v1 | ✅ emits title/artist/album + progress trio | ✅ consumes (for the self-report) | ✅ consumes; clock-synced |
 | artwork@v1 | ✅ 512×512 JPEG, channel 0 | n/a | ✅ declares 1 channel, decodes types 8–11 |
-| controller@v1 | ✅ advertises play/pause/next/previous per source | n/a | ⚠️ sends commands; `switch` unimplemented |
+| controller@v1 | ✅ advertises play/pause/next/previous per source | n/a | ✅ sends all commands incl. `switch` (generic client/command) |
 | visualizer@v1 | ❌ not implemented (planned) | ❌ | ❌ |
 | color@v1 | ❌ not implemented | ❌ | ❌ |
 
@@ -83,14 +85,15 @@ Before this we held a stream from boot and announced `playing` forever, on every
 
 | Requirement | Status | Consequence |
 |---|---|---|
-| `client/time` sent continuously; clock via the time filter | ❌ we derive an offset from message timestamps | works for progress display today; drifts, and a strict server may treat us as unsynchronized |
-| `client/state` with `state` (REQUIRED) | ❌ never sent | servers cannot know we are synchronized; unknown how third-party servers react |
-| Controller `switch` command | ❌ | cannot cycle a client between group and solo — MA advertises this command |
-| Group volume "preserving relative levels" | ⚠️ naive per-stream volume | group volume changes flatten relative levels |
-| `stream/request-format` | ❌ | cannot renegotiate artwork size at runtime |
+| `client/time` sent continuously; clock via a filter | ✅ `TimeFilter`, best-of-window min-delay; NTP formula verbatim from the library; adaptive 0.2→3 s cadence | done 2026-07-23 |
+| `client/state` with `state` (REQUIRED) | ✅ sends `{state:'synchronized'}` once the clock settles | done 2026-07-23 |
+| Controller `switch` command | ✅ generic `client/command` sends it (all commands MA advertises are sendable) | done |
+| Group volume "preserving relative levels" | ⚠️ naive per-stream volume | REMAINING — quality, not conformance: group volume flattens relative levels |
+| `stream/request-format` | ❌ | REMAINING — cannot renegotiate artwork size at runtime; we hardcode 512×512 |
 
-None of these break our own stack — our server is lenient with its own GUI. All of them are
-reasons the GUI is not yet safe to point at a foreign server for anything beyond reading state.
+The two REQUIRED items (client/time, client/state) are done and hardware-verified, so the GUI is
+now spec-safe to point at a third-party server for reading state and issuing whatever commands that
+server advertises. The two remaining items are quality-of-life and do not affect conformance.
 
 ## What we learned about Music Assistant (2.9.9)
 

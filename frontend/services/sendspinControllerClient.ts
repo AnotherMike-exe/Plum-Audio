@@ -13,6 +13,44 @@
 
 export type PlaybackState = 'playing' | 'paused' | 'stopped' | 'unknown';
 
+/**
+ * Clock sync filter — the controller half of the spec's REQUIRED time synchronization.
+ *
+ * Every Sendspin client "must continuously send client/time"; the server replies with server/time
+ * carrying four timestamps, and the client derives a server↔local clock offset. All progress
+ * timestamps ride the server's monotonic clock, so without this our extrapolated position drifts,
+ * and a strict server can treat a controller that never syncs as not operational.
+ *
+ * Strategy: best-of-window. Each round-trip yields (offset, delay); the sample with the LOWEST
+ * one-way delay in the recent window is the most trustworthy (it suffered the least queuing), so
+ * its offset wins — the classic NTP "minimum filter". `error` is that best delay, which the send
+ * loop uses to back off once the clock is settled.
+ */
+export class TimeFilter {
+  private samples: Array<{ offsetUs: number; delayUs: number }> = [];
+  private static readonly WINDOW = 8;
+  private best: { offsetUs: number; delayUs: number } | null = null;
+
+  /** Feed one round-trip. Formulas match aiosendspin's _handle_server_time exactly. */
+  update(offsetUs: number, delayUs: number): void {
+    this.samples.push({ offsetUs, delayUs });
+    if (this.samples.length > TimeFilter.WINDOW) this.samples.shift();
+    this.best = this.samples.reduce((a, b) => (b.delayUs < a.delayUs ? b : a));
+  }
+
+  get synchronized(): boolean {
+    return this.samples.length >= 3;
+  }
+  /** server_us − local_us, in microseconds. */
+  get offsetUs(): number {
+    return this.best?.offsetUs ?? 0;
+  }
+  /** Best (lowest) one-way delay seen — a proxy for remaining uncertainty. */
+  get errorUs(): number {
+    return this.best?.delayUs ?? Number.POSITIVE_INFINITY;
+  }
+}
+
 /** Every MediaCommand the controller protocol defines. No `seek`. */
 export type ControllerCommand =
   | 'play' | 'pause' | 'stop' | 'next' | 'previous'
@@ -76,7 +114,13 @@ export class SendspinControllerClient {
   private ws: WebSocket | null = null;
   private np: NowPlaying = emptyNowPlaying();
   private artworkObjectUrl: string | null = null;
-  private serverClockOffsetUs = 0; // serverUs - localUs, from the last timestamped message
+  // Clock sync: the filter is authoritative once synchronized; before then we fall back to the
+  // rough metadata-timestamp offset so progress still moves at connect. `serverClockOffsetUs` is
+  // the value the data service reads (server_us − local_us).
+  private clock = new TimeFilter();
+  private serverClockOffsetUs = 0;
+  private timeTimer: ReturnType<typeof setTimeout> | null = null;
+  private stateSent = false; // client/state{synchronized} is sent once per connection
   private closed = false;
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -116,12 +160,50 @@ export class SendspinControllerClient {
   close(): void {
     this.closed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = null;
+    if (this.timeTimer) clearTimeout(this.timeTimer);
+    this.reconnectTimer = this.timeTimer = null;
     this.revokeArtwork();
     if (this.ws) {
       this.ws.onclose = null;
       this.ws.close();
       this.ws = null;
+    }
+  }
+
+  private nowUs(): number {
+    return Date.now() * 1000;
+  }
+
+  /** Send client/time. Restarts the adaptive loop: fast until synced, then backs off. */
+  private sendTime(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'client/time', payload: { client_transmitted: this.nowUs() } }));
+    // Match aiosendspin's cadence: 200 ms until the clock settles, then ease off to 3 s.
+    const err = this.clock.errorUs;
+    const nextMs = !this.clock.synchronized ? 200 : err < 1000 ? 3000 : err < 5000 ? 500 : 200;
+    if (this.timeTimer) clearTimeout(this.timeTimer);
+    this.timeTimer = setTimeout(() => this.sendTime(), nextMs);
+  }
+
+  /** server/time reply → NTP offset/delay → filter (formulas verbatim from the library). */
+  private onServerTime(p: { client_transmitted: number; server_received: number; server_transmitted: number }): void {
+    const now = this.nowUs();
+    const offset = ((p.server_received - p.client_transmitted) + (p.server_transmitted - now)) / 2;
+    const delay = ((now - p.client_transmitted) - (p.server_transmitted - p.server_received)) / 2;
+    this.clock.update(Math.round(offset), Math.round(delay));
+    if (this.clock.synchronized) {
+      this.serverClockOffsetUs = this.clock.offsetUs; // authoritative once we have real samples
+      if (!this.stateSent) {
+        this.sendState('synchronized');
+        this.stateSent = true;
+      }
+    }
+  }
+
+  /** client/state — REQUIRED. We are a controller/metadata client, so no player payload. */
+  private sendState(state: 'synchronized' | 'error' | 'external_source'): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: 'client/state', payload: { state } }));
     }
   }
 
@@ -165,6 +247,8 @@ export class SendspinControllerClient {
     this.ws = ws;
     ws.onopen = () => {
       this.reconnectAttempts = 0;
+      this.clock = new TimeFilter(); // a new socket is a new clock relationship
+      this.stateSent = false;
       ws.send(
         JSON.stringify({
           type: 'client/hello',
@@ -179,6 +263,8 @@ export class SendspinControllerClient {
           },
         }),
       );
+      // Begin continuous clock sync immediately (spec: clients send client/time continuously).
+      this.sendTime();
       // Flush any commands queued during the reconnect, once the server has had time to re-group us
       // into the source group (a command sent while still in our solo group would go nowhere).
       if (this.pendingCommands.length > 0) setTimeout(() => this.flushPending(), 600);
@@ -245,6 +331,9 @@ export class SendspinControllerClient {
       return;
     }
     switch (msg.type) {
+      case 'server/time':
+        this.onServerTime(msg.payload);
+        break;
       case 'server/state':
         this.onServerState(msg.payload);
         break;
@@ -333,7 +422,11 @@ export class SendspinControllerClient {
   }
 
   private captureClockOffset(serverTimestampUs: number): void {
-    if (typeof serverTimestampUs === 'number') {
+    // Fallback only. Treating a metadata anchor timestamp as "server-now" ignores transmission
+    // delay and is crude, but it lets progress move before the first few client/time round-trips
+    // land (and if a non-conformant server never answers client/time at all). Once the filter is
+    // synchronized it owns serverClockOffsetUs and this is ignored.
+    if (typeof serverTimestampUs === 'number' && !this.clock.synchronized) {
       this.serverClockOffsetUs = serverTimestampUs - Date.now() * 1000;
     }
   }

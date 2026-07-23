@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { mapViewToModel, streamId, parseStreamId, MeshView } from '../../../services/sendspinDataService';
-import { NowPlaying, currentPositionMs, SendspinControllerClient } from '../../../services/sendspinControllerClient';
+import { NowPlaying, currentPositionMs, SendspinControllerClient, TimeFilter } from '../../../services/sendspinControllerClient';
 
 function np(partial: Partial<NowPlaying>): NowPlaying {
   return { groupId: null, groupName: null, playbackState: 'unknown', supportedCommands: [], ...partial };
@@ -145,5 +145,34 @@ describe('currentPositionMs extrapolation', () => {
 
   it('returns 0 with no progress info', () => {
     expect(currentPositionMs(np({ playbackState: 'playing' }), 0)).toBe(0);
+  });
+});
+
+describe('TimeFilter (clock sync)', () => {
+  it('is unsynchronized until it has enough samples, then reports the best-delay offset', () => {
+    const f = new TimeFilter();
+    expect(f.synchronized).toBe(false);
+    f.update(1000, 50);
+    f.update(1000, 5);
+    f.update(1000, 80);
+    expect(f.synchronized).toBe(true);
+    expect(f.offsetUs).toBe(1000);
+    expect(f.errorUs).toBe(5);
+  });
+
+  it('picks the minimum-delay sample regardless of order or offset noise', () => {
+    const f = new TimeFilter();
+    f.update(2200, 40);
+    f.update(2000, 3);
+    f.update(1800, 60);
+    expect(f.offsetUs).toBe(2000);
+  });
+
+  it('reproduces the aiosendspin NTP offset/delay formula', () => {
+    const ct = 1000, sr = 6000, st = 6000, now = 2000;
+    const offset = ((sr - ct) + (st - now)) / 2;
+    const delay = ((now - ct) - (st - sr)) / 2;
+    expect(offset).toBe(4500);
+    expect(delay).toBe(500);
   });
 });
