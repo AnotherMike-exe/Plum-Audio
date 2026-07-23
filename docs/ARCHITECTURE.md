@@ -385,9 +385,11 @@ Voice PE).** Not a stand-in — real foreign implementations on their own segmen
   `home-assistant-voice-a1b2c3`, connects as its MAC). One mover handles all three cases — ours in
   the mesh (router), ours held by a foreign server (adopt by URL; the router cannot reclaim what is
   in no unit's view), and not ours at all (adopt/release).
-- MA as a controller target: accepts controller-role clients, but advertises
-  `supported_commands = [volume, mute, switch]` — **no transport**. Unresolved whether that is
-  state-dependent; re-probe during playback.
+- MA as a controller target: a freshly connected controller lands in MA's OWN solo group, NOT the
+  playing session (confirmed 2026-07-23 with MA mid-playback: player in group `af2c0caf`, a
+  controller in group `d1c40416`, stopped, `[volume, mute, switch]` only). So we cannot remote MA's
+  transport over the controller role — that needs MA's own (Home Assistant) API, outside Sendspin.
+  See docs/SPEC-CONFORMANCE.md.
 
 Full conformance status: **docs/SPEC-CONFORMANCE.md**. Test strategy: **docs/TESTING.md**.
 

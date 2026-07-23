@@ -97,11 +97,20 @@ server advertises. The two remaining items are quality-of-life and do not affect
 
 ## What we learned about Music Assistant (2.9.9)
 
-- Accepts a controller-role client, places it in a real group, pushes group + metadata + controller
+- Accepts a controller-role client, places it in a group, pushes group + metadata + controller
   state. Reports its own session as `connection_reason=discovery`.
-- Advertises `supported_commands = [volume, mute, switch]` — **no transport**. Either MA does not
-  expose transport over the controller role, or `supported_commands` is state-dependent and would
-  include it during playback. **Unresolved — re-probe while MA is playing.**
+- **A freshly connected controller lands in its OWN solo group, not the active playback session.**
+  Resolved 2026-07-23 with MA actively streaming to our player: our player was in MA group
+  `af2c0caf…` (`playing`, "1 Last Cigarette") while a controller connecting at the same moment
+  landed in a different group `d1c40416…` (`stopped`), advertising only
+  `supported_commands = [volume, mute, switch]`. So the earlier "no transport" was **not**
+  state-dependent — a controller simply is not placed in the playing group, so it can neither see
+  nor drive the active session.
+- **Consequence for the GUI**: remote-controlling MA's playback over the Sendspin controller role is
+  not achievable as MA implements it — a connecting controller is isolated in an empty group. We can
+  fully control our OWN sources, render MA's audio as a player, and read/volume our own controller
+  group; genuine "remote for MA" needs MA's own API (Home Assistant), which is outside Sendspin.
+  This is consistent with the protocol having no library/topology surface.
 - Discovers players by mDNS `_sendspin._tcp`, with manual IP entry as a fallback.
 
 ## Deliberate deviations (not gaps)
