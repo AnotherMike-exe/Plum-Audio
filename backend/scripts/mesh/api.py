@@ -73,6 +73,7 @@ class MeshApi:
         self._consumers: set[web.WebSocketResponse] = set()
         self._producer: web.WebSocketResponse | None = None
         self._last_ctrl: dict | None = None  # cache so a GUI that connects mid-session gets it
+        self._last_art: dict | None = None   # ditto for album art (per-track, low rate)
 
     async def start(self) -> None:
         app = web.Application(middlewares=[_cors])
@@ -181,9 +182,10 @@ class MeshApi:
             logger.info("consume relay: player producer connected")
         else:
             self._consumers.add(ws)
-            if self._last_ctrl is not None:  # bring a late GUI up to speed immediately
-                with contextlib.suppress(Exception):
-                    await ws.send_json(self._last_ctrl)
+            for cached in (self._last_ctrl, self._last_art):  # bring a late GUI up to speed
+                if cached is not None:
+                    with contextlib.suppress(Exception):
+                        await ws.send_json(cached)
         try:
             async for msg in ws:
                 if msg.type is not web.WSMsgType.TEXT:
@@ -195,7 +197,9 @@ class MeshApi:
                 if is_player:
                     if data.get("t") == "ctrl":
                         self._last_ctrl = data
-                    await self._broadcast(data)  # ctrl + viz → every GUI
+                    elif data.get("t") == "art":
+                        self._last_art = data
+                    await self._broadcast(data)  # ctrl + viz + art → every GUI
                 elif data.get("t") == "cmd" and self._producer is not None:
                     with contextlib.suppress(Exception):
                         await self._producer.send_json(data)  # command → the player
@@ -203,6 +207,7 @@ class MeshApi:
             if is_player and self._producer is ws:
                 self._producer = None
                 self._last_ctrl = None
+                self._last_art = None
             else:
                 self._consumers.discard(ws)
         return ws

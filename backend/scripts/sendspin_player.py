@@ -44,6 +44,8 @@ import numpy as np
 from aiosendspin.client.client import SendspinClient
 from aiosendspin.client.listener import ClientListener
 from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
+from aiosendspin.models.artwork import ArtworkChannel, ClientHelloArtworkSupport
+from aiosendspin.models.types import ArtworkSource, PictureFormat
 from aiosendspin.models.visualizer import ClientHelloVisualizerSpectrum, ClientHelloVisualizerSupport
 from aiosendspin.models.types import AudioCodec, GoodbyeReason, MediaCommand, PlayerCommand, Roles
 
@@ -143,6 +145,17 @@ class AlsaRenderer:
                 viz["l"] = round(loud / 65535, 4)
         self._relay_viz = viz
 
+    def _on_artwork(self, channel: int, data: bytes) -> None:
+        # Channel 0 = album art (the only channel we declared). Empty payload = cleared. Relay as a
+        # data URL over the consume WS (per-track, low rate — no need for a binary channel).
+        if channel != 0:
+            return
+        import base64
+
+        url = f"data:image/jpeg;base64,{base64.b64encode(data).decode()}" if data else None
+        self._relay_art = {"t": "art", "d": url}
+        self._relay_art_dirty = True
+
     def _on_metadata(self, payload) -> None:
         md = getattr(payload, "metadata", None)
         if md is None:
@@ -210,6 +223,10 @@ class AlsaRenderer:
                 self._relay_ctrl_dirty = False
                 with contextlib.suppress(Exception):
                     await ws.send_json(self._relay_ctrl)
+            if self._relay_art_dirty and self._relay_art is not None:
+                self._relay_art_dirty = False
+                with contextlib.suppress(Exception):
+                    await ws.send_json(self._relay_art)
             if self._relay_viz is not None:
                 frame, self._relay_viz = self._relay_viz, None
                 with contextlib.suppress(Exception):
@@ -380,15 +397,20 @@ class SendspinPlayer:
             types=["spectrum", "loudness"],
             spectrum=ClientHelloVisualizerSpectrum(n_disp_bins=256, scale="log", f_min=40, f_max=16000),
         )
+        art_support = ClientHelloArtworkSupport(
+            channels=[ArtworkChannel(source=ArtworkSource.ALBUM, format=PictureFormat.JPEG,
+                                     media_width=512, media_height=512)],
+        )
         self.client = SendspinClient(
             client_id=player_id,
             client_name=player_name,
             # PLAYER renders; METADATA/CONTROLLER/VISUALIZER make this speaker a full CONSUMER of
             # whatever group it plays in — so a foreign server (Music Assistant) serving to us can be
             # observed (title/art), controlled (transport/volume) and visualized, as a group member.
-            roles=[Roles.PLAYER, Roles.METADATA, Roles.CONTROLLER, Roles.VISUALIZER],
+            roles=[Roles.PLAYER, Roles.METADATA, Roles.CONTROLLER, Roles.VISUALIZER, Roles.ARTWORK],
             player_support=support,
             visualizer_support=viz_support,
+            artwork_support=art_support,
             static_delay_ms=static_delay_ms,
             initial_volume=initial_volume,
         )
@@ -415,12 +437,15 @@ class SendspinPlayer:
         self._relay_ctrl: dict | None = None
         self._relay_ctrl_dirty = False
         self._relay_viz: dict | None = None  # {"s":[0-255 x N],"l":loudness}
+        self._relay_art: dict | None = None  # {"t":"art","d":<data-url|null>}
+        self._relay_art_dirty = False
         self._relay_task: asyncio.Task | None = None
         self.relay_url = os.environ.get("PLUM_PLAYER_RELAY_URL", "ws://127.0.0.1:5001/api/mesh/consume?role=player")
         self.client.add_group_update_listener(self._on_group_update)
         self.client.add_metadata_listener(self._on_metadata)
         self.client.add_controller_state_listener(self._on_controller_state)
         self.client.add_visualizer_listener(self._on_visualizer)
+        self.client.add_artwork_listener(self._on_artwork)
 
     # -- self-report ---------------------------------------------------------
 
@@ -457,6 +482,17 @@ class SendspinPlayer:
             if loud is not None:
                 viz["l"] = round(loud / 65535, 4)
         self._relay_viz = viz
+
+    def _on_artwork(self, channel: int, data: bytes) -> None:
+        # Channel 0 = album art (the only channel we declared). Empty payload = cleared. Relay as a
+        # data URL over the consume WS (per-track, low rate — no need for a binary channel).
+        if channel != 0:
+            return
+        import base64
+
+        url = f"data:image/jpeg;base64,{base64.b64encode(data).decode()}" if data else None
+        self._relay_art = {"t": "art", "d": url}
+        self._relay_art_dirty = True
 
     def _on_metadata(self, payload) -> None:
         md = getattr(payload, "metadata", None)
@@ -525,6 +561,10 @@ class SendspinPlayer:
                 self._relay_ctrl_dirty = False
                 with contextlib.suppress(Exception):
                     await ws.send_json(self._relay_ctrl)
+            if self._relay_art_dirty and self._relay_art is not None:
+                self._relay_art_dirty = False
+                with contextlib.suppress(Exception):
+                    await ws.send_json(self._relay_art)
             if self._relay_viz is not None:
                 frame, self._relay_viz = self._relay_viz, None
                 with contextlib.suppress(Exception):

@@ -105,7 +105,7 @@ server advertises. The two remaining items are quality-of-life and do not affect
   command set (play/pause/next/previous/stop/volume/mute/repeat/shuffle), metadata, AND the
   visualizer role (256-bin spectrum + loudness), and honors transport commands sent back. This is
   how Plum observes/controls/visualizes MA-served audio (commit 6148204): the player negotiates
-  PLAYER+METADATA+CONTROLLER+VISUALIZER and relays to the GUI. Fully spec-native at the MA boundary.
+  PLAYER+METADATA+CONTROLLER+VISUALIZER+ARTWORK and relays to the GUI (album art included). Fully spec-native at the MA boundary.
 - **A freshly connected CONTROLLER (not a member) lands in its OWN solo group, not the session.**
   Resolved 2026-07-23 with MA actively streaming to our player: our player was in MA group
   `af2c0caf…` (`playing`, "1 Last Cigarette") while a controller connecting at the same moment

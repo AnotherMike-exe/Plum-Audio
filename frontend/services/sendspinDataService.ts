@@ -269,6 +269,7 @@ export class SendspinDataService {
   private consumeWs: WebSocket | null = null;
   private consumeCtrl: { commands: string[]; volume: number | null; muted: boolean | null } | null = null;
   private consumeViz: VizFrame | null = null;
+  private consumeArt: string | null = null;  // album art data URL from the foreign server
   private listeners = new Set<Listener>();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
@@ -312,11 +313,15 @@ export class SendspinDataService {
         this.emit();
       } else if (m.t === 'viz' && Array.isArray(m.s)) {
         this.consumeViz = { spectrum: Uint8Array.from(m.s), loudness: m.l ?? 0, at: Date.now() };
+      } else if (m.t === 'art') {
+        this.consumeArt = m.d ?? null;
+        this.emit();
       }
     };
     ws.onclose = () => {
       this.consumeCtrl = null;
       this.consumeViz = null;
+      this.consumeArt = null;
       if (this.pollTimer) setTimeout(() => this.openConsume(), 2000); // still running → reconnect
     };
     ws.onerror = () => ws.close();
@@ -355,7 +360,7 @@ export class SendspinDataService {
           title: fc.foreignServer.title ?? '',
           artist: fc.foreignServer.artist ?? '',
           album: '',
-          albumArtUrl: '',
+          albumArtUrl: this.consumeArt ?? '',
           duration: 0,
         },
         isPlaying: playing,

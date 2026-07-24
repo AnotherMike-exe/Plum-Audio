@@ -392,17 +392,17 @@ Voice PE).** Not a stand-in — real foreign implementations on their own segmen
   visualize MA-served audio** (commit 6148204) via the player relaying its member-view to the GUI.
 
 **CONSUME + OBSERVE + CONTROL FOREIGN PLAYBACK (2026-07-23, `6148204`).** The completeness of the
-"consumption" side: our player negotiates PLAYER+METADATA+CONTROLLER+VISUALIZER, so wherever it
+"consumption" side: our player negotiates PLAYER+METADATA+CONTROLLER+VISUALIZER+ARTWORK, so wherever it
 plays — our source, a peer, or a foreign server (Music Assistant) — it observes that group's
 controller state + visualizer as a spec member and can drive transport. The player is INVARIANT to
 audio origin, so this is uniform. Relay to the GUI (internal, since the GUI talks to our server, not
 the player): the player is a producer on a `/api/mesh/consume` WS (mesh API), streaming ctrl +
 spectrum and taking commands; the GUI synthesizes a `foreign::` stream from the player's self-report
-so the existing now-playing/transport/visualizer render on it. Reuses the mesh API (no new player
-port) — the only new surface is one WS. This is what makes "any Sendspin server serving our
+so the existing now-playing/transport/visualizer render on it. Album art rides the same relay
+(the artwork role → a JPEG data URL). Reuses the mesh API (no new player port) — the only new surface is one WS. This is what makes "any Sendspin server serving our
 endpoints" a first-class, controllable, visualizable source in the GUI. Hardware-verified against
-real Music Assistant: featured now-playing, live visualizer off MA's spectrum, and pause/play/next
-driving MA. The visualizer per-source boundary from the prior section is thus SUPERSEDED for the
+real Music Assistant: featured now-playing WITH ALBUM ART, live visualizer off MA's spectrum, and
+pause/play/next driving MA. The visualizer per-source boundary from the prior section is thus SUPERSEDED for the
 player's own session — it visualizes whatever the speaker plays, foreign included, via the relay.
 
 **VISUALIZER = the native Sendspin visualizer role (2026-07-23).** aiosendspin's `visualizer@v1`
