@@ -20,18 +20,16 @@ weights integration and interop over breadth of unit coverage.
 
 | Suite | Runs | Covers |
 |---|---|---|
-| `frontend/tests/unit/**` (vitest) | `npx vitest run` | view→model mapping, local-player-by-host, progress extrapolation, settings service |
-| `tests/Unit/**` (pytest) | `PYTHONPATH=backend/scripts pytest tests/Unit` | router path selection, loopback URL rewrite, snapshot wire round trip |
+| `frontend/tests/unit/**` (vitest) | `npx vitest run` | view→model mapping, local-player-by-host, progress extrapolation, `TimeFilter` clock sync, settings service (17 in the data-service suite) |
+| `tests/Unit/**` (pytest, 25) | `PYTHONPATH=backend/scripts pytest tests/Unit` | router path selection · loopback URL rewrite · snapshot wire round trip · **source_config** (port/UDP allocation, filtering, template substitution) · **source_manager** reconcile (start order, rename-respools-keeps-source, dead/empty respawn, render-on-change, one-bad-endpoint isolation) |
 
-**Gaps to close (highest value first):**
-1. `SourceManagerBase` reconcile — desired/running diffing, signature respool, empty-proc respawn,
-   daemon start order. Currently proven only by a scratch script; make it a pytest with a fake
-   server + fake daemons.
-2. `spotify_config` / `airplay_config` rendering — port/UDP-block allocation, endpoint filtering.
-3. `SourceFeeder` idle transitions — first audio → `playing`, EOF → `stopped`, idle timeout →
-   `stopped` (a fake group recording `start_stream`/`stop` calls; no ALSA needed).
-4. `integrations_api` CRUD — already exercised by a scratch script; promote to pytest with a temp
-   settings file.
+**Done 2026-07-23:** `test_source_config.py` (9) and `test_source_manager.py` (8) replace the
+scratch smoke script. `SourceFeeder` idle transitions can't be unit-tested (they need a real FIFO +
+group, and sendspin_server imports aiosendspin) — they are covered by `t2_source_lifecycle.sh`
+instead. `integrations_api` CRUD is covered live by `t2_endpoint_crud.sh`.
+
+**Still open (tier 1):** a pytest for `settings_api` atomic write + version bump + deep-merge, and
+for the `integrations_api` EndpointsManager port allocation with a temp settings file (both pure).
 
 ## Tier 2 — single unit on hardware
 
@@ -90,24 +88,21 @@ Untested: **the image has never been built.** Before any deployment claim —
 
 ---
 
-## The immediate task: make tiers 2–4 reproducible
+## Integration harness — built 2026-07-23
 
-Every hardware check so far has been an ad-hoc script. Promote them to `tests/Integration/` as
-runnable, self-describing scripts with a tiny harness:
+`tests/Integration/` now holds the promoted scripts + a shared harness (`lib.sh`: ssh/curl helpers,
+assertions, `wait_for`, and `defer` teardown that always runs). Each takes its host(s) as arguments,
+prints PASS/FAIL per assertion, exits non-zero on failure, and **leaves the rig as it found it** —
+non-negotiable for tier 4's live third-party devices. `run.sh` drives a whole rig's suite; see
+`tests/Integration/README.md`.
 
-```
-tests/Integration/
-  README.md              which rig each needs, and how to point at it
-  lib.sh                 ssh/curl helpers, assert_json, wait_for
-  t2_source_lifecycle.sh t2_endpoint_crud.sh t2_airplay_mpris.sh
-  t3_mesh_roam.sh        t3_multigroup.sh
-  t4_interop_ma.sh       t4_adopt_release.sh   t4_controller_probe.py
-```
+| Script | Status |
+|---|---|
+| `t2_source_lifecycle.sh` | ✅ passing (VLAN-7 unit) — the feeder idle contract's home |
+| `t2_endpoint_crud.sh` | ✅ passing — live add/rename/remove, others untouched |
+| `t4_interop_ma.sh` | ✅ passing — MA discovered, we advertise both ways, claim self-reported |
+| `t4_adopt_release.sh` | ✅ passing — adopt an HA Voice PE, release incl. the socket-closed check |
+| `t3_mesh_roam.sh` | written, syntax-checked; **pending** the two-unit `.201` rig being powered up |
 
-Each script: take the target host(s) as arguments, print PASS/FAIL per assertion, exit non-zero on
-failure, and leave the rig in the state it found it. That last property is not optional — tier 4
-runs against live devices in someone's home.
-
-**Suggested order:** (1) the harness + `t4_adopt_release.sh` and `t4_interop_ma.sh`, since those
-cover the newest and least-proven code and currently exist only as scratch files; (2) tier 2
-scripts; (3) the tier-1 pytest gaps above; (4) tier 6 once the image builds.
+**Remaining:** run `t3_mesh_roam.sh` on the mesh rig; add `t2_airplay_mpris.sh` (per-endpoint
+private-bus MPRIS ownership) and a `t3_multigroup.sh`; the tier-5 soak and tier-6 container tiers.
