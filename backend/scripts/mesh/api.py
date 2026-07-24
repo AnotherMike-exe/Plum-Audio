@@ -26,6 +26,7 @@ there is no delegation. Multiple sources may run concurrently, each anchoring it
 
 from __future__ import annotations
 
+import contextlib
 import logging
 
 from aiohttp import web
@@ -64,6 +65,14 @@ class MeshApi:
         self._neighbourhood = neighbourhood
         self.port = port
         self._runner: web.AppRunner | None = None
+        # Consume relay: the local player (producer) forwards what it observes as a group MEMBER of
+        # whatever server it plays — including a FOREIGN one (Music Assistant) — namely the group's
+        # controller state and visualizer frames, plus commands back. This is purely internal
+        # plumbing between our own player and our own GUI; the spec-native part is the player being a
+        # conformant group member. See sendspin_player.py / MeshApi._consume.
+        self._consumers: set[web.WebSocketResponse] = set()
+        self._producer: web.WebSocketResponse | None = None
+        self._last_ctrl: dict | None = None  # cache so a GUI that connects mid-session gets it
 
     async def start(self) -> None:
         app = web.Application(middlewares=[_cors])
@@ -72,6 +81,7 @@ class MeshApi:
                 web.get("/api/mesh/snapshot", self._snapshot),
                 web.get("/api/mesh/view", self._view),
                 web.get("/api/mesh/neighbourhood", self._neighbours),
+                web.get("/api/mesh/consume", self._consume),
                 web.post("/api/mesh/player-state", self._player_state),
                 web.post("/api/mesh/adopt", self._adopt),
                 web.post("/api/mesh/release", self._release),
@@ -154,6 +164,58 @@ class MeshApi:
             return web.json_response({"error": "player_id and source_id required"}, status=400)
         await self._engine.release_client(source_id, player_id, url=url)
         return web.json_response({"ok": True})
+
+    async def _consume(self, request: web.Request) -> web.WebSocketResponse:
+        """WS bridge for foreign-server consumption. `?role=player` = the producer (our local
+        player, one at a time); anything else = a GUI consumer.
+
+        Producer → consumers: `{"t":"ctrl",...}` (supported_commands/volume, cached) and
+        `{"t":"viz","s":[...],"l":N}` (spectrum 0-255 + loudness, ~30/s, not cached).
+        Consumer → producer: `{"t":"cmd","command":"pause"}` (transport to the foreign server).
+        """
+        ws = web.WebSocketResponse(heartbeat=30)
+        await ws.prepare(request)
+        is_player = request.query.get("role") == "player"
+        if is_player:
+            self._producer = ws
+            logger.info("consume relay: player producer connected")
+        else:
+            self._consumers.add(ws)
+            if self._last_ctrl is not None:  # bring a late GUI up to speed immediately
+                with contextlib.suppress(Exception):
+                    await ws.send_json(self._last_ctrl)
+        try:
+            async for msg in ws:
+                if msg.type is not web.WSMsgType.TEXT:
+                    continue
+                try:
+                    data = msg.json()
+                except Exception:  # noqa: BLE001
+                    continue
+                if is_player:
+                    if data.get("t") == "ctrl":
+                        self._last_ctrl = data
+                    await self._broadcast(data)  # ctrl + viz → every GUI
+                elif data.get("t") == "cmd" and self._producer is not None:
+                    with contextlib.suppress(Exception):
+                        await self._producer.send_json(data)  # command → the player
+        finally:
+            if is_player and self._producer is ws:
+                self._producer = None
+                self._last_ctrl = None
+            else:
+                self._consumers.discard(ws)
+        return ws
+
+    async def _broadcast(self, data: dict) -> None:
+        dead = []
+        for c in self._consumers:
+            try:
+                await c.send_json(data)
+            except Exception:  # noqa: BLE001 - drop a dead consumer, keep the rest
+                dead.append(c)
+        for c in dead:
+            self._consumers.discard(c)
 
     async def _neighbours(self, _request: web.Request) -> web.Response:
         """Every Sendspin server and player mDNS can see on this segment, ours flagged.

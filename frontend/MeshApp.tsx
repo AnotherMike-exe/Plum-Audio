@@ -30,7 +30,7 @@ import { Icon } from './components/Icon';
 import { Settings } from './components/Settings';
 import { Visualizer } from './components/Visualizer';
 import { Client, Settings as SettingsType, Stream } from './types';
-import { Model, SendspinDataService } from './services/sendspinDataService';
+import { Model, SendspinDataService, FOREIGN_PREFIX } from './services/sendspinDataService';
 import { settingsService } from './services/settingsService';
 import { useThemeSettings } from './hooks/useThemeSettings';
 
@@ -201,6 +201,7 @@ export default function MeshApp(): React.ReactElement {
    *  - not ours at all            -> adopt (dial) / release (hang up)
    */
   const moveClient = useCallback((client: Client, streamId: string | null) => {
+    if (streamId && streamId.startsWith(FOREIGN_PREFIX)) return; // foreign session: nothing to route
     const url = client.url;
     if (streamId && url && (client.isForeign || client.foreignServer)) {
       void service.adoptSpeaker(url, streamId);

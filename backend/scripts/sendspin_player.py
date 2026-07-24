@@ -44,7 +44,8 @@ import numpy as np
 from aiosendspin.client.client import SendspinClient
 from aiosendspin.client.listener import ClientListener
 from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
-from aiosendspin.models.types import AudioCodec, GoodbyeReason, PlayerCommand, Roles
+from aiosendspin.models.visualizer import ClientHelloVisualizerSpectrum, ClientHelloVisualizerSupport
+from aiosendspin.models.types import AudioCodec, GoodbyeReason, MediaCommand, PlayerCommand, Roles
 
 try:
     import sounddevice as sd
@@ -114,6 +115,34 @@ class AlsaRenderer:
         self._state["group_name"] = getattr(payload, "group_name", None)
         self._state["playback_state"] = getattr(state, "value", state)
 
+    def _on_controller_state(self, payload) -> None:
+        ctrl = getattr(payload, "controller", None)
+        if ctrl is None:
+            return
+        cmds = getattr(ctrl, "supported_commands", None)
+        new = {
+            "t": "ctrl",
+            "commands": [getattr(c, "value", c) for c in (cmds or [])],
+            "volume": getattr(ctrl, "volume", None),
+            "muted": getattr(ctrl, "muted", None),
+        }
+        if new != self._relay_ctrl:
+            self._relay_ctrl = new
+            self._relay_ctrl_dirty = True
+
+    def _on_visualizer(self, frames) -> None:  # frames: list[VisualizerFrame]
+        # Spectrum and loudness arrive as separate frames; merge into the latest {s,l}. Scale the
+        # wire's uint16 spectrum to 0-255, the shape the GUI's canvas already consumes.
+        viz = self._relay_viz or {"t": "viz"}
+        for f in frames:
+            spec = getattr(f, "spectrum", None)
+            if spec is not None:
+                viz["s"] = [min(255, v >> 8) for v in spec]
+            loud = getattr(f, "loudness", None)
+            if loud is not None:
+                viz["l"] = round(loud / 65535, 4)
+        self._relay_viz = viz
+
     def _on_metadata(self, payload) -> None:
         md = getattr(payload, "metadata", None)
         if md is None:
@@ -148,6 +177,61 @@ class AlsaRenderer:
         from mesh.avahi import local_ip
 
         return local_ip() or "127.0.0.1"
+
+    async def _relay_loop(self) -> None:
+        """Producer side of the consume relay: push ctrl + viz to the mesh API, take commands back.
+        Best-effort; the audio path never waits on it."""
+        import aiohttp
+
+        while True:
+            try:
+                async with aiohttp.ClientSession() as session, session.ws_connect(self.relay_url, heartbeat=30) as ws:
+                    logger.info("consume relay connected (%s)", self.relay_url)
+                    sender = asyncio.ensure_future(self._relay_send(ws))
+                    try:
+                        async for msg in ws:
+                            if msg.type is aiohttp.WSMsgType.TEXT:
+                                with contextlib.suppress(Exception):
+                                    await self._relay_command(msg.json())
+                    finally:
+                        sender.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await sender
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - mesh API down / restarting; retry
+                logger.debug("consume relay error; retrying", exc_info=True)
+            await asyncio.sleep(2.0)
+
+    async def _relay_send(self, ws) -> None:
+        """~30 fps: emit the latest ctrl (on change) + latest viz frame (coalesced)."""
+        while True:
+            if self._relay_ctrl_dirty and self._relay_ctrl is not None:
+                self._relay_ctrl_dirty = False
+                with contextlib.suppress(Exception):
+                    await ws.send_json(self._relay_ctrl)
+            if self._relay_viz is not None:
+                frame, self._relay_viz = self._relay_viz, None
+                with contextlib.suppress(Exception):
+                    await ws.send_json(frame)
+            await asyncio.sleep(1 / 30)
+
+    async def _relay_command(self, data: dict) -> None:
+        """A transport command from the GUI → send it to the server we are a member of."""
+        if data.get("t") != "cmd":
+            return
+        try:
+            cmd = MediaCommand(data.get("command"))
+        except ValueError:
+            return
+        kwargs = {}
+        if cmd is MediaCommand.VOLUME and data.get("volume") is not None:
+            kwargs["volume"] = int(data["volume"])
+        if cmd is MediaCommand.MUTE and data.get("mute") is not None:
+            kwargs["mute"] = bool(data["mute"])
+        with contextlib.suppress(Exception):
+            await self.client.send_group_command(cmd, **kwargs)
+            logger.info("consume relay: sent %s to server", cmd.value)
 
     async def _report_loop(self) -> None:
         """Push our state to this unit's mesh API. Best-effort: the audio path never waits on it."""
@@ -290,13 +374,21 @@ class SendspinPlayer:
             buffer_capacity=self.renderer._max_bytes,  # advertise our real buffer ceiling
             supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
         )
+        viz_support = ClientHelloVisualizerSupport(
+            buffer_capacity=1 << 16,
+            rate_max=30,
+            types=["spectrum", "loudness"],
+            spectrum=ClientHelloVisualizerSpectrum(n_disp_bins=256, scale="log", f_min=40, f_max=16000),
+        )
         self.client = SendspinClient(
             client_id=player_id,
             client_name=player_name,
-            # METADATA too: a claimed speaker must be able to say WHAT it is playing, not just that
-            # it left. That is the whole point of the self-report below.
-            roles=[Roles.PLAYER, Roles.METADATA],
+            # PLAYER renders; METADATA/CONTROLLER/VISUALIZER make this speaker a full CONSUMER of
+            # whatever group it plays in — so a foreign server (Music Assistant) serving to us can be
+            # observed (title/art), controlled (transport/volume) and visualized, as a group member.
+            roles=[Roles.PLAYER, Roles.METADATA, Roles.CONTROLLER, Roles.VISUALIZER],
             player_support=support,
+            visualizer_support=viz_support,
             static_delay_ms=static_delay_ms,
             initial_volume=initial_volume,
         )
@@ -317,8 +409,18 @@ class SendspinPlayer:
         self._state: dict = {"attached": False}
         self._report_task: asyncio.Task | None = None
         self.report_url = os.environ.get("PLUM_PLAYER_STATE_URL", "http://127.0.0.1:5001/api/mesh/player-state")
+        # Consume relay: forward the group's controller state + visualizer frames (which we receive
+        # as a MEMBER of whatever server serves us, foreign ones included) to our GUI, and take
+        # transport commands back. Latest-wins coalescing so 30 fps viz never backs up.
+        self._relay_ctrl: dict | None = None
+        self._relay_ctrl_dirty = False
+        self._relay_viz: dict | None = None  # {"s":[0-255 x N],"l":loudness}
+        self._relay_task: asyncio.Task | None = None
+        self.relay_url = os.environ.get("PLUM_PLAYER_RELAY_URL", "ws://127.0.0.1:5001/api/mesh/consume?role=player")
         self.client.add_group_update_listener(self._on_group_update)
         self.client.add_metadata_listener(self._on_metadata)
+        self.client.add_controller_state_listener(self._on_controller_state)
+        self.client.add_visualizer_listener(self._on_visualizer)
 
     # -- self-report ---------------------------------------------------------
 
@@ -327,6 +429,34 @@ class SendspinPlayer:
         self._state["group_id"] = getattr(payload, "group_id", None)
         self._state["group_name"] = getattr(payload, "group_name", None)
         self._state["playback_state"] = getattr(state, "value", state)
+
+    def _on_controller_state(self, payload) -> None:
+        ctrl = getattr(payload, "controller", None)
+        if ctrl is None:
+            return
+        cmds = getattr(ctrl, "supported_commands", None)
+        new = {
+            "t": "ctrl",
+            "commands": [getattr(c, "value", c) for c in (cmds or [])],
+            "volume": getattr(ctrl, "volume", None),
+            "muted": getattr(ctrl, "muted", None),
+        }
+        if new != self._relay_ctrl:
+            self._relay_ctrl = new
+            self._relay_ctrl_dirty = True
+
+    def _on_visualizer(self, frames) -> None:  # frames: list[VisualizerFrame]
+        # Spectrum and loudness arrive as separate frames; merge into the latest {s,l}. Scale the
+        # wire's uint16 spectrum to 0-255, the shape the GUI's canvas already consumes.
+        viz = self._relay_viz or {"t": "viz"}
+        for f in frames:
+            spec = getattr(f, "spectrum", None)
+            if spec is not None:
+                viz["s"] = [min(255, v >> 8) for v in spec]
+            loud = getattr(f, "loudness", None)
+            if loud is not None:
+                viz["l"] = round(loud / 65535, 4)
+        self._relay_viz = viz
 
     def _on_metadata(self, payload) -> None:
         md = getattr(payload, "metadata", None)
@@ -362,6 +492,61 @@ class SendspinPlayer:
         from mesh.avahi import local_ip
 
         return local_ip() or "127.0.0.1"
+
+    async def _relay_loop(self) -> None:
+        """Producer side of the consume relay: push ctrl + viz to the mesh API, take commands back.
+        Best-effort; the audio path never waits on it."""
+        import aiohttp
+
+        while True:
+            try:
+                async with aiohttp.ClientSession() as session, session.ws_connect(self.relay_url, heartbeat=30) as ws:
+                    logger.info("consume relay connected (%s)", self.relay_url)
+                    sender = asyncio.ensure_future(self._relay_send(ws))
+                    try:
+                        async for msg in ws:
+                            if msg.type is aiohttp.WSMsgType.TEXT:
+                                with contextlib.suppress(Exception):
+                                    await self._relay_command(msg.json())
+                    finally:
+                        sender.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await sender
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - mesh API down / restarting; retry
+                logger.debug("consume relay error; retrying", exc_info=True)
+            await asyncio.sleep(2.0)
+
+    async def _relay_send(self, ws) -> None:
+        """~30 fps: emit the latest ctrl (on change) + latest viz frame (coalesced)."""
+        while True:
+            if self._relay_ctrl_dirty and self._relay_ctrl is not None:
+                self._relay_ctrl_dirty = False
+                with contextlib.suppress(Exception):
+                    await ws.send_json(self._relay_ctrl)
+            if self._relay_viz is not None:
+                frame, self._relay_viz = self._relay_viz, None
+                with contextlib.suppress(Exception):
+                    await ws.send_json(frame)
+            await asyncio.sleep(1 / 30)
+
+    async def _relay_command(self, data: dict) -> None:
+        """A transport command from the GUI → send it to the server we are a member of."""
+        if data.get("t") != "cmd":
+            return
+        try:
+            cmd = MediaCommand(data.get("command"))
+        except ValueError:
+            return
+        kwargs = {}
+        if cmd is MediaCommand.VOLUME and data.get("volume") is not None:
+            kwargs["volume"] = int(data["volume"])
+        if cmd is MediaCommand.MUTE and data.get("mute") is not None:
+            kwargs["mute"] = bool(data["mute"])
+        with contextlib.suppress(Exception):
+            await self.client.send_group_command(cmd, **kwargs)
+            logger.info("consume relay: sent %s to server", cmd.value)
 
     async def _report_loop(self) -> None:
         """Push our state to this unit's mesh API. Best-effort: the audio path never waits on it."""
@@ -407,6 +592,8 @@ class SendspinPlayer:
         logger.info("player listening on :%d (id=%s)", self.port, self.player_id)
         if self.report_url:
             self._report_task = asyncio.ensure_future(self._report_loop())
+        if self.relay_url:
+            self._relay_task = asyncio.ensure_future(self._relay_loop())
 
         # Advertise ourselves the way the spec says a server-dialed client should: _sendspin._tcp,
         # port 8928, TXT path + name. Published through the system Avahi rather than aiosendspin's
@@ -436,11 +623,13 @@ class SendspinPlayer:
                     logger.info("dialed home server %s", home_server_url)
 
     async def stop(self) -> None:
-        if self._report_task is not None:
-            self._report_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._report_task
-            self._report_task = None
+        for task_attr in ("_report_task", "_relay_task"):
+            task = getattr(self, task_attr)
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                setattr(self, task_attr, None)
         if self._avahi is not None:
             with contextlib.suppress(Exception):
                 await self._avahi.close()

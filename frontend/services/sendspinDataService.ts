@@ -17,6 +17,8 @@ import { NowPlaying, SendspinControllerClient, currentPositionMs, ControllerComm
 const MESH_API_PORT = 5001;
 const MESH_API_BASE = import.meta.env.VITE_MESH_API_URL || '/api/mesh';
 const POLL_INTERVAL_MS = 3000;
+// Synthetic stream id for a foreign-server session our player renders (see snapshot()).
+export const FOREIGN_PREFIX = 'foreign::';
 
 // ---- Mesh REST wire shapes (backend/scripts/mesh/model.py) ----
 interface WirePlayer {
@@ -261,6 +263,12 @@ export class SendspinDataService {
   private unitHosts = new Map<string, string>(); // unitId -> host (for per-unit REST)
   private lastView: MeshView = { units: [] };
   private neighbourhood: Neighbourhood | null = null;
+  // Foreign-server consume relay (see MeshApi._consume): our player, as a group member of a foreign
+  // server (Music Assistant), forwards that group's controller state + visualizer frames here, and
+  // we send transport commands back. Lets the GUI observe + control + visualize foreign playback.
+  private consumeWs: WebSocket | null = null;
+  private consumeCtrl: { commands: string[]; volume: number | null; muted: boolean | null } | null = null;
+  private consumeViz: VizFrame | null = null;
   private listeners = new Set<Listener>();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
@@ -270,6 +278,7 @@ export class SendspinDataService {
     this.pollTimer = setInterval(() => void this.poll(), POLL_INTERVAL_MS);
     // Re-emit ~2x/s so extrapolated position advances even without new WS messages.
     this.tickTimer = setInterval(() => this.emit(), 500);
+    this.openConsume();
   }
 
   stop(): void {
@@ -278,6 +287,46 @@ export class SendspinDataService {
     this.pollTimer = this.tickTimer = null;
     for (const c of this.controllers.values()) c.close();
     this.controllers.clear();
+    this.consumeWs?.close();
+    this.consumeWs = null;
+  }
+
+  private openConsume(): void {
+    // ws(s):// same-origin /api/mesh/consume (nginx proxies it). In dev, VITE_MESH_API_URL is a full
+    // http URL → swap the scheme. Auto-reconnects; the relay is optional, the mesh renders without it.
+    let url: string;
+    if (MESH_API_BASE.startsWith('http')) url = MESH_API_BASE.replace(/^http/, 'ws') + '/consume';
+    else url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + MESH_API_BASE + '/consume';
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(url);
+    } catch {
+      return;
+    }
+    this.consumeWs = ws;
+    ws.onmessage = (ev) => {
+      let m: any;
+      try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.t === 'ctrl') {
+        this.consumeCtrl = { commands: m.commands || [], volume: m.volume ?? null, muted: m.muted ?? null };
+        this.emit();
+      } else if (m.t === 'viz' && Array.isArray(m.s)) {
+        this.consumeViz = { spectrum: Uint8Array.from(m.s), loudness: m.l ?? 0, at: Date.now() };
+      }
+    };
+    ws.onclose = () => {
+      this.consumeCtrl = null;
+      this.consumeViz = null;
+      if (this.pollTimer) setTimeout(() => this.openConsume(), 2000); // still running → reconnect
+    };
+    ws.onerror = () => ws.close();
+  }
+
+  /** Send a transport command to the foreign server our player is a member of (via the relay). */
+  private sendForeignCommand(command: string, args: { volume?: number; mute?: boolean } = {}): void {
+    if (this.consumeWs?.readyState === WebSocket.OPEN) {
+      this.consumeWs.send(JSON.stringify({ t: 'cmd', command, ...args }));
+    }
   }
 
   subscribe(cb: Listener): () => void {
@@ -287,7 +336,35 @@ export class SendspinDataService {
   }
 
   snapshot(): Model {
-    return mapViewToModel(this.lastView, this.npByGroup, this.offsetByGroup, Date.now(), this.neighbourhood);
+    const model = mapViewToModel(this.lastView, this.npByGroup, this.offsetByGroup, Date.now(), this.neighbourhood);
+    // Our player playing a FOREIGN server (MA) is not a stream in the mesh view — synthesize one so
+    // now-playing, transport and the visualizer all light up on it. Its metadata rides the player's
+    // self-report (foreignServer); controls + spectrum ride the consume relay.
+    const fc = model.clients.find((c) => c.isLocal && c.foreignServer);
+    if (fc?.foreignServer) {
+      const sid = `${FOREIGN_PREFIX}${fc.id}`;
+      const playing = fc.foreignServer.title != null; // best signal we have; refined by relay later
+      model.streams.push({
+        id: sid,
+        serverName: fc.foreignServer.name,
+        name: fc.foreignServer.name,
+        sourceDevice: 'foreign',
+        active: true,
+        currentTrack: {
+          id: sid,
+          title: fc.foreignServer.title ?? '',
+          artist: fc.foreignServer.artist ?? '',
+          album: '',
+          albumArtUrl: '',
+          duration: 0,
+        },
+        isPlaying: playing,
+        progress: 0,
+        volume: this.consumeCtrl?.volume ?? undefined,
+      });
+      fc.currentStreamId = sid; // makes it the featured stream for the local page
+    }
+    return model;
   }
 
   // -- commands -----------------------------------------------------------
@@ -312,6 +389,10 @@ export class SendspinDataService {
   }
 
   controlStream(federatedStreamId: string, command: ControllerCommand): void {
+    if (federatedStreamId.startsWith(FOREIGN_PREFIX)) {
+      this.sendForeignCommand(command);
+      return;
+    }
     const controller = this.controllers.get(federatedStreamId);
     if (!controller) return;
     controller.send(command);
@@ -321,6 +402,10 @@ export class SendspinDataService {
   }
 
   setStreamVolume(federatedStreamId: string, volume: number): void {
+    if (federatedStreamId.startsWith(FOREIGN_PREFIX)) {
+      this.sendForeignCommand('volume', { volume });
+      return;
+    }
     this.controllers.get(federatedStreamId)?.send('volume', { volume });
   }
 
@@ -331,6 +416,16 @@ export class SendspinDataService {
     canGoNext: boolean;
     canGoPrevious: boolean;
   } {
+    if (federatedStreamId.startsWith(FOREIGN_PREFIX)) {
+      const cmds = this.consumeCtrl?.commands ?? [];
+      return {
+        canPlay: cmds.includes('play'),
+        canPause: cmds.includes('pause'),
+        canSeek: false,
+        canGoNext: cmds.includes('next'),
+        canGoPrevious: cmds.includes('previous'),
+      };
+    }
     const { unitId, sourceId } = parseStreamId(federatedStreamId);
     const src = this.lastView.units
       .find((u) => u.unit_id === unitId)
@@ -351,6 +446,7 @@ export class SendspinDataService {
    * ~30×/s and would otherwise trigger a full re-render each time.
    */
   getVizFrame(federatedStreamId: string): VizFrame | null {
+    if (federatedStreamId.startsWith(FOREIGN_PREFIX)) return this.consumeViz;
     return this.controllers.get(federatedStreamId)?.vizFrame ?? null;
   }
 
