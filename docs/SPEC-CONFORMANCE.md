@@ -99,18 +99,25 @@ server advertises. The two remaining items are quality-of-life and do not affect
 
 - Accepts a controller-role client, places it in a group, pushes group + metadata + controller
   state. Reports its own session as `connection_reason=discovery`.
-- **A freshly connected controller lands in its OWN solo group, not the active playback session.**
+- **Observe/control a foreign session by being a group MEMBER, not a fresh controller.** A
+  controller that merely connects lands in an isolated solo group (below). But our PLAYER, as the
+  renderer, is already a member of the playing group — and to a member MA emits the FULL controller
+  command set (play/pause/next/previous/stop/volume/mute/repeat/shuffle), metadata, AND the
+  visualizer role (256-bin spectrum + loudness), and honors transport commands sent back. This is
+  how Plum observes/controls/visualizes MA-served audio (commit 6148204): the player negotiates
+  PLAYER+METADATA+CONTROLLER+VISUALIZER and relays to the GUI. Fully spec-native at the MA boundary.
+- **A freshly connected CONTROLLER (not a member) lands in its OWN solo group, not the session.**
   Resolved 2026-07-23 with MA actively streaming to our player: our player was in MA group
   `af2c0caf…` (`playing`, "1 Last Cigarette") while a controller connecting at the same moment
   landed in a different group `d1c40416…` (`stopped`), advertising only
   `supported_commands = [volume, mute, switch]`. So the earlier "no transport" was **not**
   state-dependent — a controller simply is not placed in the playing group, so it can neither see
   nor drive the active session.
-- **Consequence for the GUI**: remote-controlling MA's playback over the Sendspin controller role is
-  not achievable as MA implements it — a connecting controller is isolated in an empty group. We can
-  fully control our OWN sources, render MA's audio as a player, and read/volume our own controller
-  group; genuine "remote for MA" needs MA's own API (Home Assistant), which is outside Sendspin.
-  This is consistent with the protocol having no library/topology surface.
+- **Consequence, corrected**: an earlier note here said remote-controlling MA "is not achievable" —
+  that was for a fresh controller. Via the player-as-member path above, we DO fully observe,
+  control and visualize MA-served audio over standard Sendspin roles. What remains outside Sendspin
+  is MA's library/browse/queue surface (its own Home Assistant API) — the protocol has no such
+  concept, as expected.
 - Discovers players by mDNS `_sendspin._tcp`, with manual IP entry as a fallback.
 
 ## Deliberate deviations (not gaps)

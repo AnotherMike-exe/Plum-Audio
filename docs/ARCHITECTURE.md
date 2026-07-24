@@ -385,11 +385,25 @@ Voice PE).** Not a stand-in — real foreign implementations on their own segmen
   `home-assistant-voice-a1b2c3`, connects as its MAC). One mover handles all three cases — ours in
   the mesh (router), ours held by a foreign server (adopt by URL; the router cannot reclaim what is
   in no unit's view), and not ours at all (adopt/release).
-- MA as a controller target: a freshly connected controller lands in MA's OWN solo group, NOT the
-  playing session (confirmed 2026-07-23 with MA mid-playback: player in group `af2c0caf`, a
-  controller in group `d1c40416`, stopped, `[volume, mute, switch]` only). So we cannot remote MA's
-  transport over the controller role — that needs MA's own (Home Assistant) API, outside Sendspin.
-  See docs/SPEC-CONFORMANCE.md.
+- MA as a controller target: a freshly connected controller lands in MA's OWN solo group (`d1c40416`,
+  stopped, `[volume, mute, switch]` only) — but that is the WRONG bridge. Our PLAYER is a member of
+  the playing group, and to a member MA emits the FULL command set + metadata + the visualizer role
+  (256-bin spectrum + loudness) and honors commands back. **So we fully observe, control and
+  visualize MA-served audio** (commit 6148204) via the player relaying its member-view to the GUI.
+
+**CONSUME + OBSERVE + CONTROL FOREIGN PLAYBACK (2026-07-23, `6148204`).** The completeness of the
+"consumption" side: our player negotiates PLAYER+METADATA+CONTROLLER+VISUALIZER, so wherever it
+plays — our source, a peer, or a foreign server (Music Assistant) — it observes that group's
+controller state + visualizer as a spec member and can drive transport. The player is INVARIANT to
+audio origin, so this is uniform. Relay to the GUI (internal, since the GUI talks to our server, not
+the player): the player is a producer on a `/api/mesh/consume` WS (mesh API), streaming ctrl +
+spectrum and taking commands; the GUI synthesizes a `foreign::` stream from the player's self-report
+so the existing now-playing/transport/visualizer render on it. Reuses the mesh API (no new player
+port) — the only new surface is one WS. This is what makes "any Sendspin server serving our
+endpoints" a first-class, controllable, visualizable source in the GUI. Hardware-verified against
+real Music Assistant: featured now-playing, live visualizer off MA's spectrum, and pause/play/next
+driving MA. The visualizer per-source boundary from the prior section is thus SUPERSEDED for the
+player's own session — it visualizes whatever the speaker plays, foreign included, via the relay.
 
 **VISUALIZER = the native Sendspin visualizer role (2026-07-23).** aiosendspin's `visualizer@v1`
 role auto-computes `spectrum` and `loudness` (also f_peak/peak/pitch) from the source's PushStream
