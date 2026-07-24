@@ -407,6 +407,19 @@ offline analysis and is skipped. The GUI's Visualizer component (ported from Plu
 `Uint8Array` of 0-255 bins, so spectrum bins are scaled uint16→uint8 — a REWIRE of its data source
 from WebAudio FFT to these frames, not a rebuild.
 
+**DONE + hardware-verified (2026-07-23, `9114149`):** the full-screen blob is spectrum-reactive off
+the native role, no browser audio. Two hardware-only bugs fixed: the canvas must read frames INSIDE
+its render loop (a ref), not via React state (per-frame setState canceled the render rAF → blank
+canvas); and `calculateBarHeights` (built for a raw linear FFT) sliced our already-log-binned
+spectrum wrong → invisible — replaced with a direct pre-binned-spectrum→bars mapping.
+
+**Boundary (the model, not a limitation to fix):** the visualizer role is per-SOURCE, computed by
+the group's server. So it follows whatever source the local player is on — OUR source or a PEER's,
+both spec-native and working. Audio a foreign server (MA) renders to our player has no source on any
+Sendspin server we can read (MA isolates a connecting controller in its own solo group), so it
+cannot be visualized. That is correct: "what the speaker plays" is visualizable exactly when some
+Sendspin server computes a visualizer role for that group.
+
 Full conformance status: **docs/SPEC-CONFORMANCE.md**. Test strategy: **docs/TESTING.md**.
 
 **KNOWN INTEROP GAP — client-side arbitration.** The spec's multi-server rules are client-side: on a
