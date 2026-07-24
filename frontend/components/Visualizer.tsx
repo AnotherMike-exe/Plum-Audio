@@ -4,6 +4,7 @@ import { AmorphousBlob } from './AmorphousBlob';
 import { StreamSelector } from './StreamSelector';
 import { Icon } from './Icon';
 import { formatTime } from '../utils/time';
+import type { VizFrame } from '../services/sendspinControllerClient';
 
 interface DualColorExtractionResult {
     backgroundColor: string;
@@ -16,7 +17,7 @@ interface VisualizerProps {
     stream: Stream | null;
     streams: Stream[];
     settings: Settings;
-    browserAudioSnapStream: any; // SnapStream type
+    getSpectrum: (() => VizFrame | null) | null;
     browserAudioMuted: boolean;
     extractedAlbumArtColors: DualColorExtractionResult | null;
     onPlayPause: () => void;
@@ -36,7 +37,7 @@ export const Visualizer: React.FC<VisualizerProps> = ({
     stream,
     streams,
     settings,
-    browserAudioSnapStream,
+    getSpectrum,
     browserAudioMuted,
     extractedAlbumArtColors,
     onPlayPause,
@@ -53,13 +54,6 @@ export const Visualizer: React.FC<VisualizerProps> = ({
 }) => {
     const [isFullscreen, setIsFullscreen] = useState(false);
     const [visualizerColor, setVisualizerColor] = useState<string>('#aa5cc3');
-
-    // Auto-start browser audio when visualizer opens if not already active
-    useEffect(() => {
-        if (isOpen && !browserAudioSnapStream) {
-            onStartBrowserAudio();
-        }
-    }, [isOpen]); // Run when visualizer opens
 
     // Handle both legacy boolean and new object visualizer settings
     const visualizerSettings: VisualizerSettings = typeof settings.integrations.visualizer === 'object'
@@ -183,7 +177,7 @@ export const Visualizer: React.FC<VisualizerProps> = ({
     };
 
     const accentColor = getUserAccentColor();
-    const isBrowserAudioActive = browserAudioSnapStream !== null;
+    const isBrowserAudioActive = true; // native visualizer role, not browser audio — always ready
 
     // Calculate progress percentage for the ring (match main GUI calculation)
     const progressPercent = duration > 0
@@ -240,8 +234,8 @@ export const Visualizer: React.FC<VisualizerProps> = ({
             {/* Visualizer Canvas - fills entire background */}
             <div className="absolute inset-0 z-0 pointer-events-none">
                 <AmorphousBlob
-                    snapStream={browserAudioSnapStream}
-                    settings={visualizerSettings}
+                    getFrame={getSpectrum}
+                    settings={{ ...visualizerSettings, enabled: true }}
                     albumArtUrl={albumArtUrl}
                     accentColor={accentColor}
                     themeSettings={settings.theme}
@@ -382,21 +376,6 @@ export const Visualizer: React.FC<VisualizerProps> = ({
 
             {/* Bottom Right: Fullscreen, Visualizer Settings, Settings, Listen Button */}
             <div className="absolute bottom-8 right-8 flex gap-3 z-10">
-                <button
-                    onClick={onToggleBrowserAudioMute}
-                    className={`w-12 h-12 flex items-center justify-center rounded-full transition-colors ${
-                        browserAudioMuted
-                            ? 'bg-[var(--bg-secondary)]/80 backdrop-blur-sm hover:bg-[var(--bg-tertiary)]'
-                            : 'bg-[var(--accent-color)] hover:brightness-110'
-                    }`}
-                    aria-label={browserAudioMuted ? 'Unmute browser audio' : 'Mute browser audio'}
-                    title={browserAudioMuted ? 'Listen in Browser' : 'Mute Browser Audio'}
-                >
-                    <Icon
-                        name={browserAudioMuted ? 'headphones' : 'headphones'}
-                        className={`w-6 h-6 ${browserAudioMuted ? 'text-[var(--text-primary)]' : 'accent-button-text'}`}
-                    />
-                </button>
 
                 <button
                     onClick={toggleFullscreen}

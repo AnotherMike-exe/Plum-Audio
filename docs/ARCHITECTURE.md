@@ -391,6 +391,22 @@ Voice PE).** Not a stand-in — real foreign implementations on their own segmen
   transport over the controller role — that needs MA's own (Home Assistant) API, outside Sendspin.
   See docs/SPEC-CONFORMANCE.md.
 
+**VISUALIZER = the native Sendspin visualizer role (2026-07-23).** aiosendspin's `visualizer@v1`
+role auto-computes `spectrum` and `loudness` (also f_peak/peak/pitch) from the source's PushStream
+audio, in-library (numpy DSP in `roles/visualizer/features.py`, driven by `push_stream.on_audio_chunk`).
+So the SERVER SIDE IS FREE: a controller that also negotiates `visualizer@v1` and is grouped into a
+streaming source's group receives binary frames on the audio timeline. No browser audio, no
+"Listen in Browser" dependency, no server code from us. Verified on hardware — with noise feeding a
+source, a visualizer client got 270 spectrum + 270 loudness frames over ~9s.
+
+Wire: client/hello carries `visualizer@v1_support` = `{buffer_capacity, rate_max, types:[spectrum,
+loudness], spectrum:{n_disp_bins, scale:lin|log|mel, f_min, f_max}}`. Frames are
+`[type:1][ts:8 BE][payload]`: **16=loudness** (`>H` uint16, 0-65535), **19=spectrum** (uint16[] BE,
+one per display bin, our requested n_disp_bins), 18=f_peak, 20=peak, 21=pitch. `beat` (17) needs
+offline analysis and is skipped. The GUI's Visualizer component (ported from Plum-Snapcast) wants a
+`Uint8Array` of 0-255 bins, so spectrum bins are scaled uint16→uint8 — a REWIRE of its data source
+from WebAudio FFT to these frames, not a rebuild.
+
 Full conformance status: **docs/SPEC-CONFORMANCE.md**. Test strategy: **docs/TESTING.md**.
 
 **KNOWN INTEROP GAP — client-side arbitration.** The spec's multi-server rules are client-side: on a

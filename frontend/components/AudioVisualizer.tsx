@@ -1,10 +1,10 @@
 import React, { useEffect, useRef } from 'react';
-import { useAudioVisualizer } from '../hooks/useAudioVisualizer';
-import type { SnapStream } from '../services/snapStreamService';
+import { useSpectrum } from '../hooks/useSpectrum';
+import type { VizFrame } from '../services/sendspinControllerClient';
 import type { VisualizerSettings } from '../types';
 
 interface AudioVisualizerProps {
-    snapStream: SnapStream | null;
+    getFrame: (() => VizFrame | null) | null;  // native visualizer-role frame provider
     settings: VisualizerSettings;
     albumArtSize: number;      // Size in pixels
     accentColor: string;
@@ -12,14 +12,14 @@ interface AudioVisualizerProps {
 }
 
 export const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
-    snapStream,
+    getFrame,
     settings,
     albumArtSize,
     accentColor,
     albumArtColor
 }) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
-    const audioData = useAudioVisualizer(snapStream, settings, settings.enabled);
+    const audioData = useSpectrum(getFrame, settings.enabled);
 
     const canvasSize = calculateCanvasSize(albumArtSize, settings.size);
 

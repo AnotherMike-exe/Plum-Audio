@@ -28,6 +28,7 @@ import { SyncedDevices } from './components/SyncedDevices';
 import { ClientManager } from './components/ClientManager';
 import { Icon } from './components/Icon';
 import { Settings } from './components/Settings';
+import { Visualizer } from './components/Visualizer';
 import { Client, Settings as SettingsType, Stream } from './types';
 import { Model, SendspinDataService } from './services/sendspinDataService';
 import { settingsService } from './services/settingsService';
@@ -62,6 +63,7 @@ export default function MeshApp(): React.ReactElement {
   const [model, setModel] = useState<Model>(EMPTY);
   const [selectedStreamId, setSelectedStreamId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [visualizerOpen, setVisualizerOpen] = useState(false);
   const [settings, setSettings] = useState<SettingsType>(settingsService.getMergedSettings());
 
   useEffect(() => {
@@ -189,6 +191,9 @@ export default function MeshApp(): React.ReactElement {
     if (f) service.setStreamVolume(f.id, v);
   }, []);
   const onClientVolume = useCallback((clientId: string, v: number) => service.setVolume(clientId, v), []);
+
+  // Native visualizer frames for the featured source; read on rAF by the visualizer.
+  const getSpectrum = useCallback(() => (featuredId ? service.getVizFrame(featuredId) : null), [featuredId]);
 
   /** Put one speaker on a stream, whichever kind of speaker it is.
    *  - ours, in the mesh          -> the router (intra-server re-group or cross-server reclaim)
@@ -355,6 +360,14 @@ export default function MeshApp(): React.ReactElement {
         <p className="text-center">Plum Audio — Mesh</p>
         <div className="flex justify-end gap-2">
           <button
+            onClick={() => setVisualizerOpen(true)}
+            className="p-2 rounded-full hover:bg-[var(--bg-secondary)] transition-colors"
+            aria-label="Open Visualizer"
+            disabled={!featured}
+          >
+            <Icon name="waveform" className="text-lg" />
+          </button>
+          <button
             onClick={() => setSettingsOpen(true)}
             className="p-2 rounded-full hover:bg-[var(--bg-secondary)] transition-colors"
             aria-label="Open Settings"
@@ -371,6 +384,26 @@ export default function MeshApp(): React.ReactElement {
           onClose={() => setSettingsOpen(false)}
         />
       )}
+
+      <Visualizer
+        isOpen={visualizerOpen}
+        onClose={() => setVisualizerOpen(false)}
+        stream={featured ?? null}
+        streams={stableStreams}
+        settings={settings}
+        getSpectrum={getSpectrum}
+        extractedAlbumArtColors={null}
+        currentVolume={featured?.volume ?? 100}
+        onPlayPause={onPlayPause}
+        onSkip={(dir) => onSkip(dir === 'next' ? 'next' : 'prev')}
+        onVolumeChange={onSourceVolume}
+        onStreamChange={onSelectStream}
+        onOpenSettings={() => { setVisualizerOpen(false); setSettingsOpen(true); }}
+        onOpenVisualizerSettings={() => { setVisualizerOpen(false); setSettingsOpen(true); }}
+        browserAudioMuted={false}
+        onStartBrowserAudio={() => {}}
+        onToggleBrowserAudioMute={() => {}}
+      />
     </div>
   );
 }

@@ -1,11 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { useAudioVisualizer } from '../hooks/useAudioVisualizer';
-import type { SnapStream } from '../services/snapStreamService';
+import type { VizFrame } from '../services/sendspinControllerClient';
 import type { VisualizerSettings } from '../types';
 import { extractDualColorsFromAlbumArt } from '../utils/albumArtColorExtraction';
 
 interface AmorphousBlobProps {
-    snapStream: SnapStream | null;
+    getFrame: (() => VizFrame | null) | null;  // native visualizer-role frame provider
     settings: VisualizerSettings;
     albumArtUrl: string;
     accentColor: string;
@@ -14,7 +13,7 @@ interface AmorphousBlobProps {
 }
 
 export const AmorphousBlob: React.FC<AmorphousBlobProps> = ({
-    snapStream,
+    getFrame,
     settings,
     albumArtUrl,
     accentColor,
@@ -22,7 +21,12 @@ export const AmorphousBlob: React.FC<AmorphousBlobProps> = ({
     onColorChange,
 }) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
-    const audioData = useAudioVisualizer(snapStream, settings, settings.enabled);
+    // Read the latest native visualizer frame INSIDE the render loop each tick — never through
+    // React state. Routing ~60 fps of frames through setState would re-render this component (and
+    // tear down + re-arm the draw effect) every frame, canceling the render rAF before it draws.
+    // A ref lets getFrame update without re-running the effect.
+    const getFrameRef = useRef(getFrame);
+    getFrameRef.current = getFrame;
     // Ensure we always have a valid color with fallback
     const [blobColor, setBlobColor] = useState<string>(accentColor || '#aa5cc3');
     const pulsePhase = useRef(0);
@@ -95,11 +99,19 @@ export const AmorphousBlob: React.FC<AmorphousBlobProps> = ({
             // Clear canvas
             ctx.clearRect(0, 0, canvas.width, canvas.height);
 
+            // Pull the current visualizer frame directly (see getFrameRef note). Stale (>250 ms) or
+            // absent → treat as no audio so the bars settle to the idle state.
+            const frame = settings.enabled ? getFrameRef.current?.() : null;
+            const audioData =
+                frame && Date.now() - frame.at < 250 ? { frequencyData: frame.spectrum } : null;
+
             // Determine if audio is playing
             const hasAudio = audioData && audioData.frequencyData.some(v => v > 0);
 
-            // Calculate bar heights
-            const barHeights = calculateBarHeights(audioData?.frequencyData, settings, hasAudio, bassMultiplierRef);
+            // Our spectrum is already the log-spaced display bins the server computed, so map it
+            // straight to bars (average N source bins per bar) rather than re-slicing it as a raw
+            // FFT — the reason the old calculateBarHeights produced an all-zero (invisible) blob.
+            const barHeights = spectrumToBars(audioData?.frequencyData, settings, hasAudio);
 
             // Draw visualization based on type
             const vizType = settings.type || 'circular';
@@ -207,7 +219,7 @@ export const AmorphousBlob: React.FC<AmorphousBlobProps> = ({
             cancelAnimationFrame(animationId);
             window.removeEventListener('resize', resizeCanvas);
         };
-    }, [audioData, settings, blobColor, albumArtUrl]);
+    }, [settings, blobColor, albumArtUrl]);
 
     return (
         <canvas
@@ -217,6 +229,52 @@ export const AmorphousBlob: React.FC<AmorphousBlobProps> = ({
         />
     );
 };
+
+// Map the server's already-binned log spectrum (0-255 per band) to `barCount` bar heights (0-1).
+// Averages source bins per bar, applies sensitivity + a min floor, then the same mirror/symmetry
+// the circular renderer expects. No frequency re-binning — the bins ARE the bands.
+function spectrumToBars(
+    frequencyData: Uint8Array | undefined,
+    settings: VisualizerSettings,
+    hasAudio: boolean,
+): number[] {
+    const barCount = settings.barCount;
+    const symmetry = settings.symmetry || 1;
+    const out = new Array(barCount).fill(0);
+    if (!hasAudio || !frequencyData || frequencyData.length === 0) return out;
+
+    const uniqueBarCount = Math.max(1, Math.floor(barCount / symmetry));
+    const sens = 0.5 + (settings.sensitivity / 100) * 1.5;
+    const per = frequencyData.length / uniqueBarCount;
+    const unique = new Array(uniqueBarCount).fill(0);
+    for (let i = 0; i < uniqueBarCount; i++) {
+        const a = Math.floor(i * per);
+        const b = Math.max(a + 1, Math.floor((i + 1) * per));
+        let sum = 0, n = 0;
+        for (let j = a; j < b && j < frequencyData.length; j++) { sum += frequencyData[j]; n++; }
+        const v = n ? (sum / n / 255) * sens : 0;
+        unique[i] = Math.max(0.05, Math.min(1.4, v)); // min floor for a live look; soft ceiling
+    }
+
+    // Mirror (optional) then repeat around the circle per symmetry, interpolating between bands.
+    let bands = unique;
+    if (settings.mirror) {
+        const half = Math.floor(uniqueBarCount / 2);
+        const firstHalf = unique.slice(0, half);
+        const base = settings.invert ? firstHalf.slice().reverse() : firstHalf;
+        const mirrored = [...base, ...base.slice().reverse()];
+        bands = new Array(uniqueBarCount).fill(0).map((_, i) => mirrored[i % mirrored.length]);
+    }
+    for (let i = 0; i < barCount; i++) {
+        const sectionSize = barCount / symmetry;
+        const pos = ((i % sectionSize) / sectionSize) * uniqueBarCount;
+        const idx = Math.floor(pos) % uniqueBarCount;
+        const next = (idx + 1) % uniqueBarCount;
+        const frac = pos - Math.floor(pos);
+        out[i] = bands[idx] * (1 - frac) + bands[next] * frac;
+    }
+    return out;
+}
 
 // Calculate bar heights from frequency data
 function calculateBarHeights(

@@ -12,7 +12,7 @@
  */
 
 import { Client, Server, Stream, Track } from '../types';
-import { NowPlaying, SendspinControllerClient, currentPositionMs, ControllerCommand } from './sendspinControllerClient';
+import { NowPlaying, SendspinControllerClient, currentPositionMs, ControllerCommand, VizFrame } from './sendspinControllerClient';
 
 const MESH_API_PORT = 5001;
 const MESH_API_BASE = import.meta.env.VITE_MESH_API_URL || '/api/mesh';
@@ -345,6 +345,15 @@ export class SendspinDataService {
     };
   }
 
+  /**
+   * Latest native visualizer frame for a stream (source), or null if none/idle. Read by the
+   * visualizer via requestAnimationFrame rather than pushed through React state — the frames arrive
+   * ~30×/s and would otherwise trigger a full re-render each time.
+   */
+  getVizFrame(federatedStreamId: string): VizFrame | null {
+    return this.controllers.get(federatedStreamId)?.vizFrame ?? null;
+  }
+
   // -- internals ----------------------------------------------------------
 
   private async poll(): Promise<void> {
@@ -389,6 +398,10 @@ export class SendspinDataService {
         // The "ctrl:<source_id>:" client id tells the unit which source group to join us to.
         const c = new SendspinControllerClient(unit.unit_id, unit.host, (_uid, np) => this.onNowPlaying(key, np), {
           clientId: `ctrl:${src.source_id}:${Math.floor(performance.now())}`,
+          // Negotiate the native visualizer role on every source controller. The server only sends
+          // spectrum/loudness while that source is actually streaming, so an idle source costs
+          // nothing — and whichever source the user opens the visualizer on already has its frames.
+          visualizer: true,
         });
         this.controllers.set(key, c);
         c.connect();

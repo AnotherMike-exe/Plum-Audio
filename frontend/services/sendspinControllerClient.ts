@@ -58,6 +58,29 @@ export type ControllerCommand =
   | 'repeat_off' | 'repeat_one' | 'repeat_all'
   | 'shuffle' | 'unshuffle' | 'switch';
 
+/**
+ * Latest visualizer frame for a source, from the native Sendspin visualizer@v1 role.
+ * `spectrum` is 0-255 per display bin (scaled from the wire's uint16), the shape the ported
+ * Visualizer component already consumes; `loudness` is 0-1. `at` is a local-clock ms stamp used to
+ * fade the bars to rest when frames stop (the source went idle). Server computes the DSP — see
+ * docs/ARCHITECTURE.md.
+ */
+export interface VizFrame {
+  spectrum: Uint8Array;
+  loudness: number;
+  at: number;
+}
+
+// Requested spectrum shape: the server bins its FFT to exactly this many log-spaced display bins
+// over the audible band. 256 gives the GUI headroom to downsample to any bar count (32-256);
+// 256 * 2 bytes * ~30 fps is trivial bandwidth, and only while a source is actually streaming.
+export const VIZ_BINS = 256;
+const VIZ_F_MIN = 40;
+const VIZ_F_MAX = 16000;
+// Binary visualizer message types (aiosendspin BinaryMessageType).
+const MSG_LOUDNESS = 16;
+const MSG_SPECTRUM = 19;
+
 /** Merged now-playing state for a unit's current group. */
 export interface NowPlaying {
   groupId: string | null;
@@ -131,21 +154,38 @@ export class SendspinControllerClient {
   // Commands issued while the WS is mid-reconnect: queue and flush once (re)connected + grouped, so
   // a click during a brief socket blip isn't silently lost. Each carries a timestamp for TTL expiry.
   private pendingCommands: Array<{ msg: string; at: number }> = [];
+  // Latest visualizer frame + an optional subscriber. Off by default (the role is only negotiated
+  // when someone actually wants the visualizer) so idle controllers don't pull spectrum they'll
+  // never render.
+  private viz: VizFrame | null = null;
+  private onViz: ((frame: VizFrame) => void) | null = null;
+  private wantViz: boolean;
 
   constructor(
     unitId: string,
     host: string,
     onUpdate: (unitId: string, np: NowPlaying) => void,
-    opts: { port?: number; clientId?: string } = {},
+    opts: { port?: number; clientId?: string; visualizer?: boolean } = {},
   ) {
     this.unitId = unitId;
     this.url = `ws://${host}:${opts.port ?? 8927}/sendspin`;
     this.clientId = opts.clientId ?? `plum-web-${unitId}-${Math.floor(performance.now())}`;
     this.onUpdate = onUpdate;
+    this.wantViz = !!opts.visualizer;
   }
 
   get nowPlaying(): NowPlaying {
     return this.np;
+  }
+
+  /** The most recent visualizer frame, or null if none has arrived (idle / role not negotiated). */
+  get vizFrame(): VizFrame | null {
+    return this.viz;
+  }
+
+  /** Subscribe to visualizer frames as they arrive (in addition to reading vizFrame). */
+  setVizListener(cb: ((frame: VizFrame) => void) | null): void {
+    this.onViz = cb;
   }
 
   get clockOffsetUs(): number {
@@ -162,6 +202,8 @@ export class SendspinControllerClient {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.timeTimer) clearTimeout(this.timeTimer);
     this.reconnectTimer = this.timeTimer = null;
+    this.viz = null;
+    this.onViz = null;
     this.revokeArtwork();
     if (this.ws) {
       this.ws.onclose = null;
@@ -256,10 +298,27 @@ export class SendspinControllerClient {
             client_id: this.clientId,
             name: 'Plum Web GUI',
             version: 1,
-            supported_roles: ['controller@v1', 'metadata@v1', 'artwork@v1'],
+            supported_roles: [
+              'controller@v1',
+              'metadata@v1',
+              'artwork@v1',
+              ...(this.wantViz ? ['visualizer@v1'] : []),
+            ],
             'artwork@v1_support': {
               channels: [{ source: 'album', format: 'jpeg', media_width: 512, media_height: 512 }],
             },
+            // The server auto-computes the spectrum to exactly this shape from the source audio;
+            // 64 log-spaced bins over the audible band render well and keep frames small.
+            ...(this.wantViz
+              ? {
+                  'visualizer@v1_support': {
+                    buffer_capacity: 65536,
+                    rate_max: 30,
+                    types: ['spectrum', 'loudness'],
+                    spectrum: { n_disp_bins: VIZ_BINS, scale: 'log', f_min: VIZ_F_MIN, f_max: VIZ_F_MAX },
+                  },
+                }
+              : {}),
           },
         }),
       );
@@ -344,6 +403,7 @@ export class SendspinControllerClient {
       case 'stream/clear':
         this.revokeArtwork();
         this.np = { ...this.np, artworkUrl: undefined };
+        this.viz = null; // no source feeding us → visualizer falls to rest
         this.emit();
         break;
       // stream/start (artwork channel config) needs no action — we already requested our size.
@@ -403,12 +463,17 @@ export class SendspinControllerClient {
     this.emit();
   }
 
+  // Every binary frame is [type:1][ts:8 BE][payload]. `type` selects the role: 8-11 artwork
+  // channels, 16 loudness, 19 spectrum.
   private onBinary(buf: ArrayBuffer): void {
     if (buf.byteLength < 9) return;
-    const view = new DataView(buf);
-    const msgType = view.getUint8(0);
+    const msgType = new DataView(buf).getUint8(0);
+    if (msgType === MSG_SPECTRUM || msgType === MSG_LOUDNESS) {
+      this.onVizBinary(msgType, buf);
+      return;
+    }
     const channel = msgType - ARTWORK_CHANNEL_0;
-    if (channel !== 0) return; // we only requested channel 0 (album, 512x512)
+    if (channel !== 0) return; // we only requested artwork channel 0 (album, 512x512)
     const imageBytes = buf.slice(9);
     this.revokeArtwork();
     if (imageBytes.byteLength === 0) {
@@ -419,6 +484,24 @@ export class SendspinControllerClient {
       this.np.artworkUrl = this.artworkObjectUrl;
     }
     this.emit();
+  }
+
+  private onVizBinary(msgType: number, buf: ArrayBuffer): void {
+    const view = new DataView(buf);
+    const frame: VizFrame = this.viz
+      ? { ...this.viz, at: Date.now() }
+      : { spectrum: new Uint8Array(VIZ_BINS), loudness: 0, at: Date.now() };
+    if (msgType === MSG_SPECTRUM) {
+      // uint16 BE per display bin → 0-255 for the component (high byte is the visible range).
+      const bins = (buf.byteLength - 9) >> 1;
+      const spectrum = new Uint8Array(bins);
+      for (let i = 0; i < bins; i++) spectrum[i] = view.getUint16(9 + i * 2, false) >> 8;
+      frame.spectrum = spectrum;
+    } else {
+      frame.loudness = view.getUint16(9, false) / 65535; // 0-1
+    }
+    this.viz = frame;
+    this.onViz?.(frame);
   }
 
   private captureClockOffset(serverTimestampUs: number): void {
