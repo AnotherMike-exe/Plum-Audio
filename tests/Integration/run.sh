@@ -15,6 +15,7 @@ case "$MODE" in
         run t2_source_lifecycle.sh "$A"
         run t2_endpoint_crud.sh "$A" spotify
         run t3_mesh_roam.sh "$A" "$B"
+        run t3_autofollow.sh "$A" "$B"
         ;;
     interop)
         U="${1:?need unit host}"

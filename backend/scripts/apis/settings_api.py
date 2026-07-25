@@ -74,6 +74,13 @@ DEFAULT_SETTINGS = {
         "enabled": False,
         "autoDiscover": True,
     },
+    "autoSwitch": {
+        # Ported from Plum-Snapcast, live here (unlike "federation" above): auto-route this unit's
+        # player onto its own source when idle and that source goes active, and/or have it follow
+        # another unit's player while idle. See mesh/follow.py.
+        "localActivity": False,
+        "slave": {"enabled": False, "masterUnitId": None},
+    },
     "audio": {
         "output": {
             "device": "hw:Headphones",

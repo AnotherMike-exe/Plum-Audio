@@ -17,10 +17,12 @@ interface SettingsProps {
 }
 
 // Phase 3: Integrations is surfaced with only the sources whose backend exists (AirPlay + Spotify
-// today — see the enabledSources prop below). Audio/Playback tabs return when their services land;
-// their render cases stay wired so re-enabling is just re-adding array entries.
+// today — see the enabledSources prop below). Audio returns when its service lands; its render
+// case stays wired so re-enabling is just re-adding the array entry. Playback (auto-route-on-connect
+// + auto-follow, mesh/follow.py) landed — re-added here.
 const tabs: Tab[] = [
     {id: 'integrations', label: 'Integrations', icon: 'puzzle-piece'},
+    {id: 'playback', label: 'Playback', icon: 'network-wired'},
     {id: 'theme', label: 'Theme', icon: 'palette'},
     {id: 'visualizer', label: 'Visualizer', icon: 'waveform'},
     {id: 'about', label: 'About', icon: 'circle-info'},

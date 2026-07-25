@@ -481,9 +481,7 @@ export interface Settings {
         localActivity: boolean;
         slave: {
             enabled: boolean;
-            masterHost: string;
-            masterWsPort: number;
-            masterStreamPort: number;
+            masterUnitId: string | null; // the mesh unit_id to follow while idle
         };
     };
     snapclientTarget?: string; // Runtime: where snapclient is currently connected (host:port)

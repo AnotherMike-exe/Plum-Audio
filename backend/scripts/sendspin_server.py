@@ -748,18 +748,47 @@ class PlumSendspinServer:
             self._wired_sources.add(source_id)
 
     def _on_control_event(self, source_id: str, _group: SendspinGroup, event: object) -> None:
-        """Forward a controller transport event to the source's sender via its remote (fire-and-forget)."""
+        """Forward a controller transport event to the source's sender via its remote (fire-and-forget).
+
+        For AirPlay we ALSO reflect play/pause on the metadata role immediately (apply_command): the
+        source takes seconds to confirm, so this is what makes every GUI on the group flip together
+        instead of one reverting to playing mid buffer-drain. The remote call is what actually drives
+        the phone/Mac; the optimistic reflection is purely for consistent, instant GUI feedback."""
         remote = self._source_remotes.get(source_id)
         if remote is None:
             return
+        reader = self._metadata_readers.get(source_id)  # AirPlay only; None for Spotify
         if isinstance(event, ControllerPlayEvent):
             asyncio.ensure_future(remote.play())
+            if reader is not None:
+                reader.apply_command("play")
         elif isinstance(event, ControllerPauseEvent):
             asyncio.ensure_future(remote.pause())
+            if reader is not None:
+                reader.apply_command("pause")
         elif isinstance(event, ControllerNextEvent):
             asyncio.ensure_future(remote.next_track())
         elif isinstance(event, ControllerPreviousEvent):
             asyncio.ensure_future(remote.previous_track())
+
+    def register_player(self, player_id: str, player_url: str) -> None:
+        """Dial this unit's player so it is a live, routable client, but leave it IDLE — not attached
+        to any source group.
+
+        Where an idle player goes is owned by the autoSwitch settings (localActivity auto-route /
+        follow) and explicit GUI routing — NOT a hardcoded home source, which would auto-play that
+        source at boot regardless of the setting (the very thing localActivity is meant to gate).
+
+        We still DIAL (connect) it, not merely register the URL: the intra-server route path
+        (attach_player) assumes an already-connected client, so a route onto a LOCAL source would
+        otherwise fail to find the player. Connected-but-ungrouped, it reports group_id=None and
+        reads as idle in the GUI until something routes it.
+        """
+        assert self.server is not None
+        self.server.register_client_url(player_id, player_url)
+        self.server.connect_to_client(
+            player_url, connection_reason=ConnectionReason.PLAYBACK, retry_initial_connection=True
+        )
 
     def attach_local_player(self, source_id: str, player_id: str, player_url: str, *, supervise: bool = True) -> None:
         """Attach this unit's own player to a source, registering its reclaim URL.
@@ -879,11 +908,17 @@ async def main() -> None:
         manager.start()
 
     if local_player_url:
-        # With the mesh on, register + attach the local player once and let routing roam it;
-        # the perpetual re-attach supervisor (Phase-1 glue) would fight cross-server reclaims.
-        # The source may not exist yet (its manager is still spinning it up) — attach_local_player
-        # waits for it.
-        srv.attach_local_player(home_source, local_player_id, local_player_url, supervise=not mesh_enabled)
+        if mesh_enabled:
+            # Register the player so peers can reclaim it and the mesh can route it, but leave it
+            # IDLE. Where it goes is owned by the autoSwitch settings (localActivity auto-route /
+            # follow via the FollowReconciler) and explicit GUI routing — NOT a hardcoded home
+            # source, which would auto-play regardless of the setting.
+            srv.register_player(local_player_id, local_player_url)
+        else:
+            # Single-unit glue (mesh off): keep the player attached to the home source, self-healing
+            # across restarts. The source may not exist yet (its manager is still spinning it up) —
+            # attach_local_player waits for it.
+            srv.attach_local_player(home_source, local_player_id, local_player_url, supervise=True)
 
     # Phase 2: the mesh (discovery + aggregation + routing + REST). Local playback above stands
     # on its own; the mesh layers cross-unit roaming on top. Disable with PLUM_MESH_ENABLED=0.
@@ -899,12 +934,27 @@ async def main() -> None:
         )
         await mesh.start()
 
+    # Auto-route-on-connect + auto-follow ("slave" mode) — only meaningful with the mesh present.
+    follow = None
+    if mesh is not None:
+        from mesh.follow import FollowReconciler  # local import: avoids an import cycle
+
+        follow = FollowReconciler(
+            mesh.aggregator, mesh.router,
+            local_unit_id=unit_id, local_player_id=local_player_id,
+            peer_provider=mesh.discovery.get_peer, delegate=mesh.client.delegate_route,
+            unroute_delegate=mesh.client.delegate_unroute,
+        )
+        follow.start()
+
     stop = asyncio.Event()
     try:
         await stop.wait()  # run forever; supervisord manages the process lifecycle
     except asyncio.CancelledError:
         pass
     finally:
+        if follow is not None:
+            await follow.stop()
         if mesh is not None:
             await mesh.stop()
         for manager in managers:

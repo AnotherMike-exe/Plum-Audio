@@ -102,7 +102,8 @@ non-negotiable for tier 4's live third-party devices. `run.sh` drives a whole ri
 | `t2_endpoint_crud.sh` | ✅ passing — live add/rename/remove, others untouched |
 | `t4_interop_ma.sh` | ✅ passing — MA discovered, we advertise both ways, claim self-reported |
 | `t4_adopt_release.sh` | ✅ passing — adopt an HA Voice PE, release incl. the socket-closed check |
-| `t3_mesh_roam.sh` | written, syntax-checked; **pending** the two-unit `.201` rig being powered up |
+| `t3_mesh_roam.sh` | ✅ passing (`.201` rig, 2026-07-24) |
+| `t3_autofollow.sh` | written, syntax-checked; **pending** a run on the `.201` rig |
 
-**Remaining:** run `t3_mesh_roam.sh` on the mesh rig; add `t2_airplay_mpris.sh` (per-endpoint
+**Remaining:** run `t3_autofollow.sh` on the mesh rig; add `t2_airplay_mpris.sh` (per-endpoint
 private-bus MPRIS ownership) and a `t3_multigroup.sh`; the tier-5 soak and tier-6 container tiers.

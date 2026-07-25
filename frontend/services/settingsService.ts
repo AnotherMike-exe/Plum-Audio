@@ -61,12 +61,10 @@ const DEFAULT_SERVER_SETTINGS = {
     autoDiscover: true,
   },
   autoSwitch: {
-    localActivity: true,
+    localActivity: false,
     slave: {
       enabled: false,
-      masterHost: '',
-      masterWsPort: 1780,
-      masterStreamPort: 1704,
+      masterUnitId: null as string | null,
     },
   },
 };

@@ -21,6 +21,7 @@ tier 4, which runs against live third-party devices in someone's home.
 | `t2_source_lifecycle.sh` | any one unit | `./t2_source_lifecycle.sh <host> [source-id]` |
 | `t2_endpoint_crud.sh` | any one unit (config API on :5002) | `./t2_endpoint_crud.sh <host> [spotify\|airplay]` |
 | `t3_mesh_roam.sh` | **two** Plum units on one segment | `./t3_mesh_roam.sh <unit-a> <unit-b>` |
+| `t3_autofollow.sh` | **two** Plum units on one segment | `./t3_autofollow.sh <unit-a> <unit-b>` |
 | `t4_interop_ma.sh` | a unit **on Music Assistant's L2 segment** | `./t4_interop_ma.sh <host>` |
 | `t4_adopt_release.sh` | a unit + a foreign Sendspin speaker on-segment | `./t4_adopt_release.sh <host> [speaker-url]` |
 
