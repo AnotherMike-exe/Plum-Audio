@@ -32,6 +32,7 @@ export const AmorphousBlob: React.FC<AmorphousBlobProps> = ({
     const pulsePhase = useRef(0);
     const bassMultiplierRef = useRef(1.0); // Track smoothed bass multiplier across frames
     const rotationAngle = useRef(0); // Track rotation angle for circular visualizers
+    const smoothedBarsRef = useRef<number[]>([]); // EMA state for temporal smoothing across frames
 
     // Notify parent when color changes
     useEffect(() => {
@@ -111,7 +112,25 @@ export const AmorphousBlob: React.FC<AmorphousBlobProps> = ({
             // Our spectrum is already the log-spaced display bins the server computed, so map it
             // straight to bars (average N source bins per bar) rather than re-slicing it as a raw
             // FFT — the reason the old calculateBarHeights produced an all-zero (invisible) blob.
-            const barHeights = spectrumToBars(audioData?.frequencyData, settings, hasAudio);
+            const rawBars = spectrumToBars(audioData?.frequencyData, settings, hasAudio);
+
+            // Temporal smoothing (EMA). The old AnalyserNode applied its own smoothingTimeConstant,
+            // so the frames we drew were already inter-frame smoothed; the native role hands us raw
+            // per-frame magnitudes, which flicker. Re-apply that smoothing here, keyed on the same
+            // `smoothing` setting the presets carry (0-100 → alpha 0..0.92), so the calm 80-90 preset
+            // values look calm again. Reset when the bar count changes so a preset swap doesn't blend
+            // mismatched arrays.
+            const alpha = Math.min(0.92, (settings.smoothing ?? 70) / 100);
+            const prev = smoothedBarsRef.current;
+            const barHeights = new Array(rawBars.length);
+            if (prev.length !== rawBars.length) {
+                for (let i = 0; i < rawBars.length; i++) barHeights[i] = rawBars[i];
+            } else {
+                for (let i = 0; i < rawBars.length; i++) {
+                    barHeights[i] = prev[i] * alpha + rawBars[i] * (1 - alpha);
+                }
+            }
+            smoothedBarsRef.current = barHeights;
 
             // Draw visualization based on type
             const vizType = settings.type || 'circular';
@@ -252,7 +271,13 @@ function spectrumToBars(
         const b = Math.max(a + 1, Math.floor((i + 1) * per));
         let sum = 0, n = 0;
         for (let j = a; j < b && j < frequencyData.length; j++) { sum += frequencyData[j]; n++; }
-        const v = n ? (sum / n / 255) * sens : 0;
+        // The native visualizer role delivers LINEAR magnitude (uint16>>8), unlike the old WebAudio
+        // AnalyserNode which handed us dB-mapped bytes. Linear magnitude is spiky and sits near zero
+        // for everything but peaks, so raw it reads as a near-flat blob. Apply a perceptual (dB-like)
+        // curve — pow(m, ~0.45) lifts low/mid detail and tames peaks — so the presets, all tuned
+        // against the old dB data, behave the way their sensitivity values expect.
+        const mean = n ? sum / n / 255 : 0;
+        const v = Math.pow(mean, 0.45) * sens;
         unique[i] = Math.max(0.05, Math.min(1.4, v)); // min floor for a live look; soft ceiling
     }
 
