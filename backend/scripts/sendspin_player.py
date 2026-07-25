@@ -109,157 +109,6 @@ class AlsaRenderer:
         # idle (e.g. a cross-server roam) — this is the honest measure of audible dropout.
         self.pad_frames = 0
 
-    # -- self-report ---------------------------------------------------------
-
-    def _on_group_update(self, payload) -> None:
-        state = getattr(payload, "playback_state", None)
-        self._state["group_id"] = getattr(payload, "group_id", None)
-        self._state["group_name"] = getattr(payload, "group_name", None)
-        self._state["playback_state"] = getattr(state, "value", state)
-
-    def _on_controller_state(self, payload) -> None:
-        ctrl = getattr(payload, "controller", None)
-        if ctrl is None:
-            return
-        cmds = getattr(ctrl, "supported_commands", None)
-        new = {
-            "t": "ctrl",
-            "commands": [getattr(c, "value", c) for c in (cmds or [])],
-            "volume": getattr(ctrl, "volume", None),
-            "muted": getattr(ctrl, "muted", None),
-        }
-        if new != self._relay_ctrl:
-            self._relay_ctrl = new
-            self._relay_ctrl_dirty = True
-
-    def _on_visualizer(self, frames) -> None:  # frames: list[VisualizerFrame]
-        # Spectrum and loudness arrive as separate frames; merge into the latest {s,l}. Scale the
-        # wire's uint16 spectrum to 0-255, the shape the GUI's canvas already consumes.
-        viz = self._relay_viz or {"t": "viz"}
-        for f in frames:
-            spec = getattr(f, "spectrum", None)
-            if spec is not None:
-                viz["s"] = [min(255, v >> 8) for v in spec]
-            loud = getattr(f, "loudness", None)
-            if loud is not None:
-                viz["l"] = round(loud / 65535, 4)
-        self._relay_viz = viz
-
-    def _on_artwork(self, channel: int, data: bytes) -> None:
-        # Channel 0 = album art (the only channel we declared). Empty payload = cleared. Relay as a
-        # data URL over the consume WS (per-track, low rate — no need for a binary channel).
-        if channel != 0:
-            return
-        import base64
-
-        url = f"data:image/jpeg;base64,{base64.b64encode(data).decode()}" if data else None
-        self._relay_art = {"t": "art", "d": url}
-        self._relay_art_dirty = True
-
-    def _on_metadata(self, payload) -> None:
-        md = getattr(payload, "metadata", None)
-        if md is None:
-            return
-        for field in ("title", "artist", "album"):
-            value = getattr(md, field, None)
-            if value is not None:
-                self._state[field] = value
-
-    def _snapshot_state(self) -> dict:
-        info = self.client.server_info
-        attached = self.client.connected and info is not None
-        state = {
-            "player_id": self.player_id,
-            "name": self.player_name,
-            "url": f"ws://{self._host_hint()}:{self.port}/sendspin",
-            "attached": bool(attached),
-        }
-        if attached and info is not None:
-            reason = getattr(info.connection_reason, "value", info.connection_reason)
-            state.update(
-                server_id=info.server_id, server_name=info.name, connection_reason=reason,
-                group_id=self._state.get("group_id"), group_name=self._state.get("group_name"),
-                playback_state=self._state.get("playback_state"),
-                title=self._state.get("title"), artist=self._state.get("artist"),
-                album=self._state.get("album"),
-            )
-        return state
-
-    @staticmethod
-    def _host_hint() -> str:
-        from mesh.avahi import local_ip
-
-        return local_ip() or "127.0.0.1"
-
-    async def _relay_loop(self) -> None:
-        """Producer side of the consume relay: push ctrl + viz to the mesh API, take commands back.
-        Best-effort; the audio path never waits on it."""
-        import aiohttp
-
-        while True:
-            try:
-                async with aiohttp.ClientSession() as session, session.ws_connect(self.relay_url, heartbeat=30) as ws:
-                    logger.info("consume relay connected (%s)", self.relay_url)
-                    sender = asyncio.ensure_future(self._relay_send(ws))
-                    try:
-                        async for msg in ws:
-                            if msg.type is aiohttp.WSMsgType.TEXT:
-                                with contextlib.suppress(Exception):
-                                    await self._relay_command(msg.json())
-                    finally:
-                        sender.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await sender
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - mesh API down / restarting; retry
-                logger.debug("consume relay error; retrying", exc_info=True)
-            await asyncio.sleep(2.0)
-
-    async def _relay_send(self, ws) -> None:
-        """~30 fps: emit the latest ctrl (on change) + latest viz frame (coalesced)."""
-        while True:
-            if self._relay_ctrl_dirty and self._relay_ctrl is not None:
-                self._relay_ctrl_dirty = False
-                with contextlib.suppress(Exception):
-                    await ws.send_json(self._relay_ctrl)
-            if self._relay_art_dirty and self._relay_art is not None:
-                self._relay_art_dirty = False
-                with contextlib.suppress(Exception):
-                    await ws.send_json(self._relay_art)
-            if self._relay_viz is not None:
-                frame, self._relay_viz = self._relay_viz, None
-                with contextlib.suppress(Exception):
-                    await ws.send_json(frame)
-            await asyncio.sleep(1 / 30)
-
-    async def _relay_command(self, data: dict) -> None:
-        """A transport command from the GUI → send it to the server we are a member of."""
-        if data.get("t") != "cmd":
-            return
-        try:
-            cmd = MediaCommand(data.get("command"))
-        except ValueError:
-            return
-        kwargs = {}
-        if cmd is MediaCommand.VOLUME and data.get("volume") is not None:
-            kwargs["volume"] = int(data["volume"])
-        if cmd is MediaCommand.MUTE and data.get("mute") is not None:
-            kwargs["mute"] = bool(data["mute"])
-        with contextlib.suppress(Exception):
-            await self.client.send_group_command(cmd, **kwargs)
-            logger.info("consume relay: sent %s to server", cmd.value)
-
-    async def _report_loop(self) -> None:
-        """Push our state to this unit's mesh API. Best-effort: the audio path never waits on it."""
-        import aiohttp
-
-        async with aiohttp.ClientSession() as session:
-            while True:
-                with contextlib.suppress(Exception):
-                    await session.post(self.report_url, json=self._snapshot_state(), timeout=aiohttp.ClientTimeout(total=3))
-                await asyncio.sleep(3.0)
-
     # -- lifecycle -----------------------------------------------------------
 
     def start(self) -> None:
@@ -417,6 +266,7 @@ class SendspinPlayer:
         renderer.set_volume(volume=initial_volume)
 
         self.client.add_audio_chunk_listener(self._on_audio)
+        self.client.add_stream_start_listener(self._on_stream_start)
         self.client.add_stream_clear_listener(self._on_stream_clear)
         self.client.add_stream_end_listener(self._on_stream_end)
         self.client.add_server_command_listener(self._on_server_command)
@@ -439,6 +289,12 @@ class SendspinPlayer:
         self._relay_viz: dict | None = None  # {"s":[0-255 x N],"l":loudness}
         self._relay_art: dict | None = None  # {"t":"art","d":<data-url|null>}
         self._relay_art_dirty = False
+        # Audio-flow truth for the play/pause boolean. A foreign server (Music Assistant) reports its
+        # controller `state`/`speed` unreliably to a member player — observed 'stopped' while audio
+        # was clearly flowing, and speed pinned at 0 while playing — so we derive "playing" from
+        # whether audio chunks are actually arriving. Updated on every chunk; sampled in _relay_send.
+        self._last_audio_mono = 0.0
+        self._audio_flowing = False
         self._relay_task: asyncio.Task | None = None
         self.relay_url = os.environ.get("PLUM_PLAYER_RELAY_URL", "ws://127.0.0.1:5001/api/mesh/consume?role=player")
         self.client.add_group_update_listener(self._on_group_update)
@@ -450,25 +306,84 @@ class SendspinPlayer:
     # -- self-report ---------------------------------------------------------
 
     def _on_group_update(self, payload) -> None:
+        new_group_id = getattr(payload, "group_id", None)
+        if new_group_id != self._state.get("group_id"):
+            # A route/switch/roam just landed us in a different group: the previous group's
+            # track/progress numbers are meaningless here and must not be relayed as if they
+            # described this one. Cleared BEFORE the new group_id lands, so a frame emitted before
+            # fresh metadata arrives for the new group reports "no data yet," not stale old data —
+            # the GUI already renders a missing np as unknown/idle rather than a wrong timeline.
+            for field in ("title", "artist", "album", "track_progress", "track_duration",
+                          "playback_speed", "progress_ts_us"):
+                self._state.pop(field, None)
         state = getattr(payload, "playback_state", None)
-        self._state["group_id"] = getattr(payload, "group_id", None)
+        self._state["group_id"] = new_group_id
         self._state["group_name"] = getattr(payload, "group_name", None)
         self._state["playback_state"] = getattr(state, "value", state)
+        self._emit_ctrl()  # relay the play/pause/stop change to the GUI
 
     def _on_controller_state(self, payload) -> None:
         ctrl = getattr(payload, "controller", None)
         if ctrl is None:
             return
         cmds = getattr(ctrl, "supported_commands", None)
+        self._state["commands"] = [getattr(c, "value", c) for c in (cmds or [])]
+        self._state["volume"] = getattr(ctrl, "volume", None)
+        self._state["muted"] = getattr(ctrl, "muted", None)
+        self._emit_ctrl()
+
+    def _emit_ctrl(self) -> None:
+        """Build the consume-relay `ctrl` frame from the latest control + transport state and mark
+        it for send if anything changed. Carries the full transport picture the GUI needs for a
+        FOREIGN source (Music Assistant): supported commands + volume, the group playback_state, and
+        the metadata-role progress snapshot (position/duration/speed). The GUI anchors extrapolation
+        to its own receipt time, so no shared clock is needed. Deduped on value — progress only
+        changes when the server sends a fresh snapshot, so a re-emit re-anchors the now-playing bar;
+        a frozen (paused) position produces no re-emit."""
+        st = self._state
         new = {
             "t": "ctrl",
-            "commands": [getattr(c, "value", c) for c in (cmds or [])],
-            "volume": getattr(ctrl, "volume", None),
-            "muted": getattr(ctrl, "muted", None),
+            "commands": st.get("commands", []),
+            "volume": st.get("volume"),
+            "muted": st.get("muted"),
+            # `playing` is the authoritative play/pause boolean (audio actually flowing); `state`/
+            # `speed` are relayed for reference but are unreliable from Music Assistant.
+            "playing": self._audio_flowing,
+            "state": st.get("playback_state"),
+            # Spec position at *this instant*, computed on the server clock the player shares; the GUI
+            # anchors to its own receipt time and extrapolates onward at `speed`.
+            "progress": self._live_progress_ms(),
+            "duration": st.get("track_duration"),
+            "speed": st.get("playback_speed"),
         }
         if new != self._relay_ctrl:
             self._relay_ctrl = new
             self._relay_ctrl_dirty = True
+
+    def _live_progress_ms(self):
+        """Position right now, per the spec formula
+            pos = track_progress + (server_now_us - timestamp) * playback_speed / 1e6
+        evaluated on the server clock this player is synced to. Falls back to the raw snapshot when
+        the clock isn't synchronized or fields are missing. Returns None if we have no snapshot."""
+        st = self._state
+        prog = st.get("track_progress")
+        if prog is None:
+            return None
+        ts = st.get("progress_ts_us")
+        speed = st.get("playback_speed")
+        if ts is None or not speed:  # no anchor, or paused (speed 0/None) → snapshot as-is
+            return prog
+        try:
+            if not self.client.is_time_synchronized:
+                return prog
+            now_srv = self.client.compute_server_time(self.client.now_us())
+            pos = prog + (now_srv - ts) * speed // 1_000_000
+        except Exception:  # noqa: BLE001 - clock not ready / API shape; fall back to the snapshot
+            return prog
+        dur = st.get("track_duration")
+        if dur:  # clamp to [0, duration] when duration is known (0 = live/unknown)
+            return max(0, min(pos, dur))
+        return max(0, pos)
 
     def _on_visualizer(self, frames) -> None:  # frames: list[VisualizerFrame]
         # Spectrum and loudness arrive as separate frames; merge into the latest {s,l}. Scale the
@@ -494,14 +409,34 @@ class SendspinPlayer:
         self._relay_art = {"t": "art", "d": url}
         self._relay_art_dirty = True
 
+    @staticmethod
+    def _defined(value):
+        # mashumaro's omit_default leaves absent fields as an UndefinedField sentinel (not None);
+        # treat both as "no value" so we never store the sentinel or a stale field.
+        return None if value is None or type(value).__name__ == "UndefinedField" else value
+
     def _on_metadata(self, payload) -> None:
         md = getattr(payload, "metadata", None)
         if md is None:
             return
         for field in ("title", "artist", "album"):
-            value = getattr(md, field, None)
+            value = self._defined(getattr(md, field, None))
             if value is not None:
                 self._state[field] = value
+        # Progress snapshot for the now-playing bar (foreign sources). Per the Sendspin spec the
+        # metadata `progress` object gives track_progress/track_duration/playback_speed (ms; speed
+        # x1000, 0 = paused) and the enclosing metadata carries a `timestamp` (server µs) marking
+        # when the snapshot is valid. The spec position is:
+        #   pos = track_progress + (server_now_us - timestamp) * playback_speed / 1e6
+        # Only the player shares the server's clock, so we anchor on that server timestamp here and
+        # compute the live position at relay time in _emit_ctrl (see there).
+        prog = self._defined(getattr(md, "progress", None))
+        if prog is not None:
+            self._state["track_progress"] = getattr(prog, "track_progress", None)
+            self._state["track_duration"] = getattr(prog, "track_duration", None)
+            self._state["playback_speed"] = getattr(prog, "playback_speed", None)
+            self._state["progress_ts_us"] = self._defined(getattr(md, "timestamp", None))
+        self._emit_ctrl()
 
     def _snapshot_state(self) -> dict:
         info = self.client.server_info
@@ -514,12 +449,19 @@ class SendspinPlayer:
         }
         if attached and info is not None:
             reason = getattr(info.connection_reason, "value", info.connection_reason)
+            # Only advertise a current track while audio is actually flowing. A foreign server (MA)
+            # holds our player as a group member even when idle, and its last metadata title lingers
+            # in _state — reporting it while stopped makes the "Idle Devices" chip claim a track is
+            # playing when none is. audio-flow is the reliable truth (MA's playback_state is not).
+            playing = self._audio_flowing
             state.update(
                 server_id=info.server_id, server_name=info.name, connection_reason=reason,
                 group_id=self._state.get("group_id"), group_name=self._state.get("group_name"),
-                playback_state=self._state.get("playback_state"),
-                title=self._state.get("title"), artist=self._state.get("artist"),
-                album=self._state.get("album"),
+                playback_state=("playing" if playing else "stopped"),
+                playing=playing,
+                title=self._state.get("title") if playing else None,
+                artist=self._state.get("artist") if playing else None,
+                album=self._state.get("album") if playing else None,
             )
         return state
 
@@ -556,7 +498,21 @@ class SendspinPlayer:
 
     async def _relay_send(self, ws) -> None:
         """~30 fps: emit the latest ctrl (on change) + latest viz frame (coalesced)."""
+        tick = 0
         while True:
+            # Stall safety-net: `playing` is driven by stream start/end, but if a stream stalls
+            # (chunks stop for >1.5 s without a stream_end), fall back to paused. Only ever turns
+            # flowing OFF — stream_start owns turning it ON.
+            if self._audio_flowing and (time.monotonic() - self._last_audio_mono) > 1.5:
+                self._audio_flowing = False
+                self._emit_ctrl()
+            # Refresh ~1/s so the cached ctrl (and any late-joining GUI) always gets a current spec
+            # position — the live progress advances continuously, so this re-emits while playing and
+            # is a no-op (deduped) while paused. Cheap: one small JSON frame per second.
+            tick += 1
+            if tick >= 30:
+                tick = 0
+                self._emit_ctrl()
             if self._relay_ctrl_dirty and self._relay_ctrl is not None:
                 self._relay_ctrl_dirty = False
                 with contextlib.suppress(Exception):
@@ -682,7 +638,16 @@ class SendspinPlayer:
 
     # -- server → player events ---------------------------------------------
 
+    def _on_stream_start(self, message) -> None:  # noqa: ANN001
+        # Stream lifecycle is the definitive play/pause signal for a foreign server: MA opens a
+        # stream on play/resume and ends it on pause. Drive `playing` off that, not raw chunk timing
+        # (which would flicker True while the jitter buffer drains after a pause).
+        self._audio_flowing = True
+        self._last_audio_mono = time.monotonic()
+        self._emit_ctrl()
+
     def _on_audio(self, server_ts_us: int, pcm: bytes, fmt) -> None:  # noqa: ANN001
+        self._last_audio_mono = time.monotonic()  # for the stall safety-net only (never flips ON)
         self.renderer.enqueue(pcm)
 
     def _on_stream_clear(self, channels) -> None:  # noqa: ANN001
@@ -691,7 +656,10 @@ class SendspinPlayer:
 
     def _on_stream_end(self, channels) -> None:  # noqa: ANN001
         logger.info("stream_end -> idle %s", self.renderer.stats())
+        self._audio_flowing = False  # stream ended → paused/stopped
+        self._last_audio_mono = 0.0
         self.renderer.mark_idle()
+        self._emit_ctrl()
 
     def _on_server_command(self, payload) -> None:  # noqa: ANN001
         # Volume/mute arrive nested: ServerCommandPayload.player -> PlayerCommandPayload(volume, mute).
