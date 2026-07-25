@@ -84,7 +84,8 @@ export default function MeshApp(): React.ReactElement {
     return () => unsub();
   }, []);
 
-  useThemeSettings(settings);
+  // Feed the featured track's artwork to the theme hook so album-art colors can drive the UI.
+  // (featured is computed below; a ref-free read is fine — the effect keys on the URL string.)
 
   const onSettingsChange = useCallback((next: SettingsType) => {
     settingsService.updateSettings(next);
@@ -120,6 +121,10 @@ export default function MeshApp(): React.ReactElement {
     () => model.streams.find((s) => s.id === featuredId),
     [model.streams, featuredId],
   );
+
+  // Theme: also drives album-art colors from the featured track's artwork; returns the extracted
+  // palette so the visualizer can share it.
+  const albumArtColors = useThemeSettings(settings, featured?.currentTrack.albumArtUrl ?? null);
 
   // The PICKER lists only sources a sender is actually using (plus whatever we're on, so a stream
   // going idle can't yank itself out from under the selection). Device lists still get the full
@@ -165,11 +170,14 @@ export default function MeshApp(): React.ReactElement {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const stableClients = useMemo(() => viewClients, [clientsSig]);
 
-  // Left card = us and whoever is synced with us. Right card = everyone else — never ourselves.
-  // Both comparisons guard on featuredId being set: when we're idle it is null, and so is every
-  // idle peer's stream, so an unguarded equality would read "synced with us" and swallow them.
+  // "Synced Devices" = OTHER units playing our featured stream — never this unit itself. The top
+  // "Select a Source" bar and the main now-playing card already are this unit's own endpoint;
+  // listing it again here (with a redundant volume row) is what the original design deliberately
+  // omitted. So exclude isLocal: when we're solo the list is empty (nothing else is synced) and the
+  // panel hides itself; when a peer joins, only the peer appears. Guard on featuredId so idle peers
+  // (currentStreamId null, like our own idle featuredId) aren't mistaken for "synced with us".
   const syncedClients: Client[] = useMemo(
-    () => stableClients.filter((c) => c.isLocal || (featuredId != null && c.currentStreamId === featuredId)),
+    () => stableClients.filter((c) => !c.isLocal && featuredId != null && c.currentStreamId === featuredId),
     [stableClients, featuredId],
   );
   const otherClients: Client[] = useMemo(
@@ -215,16 +223,14 @@ export default function MeshApp(): React.ReactElement {
     else void service.unrouteClient(client.id);
   }, []);
 
-  /** Route this unit — and everyone currently grouped with it — onto the chosen source. */
+  /** Route THIS unit's own endpoint onto the chosen source. Never touches whoever else happens to
+   *  share the current group (e.g. a peer we're following, or one following us) — that shared
+   *  group is a consequence of routing decisions, not something the top selector should undo for
+   *  everyone in it. One player per unit, so `mine` is always at most one client. */
   const onSelectStream = useCallback((streamId: string | null) => {
     setSelectedStreamId(streamId);
-    const m = modelRef.current;
-    const mine = m.clients.filter((c) => c.isLocal);
-    const current = mine.find((c) => c.currentStreamId)?.currentStreamId ?? null;
-    // Whoever shares our group moves with us; a solo unit just moves itself.
-    const group = current ? m.clients.filter((c) => c.currentStreamId === current) : mine;
-    const targets = group.length ? group : mine;
-    for (const c of targets) moveClient(c, streamId);
+    const mine = modelRef.current.clients.filter((c) => c.isLocal);
+    for (const c of mine) moveClient(c, streamId);
   }, [moveClient]);
   const onClientStreamChange = useCallback((clientId: string, streamId: string | null) => {
     const client = modelRef.current.clients.find((c) => c.id === clientId);
@@ -282,7 +288,7 @@ export default function MeshApp(): React.ReactElement {
           {shouldShowControls && featured ? (
             <div className="flex-grow flex flex-col">
               <div className="space-y-6">
-                <NowPlaying stream={featured} canSeek={false} />
+                <NowPlaying stream={featured} canSeek={false} onAlbumArtClick={() => setVisualizerOpen(true)} />
                 <MemoPlayerControls
                   stream={featured}
                   volume={featured.volume ?? 100}
@@ -309,24 +315,21 @@ export default function MeshApp(): React.ReactElement {
               <p className="text-[var(--text-secondary)] mt-2">
                 Start playing to an endpoint, or choose an active source above.
               </p>
-              {/* Our own speaker still has a story to tell while we're idle — above all when some
-                  other Sendspin server has claimed it. Without this the holding state renders no
-                  device list at all and the speaker silently disappears from its own unit's page. */}
-              {myPlayers.length > 0 && (
+              {/* Our own speaker only needs a row here when some OTHER Sendspin server has claimed
+                  it — that's information the top selector can't show (it has nothing to select),
+                  and without this the speaker would silently disappear from its own unit's page.
+                  A plainly idle speaker has nothing to add beyond what "Select a Source" above
+                  already says with nothing chosen, so it's left out — the top bar is the one
+                  place that controls this unit's own endpoint. */}
+              {myPlayers.some((p) => p.foreignServer) && (
                 <div className="mt-8 w-full max-w-md space-y-2">
-                  {myPlayers.map((p) => (
+                  {myPlayers.filter((p) => p.foreignServer).map((p) => (
                     <div key={p.id} className="flex items-center justify-between gap-3 p-3 rounded-lg bg-[var(--bg-tertiary)]">
                       <span className="font-semibold truncate">{p.name}</span>
                       <span className="text-sm text-[var(--text-secondary)] truncate text-right">
-                        {p.foreignServer ? (
-                          <>
-                            <Icon name="tower-broadcast" className="mr-2 text-[var(--text-muted)]" />
-                            {p.foreignServer.name}
-                            {p.foreignServer.title ? ` · ${p.foreignServer.title}` : ''}
-                          </>
-                        ) : (
-                          'Idle'
-                        )}
+                        <Icon name="tower-broadcast" className="mr-2 text-[var(--text-muted)]" />
+                        {p.foreignServer!.name}
+                        {p.foreignServer!.title ? ` · ${p.foreignServer!.title}` : ''}
                       </span>
                     </div>
                   ))}
@@ -393,7 +396,7 @@ export default function MeshApp(): React.ReactElement {
         streams={stableStreams}
         settings={settings}
         getSpectrum={getSpectrum}
-        extractedAlbumArtColors={null}
+        extractedAlbumArtColors={albumArtColors}
         currentVolume={featured?.volume ?? 100}
         onPlayPause={onPlayPause}
         onSkip={(dir) => onSkip(dir === 'next' ? 'next' : 'prev')}

@@ -229,7 +229,17 @@ export function mapViewToModel(
   );
   // An ADOPTED foreign speaker is in a unit's group like any other player, so flag it by URL —
   // release needs to know to hang up rather than just re-group it.
-  const foreignUrls = new Set((neighbourhood?.players ?? []).filter((p) => !p.is_own).map((p) => p.url));
+  //
+  // `neighbourhood.is_own` only means "not literally this unit's own player" — a PEER unit's own
+  // player also comes back `is_own: false` (it's a candidate render endpoint from that unit's point
+  // of view too), so it must not be treated as foreign here. A player is only genuinely foreign if
+  // its host isn't one of our own mesh units', regardless of adoption state.
+  const unitHosts = new Set(view.units.map((u) => u.host).filter(Boolean) as string[]);
+  const foreignUrls = new Set(
+    (neighbourhood?.players ?? [])
+      .filter((p) => !p.is_own && !unitHosts.has(hostOf(p.url) ?? ''))
+      .map((p) => p.url),
+  );
   for (const c of clients) {
     if (c.url && foreignUrls.has(c.url)) c.isForeign = true;
   }
@@ -267,7 +277,16 @@ export class SendspinDataService {
   // server (Music Assistant), forwards that group's controller state + visualizer frames here, and
   // we send transport commands back. Lets the GUI observe + control + visualize foreign playback.
   private consumeWs: WebSocket | null = null;
-  private consumeCtrl: { commands: string[]; volume: number | null; muted: boolean | null } | null = null;
+  private consumeCtrl: {
+    commands: string[]; volume: number | null; muted: boolean | null;
+    playing: boolean | null;   // authoritative play/pause (audio actually flowing at the player)
+    state: string | null;      // group playback_state ('playing' | 'stopped'); 'stopped' = feed ended
+    progress: number | null;   // spec position valid at receipt (ms), computed on the server clock
+    duration: number | null;   // track duration (ms; 0/unknown for live)
+    speed: number | null;      // playback_speed x1000 (spec extrapolation rate; 0/absent = unknown)
+    at: number;                // Date.now() at receipt — anchor for onward extrapolation
+  } | null = null;
+  private consumeCtrlOptimisticUntil = 0;  // ignore relayed `playing` briefly after a local toggle
   private consumeViz: VizFrame | null = null;
   private consumeArt: string | null = null;  // album art data URL from the foreign server
   private listeners = new Set<Listener>();
@@ -309,7 +328,21 @@ export class SendspinDataService {
       let m: any;
       try { m = JSON.parse(ev.data); } catch { return; }
       if (m.t === 'ctrl') {
-        this.consumeCtrl = { commands: m.commands || [], volume: m.volume ?? null, muted: m.muted ?? null };
+        const prev = this.consumeCtrl;
+        // Within the optimistic window after a local toggle, keep our intended `playing` so a stale
+        // in-flight frame doesn't flip the button back; everything else takes the relayed values.
+        const keepOptimistic = Date.now() < this.consumeCtrlOptimisticUntil;
+        this.consumeCtrl = {
+          commands: m.commands || [],
+          volume: m.volume ?? null,
+          muted: m.muted ?? null,
+          playing: keepOptimistic ? (prev?.playing ?? null) : (typeof m.playing === 'boolean' ? m.playing : null),
+          state: typeof m.state === 'string' ? m.state : null,
+          progress: typeof m.progress === 'number' ? m.progress : null,
+          duration: typeof m.duration === 'number' ? m.duration : null,
+          speed: typeof m.speed === 'number' ? m.speed : null,
+          at: Date.now(),
+        };
         this.emit();
       } else if (m.t === 'viz' && Array.isArray(m.s)) {
         this.consumeViz = { spectrum: Uint8Array.from(m.s), loudness: m.l ?? 0, at: Date.now() };
@@ -329,6 +362,13 @@ export class SendspinDataService {
 
   /** Send a transport command to the foreign server our player is a member of (via the relay). */
   private sendForeignCommand(command: string, args: { volume?: number; mute?: boolean } = {}): void {
+    // Optimistically flip the button so it responds instantly; the relay's audio-flow truth (~1s
+    // round-trip through MA) reconciles it. The window makes a stale in-flight frame yield to us.
+    if ((command === 'play' || command === 'pause') && this.consumeCtrl) {
+      this.consumeCtrl.playing = command === 'play';
+      this.consumeCtrlOptimisticUntil = Date.now() + 1500;
+      this.emit();
+    }
     if (this.consumeWs?.readyState === WebSocket.OPEN) {
       this.consumeWs.send(JSON.stringify({ t: 'cmd', command, ...args }));
     }
@@ -346,9 +386,29 @@ export class SendspinDataService {
     // now-playing, transport and the visualizer all light up on it. Its metadata rides the player's
     // self-report (foreignServer); controls + spectrum ride the consume relay.
     const fc = model.clients.find((c) => c.isLocal && c.foreignServer);
-    if (fc?.foreignServer) {
+    const cc = this.consumeCtrl;
+    // Feed ended: the player is still a member of MA's group but MA has STOPPED (group
+    // playback_state 'stopped', per spec, and no audio flowing) — distinct from a pause, which keeps
+    // state 'playing' with speed 0. Drop the synthesized stream so the GUI returns to the idle/none
+    // state instead of lingering on the last track. (A full detach clears foreignServer upstream and
+    // is handled already; this covers stopped-but-still-attached.)
+    const feedEnded = cc != null && cc.playing === false && cc.state === 'stopped';
+    if (fc?.foreignServer && !feedEnded) {
       const sid = `${FOREIGN_PREFIX}${fc.id}`;
-      const playing = fc.foreignServer.title != null; // best signal we have; refined by relay later
+      // Play/pause: the player's audio-flow truth (Music Assistant's own state/speed fields proved
+      // unreliable to a group member — it reports speed 0 and even state 'stopped' mid-playback).
+      const playing = cc?.playing != null ? cc.playing : fc.foreignServer.title != null;
+      // Position: the relay already carries the spec position valid at receipt (computed on the
+      // server clock the player shares). Extrapolate onward at the spec playback_speed; when audio
+      // is flowing but the server under-reports speed (0/absent), fall back to 1x so the bar still
+      // advances. Halted when paused.
+      const durMs = cc?.duration ?? 0;
+      let posMs = cc?.progress ?? 0;
+      if (cc?.progress != null && playing) {
+        const rate = cc.speed && cc.speed > 0 ? cc.speed / 1000 : 1;
+        posMs = cc.progress + (Date.now() - cc.at) * rate;
+      }
+      if (durMs > 0) posMs = Math.max(0, Math.min(posMs, durMs));
       model.streams.push({
         id: sid,
         serverName: fc.foreignServer.name,
@@ -361,10 +421,10 @@ export class SendspinDataService {
           artist: fc.foreignServer.artist ?? '',
           album: '',
           albumArtUrl: this.consumeArt ?? '',
-          duration: 0,
+          duration: durMs / 1000,
         },
         isPlaying: playing,
-        progress: 0,
+        progress: posMs / 1000,
         volume: this.consumeCtrl?.volume ?? undefined,
       });
       fc.currentStreamId = sid; // makes it the featured stream for the local page
