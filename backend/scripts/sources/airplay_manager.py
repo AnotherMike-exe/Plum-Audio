@@ -47,9 +47,11 @@ class AirplayManager(SourceManagerBase):
         self.config_root = config_root
         self.binary = binary
         self.dbus_binary = dbus_binary
-        # A survivor of a crashed run still holds the RAOP port (and its bus socket), which would
-        # keep the fresh instance from starting. Scoped to our config root.
-        self.stale_pattern = f"shairport-sync.*{config_root}"
+        # A survivor of a crashed/previous run still holds the RAOP port (shairport) or the bus
+        # socket path (dbus-daemon), which would block or orphan the fresh instance — the private
+        # dbus-daemon especially, since it detaches (setsid) and would otherwise pile up one per
+        # restart, leaving AirplayRemote resolving the wrong daemon. Sweep BOTH, scoped to our root.
+        self.stale_pattern = [f"shairport-sync.*{config_root}", f"dbus-daemon.*{config_root}"]
 
     def desired(self, settings: dict) -> dict[str, tuple[tuple, object]]:
         endpoints = airplay_config.enabled_endpoints(settings)

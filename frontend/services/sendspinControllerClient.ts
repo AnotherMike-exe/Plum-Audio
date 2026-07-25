@@ -123,10 +123,6 @@ export function currentPositionMs(np: NowPlaying, serverClockOffsetUs: number, n
 const ARTWORK_CHANNEL_0 = 8; // binary message types 8..11 = artwork channels 0..3
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
-// How long to hold an optimistic play/pause before letting server state win again. Covers the
-// AirPlay round-trip (buffered audio keeps draining for ~5s, so `pend` lands late); if the command
-// never takes (e.g. the source ignored it), reality reasserts after this window.
-const OPTIMISTIC_HOLD_MS = 8000;
 
 export class SendspinControllerClient {
   readonly unitId: string;
@@ -147,10 +143,6 @@ export class SendspinControllerClient {
   private closed = false;
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  // Optimistic transport: after a GUI play/pause, hold this speed until the server confirms it (a
-  // matching speed arrives) or OPTIMISTIC_HOLD_MS elapses. null = no action pending.
-  private optimisticSpeed: number | null = null;
-  private optimisticUntil = 0;
   // Commands issued while the WS is mid-reconnect: queue and flush once (re)connected + grouped, so
   // a click during a brief socket blip isn't silently lost. Each carries a timestamp for TTL expiry.
   private pendingCommands: Array<{ msg: string; at: number }> = [];
@@ -335,7 +327,6 @@ export class SendspinControllerClient {
 
   private scheduleReconnect(): void {
     if (this.closed) return;
-    this.clearOptimistic(); // don't hold a stale transport guess across a drop
     // Keep the last-known now-playing through brief blips — a healthy reconnect (server restart,
     // roam) is sub-second and the reconnected socket re-emits full state, so blanking immediately
     // makes the GUI flash "disconnected" and drop art/progress mid-pause. Only reset to unknown
@@ -350,32 +341,32 @@ export class SendspinControllerClient {
   }
 
   /**
-   * Optimistically reflect a GUI-initiated transport action before the source round-trips.
-   * AirPlay's pause round-trip (MPRIS → shairport → buffer drain → `pend` → metadata diff) takes
-   * several seconds; reflecting speed locally flips the button instantly. The next real progress
-   * diff refines the anchor. Only touches playback speed/state — never title/art — so a no-op
-   * command self-corrects on the next update rather than blanking anything.
+   * Optimistically reflect a GUI-initiated transport action for the click-to-render gap before the
+   * next real `server/state` arrives (normally well under a second — one WS round trip). Only
+   * touches playback speed/state — never title/art — so a no-op command self-corrects on the next
+   * update rather than blanking anything.
+   *
+   * This is a one-shot local flip, not a hold: the very next real update wins outright, even if it
+   * disagrees (AirPlay's pause round-trip — MPRIS → shairport → buffer drain → `pend` → metadata
+   * diff — can take several seconds, so the button may visibly revert while that drains). That is
+   * deliberate. A second Sendspin controller client on ANOTHER unit's GUI, watching the same group,
+   * has no optimistic flip of its own and reflects the real broadcast immediately — if this client
+   * suppressed disagreeing updates instead of yielding to them, the two GUIs would show conflicting
+   * transport state and diverging timelines for as long as the suppression lasted. See
+   * frontend/MeshApp.tsx's follow feature, which routinely puts two GUIs on one group.
    */
   applyOptimisticTransport(command: ControllerCommand): void {
     if (command === 'pause') {
       this.np.playbackSpeed = 0;
-      this.optimisticSpeed = 0;
     } else if (command === 'play') {
       this.np.playbackSpeed = 1000;
       this.np.playbackState = 'playing';
       // Re-anchor so extrapolation resumes from the frozen position, not a stale timestamp.
       if (this.np.trackProgressMs != null) this.np.timestampUs = Date.now() * 1000 + this.serverClockOffsetUs;
-      this.optimisticSpeed = 1000;
     } else {
       return;
     }
-    this.optimisticUntil = Date.now() + OPTIMISTIC_HOLD_MS;
     this.emit();
-  }
-
-  private clearOptimistic(): void {
-    this.optimisticSpeed = null;
-    this.optimisticUntil = 0;
   }
 
   private onMessage(ev: MessageEvent): void {
@@ -401,9 +392,12 @@ export class SendspinControllerClient {
         break;
       case 'stream/end':
       case 'stream/clear':
-        this.revokeArtwork();
-        this.np = { ...this.np, artworkUrl: undefined };
-        this.viz = null; // no source feeding us → visualizer falls to rest
+        // Audio stopped/flushed (pause, idle, a roam) — but the TRACK hasn't changed, so keep its
+        // artwork. Revoking it here blanks the cover on every pause/idle/switch until the next PICT
+        // (which only arrives on a track change), the reported "art disappears on switch". Art is
+        // replaced on the next PICT and cleared on an explicit empty PICT; only the visualizer
+        // falls to rest here, since no audio is flowing.
+        this.viz = null;
         this.emit();
         break;
       // stream/start (artwork channel config) needs no action — we already requested our size.
@@ -422,26 +416,12 @@ export class SendspinControllerClient {
       if ('album' in md) this.np.album = md.album ?? undefined;
       if ('artwork_url' in md && !this.artworkObjectUrl) this.np.artworkUrl = md.artwork_url ?? undefined;
       if (md.progress) {
-        const serverSpeed = md.progress.playback_speed;
-        const holding = this.optimisticSpeed != null && this.optimisticUntil > Date.now();
-        if (holding && serverSpeed !== this.optimisticSpeed) {
-          // GUI action hasn't round-tripped to the source yet — hold the button where the user put
-          // it and ignore in-flight frames from the pre-action state (AirPlay keeps sending
-          // speed=1000 for ~5s after a pause). Freeze the position for a held pause; let it advance
-          // for a held play.
-          this.np.playbackSpeed = this.optimisticSpeed as number;
-          if (this.optimisticSpeed !== 0) {
-            this.np.trackProgressMs = md.progress.track_progress;
-            this.np.trackDurationMs = md.progress.track_duration;
-            this.np.timestampUs = md.timestamp;
-          }
-        } else {
-          if (holding) this.clearOptimistic(); // server confirmed the action
-          this.np.trackProgressMs = md.progress.track_progress;
-          this.np.trackDurationMs = md.progress.track_duration;
-          this.np.playbackSpeed = serverSpeed;
-          this.np.timestampUs = md.timestamp;
-        }
+        // Always the real broadcast, unconditionally — see applyOptimisticTransport's docstring on
+        // why this must never be held/suppressed in favor of a local guess.
+        this.np.trackProgressMs = md.progress.track_progress;
+        this.np.trackDurationMs = md.progress.track_duration;
+        this.np.playbackSpeed = md.progress.playback_speed;
+        this.np.timestampUs = md.timestamp;
       }
       changed = true;
     }

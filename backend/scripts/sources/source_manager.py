@@ -70,8 +70,10 @@ class _Running:
 class SourceManagerBase:
     """Reconciles Sendspin sources + their daemons from settings.json, live."""
 
-    #: pkill pattern matching this family's daemons, used to sweep survivors of a crashed run.
-    stale_pattern: str | None = None
+    #: pkill pattern(s) matching this family's daemons, used to sweep survivors of a previous run.
+    #: A single string, or a list when a family spawns more than one kind of daemon (e.g. AirPlay
+    #: runs shairport-sync AND a private dbus-daemon — both must be swept or the daemon pile up).
+    stale_pattern: str | list[str] | None = None
 
     def __init__(
         self,
@@ -295,7 +297,9 @@ class SourceManagerBase:
         """
         if not self.stale_pattern:
             return
-        try:
-            subprocess.run(["pkill", "-f", self.stale_pattern], capture_output=True, timeout=10, check=False)
-        except (OSError, subprocess.SubprocessError) as e:
-            logger.debug("[%s] stale daemon sweep skipped: %s", self.name, e)
+        patterns = [self.stale_pattern] if isinstance(self.stale_pattern, str) else self.stale_pattern
+        for pattern in patterns:
+            try:
+                subprocess.run(["pkill", "-f", pattern], capture_output=True, timeout=10, check=False)
+            except (OSError, subprocess.SubprocessError) as e:
+                logger.debug("[%s] stale daemon sweep skipped (%s): %s", self.name, pattern, e)

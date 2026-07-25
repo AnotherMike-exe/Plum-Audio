@@ -18,6 +18,7 @@ any call failure, so a shairport restart self-heals on the next command.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Callable
 
@@ -56,6 +57,22 @@ class AirplayRemote:
                 self._bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
                 logger.info("airplay remote: connected to system D-Bus")
 
+    def _drop(self) -> None:
+        """Tear the whole connection down so the NEXT command reconnects from scratch.
+
+        Dropping only the proxy is not enough: our per-endpoint bus lives on a fixed socket PATH
+        that the manager unlinks-and-recreates on any shairport respool (and stale dbus-daemons can
+        pile up on that path). A cached `self._bus` therefore keeps pointing at an ORPHANED daemon
+        that no longer has shairport on it — every command then fails "MPRIS unavailable" forever.
+        Dropping the bus too means the next `connect()` opens a fresh socket to the path, landing on
+        whatever daemon currently owns it — i.e. the one shairport actually registered on.
+        """
+        self._player = None
+        if self._bus is not None:
+            with contextlib.suppress(Exception):
+                self._bus.disconnect()
+            self._bus = None
+
     async def _player_iface(self):
         if self._player is not None:
             return self._player
@@ -67,8 +84,8 @@ class AirplayRemote:
             if self._on_source_volume is not None:
                 obj.get_interface(PROPS_IFACE).on_properties_changed(self._on_props_changed)
             logger.info("airplay remote: bound to %s", MPRIS_NAME)
-        except Exception:  # noqa: BLE001 - shairport may be down or not own the name yet
-            self._player = None
+        except Exception:  # noqa: BLE001 - shairport down, wrong/orphaned daemon, or name not owned yet
+            self._drop()  # force a fresh bus + introspect next time, not a stuck stale connection
             logger.debug("airplay remote: MPRIS not available yet", exc_info=True)
         return self._player
 
@@ -81,7 +98,7 @@ class AirplayRemote:
             await getattr(player, method)()
             logger.info("airplay remote: %s", method)
         except Exception:  # noqa: BLE001 - name owner may have changed (shairport restart)
-            self._player = None  # drop the stale proxy; next command re-resolves
+            self._drop()  # drop the stale bus+proxy; next command re-resolves the current socket
             logger.debug("airplay remote: %s failed", method, exc_info=True)
 
     async def play(self) -> None:
