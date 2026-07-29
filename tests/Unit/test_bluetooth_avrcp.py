@@ -366,3 +366,62 @@ def test_first_position_of_a_session_is_always_anchored():
     avrcp._duration_ms = 400_346
     avrcp._apply_position_signal(32_320)
     assert role.set_metadata_calls[-1].track_progress == 32_320
+
+
+# -- cover-art bus liveness ----------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    avrcp_mod is None, reason="needs the real modules"
+)
+def test_coverart_reconnects_when_its_private_bus_died():
+    """A cached MessageBus whose daemon was replaced must be dropped, not reused.
+
+    Our obex daemons are respooled as a SET (any endpoint edit does it), so the private dbus-daemon
+    behind the cover-art bus gets replaced. dbus-next does not raise on that — verified on hardware:
+    `connected` flips to False within 0.1 s, but every introspect on the dead bus HANGS to timeout.
+    Reusing it therefore killed album art permanently while logging only "the device may not support
+    AVRCP cover art". Observed 2026-07-29 after obexd lost a bus-name race and the set restarted.
+    """
+    import importlib
+    ca_mod = importlib.import_module("sources.bluetooth_coverart")
+
+    class DeadBus:
+        connected = False
+        def __init__(self): self.disconnected = False
+        def disconnect(self): self.disconnected = True
+
+    ca = ca_mod.BluetoothCoverArt.__new__(ca_mod.BluetoothCoverArt)
+    ca.instance_id = "1"
+    ca.bus_address = "unix:path=/nonexistent/obex.socket"
+    dead = DeadBus()
+    ca._bus = dead
+    ca._session_path = "/org/bluez/obex/session0"
+    ca._session_device = "AA:BB:CC:DD:EE:FF"
+    ca._image = object()
+    ca._warned_unavailable = True
+
+    # The reconnect attempt fails (no such socket), but what matters is that the corpse was released
+    # and the session state that lived on it was forgotten.
+    assert asyncio.run(ca._connect()) is False
+    assert dead.disconnected, "the dead bus was not disconnected"
+    assert ca._bus is None, "the dead bus was kept and would be reused"
+    assert ca._session_path is None and ca._session_device is None
+    assert ca._image is None
+
+
+def test_coverart_reuses_a_live_bus():
+    """The liveness check must not cost a reconnect on every track."""
+    import importlib
+    ca_mod = importlib.import_module("sources.bluetooth_coverart")
+
+    class LiveBus:
+        connected = True
+        def disconnect(self): raise AssertionError("disconnected a live bus")
+
+    ca = ca_mod.BluetoothCoverArt.__new__(ca_mod.BluetoothCoverArt)
+    ca.instance_id = "1"
+    ca._bus = LiveBus()
+    ca._session_path = "/org/bluez/obex/session0"
+    assert asyncio.run(ca._connect()) is True
+    assert ca._session_path == "/org/bluez/obex/session0", "a live bus lost its session"

@@ -88,9 +88,31 @@ class BluetoothCoverArt:
             self._bus = None
 
     async def _connect(self) -> bool:
-        """Connect to this endpoint's private obex bus. False if obexd isn't up yet."""
+        """Connect to this endpoint's private obex bus. False if obexd isn't up yet.
+
+        The liveness check is load-bearing, not defensive. Our obex daemons are a SET that the
+        source manager respools as a unit, so the private dbus-daemon behind `bus_address` gets
+        replaced — and when it does, a cached MessageBus is left pointing at a socket nobody is
+        serving. dbus-next does not raise on that; every subsequent introspect simply hangs until
+        CONNECT_TIMEOUT_S, so album art dies permanently while the log shows only "the device may
+        not support AVRCP cover art". Observed on hardware 2026-07-29: obexd lost a startup race for
+        its bus name ("Name already in use", because the previous generation's setsid'd children
+        outlived the server), the manager restarted the set, and art never came back for the life of
+        the process.
+        """
         if self._bus is not None:
-            return True
+            if self._bus.connected:
+                return True
+            logger.info(
+                "[bluetooth-%s] obex bus went away (daemon respool); reconnecting", self.instance_id
+            )
+            with contextlib.suppress(Exception):
+                self._bus.disconnect()
+            self._bus = None
+            self._session_path = None  # the session lived on the old daemon
+            self._session_device = None
+            self._image = None
+            self._warned_unavailable = False  # a new generation deserves a fresh complaint
         try:
             self._bus = await asyncio.wait_for(
                 MessageBus(bus_address=self.bus_address).connect(), timeout=CONNECT_TIMEOUT_S
@@ -138,11 +160,20 @@ class BluetoothCoverArt:
                 timeout=CONNECT_TIMEOUT_S,
             )
         except Exception:  # noqa: BLE001 - phone refused BIP, or obexd can't reach the port
+            # Distinguish "the phone said no" from "we are talking to a corpse". The second used to
+            # be reported as the first, which is how a dead bus masqueraded as an unsupported device.
+            dead = self._bus is None or not self._bus.connected
             logger.info(
-                "[bluetooth-%s] could not open a cover-art session to %s (port %s); "
-                "the device may not support AVRCP cover art",
-                self.instance_id, address, obex_port, exc_info=True,
+                "[bluetooth-%s] could not open a cover-art session to %s (port %s); %s",
+                self.instance_id, address, obex_port,
+                "the obex bus is gone — will reconnect on the next track"
+                if dead else "the device may not support AVRCP cover art",
+                exc_info=True,
             )
+            if dead and self._bus is not None:
+                with contextlib.suppress(Exception):
+                    self._bus.disconnect()
+                self._bus = None
             return False
 
         self._session_path = str(session_path)
