@@ -108,6 +108,7 @@ class BluetoothAvrcp:
         self._warned_no_role = False
         self._playing = False
         self._duration_ms = 0
+        self._last_title: str | None = None
         self._last_speed: int | None = None  # last published playback_speed, for transition logging
         # Our own anchor, so we can tell what a polled position SHOULD be (see _progress_ticker).
         self._anchor_pos_ms: int | None = None
@@ -314,6 +315,12 @@ class BluetoothAvrcp:
         port = values.get("ObexPort")
         if isinstance(port, int) and port > 0:
             self._obex_port = port
+            # Open the BIP session NOW rather than waiting for an ImgHandle — many phones only
+            # start publishing the handle once a session exists. See BluetoothCoverArt.prepare.
+            if self.cover_art is not None:
+                asyncio.ensure_future(
+                    self.cover_art.prepare(self.adapter.active_address, self._obex_port)
+                )
         if "Repeat" in values:
             self._repeat = REPEAT_FROM_BLUEZ.get(str(values["Repeat"]).lower(), RepeatMode.OFF)
         if "Shuffle" in values:
@@ -391,7 +398,15 @@ class BluetoothAvrcp:
         # Bluetooth stream shows the wrong position". Ask the phone where it actually is; on a
         # genuine track change it answers ~0 anyway.
         if kwargs:
-            asyncio.ensure_future(self._reanchor_now(fallback_freeze=False))
+            # A real track change legitimately starts near 0; a re-sent Track for the SAME title
+            # (late ImgHandle, a controller joining) does not, so only the former is trusted.
+            title = kwargs.get("title")
+            is_new_track = bool(title) and title != self._last_title
+            if title:
+                self._last_title = str(title)
+            asyncio.ensure_future(
+                self._reanchor_now(fallback_freeze=False, new_track=is_new_track)
+            )
 
     def _apply_status(self, status: str) -> None:
         playing = status.lower() in PLAYING_STATES
@@ -407,8 +422,15 @@ class BluetoothAvrcp:
         # because it reports Position sporadically. Async because it needs a D-Bus round trip.
         asyncio.ensure_future(self._reanchor_now(fallback_freeze=not playing))
 
-    async def _reanchor_now(self, *, fallback_freeze: bool) -> None:
-        """Publish progress using a freshly-read Position, so play/pause lands on the real spot."""
+    async def _reanchor_now(self, *, fallback_freeze: bool, new_track: bool = False) -> None:
+        """Publish progress using a freshly-read Position, so play/pause lands on the real spot.
+
+        Guarded, because phones lie about Position WHILE PAUSED: the rig device reports 0 when
+        paused and the true offset when playing, so a naive read anchors a part-way track at 0:00
+        (seen as "wrong position on connect, correct after a play/pause"). A genuine track change
+        legitimately IS ~0, so `new_track` is trusted outright; otherwise the reading has to agree
+        with our own anchor or it is discarded in favour of it.
+        """
         role = self._metadata_role()
         if role is None or role.metadata is None:
             return
@@ -417,6 +439,26 @@ class BluetoothAvrcp:
         if props is not None:
             with contextlib.suppress(Exception):
                 position = int((await props.call_get(PLAYER_IFACE, "Position")).value)
+
+        if position is not None and not new_track:
+            expected = self._expected_position_ms()
+            if expected is not None and abs(position - expected) > POSITION_TOLERANCE_MS:
+                logger.info(
+                    "[bluetooth-%s] distrusting reported position %d ms (expected ~%d); keeping our anchor",
+                    self.instance_id, position, int(expected),
+                )
+                position = int(expected)
+            elif expected is None and position == 0 and not self._playing:
+                # Nothing to check against yet AND the classic paused-device lie. Publishing 0 here
+                # is what showed 0:00 for a track already part-way through on first connect;
+                # publishing nothing leaves the timeline blank until the first trustworthy reading,
+                # which is honest rather than wrong.
+                logger.info(
+                    "[bluetooth-%s] paused device reports position 0 with no anchor yet; "
+                    "holding off until a trustworthy reading", self.instance_id,
+                )
+                position = None
+
         if position is not None and self._duration_ms:
             self._anchor_progress(position, self._duration_ms)
             return

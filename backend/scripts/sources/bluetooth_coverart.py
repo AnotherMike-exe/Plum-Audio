@@ -33,6 +33,7 @@ import contextlib
 import io
 import logging
 import os
+import tempfile
 
 from dbus_next import Variant
 from dbus_next.aio import MessageBus
@@ -46,7 +47,9 @@ CLIENT_IFACE = "org.bluez.obex.Client1"
 
 # Session methods that mean "give me the image for this handle", best first. GetThumbnail returns a
 # small (typically 200x200) JPEG, which is all the GUI needs and by far the fastest to transfer.
-FETCH_METHODS = ("call_get_thumbnail", "call_get_image_thumbnail", "call_get_image")
+# Verified present on obexd 5.82: Image1 offers Properties/Get/GetThumbnail. Thumbnail
+# first — it is a small JPEG, which is all the GUI needs and far faster over BIP.
+FETCH_METHODS = ("call_get_thumbnail", "call_get")
 # Interfaces BlueZ has used for the BIP image-pull client.
 IMAGE_IFACES = ("org.bluez.obex.Image1", "org.bluez.obex.ImagePull1", "org.bluez.obex.BipImagePull1")
 
@@ -73,6 +76,7 @@ class BluetoothCoverArt:
         self._last_handle: str | None = None
         self._fetching = False
         self._warned_unavailable = False
+        self._warned_skipped = False
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -119,11 +123,17 @@ class BluetoothCoverArt:
         try:
             intro = await self._bus.introspect(OBEX_BUS, OBEX_ROOT)
             client = self._bus.get_proxy_object(OBEX_BUS, OBEX_ROOT, intro).get_interface(CLIENT_IFACE)
-            # Target 'avrcp' is what selects the cover-art (BIP) service; Channel carries the PSM
-            # BlueZ told us about via MediaPlayer1.ObexPort.
+            # Target and port key are both fussy, and both were wrong on the first attempt.
+            # Probed against obexd 5.82 on the rig:
+            #   Target 'avrcp'                -> DBusError with no message at all
+            #   Target 'bip-avrcp' + Channel  -> "Unable to find service record" (SDP lookup)
+            #   Target 'bip-avrcp' + PSM      -> session created
+            # PSM is the right key because MediaPlayer1.ObexPort is an L2CAP PSM, not an RFCOMM
+            # channel; passing it as Channel sends obexd looking for a service record that the
+            # phone does not publish.
             session_path = await asyncio.wait_for(
                 client.call_create_session(
-                    address, {"Target": Variant("s", "avrcp"), "Channel": Variant("q", int(obex_port))}
+                    address, {"Target": Variant("s", "bip-avrcp"), "PSM": Variant("q", int(obex_port))}
                 ),
                 timeout=CONNECT_TIMEOUT_S,
             )
@@ -181,10 +191,37 @@ class BluetoothCoverArt:
 
     # -- fetch ---------------------------------------------------------------
 
+    async def prepare(self, address: str | None, obex_port: int | None) -> None:
+        """Open the BIP session as soon as we know the device supports cover art.
+
+        THIS IS NOT AN OPTIMISATION — it is what makes cover art work at all. Phones commonly
+        withhold `Track.ImgHandle` until a BIP session exists, so waiting for a handle before
+        opening the session deadlocks: no session, therefore no handle, therefore no session.
+        Observed exactly that on the rig (ObexPort=4105 present, ImgHandle absent). Plum-Snapcast's
+        control script had already found this and opened the session proactively on track change;
+        its comment ("some devices may only provide ImgHandle after session is established") is the
+        only surviving record of it, since that code could never actually run on BlueZ 5.70.
+        """
+        if not address or not obex_port or self._session_path is not None:
+            return
+        if await self._ensure_session(address, int(obex_port)):
+            logger.info(
+                "[bluetooth-%s] cover-art session open; the device may now publish ImgHandle",
+                self.instance_id,
+            )
+
     async def handle_track(self, address: str | None, obex_port: int | None, img_handle: str | None) -> None:
         """Fetch and publish art for the current track, if this device offers any."""
         if not address or not obex_port or not img_handle:
-            return  # device doesn't do cover art, or the handle hasn't arrived yet
+            # Log the reason ONCE: a silent return here is indistinguishable from "no art exists",
+            # which is exactly how the ImgHandle deadlock above hid for a whole test round.
+            if not self._warned_skipped:
+                self._warned_skipped = True
+                logger.info(
+                    "[bluetooth-%s] no art fetch yet (address=%s obex_port=%s img_handle=%s)",
+                    self.instance_id, address, obex_port, img_handle,
+                )
+            return
         if img_handle == self._last_handle or self._fetching:
             return
         if self._artwork_role() is None:
@@ -208,31 +245,38 @@ class BluetoothCoverArt:
             self._fetching = False
 
     async def _fetch(self, img_handle: str) -> Image.Image | None:
+        """Ask for the thumbnail and load it once the transfer lands.
+
+        Signature (obexd 5.82): GetThumbnail(in='s' destination, 's' handle) -> ('o' transfer, props).
+        WE choose the destination file; the returned object path is the Transfer1, NOT the image —
+        reading that as a path was silently wrong before it was ever exercised.
+        """
         if self._image_iface is None or self._fetch_method is None:
             return None
+        dest = self._destination_path()
+        with contextlib.suppress(OSError):
+            os.unlink(dest)  # a leftover from a previous track would look like an instant success
         try:
-            result = await asyncio.wait_for(
-                getattr(self._image_iface, self._fetch_method)(img_handle), timeout=FETCH_TIMEOUT_S
-            )
+            call = getattr(self._image_iface, self._fetch_method)
+            # Get() takes an extra filter dict; GetThumbnail() does not.
+            args = (dest, img_handle, {}) if self._fetch_method == "call_get" else (dest, img_handle)
+            await asyncio.wait_for(call(*args), timeout=FETCH_TIMEOUT_S)
         except Exception:  # noqa: BLE001 - transfer failed/timed out; drop this handle
-            logger.debug("[bluetooth-%s] cover-art fetch failed", self.instance_id, exc_info=True)
-            # The session may be wedged; force a fresh one next time.
-            await self._close_session()
+            logger.info("[bluetooth-%s] cover-art fetch failed", self.instance_id, exc_info=True)
+            await self._close_session()  # session may be wedged; force a fresh one next time
             return None
-        return await self._load_image(result)
+        return await self._load_image(dest)
 
-    async def _load_image(self, result) -> Image.Image | None:
+    def _destination_path(self) -> str:
+        return os.path.join(tempfile.gettempdir(), f"plum-bt-art-{self.instance_id}.img")
+
+    async def _load_image(self, path: str) -> Image.Image | None:
         """BIP transfers land as a FILE — the call returns its destination PATH, not the bytes.
 
         obexd returns that path immediately and fills the file in as the transfer proceeds, so
         reading straight away yields a truncated (or missing) image. Poll briefly for it to settle:
         a thumbnail is small, so this normally resolves on the first or second look.
         """
-        path = result[0] if isinstance(result, (list, tuple)) and result else result
-        if not isinstance(path, str) or not path:
-            logger.debug("[bluetooth-%s] unexpected fetch result: %r", self.instance_id, result)
-            return None
-
         last_size = -1
         for _ in range(TRANSFER_POLL_ATTEMPTS):
             size = os.path.getsize(path) if os.path.exists(path) else 0
