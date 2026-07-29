@@ -61,15 +61,20 @@ from aiosendspin.server.roles.controller.events import (
     ControllerPauseEvent,
     ControllerPlayEvent,
     ControllerPreviousEvent,
+    ControllerRepeatEvent,
+    ControllerShuffleEvent,
 )
 from aiosendspin.server.roles.player import PlayerV1Role
 from aiosendspin.server.server import ClientAddedEvent, ClientUpdatedEvent, ConnectionReason, SendspinServer
 
 from mesh.model import PlayerState, SourceState, UnitSnapshot
-from sources import airplay_config, spotify_config
+from sources import airplay_config, bluetooth_config, spotify_config
 from sources.airplay_metadata import AirplayMetadataReader
 from sources.airplay_manager import AirplayManager
 from sources.airplay_remote import AirplayRemote
+from sources.bluetooth_adapter import BluetoothAdapter
+from sources.bluetooth_avrcp import BluetoothAvrcp
+from sources.bluetooth_manager import BluetoothManager
 from sources.spotify_golibrespot import SpotifyGoLibrespot
 from sources.spotify_manager import SpotifyManager
 
@@ -294,6 +299,8 @@ class PlumSendspinServer:
         self._metadata_readers: dict[str, AirplayMetadataReader] = {}  # source_id -> shairport pipe reader
         self._airplay_remotes: dict[str, AirplayRemote] = {}  # source_id -> per-instance MPRIS remote
         self._spotify_monitors: dict[str, SpotifyGoLibrespot] = {}  # source_id -> go-librespot event monitor
+        self._bluetooth_adapters: dict[str, BluetoothAdapter] = {}  # source_id -> BlueZ adapter owner
+        self._bluetooth_avrcp: dict[str, BluetoothAvrcp] = {}  # source_id -> AVRCP metadata/transport
         # Per-source transport remote (has async play/pause/next_track/previous_track). AirPlay's
         # AirplayRemote and each SpotifyGoLibrespot both satisfy it, so controller events route by source.
         self._source_remotes: dict[str, object] = {}
@@ -319,6 +326,12 @@ class PlumSendspinServer:
         for monitor in self._spotify_monitors.values():
             await monitor.stop()
         self._spotify_monitors.clear()
+        for avrcp in self._bluetooth_avrcp.values():
+            await avrcp.stop()
+        self._bluetooth_avrcp.clear()
+        for adapter in self._bluetooth_adapters.values():
+            await adapter.stop()
+        self._bluetooth_adapters.clear()
         self._source_remotes.clear()
         for reader in self._metadata_readers.values():
             await reader.stop()
@@ -435,15 +448,19 @@ class PlumSendspinServer:
             await handle.group.add_client(client)
             logger.info("[%s] grouped controller client %s", source_id, client_id)
             # A controller joining creates the controller group role; (re)advertise transport
-            # commands on it now so this controller sees play/pause/next/previous as supported.
-            # Gate on this source having a remote — a source with no transport control (a bare
-            # FIFO) must not claim commands it can't honour.
-            if self._source_remotes.get(source_id) is not None:
+            # commands on it now so this controller sees the source's supported commands. Gate on
+            # this source having a remote — a source with no transport control (a bare FIFO) must not
+            # claim commands it can't honour. The command set is per-remote (Spotify adds
+            # repeat/shuffle; AirPlay stays play/pause/next/previous — see _supported_commands_for).
+            remote = self._source_remotes.get(source_id)
+            if remote is not None:
                 controller = handle.group.group_role("controller")
                 if controller is not None:
-                    controller.set_supported_commands(
-                        [MediaCommand.PLAY, MediaCommand.PAUSE, MediaCommand.NEXT, MediaCommand.PREVIOUS]
-                    )
+                    controller.set_supported_commands(self._supported_commands_for(source_id))
+                    # The controller role only exists once a controller is present, so republish the
+                    # source's current repeat/shuffle onto it now that this one has joined.
+                    if hasattr(remote, "push_modes"):
+                        remote.push_modes()
 
     def _requested_source(self, client_id: str) -> str | None:
         """The source a controller client asked to observe, from a "ctrl:<source_id>:<nonce>" id."""
@@ -725,6 +742,71 @@ class PlumSendspinServer:
         await self.stop_source(source_id)
         logger.info("[%s] spotify source stopped", source_id)
 
+    async def start_bluetooth_source(self, instance: bluetooth_config.BluetoothInstance) -> None:
+        """Bring up a Bluetooth endpoint as a source: group + feeder + BlueZ adapter + AVRCP.
+
+        The feeder waits for a writer on the FIFO, so starting eagerly is safe long before any phone
+        connects — the source simply sits idle (playback_state=stopped) until one does, exactly as
+        an AirPlay endpoint does between sessions. BluetoothAdapter owns the radio and spawns the
+        arecord capture child on connect; BluetoothAvrcp serves double duty as the metadata pump and
+        the source's transport remote.
+        """
+        self.start_source(instance.source_id, instance.fifo_path, name=instance.device_name)
+        handle = self.sources[instance.source_id]
+        adapter = BluetoothAdapter(instance)
+        avrcp = BluetoothAvrcp(
+            handle.group, instance.instance_id, adapter,
+            # Repeat/shuffle support is discovered per connected player, not known up front, so the
+            # advertised command set has to be republished when it changes (see bluetooth_avrcp).
+            on_commands_changed=functools.partial(self.refresh_source_commands, instance.source_id),
+        )
+        avrcp.start()  # register the BlueZ listeners BEFORE start() replays existing objects
+        await adapter.start()
+        self._bluetooth_adapters[instance.source_id] = adapter
+        self._bluetooth_avrcp[instance.source_id] = avrcp
+        self._wire_transport_control(instance.source_id, avrcp)
+        logger.info(
+            "[%s] bluetooth source up (name=%r adapter=%s)",
+            instance.source_id, instance.device_name, instance.adapter,
+        )
+
+    async def stop_bluetooth_source(self, source_id: str) -> None:
+        """Tear down a Bluetooth source: AVRCP, then the adapter (which kills capture), then the source."""
+        avrcp = self._bluetooth_avrcp.pop(source_id, None)
+        if avrcp is not None:
+            await avrcp.stop()
+        adapter = self._bluetooth_adapters.pop(source_id, None)
+        if adapter is not None:
+            await adapter.stop()
+        self._source_remotes.pop(source_id, None)
+        await self.stop_source(source_id)
+        logger.info("[%s] bluetooth source stopped", source_id)
+
+    async def update_bluetooth_source(self, instance: bluetooth_config.BluetoothInstance) -> None:
+        """Apply an edited endpoint to the LIVE adapter (alias, discoverable, pairable)."""
+        adapter = self._bluetooth_adapters.get(instance.source_id)
+        if adapter is not None:
+            await adapter.apply_settings(instance)
+
+    def refresh_source_commands(self, source_id: str) -> None:
+        """Re-publish a source's supported command set on its controller role.
+
+        Most sources know their capabilities up front, so _wire_transport_control advertises once.
+        Bluetooth doesn't: whether repeat/shuffle exist depends on the phone that just connected, so
+        it calls this when that answer changes.
+        """
+        handle = self.sources.get(source_id)
+        if handle is None:
+            return
+        controller = handle.group.group_role("controller")
+        if controller is None:
+            return
+        with contextlib.suppress(Exception):
+            controller.set_supported_commands(self._supported_commands_for(source_id))
+            remote = self._source_remotes.get(source_id)
+            if remote is not None and hasattr(remote, "push_modes"):
+                remote.push_modes()
+
     def _wire_transport_control(self, source_id: str, remote: object) -> None:
         """Advertise transport commands on a source's controller role and route its events to `remote`.
 
@@ -738,14 +820,29 @@ class PlumSendspinServer:
         self._source_remotes[source_id] = remote
         controller = handle.group.group_role("controller")
         if controller is not None:
-            controller.set_supported_commands(
-                [MediaCommand.PLAY, MediaCommand.PAUSE, MediaCommand.NEXT, MediaCommand.PREVIOUS]
-            )
+            controller.set_supported_commands(self._supported_commands_for(source_id))
+            if hasattr(remote, "push_modes"):
+                remote.push_modes()  # seed the controller role with the source's repeat/shuffle
         # The source's anchor group persists across stop/start, so only register the listener once —
         # events dispatch via self._source_remotes[source_id], which we repopulate above on re-add.
         if source_id not in self._wired_sources:
             handle.group.add_event_listener(functools.partial(self._on_control_event, source_id))
             self._wired_sources.add(source_id)
+
+    def _supported_commands_for(self, source_id: str) -> list[MediaCommand]:
+        """The controller commands a source advertises. Every source with a transport remote honours
+        play/pause/next/previous; a remote that flags `supports_repeat_shuffle` (go-librespot) adds
+        the repeat/shuffle set. Advertising only what we honour keeps a conformant controller (and our
+        own GUI) from showing controls the source can't action — which is how the GUI hides
+        repeat/shuffle for AirPlay."""
+        remote = self._source_remotes.get(source_id)
+        commands = [MediaCommand.PLAY, MediaCommand.PAUSE, MediaCommand.NEXT, MediaCommand.PREVIOUS]
+        if remote is not None and getattr(remote, "supports_repeat_shuffle", False):
+            commands += [
+                MediaCommand.REPEAT_OFF, MediaCommand.REPEAT_ONE, MediaCommand.REPEAT_ALL,
+                MediaCommand.SHUFFLE, MediaCommand.UNSHUFFLE,
+            ]
+        return commands
 
     def _on_control_event(self, source_id: str, _group: SendspinGroup, event: object) -> None:
         """Forward a controller transport event to the source's sender via its remote (fire-and-forget).
@@ -770,6 +867,21 @@ class PlumSendspinServer:
             asyncio.ensure_future(remote.next_track())
         elif isinstance(event, ControllerPreviousEvent):
             asyncio.ensure_future(remote.previous_track())
+        elif isinstance(event, ControllerRepeatEvent):
+            # Only sources whose remote can honour it advertise repeat (so a conformant controller
+            # never sends this to AirPlay); guard anyway. Drive the source, and optimistically reflect
+            # the new mode to every GUI on the group — the daemon's own event stream re-confirms it.
+            if hasattr(remote, "set_repeat"):
+                asyncio.ensure_future(remote.set_repeat(event.mode))
+                controller = _group.group_role("controller")
+                if controller is not None:
+                    controller.set_repeat(event.mode)
+        elif isinstance(event, ControllerShuffleEvent):
+            if hasattr(remote, "set_shuffle"):
+                asyncio.ensure_future(remote.set_shuffle(event.shuffle))
+                controller = _group.group_role("controller")
+                if controller is not None:
+                    controller.set_shuffle(event.shuffle)
 
     def register_player(self, player_id: str, player_url: str) -> None:
         """Dial this unit's player so it is a live, routable client, but leave it IDLE — not attached
@@ -903,7 +1015,7 @@ async def main() -> None:
     # Sources are config-driven: each manager owns a Sendspin source + the daemon process(es) per
     # enabled endpoint, reconciled from settings.json every few seconds, so GUI endpoint edits
     # (add/rename/enable/disable/remove) apply live. Nothing here is started from env any more.
-    managers = [AirplayManager(srv), SpotifyManager(srv)]
+    managers = [AirplayManager(srv), SpotifyManager(srv), BluetoothManager(srv)]
     for manager in managers:
         manager.start()
 
