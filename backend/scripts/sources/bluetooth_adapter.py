@@ -122,6 +122,13 @@ class BluetoothAdapter:
     async def stop(self) -> None:
         await self._stop_capture()
         await self._unregister_agent()
+        # Stop advertising. We configured the radio on the way up, so leaving it discoverable and
+        # pairable on the way down means disabling Bluetooth in the GUI silently leaves the unit
+        # advertising itself to anyone in range — with auto-pair no longer running to accept them.
+        # Powered is deliberately left alone: the radio may belong to something else on the host,
+        # and turning it off is far more invasive than simply going quiet.
+        await self._set_adapter_prop("Discoverable", Variant("b", False))
+        await self._set_adapter_prop("Pairable", Variant("b", False))
         if self._bus is not None:
             with contextlib.suppress(Exception):
                 self._bus.disconnect()
