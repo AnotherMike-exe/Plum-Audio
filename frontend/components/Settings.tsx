@@ -16,8 +16,10 @@ interface SettingsProps {
     initialTab?: string; // Optional initial tab to open
 }
 
-// Phase 3: Integrations is surfaced with only the sources whose backend exists (AirPlay + Spotify
-// today — see the enabledSources prop below). Audio returns when its service lands; its render
+// Phase 3: Integrations is surfaced with only the sources whose backend exists (AirPlay, Spotify
+// and Bluetooth today — see the enabledSources prop below). A source whose backend lands but which
+// is NOT added to that array is invisible in Settings with no other symptom, so add it here as part
+// of the slice, not afterwards. Audio returns when its service lands; its render
 // case stays wired so re-enabling is just re-adding the array entry. Playback (auto-route-on-connect
 // + auto-follow, mesh/follow.py) landed — re-added here.
 const tabs: Tab[] = [
@@ -34,7 +36,7 @@ export const Settings: React.FC<SettingsProps> = ({settings, onSettingsChange, o
     const renderTabContent = () => {
         switch (activeTab) {
             case 'integrations':
-                return <IntegrationsTab settings={settings} onSettingsChange={onSettingsChange} enabledSources={['airplay', 'spotify']} />;
+                return <IntegrationsTab settings={settings} onSettingsChange={onSettingsChange} enabledSources={['airplay', 'spotify', 'bluetooth']} />;
             case 'audio':
                 return <AudioTab settings={settings} onSettingsChange={onSettingsChange} />;
             case 'playback':
