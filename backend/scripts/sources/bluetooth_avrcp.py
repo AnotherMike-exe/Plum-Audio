@@ -34,9 +34,13 @@ POSITION HANDLING — the fiddliest part of this file, all of it learned on hard
     add the already-elapsed time on top, i.e. double-count: right for a moment, then a jump
     forward, compounding after each pause. This was the actual cause of the timeline bug, and
     airplay_metadata._emit_progress had already found and documented the same library quirk.
-  * The 1 Hz ticker sanity-checks each polled position against our own anchor and drops wild
-    values. Measured on hardware, BlueZ's Position is accurate to ~2 ms over 13 s, so this is a
-    cheap guard rather than a workaround; genuine seeks arrive as Position SIGNALS and are trusted.
+  * TRUST BlueZ's Position; it is accurate to ~2 ms over 13 s (measured). An earlier version made
+    the ticker reject readings that disagreed with our own anchor, on a theory about pause-inflated
+    positions that measurement disproved — all it could ever do was discard the truth, including a
+    real scrub. The single misreport actually observed is a paused device claiming 0, handled at
+    the one place it occurs (_reanchor_now).
+  * A remote scrub arrives BOTH as a Position SIGNAL and in the polled property; the signal is
+    logged because it is the only way to tell a jump from normal advance.
 """
 
 from __future__ import annotations
@@ -72,10 +76,9 @@ SEED_RETRY_S = 0.5
 # How often we re-anchor progress from BlueZ's Position (see _progress_ticker). Matches
 # airplay_metadata.PROGRESS_TICK_S — same problem, same cadence.
 PROGRESS_TICK_S = 1.0
-# How far a POLLED position may sit from our own extrapolation before we reject it. Generous
-# enough to absorb normal jitter and slow clock drift, tight enough to catch BlueZ's
-# pause-inflated Position (which is off by the whole paused duration).
-POSITION_TOLERANCE_MS = 2500
+# A paused track sitting past this offset cannot really be at 0 — that is the device lying (see
+# _reanchor_now). Deliberately narrow: it is the only misreport actually observed on hardware.
+POSITION_ZERO_LIE_MS = 2000
 
 # BlueZ MediaPlayer1.Repeat <-> Sendspin RepeatMode. BlueZ also has "group", which has no Sendspin
 # equivalent; we read it as ALL (closest meaning) and never write it.
@@ -113,7 +116,6 @@ class BluetoothAvrcp:
         # Our own anchor, so we can tell what a polled position SHOULD be (see _progress_ticker).
         self._anchor_pos_ms: int | None = None
         self._anchor_at: float = 0.0
-        self._warned_position_drift = False
         self._repeat = RepeatMode.OFF
         self._shuffle = False
         # Whether THIS player exposes Repeat/Shuffle at all (see module docstring).
@@ -157,21 +159,12 @@ class BluetoothAvrcp:
                 position = int((await props.call_get(PLAYER_IFACE, "Position")).value)
             except Exception:  # noqa: BLE001 - player vanished mid-poll; next tick retries
                 continue
-            # DISTRUST THE POLL. BlueZ's Position keeps accumulating while the phone is paused, so
-            # after a pause it reads ahead of where playback actually resumes — the anchor written
-            # at the play/pause event is right, then a second later this poll yanks the timeline
-            # forward. (Observed: correct on resume, jumps ~1 s later, every cycle.) Event-driven
-            # reads are authoritative; a poll is only allowed to make small corrections. A genuine
-            # seek arrives as a Position SIGNAL, which _on_props trusts outright.
-            expected = self._expected_position_ms()
-            if expected is not None and abs(position - expected) > POSITION_TOLERANCE_MS:
-                if not self._warned_position_drift:
-                    self._warned_position_drift = True
-                    logger.info(
-                        "[bluetooth-%s] ignoring implausible polled position %d ms (expected ~%d); "
-                        "trusting our own anchor", self.instance_id, position, int(expected),
-                    )
-                continue
+            # Trust the poll. An earlier version rejected readings that disagreed with our own
+            # anchor, on the theory that BlueZ inflates Position across pauses — MEASUREMENT
+            # DISPROVED THAT (accurate to ~2 ms over 13 s), and the symptom it was meant to fix
+            # turned out to be the stale-timestamp bug. Keeping the guard would only ever discard
+            # the truth, including a legitimate scrub. The one lie we DID measure — a reported 0
+            # while paused — is handled where it happens, in _reanchor_now.
             self._anchor_progress(position, self._duration_ms)
 
     # -- role access ---------------------------------------------------------
@@ -232,7 +225,11 @@ class BluetoothAvrcp:
         if "Status" in changed:
             self._apply_status(str(changed["Status"]))
         if "Position" in changed:
-            self._anchor_progress(int(changed["Position"]), self._duration_ms)
+            # A Position SIGNAL is BlueZ telling us the phone jumped (scrub/seek) — the polled
+            # property alone can't distinguish that from normal advance. Rare enough to log always.
+            seek_to = int(changed["Position"])
+            logger.info("[bluetooth-%s] seek signal -> %d ms", self.instance_id, seek_to)
+            self._anchor_progress(seek_to, self._duration_ms)
         # Seeing either property at all proves the player exposes it. This is the backstop for a
         # phone that populates these later than the seed's retry window — without it, support is
         # decided once at bind time and a late arrival is never noticed.
@@ -428,8 +425,8 @@ class BluetoothAvrcp:
         Guarded, because phones lie about Position WHILE PAUSED: the rig device reports 0 when
         paused and the true offset when playing, so a naive read anchors a part-way track at 0:00
         (seen as "wrong position on connect, correct after a play/pause"). A genuine track change
-        legitimately IS ~0, so `new_track` is trusted outright; otherwise the reading has to agree
-        with our own anchor or it is discarded in favour of it.
+        legitimately IS ~0, so `new_track` is trusted outright. Everything except that one lie is
+        believed — a broader rule would also throw away a real scrub.
         """
         role = self._metadata_role()
         if role is None or role.metadata is None:
@@ -440,15 +437,18 @@ class BluetoothAvrcp:
             with contextlib.suppress(Exception):
                 position = int((await props.call_get(PLAYER_IFACE, "Position")).value)
 
-        if position is not None and not new_track:
+        # Narrowly targeted at the ONE lie measured on hardware: a paused device reporting exactly
+        # 0. Anything else is taken at face value — a broad "must agree with our anchor" rule would
+        # also discard the truth after a scrub, which is the mistake the ticker used to make.
+        if position == 0 and not new_track and not self._playing:
             expected = self._expected_position_ms()
-            if expected is not None and abs(position - expected) > POSITION_TOLERANCE_MS:
+            if expected is not None and expected > POSITION_ZERO_LIE_MS:
                 logger.info(
-                    "[bluetooth-%s] distrusting reported position %d ms (expected ~%d); keeping our anchor",
-                    self.instance_id, position, int(expected),
+                    "[bluetooth-%s] paused device reports position 0; keeping our anchor (~%d ms)",
+                    self.instance_id, int(expected),
                 )
                 position = int(expected)
-            elif expected is None and position == 0 and not self._playing:
+            elif expected is None:
                 # Nothing to check against yet AND the classic paused-device lie. Publishing 0 here
                 # is what showed 0:00 for a track already part-way through on first connect;
                 # publishing nothing leaves the timeline blank until the first trustworthy reading,
