@@ -34,13 +34,13 @@ POSITION HANDLING — the fiddliest part of this file, all of it learned on hard
     add the already-elapsed time on top, i.e. double-count: right for a moment, then a jump
     forward, compounding after each pause. This was the actual cause of the timeline bug, and
     airplay_metadata._emit_progress had already found and documented the same library quirk.
-  * BlueZ's Position is accurate DURING PLAYBACK (~2 ms over 13 s, measured) but keeps advancing
-    by wall clock across a pause/idle, so it can report far past the end of the track. Sanity-check
-    it against track_duration — that catches the real lie and can never reject a legitimate remote
-    scrub, which is always inside the track. A paused device reporting exactly 0 is the other
-    observed misreport, handled in _reanchor_now.
-  * A remote scrub arrives BOTH as a Position SIGNAL and in the polled property; the signal is
-    logged because it is the only way to tell a jump from normal advance.
+  * MediaPlayer1.Position is an INTERPOLATION, not a measurement. BlueZ advances it by wall clock
+    between the AVRCP notifications the phone sends, and it drifts — observed reporting 454520 ms
+    on a 400346 ms track, climbing, and NOT returning when the user scrubbed back. Do not build on
+    it. The authoritative source is the Position SIGNAL (a relayed AVRCP notification), which is
+    what carries a scrub; between signals we advance our OWN anchor, as airplay_metadata.py does.
+  * Sanity-check any position against track_duration. That catches the drift and can never reject
+    a legitimate scrub, which is always inside the track.
 """
 
 from __future__ import annotations
@@ -111,6 +111,7 @@ class BluetoothAvrcp:
         self._transport_path: str | None = None
         self._ticker_task: asyncio.Task | None = None
         self._warned_no_role = False
+        self._ticks = 0
         self._playing = False
         self._duration_ms = 0
         self._last_title: str | None = None
@@ -141,33 +142,36 @@ class BluetoothAvrcp:
             self._ticker_task = None
 
     async def _progress_ticker(self) -> None:
-        """Re-anchor progress from BlueZ's own Position at a steady cadence while playing.
+        """Re-emit OUR OWN advancing anchor once a second. Never polls the device.
 
-        BlueZ emits `Position` only sporadically — often just on track change and seek — so a single
-        anchor has to carry the whole track. The metadata role extrapolates from the anchor's
-        timestamp and CLAMPS at track_duration, so a stale anchor makes the GUI timeline drift and
-        then park at 100%, and any client joining mid-track reads the wrong position entirely.
-        airplay_metadata.py hit exactly this and solved it the same way (PROGRESS_TICK_S); Position
-        is a readable property, so we simply ask.
+        BlueZ's MediaPlayer1.Position is an INTERPOLATION, not a measurement: it advances by wall
+        clock between the AVRCP notifications the phone actually sends, and it drifts. Observed on
+        the rig, mid-track and playing:
+
+            Title: Never More   Duration: 400346   Position: 454520
+
+        — 54 s past the end of its own track, climbing monotonically, and NOT coming back down when
+        the user scrubbed backwards. Polling that was self-defeating: every reading was rejected as
+        impossible, so nothing was published at all and clients extrapolated from a stale anchor
+        forever ("the timeline just keeps counting up and ignores my scrubs").
+
+        The authoritative source is the Position SIGNAL (_on_props), which is BlueZ relaying a real
+        AVRCP notification — that is what carries a scrub. Between signals we advance our own anchor,
+        exactly as airplay_metadata.py does; it never asks shairport where it is either.
         """
         while True:
             await asyncio.sleep(PROGRESS_TICK_S)
-            if not self._playing or self._player_path is None or not self._duration_ms:
+            if not self._playing or not self._duration_ms:
                 continue
-            props = await self._player_props()
-            if props is None:
+            expected = self._expected_position_ms()
+            if expected is None:
                 continue
-            try:
-                position = int((await props.call_get(PLAYER_IFACE, "Position")).value)
-            except Exception:  # noqa: BLE001 - player vanished mid-poll; next tick retries
-                continue
-            # Trust the poll. An earlier version rejected readings that disagreed with our own
-            # anchor, on the theory that BlueZ inflates Position across pauses — MEASUREMENT
-            # DISPROVED THAT (accurate to ~2 ms over 13 s), and the symptom it was meant to fix
-            # turned out to be the stale-timestamp bug. Keeping the guard would only ever discard
-            # the truth, including a legitimate scrub. The one lie we DID measure — a reported 0
-            # while paused — is handled where it happens, in _reanchor_now.
-            self._anchor_progress(position, self._duration_ms)
+            if expected > self._duration_ms:
+                continue  # ran off the end of the track; wait for the next real event
+            if self._ticks == 0:
+                logger.info("[bluetooth-%s] progress ticker running (pos=%d)", self.instance_id, int(expected))
+            self._ticks += 1
+            self._anchor_progress(int(expected), self._duration_ms)
 
     # -- role access ---------------------------------------------------------
 
@@ -518,6 +522,7 @@ class BluetoothAvrcp:
         # extrapolate from here (speed 0 freezes at this anchor).
         self._anchor_pos_ms = max(0, int(position_ms))
         self._anchor_at = time.monotonic()
+
         if role.metadata is None:
             return
         # Force a FRESH server timestamp — do NOT use role.update() here. update() does
