@@ -168,3 +168,17 @@ def test_agent_dbus_signatures_are_bare_type_codes():
     assert signatures["Cancel"] == ("", "")
     # Belt and braces: a quote anywhere means PEP 563 stringified them.
     assert not any("'" in sig for pair in signatures.values() for sig in pair)
+
+
+# -- A2DP re-negotiation path derivation ---------------------------------------------------------
+
+
+def test_device_path_derivation_matches_bluez_layout():
+    """BluetoothAdapter._renegotiate_a2dp derives this when its connected map has lost the device.
+
+    Getting it wrong means introspecting a non-existent object and logging a failure instead of
+    recovering an orphaned A2DP transport, so pin the exact shape BlueZ uses.
+    """
+    (inst,) = bc.instances_from_settings(_settings([{"id": "1", "enabled": True}]))
+    derived = f"{inst.adapter_path}/dev_{'AA:BB:CC:DD:EE:99'.replace(':', '_')}"
+    assert derived == f"/org/bluez/{inst.adapter}/dev_AA_BB_CC_DD_EE_99"

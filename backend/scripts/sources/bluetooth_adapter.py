@@ -474,7 +474,13 @@ class BluetoothAdapter:
                     # own and we would retry forever. Ask BlueZ to re-establish just the A2DP
                     # profile — far less invasive than a full Disconnect(), which many phones do
                     # not auto-recover from.
-                    if attempt == CAPTURE_RENEGOTIATE_AFTER:
+                    # Retried on every further multiple, NOT once at exactly this attempt: the
+                    # remedy can itself fail (a phone busy re-establishing the link refuses it), and
+                    # a single shot then left the source permanently mute with the retry loop
+                    # spinning forever. Observed on hardware 2026-07-29: eleven consecutive
+                    # immediate failures, no recovery, and — because the failure path logged at
+                    # DEBUG — not one line saying recovery had even been tried.
+                    if attempt % CAPTURE_RENEGOTIATE_AFTER == 0:
                         await self._renegotiate_a2dp(address)
             await asyncio.sleep(max(min(CAPTURE_RETRY_S * attempt, CAPTURE_RETRY_MAX_S), 0.5))
 
@@ -512,17 +518,46 @@ class BluetoothAdapter:
         return False
 
     async def _renegotiate_a2dp(self, address: str) -> None:
-        """Ask BlueZ to re-establish the A2DP profile for a connected device."""
-        path = next((p for p, addr in self._connected.items() if addr == address), None)
-        if path is None or self._bus is None:
+        """Ask BlueZ to re-establish the A2DP profile for a connected device.
+
+        This is the fix for an ORPHANED TRANSPORT: the phone is still Connected at the ACL level, but
+        the A2DP transport was negotiated against a bluealsa instance that has since been replaced,
+        so bluealsa has no PCM for it and arecord fails with "PCM not found" forever. Nothing
+        reconnects on its own, because from BlueZ's point of view nothing is wrong.
+        ConnectProfile on the A2DP UUID alone re-runs just that negotiation — verified on hardware
+        2026-07-29 to bring the PCM straight back — and is far less invasive than Device1.Disconnect,
+        which many phones do not auto-recover from.
+
+        EVERY outcome is logged at INFO/WARNING, including the two "can't even try" cases. This
+        function previously reported success at INFO and everything else at DEBUG, so on a normal
+        INFO-level log an unrecoverable source was indistinguishable from one nobody had tried to
+        recover — which is exactly how it went unnoticed.
+        """
+        if self._bus is None:
+            logger.warning(
+                "[%s] cannot re-negotiate A2DP with %s: no D-Bus connection",
+                self.instance.source_id, address,
+            )
             return
+        path = next((p for p, addr in self._connected.items() if addr == address), None)
+        if path is None:
+            # Derive it rather than give up: the layout is fixed, and a device we are actively
+            # capturing from is by definition present even if our own map has lost track of it
+            # (a daemon respool can rebuild this object without re-scanning).
+            path = f"{self.instance.adapter_path}/dev_{address.replace(':', '_')}"
+            logger.info(
+                "[%s] %s not in the connected map; trying derived path %s",
+                self.instance.source_id, address, path,
+            )
         try:
             intro = await self._bus.introspect(BLUEZ, path)
             device = self._bus.get_proxy_object(BLUEZ, path, intro).get_interface(DEVICE_IFACE)
             await device.call_connect_profile(A2DP_SOURCE_UUID)
             logger.info("[%s] re-negotiated A2DP with %s", self.instance.source_id, address)
-        except Exception:  # noqa: BLE001 - phone may refuse; the retry loop carries on regardless
-            logger.debug("[%s] ConnectProfile failed for %s", self.instance.source_id, address, exc_info=True)
+        except Exception as e:  # noqa: BLE001 - phone may refuse; the retry loop carries on regardless
+            logger.warning(
+                "[%s] A2DP re-negotiation with %s failed: %s", self.instance.source_id, address, e,
+            )
 
     async def _spawn_capture(self, address: str):
         # BlueZ sets the A2DP transport up slightly after it announces the connection; opening the

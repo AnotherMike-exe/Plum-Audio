@@ -16,7 +16,10 @@ Needs aiosendspin + dbus-next (real runtime deps); skipped on a bare checkout.
 Run: `pytest tests/Unit`.
 """
 
+import asyncio
+import contextlib
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -201,3 +204,165 @@ def test_a_scrub_within_the_track_is_always_honoured():
 
     avrcp._anchor_progress(189_000, 190_066)          # and forward to near the end
     assert role.set_metadata_calls[-1].track_progress == 189_000
+
+
+# -- the ticker must be unkillable ---------------------------------------------------------------
+
+
+def test_a_failing_tick_does_not_kill_the_ticker():
+    """A raise inside the loop body must be swallowed, logged, and the loop must carry on.
+
+    This is the highest-value guard in the file. asyncio only reports an unretrieved task exception
+    when the task is garbage collected, and BluetoothAvrcp holds a strong reference to its ticker
+    task for the life of the process — so before this, one bad tick killed periodic progress
+    SILENTLY, with nothing in the log. Because clients extrapolate locally between anchors, the GUI
+    went on counting up smoothly and only lost its corrections, which is why it was reported as
+    "scrubs on the phone never reach the GUI" rather than as a stopped timeline.
+    """
+    avrcp, role = _avrcp()
+    calls = []
+
+    def boom():
+        calls.append(len(calls))
+        if len(calls) <= 2:
+            raise RuntimeError("metadata role went away mid-tick")
+
+    avrcp._tick_once = boom
+
+    async def drive():
+        task = asyncio.ensure_future(avrcp._progress_ticker())
+        # Four ticks' worth of wall clock; the first two raise, the rest must still be attempted.
+        await asyncio.sleep(avrcp_mod.PROGRESS_TICK_S * 4.5)
+        assert not task.done(), "the ticker exited on a failing tick"
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    asyncio.run(drive())
+    assert len(calls) >= 4, f"ticker stopped calling _tick_once after a raise (got {len(calls)})"
+
+
+def test_ensure_ticker_revives_a_dead_task():
+    """Even a ticker lost to outside cancellation comes back on the next player bind."""
+    avrcp, _ = _avrcp()
+
+    async def drive():
+        avrcp._ensure_ticker()
+        first = avrcp._ticker_task
+        first.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await first
+        assert first.done()
+
+        avrcp._ensure_ticker()
+        assert avrcp._ticker_task is not first, "_ensure_ticker did not replace the dead task"
+        assert not avrcp._ticker_task.done()
+        avrcp._ticker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await avrcp._ticker_task
+
+    asyncio.run(drive())
+
+
+def test_ensure_ticker_does_not_double_start_a_live_ticker():
+    avrcp, _ = _avrcp()
+
+    async def drive():
+        avrcp._ensure_ticker()
+        live = avrcp._ticker_task
+        avrcp._ensure_ticker()
+        assert avrcp._ticker_task is live, "a second ticker was started alongside a live one"
+        live.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await live
+
+    asyncio.run(drive())
+
+
+def test_tick_holds_instead_of_publishing_past_the_end_of_the_track():
+    avrcp, role = _avrcp()
+    avrcp._playing = True
+    avrcp._duration_ms = 10_000
+    avrcp._anchor_pos_ms = 9_500
+    avrcp._anchor_at = time.monotonic() - 5.0        # extrapolates to 14_500
+    before = len(role.set_metadata_calls)
+    avrcp._tick_once()
+    assert len(role.set_metadata_calls) == before, "published a position past the end of the track"
+
+
+# -- session state must not outlive the AVRCP player ---------------------------------------------
+
+
+def test_player_teardown_clears_the_anchor():
+    """Observed on hardware: a reconnect hours later resurrected a four-hour-old position.
+
+    The device honestly reported 0, and the paused-device-lie guard preferred the ancient anchor.
+    """
+    avrcp, _ = _avrcp()
+    avrcp._playing = True
+    avrcp._anchor_progress(301_297, 400_346)
+    avrcp._last_title = "Never More"
+    assert avrcp._expected_position_ms() is not None
+
+    # Set the path directly rather than via present=True: binding also schedules the D-Bus seed,
+    # which needs a running loop and is not what this test is about.
+    avrcp._player_path = "/org/bluez/hci0/dev_X/player0"
+    avrcp._on_object("/org/bluez/hci0/dev_X/player0", [avrcp_mod.PLAYER_IFACE], False)
+
+    assert avrcp._expected_position_ms() is None, "the anchor survived the player object"
+    assert avrcp._duration_ms == 0
+    assert avrcp._last_title is None
+    assert avrcp._playing is False
+
+
+# -- a repeated Position is not a seek -----------------------------------------------------------
+
+
+def test_repeated_position_matching_our_anchor_is_not_a_seek():
+    """BlueZ re-emits every property when it recreates the player; that is not a jump."""
+    avrcp, role = _avrcp()
+    avrcp._playing = False
+    avrcp._anchor_progress(301_297, 400_346)
+    before = len(role.set_metadata_calls)
+
+    avrcp._apply_position_signal(301_297)
+    assert len(role.set_metadata_calls) == before, "a redundant Position was republished as a seek"
+
+
+def test_a_real_seek_is_still_honoured_after_the_dedupe():
+    avrcp, role = _avrcp()
+    avrcp._playing = False
+    avrcp._duration_ms = 400_346
+    avrcp._anchor_progress(301_297, 400_346)
+
+    avrcp._apply_position_signal(120_000)             # user scrubbed back
+    assert role.set_metadata_calls[-1].track_progress == 120_000
+
+
+def test_a_seek_arriving_before_any_duration_is_held_then_applied():
+    """BlueZ does not guarantee Track precedes Position in the burst it emits for a new player.
+
+    Without a duration _anchor_progress drops the value outright, so the first seek of a session
+    would be lost — a wider window now that teardown clears the duration.
+    """
+    avrcp, role = _avrcp()
+
+    async def drive():
+        avrcp._apply_position_signal(45_000)
+        assert role.set_metadata_calls == [], "anchored a position with no known track length"
+        assert avrcp._pending_position_ms == 45_000
+
+        # _apply_track schedules a re-anchor, so it needs a running loop.
+        avrcp._apply_track({"Title": "Wish I Could Forget", "Duration": 206_626})
+        assert role.set_metadata_calls[-1].track_progress == 45_000
+        assert avrcp._pending_position_ms is None
+
+    asyncio.run(drive())
+
+
+def test_first_position_of_a_session_is_always_anchored():
+    """With no anchor of our own there is nothing to compare against — take the device's word."""
+    avrcp, role = _avrcp()
+    avrcp._duration_ms = 400_346
+    avrcp._apply_position_signal(32_320)
+    assert role.set_metadata_calls[-1].track_progress == 32_320

@@ -41,6 +41,16 @@ POSITION HANDLING — the fiddliest part of this file, all of it learned on hard
     what carries a scrub; between signals we advance our OWN anchor, as airplay_metadata.py does.
   * Sanity-check any position against track_duration. That catches the drift and can never reject
     a legitimate scrub, which is always inside the track.
+  * THE PROGRESS TICKER MUST NEVER BE ABLE TO DIE. Clients extrapolate locally between anchors, so
+    a dead ticker does not look like a frozen timeline — the GUI keeps counting up perfectly
+    smoothly and only the CORRECTIONS go missing. It presents as "my scrubs never show up", which
+    sends you hunting through the relay and the GUI instead of the one loop that stopped. Worse,
+    asyncio surfaces an unretrieved task exception only on garbage collection, and we hold a strong
+    reference to the task forever, so it dies without a single line in the log. Hence the blanket
+    except in _progress_ticker plus _ensure_ticker() on every player bind.
+  * Session state (anchor, duration, title, playing) belongs to ONE AVRCP session. Reset it when the
+    player object goes away, or a reconnect hours later resurrects the old position — the
+    paused-device-lie guard will actively prefer a four-hour-old anchor over the device's honest 0.
 """
 
 from __future__ import annotations
@@ -81,6 +91,10 @@ PROGRESS_TICK_S = 1.0
 POSITION_ZERO_LIE_MS = 2000
 # Slack before a reported position counts as past the end of the track (see _anchor_progress).
 POSITION_OVERRUN_SLACK_MS = 2000
+# How far a Position signal must diverge from our own anchor to count as a real seek rather than
+# BlueZ re-announcing what we already know (see _apply_position_signal). Comfortably over one
+# ticker period, so normal advance never reads as a jump.
+POSITION_SEEK_EPSILON_MS = 1500
 
 # BlueZ MediaPlayer1.Repeat <-> Sendspin RepeatMode. BlueZ also has "group", which has no Sendspin
 # equivalent; we read it as ALL (closest meaning) and never write it.
@@ -119,6 +133,9 @@ class BluetoothAvrcp:
         # Our own anchor, so we can tell what a polled position SHOULD be (see _progress_ticker).
         self._anchor_pos_ms: int | None = None
         self._anchor_at: float = 0.0
+        self._warned_overrun = False
+        # A Position signal that arrived before any track length (see _apply_position_signal).
+        self._pending_position_ms: int | None = None
         self._repeat = RepeatMode.OFF
         self._shuffle = False
         # Whether THIS player exposes Repeat/Shuffle at all (see module docstring).
@@ -129,8 +146,7 @@ class BluetoothAvrcp:
     def start(self) -> None:
         self.adapter.add_props_listener(self._on_props)
         self.adapter.add_object_listener(self._on_object)
-        if self._ticker_task is None:
-            self._ticker_task = asyncio.ensure_future(self._progress_ticker())
+        self._ensure_ticker()
 
     async def stop(self) -> None:
         self._player_path = None
@@ -140,6 +156,42 @@ class BluetoothAvrcp:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._ticker_task
             self._ticker_task = None
+        self._reset_session_state()
+
+    def _ensure_ticker(self) -> None:
+        """(Re)start the progress ticker unless it is already running.
+
+        Belt and braces around the silent-death mode documented in _progress_ticker: called from
+        start() AND from every AVRCP player bind, so a ticker lost to something the loop's own
+        except clause cannot catch (an outside cancellation, say) is back within one reconnect
+        instead of staying dead for the life of the process.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no loop yet (or under a sync unit test); start() will be called again in one
+        if self._ticker_task is None or self._ticker_task.done():
+            self._ticker_task = asyncio.ensure_future(self._progress_ticker())
+
+    def _reset_session_state(self) -> None:
+        """Forget everything that described the PREVIOUS AVRCP session.
+
+        The anchor must not outlive the player object. Observed on hardware 2026-07-29: the phone
+        detached and re-attached hours later correctly reporting Position 0, the paused-device-lie
+        guard in _reanchor_now decided a FOUR-HOUR-OLD anchor (301297 ms, from a track that was no
+        longer even loaded) was the more trustworthy of the two, and pinned every client to it.
+        Within one session that guard is right — a part-way track really cannot be at 0 — but across
+        a reconnect there is nothing worth keeping, so make sure there is nothing to keep.
+        """
+        self._playing = False
+        self._duration_ms = 0
+        self._last_title = None
+        self._last_speed = None
+        self._anchor_pos_ms = None
+        self._anchor_at = 0.0
+        self._ticks = 0
+        self._warned_overrun = False
+        self._pending_position_ms = None
 
     async def _progress_ticker(self) -> None:
         """Re-emit OUR OWN advancing anchor once a second. Never polls the device.
@@ -158,20 +210,52 @@ class BluetoothAvrcp:
         The authoritative source is the Position SIGNAL (_on_props), which is BlueZ relaying a real
         AVRCP notification — that is what carries a scrub. Between signals we advance our own anchor,
         exactly as airplay_metadata.py does; it never asks shairport where it is either.
+
+        THIS LOOP MUST NEVER EXIT. See the except clause.
         """
         while True:
             await asyncio.sleep(PROGRESS_TICK_S)
-            if not self._playing or not self._duration_ms:
-                continue
-            expected = self._expected_position_ms()
-            if expected is None:
-                continue
-            if expected > self._duration_ms:
-                continue  # ran off the end of the track; wait for the next real event
-            if self._ticks == 0:
-                logger.info("[bluetooth-%s] progress ticker running (pos=%d)", self.instance_id, int(expected))
-            self._ticks += 1
-            self._anchor_progress(int(expected), self._duration_ms)
+            try:
+                self._tick_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a bad tick must not end the ticker
+                # asyncio reports an unretrieved task exception only when the task is GARBAGE
+                # COLLECTED, and self._ticker_task holds a strong reference for the life of the
+                # process — so one raise in here dies in complete silence, with nothing in the log.
+                # Measured cost on hardware 2026-07-29: 16 minutes of playback across five tracks,
+                # `playing` set, a valid anchor and duration the whole time, and not one periodic
+                # update reaching a controller client (verified with a headless controller probe —
+                # zero progress frames in 12 minutes). Clients extrapolate locally, so the GUI still
+                # LOOKS like it is tracking; what silently stops is every CORRECTION, which is why
+                # this surfaced as "scrubs on the phone never show up in the GUI" rather than as a
+                # frozen timeline.
+                logger.exception(
+                    "[bluetooth-%s] progress tick failed; ticker continues", self.instance_id
+                )
+
+    def _tick_once(self) -> None:
+        if not self._playing or not self._duration_ms:
+            return
+        expected = self._expected_position_ms()
+        if expected is None:
+            return
+        if expected > self._duration_ms:
+            # Extrapolated off the end with no AVRCP event to correct us. Hold here and wait for a
+            # real one; log once, because going quiet is otherwise indistinguishable from the
+            # silent-ticker-death above.
+            if not self._warned_overrun:
+                self._warned_overrun = True
+                logger.info(
+                    "[bluetooth-%s] extrapolated past end of track (%d/%d ms); holding until the "
+                    "next AVRCP event", self.instance_id, int(expected), self._duration_ms,
+                )
+            return
+        self._warned_overrun = False
+        if self._ticks == 0:
+            logger.info("[bluetooth-%s] progress ticker running (pos=%d)", self.instance_id, int(expected))
+        self._ticks += 1
+        self._anchor_progress(int(expected), self._duration_ms)
 
     # -- role access ---------------------------------------------------------
 
@@ -202,11 +286,13 @@ class BluetoothAvrcp:
             if present:
                 self._player_path = path
                 logger.info("[bluetooth-%s] AVRCP player bound: %s", self.instance_id, path)
+                self._ensure_ticker()
                 asyncio.ensure_future(self._seed_from_player())
             elif self._player_path == path:
                 logger.info("[bluetooth-%s] AVRCP player gone", self.instance_id)
                 self._player_path = None
                 self._set_command_support(False)
+                self._reset_session_state()
         if TRANSPORT_IFACE in interfaces:
             if present:
                 self._transport_path = path
@@ -231,11 +317,7 @@ class BluetoothAvrcp:
         if "Status" in changed:
             self._apply_status(str(changed["Status"]))
         if "Position" in changed:
-            # A Position SIGNAL is BlueZ telling us the phone jumped (scrub/seek) — the polled
-            # property alone can't distinguish that from normal advance. Rare enough to log always.
-            seek_to = int(changed["Position"])
-            logger.info("[bluetooth-%s] seek signal -> %d ms", self.instance_id, seek_to)
-            self._anchor_progress(seek_to, self._duration_ms)
+            self._apply_position_signal(int(changed["Position"]))
         # Seeing either property at all proves the player exposes it. This is the backstop for a
         # phone that populates these later than the seed's retry window — without it, support is
         # decided once at bind time and a late arrival is never noticed.
@@ -247,6 +329,37 @@ class BluetoothAvrcp:
         if "Shuffle" in changed:
             self._shuffle = str(changed["Shuffle"]).lower() != "off"
             self.push_modes()
+
+    def _apply_position_signal(self, seek_to: int) -> None:
+        """Handle a Position SIGNAL — BlueZ relaying a real AVRCP notification.
+
+        This is the ONLY thing that can carry a within-track scrub, so it is never dropped on the
+        grounds of being unexpected. It is dropped when it says nothing new: BlueZ re-emits the whole
+        MediaPlayer1 property set every time it (re)creates the player object, which on a phone that
+        reconnects often means the same Position arriving repeatedly — logged as a "seek" each time,
+        and worse, re-publishing an anchor we already hold. Compare against where we think we are and
+        only act on a genuine divergence.
+        """
+        expected = self._expected_position_ms()
+        if expected is not None and abs(seek_to - expected) <= POSITION_SEEK_EPSILON_MS:
+            logger.debug(
+                "[bluetooth-%s] position signal %d ms matches our anchor (~%d ms); no seek",
+                self.instance_id, seek_to, int(expected),
+            )
+            return
+        logger.info(
+            "[bluetooth-%s] seek signal -> %d ms (we had ~%s)", self.instance_id, seek_to,
+            "nothing" if expected is None else "%d ms" % int(expected),
+        )
+        if not self._duration_ms:
+            # A position means nothing without a track length, and _anchor_progress would drop it.
+            # BlueZ has no ordering guarantee between Track and Position within the burst it emits
+            # when it creates a player, and _reset_session_state now clears the duration on every
+            # teardown — so hold the value and let _apply_track redeem it the moment a Duration
+            # lands, rather than losing the first seek of a session.
+            self._pending_position_ms = seek_to
+            return
+        self._anchor_progress(seek_to, self._duration_ms)
 
     async def _player_props(self):
         bus = self.adapter.bus
@@ -385,6 +498,13 @@ class BluetoothAvrcp:
         duration = values.get("Duration")
         if isinstance(duration, int) and duration > 0:
             self._duration_ms = duration
+            if self._pending_position_ms is not None:
+                pending, self._pending_position_ms = self._pending_position_ms, None
+                logger.info(
+                    "[bluetooth-%s] applying held seek %d ms now a duration is known",
+                    self.instance_id, pending,
+                )
+                self._anchor_progress(pending, self._duration_ms)
 
         # Album art rides the Track dict as an opaque handle; fetching it is a separate OBEX
         # conversation, so hand it off and never await it here — art must not delay metadata.
