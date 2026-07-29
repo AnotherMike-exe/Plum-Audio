@@ -162,11 +162,9 @@ export function createMockSettings(overrides: Partial<Settings> = {}): Settings 
         endpoints: [createMockAirPlayEndpoint()]
       },
       bluetooth: {
-        enabled: false,
-        deviceName: 'Test Bluetooth',
-        adapter: 'hci0',
         autoPair: true,
-        discoverable: true
+        discoverable: true,
+        endpoints: [{ id: '1', enabled: false, deviceName: 'Test Bluetooth', adapter: 'hci0' }]
       },
       spotify: {
         bitrate: 320,

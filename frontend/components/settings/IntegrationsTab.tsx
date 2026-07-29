@@ -57,8 +57,15 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
   const [newSpotifyEndpointName, setNewSpotifyEndpointName] = useState('');
   const [showAddSpotifyEndpoint, setShowAddSpotifyEndpoint] = useState(false);
 
+  // Bluetooth is modelled as an endpoints array (keyed by adapter) to share the source manager and
+  // endpoint CRUD with AirPlay/Spotify, but a unit has ONE radio — so this card stays single-instance
+  // and simply drives endpoint[0] rather than offering an add/remove list whose only extra row could
+  // never come up. autoPair/discoverable remain section-level.
+  const btEndpoint = settings.integrations.bluetooth.endpoints?.[0];
+  const btEnabled = !!btEndpoint?.enabled;
+
   // Bluetooth device name state
-  const [bluetoothDeviceName, setBluetoothDeviceName] = useState(settings.integrations.bluetooth.deviceName);
+  const [bluetoothDeviceName, setBluetoothDeviceName] = useState(btEndpoint?.deviceName ?? '');
   const [bluetoothNameStatus, setBluetoothNameStatus] = useState<ApplyStatus>('idle');
   const [bluetoothNameMessage, setBluetoothNameMessage] = useState('');
   const [isTogglingBluetooth, setIsTogglingBluetooth] = useState(false);
@@ -143,11 +150,11 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
   }, []);
 
   useEffect(() => {
-    setBluetoothDeviceName(settings.integrations.bluetooth.deviceName);
-  }, [settings.integrations.bluetooth.deviceName]);
+    setBluetoothDeviceName(btEndpoint?.deviceName ?? '');
+  }, [btEndpoint?.deviceName]);
 
   // Check if device name has changed
-  const bluetoothNameChanged = bluetoothDeviceName !== settings.integrations.bluetooth.deviceName;
+  const bluetoothNameChanged = bluetoothDeviceName !== (btEndpoint?.deviceName ?? '');
 
   const toggleSection = (section: string) => {
     setExpandedSection(expandedSection === section ? null : section);
@@ -506,7 +513,9 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
             ...settings.integrations,
             bluetooth: {
               ...settings.integrations.bluetooth,
-              enabled,
+              endpoints: (settings.integrations.bluetooth.endpoints ?? []).map((ep, i) =>
+                i === 0 ? { ...ep, enabled } : ep,
+              ),
             },
           },
         });
@@ -526,7 +535,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
     if (!bluetoothNameChanged) return;
 
     // Track if Bluetooth was disabled before applying
-    const wasDisabled = !settings.integrations.bluetooth.enabled;
+    const wasDisabled = !btEnabled;
 
     setBluetoothNameStatus('applying');
     setBluetoothNameMessage('Applying changes... this may take up to 60 seconds');
@@ -538,15 +547,20 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
         setBluetoothNameStatus('success');
         setBluetoothNameMessage('Applied');
 
-        // Update settings - if Bluetooth was disabled, it's now enabled
+        // Reflect the rename on endpoint[0]. (The /bluetooth/device-name shim renames the first
+        // endpoint server-side, so this only mirrors what already happened.) `wasDisabled` keeps
+        // the ported behaviour where applying a name also brings the endpoint up.
         onSettingsChange({
           ...settings,
           integrations: {
             ...settings.integrations,
             bluetooth: {
               ...settings.integrations.bluetooth,
-              deviceName: bluetoothDeviceName,
-              enabled: wasDisabled ? true : settings.integrations.bluetooth.enabled,
+              endpoints: (settings.integrations.bluetooth.endpoints ?? []).map((ep, i) =>
+                i === 0
+                  ? { ...ep, deviceName: bluetoothDeviceName, enabled: wasDisabled ? true : ep.enabled }
+                  : ep,
+              ),
             },
           },
         });
@@ -856,16 +870,16 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                 <input
                   type="checkbox"
                   className="sr-only"
-                  checked={settings.integrations.bluetooth.enabled}
+                  checked={btEnabled}
                   onChange={(e) => handleBluetoothToggle(e.target.checked)}
                   disabled={isTogglingBluetooth}
                   id="bluetooth-toggle"
                 />
                 <label
                   htmlFor="bluetooth-toggle"
-                  className={`block w-12 h-6 rounded-full transition cursor-pointer ${settings.integrations.bluetooth.enabled ? 'bg-[var(--accent-color)]' : 'bg-[var(--bg-tertiary-hover)]'} ${isTogglingBluetooth ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  className={`block w-12 h-6 rounded-full transition cursor-pointer ${btEnabled ? 'bg-[var(--accent-color)]' : 'bg-[var(--bg-tertiary-hover)]'} ${isTogglingBluetooth ? 'opacity-50 cursor-not-allowed' : ''}`}
                 >
-                  <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform ${settings.integrations.bluetooth.enabled ? 'translate-x-6' : ''}`}></div>
+                  <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform ${btEnabled ? 'translate-x-6' : ''}`}></div>
                 </label>
               </div>
               <button
@@ -926,17 +940,17 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                 </label>
                 <input
                   type="text"
-                  value={settings.integrations.bluetooth.adapter}
-                  onChange={(e) => handleBluetoothChange('adapter', e.target.value)}
-                  className="w-full px-3 py-2 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-color)]"
-                  placeholder="hci0"
+                  value={btEndpoint?.adapter ?? 'hci0'}
+                  readOnly
+                  title="Assigned by the server from the adapters this host actually has"
+                  className="w-full px-3 py-2 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded text-[var(--text-muted)] cursor-not-allowed"
                 />
               </div>
               <div className="flex items-center">
                 <input
                   type="checkbox"
                   id="bt-discoverable"
-                  checked={settings.integrations.bluetooth.discoverable}
+                  checked={!!settings.integrations.bluetooth.discoverable}
                   onChange={(e) => handleBluetoothChange('discoverable', e.target.checked)}
                   className="mr-2"
                 />

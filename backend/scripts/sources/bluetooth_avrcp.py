@@ -95,11 +95,13 @@ REPEAT_TO_BLUEZ = {
 class BluetoothAvrcp:
     """Drives one Bluetooth source's metadata/transport. Also the source's transport remote."""
 
-    def __init__(self, group, instance_id: str, adapter, *, on_commands_changed=None) -> None:
+    def __init__(self, group, instance_id: str, adapter, *, on_commands_changed=None, cover_art=None) -> None:
         self.group = group
         self.instance_id = instance_id
         self.adapter = adapter  # BluetoothAdapter — owns the bus and the BlueZ signal fan-out
         self._on_commands_changed = on_commands_changed
+        self.cover_art = cover_art  # BluetoothCoverArt | None — best-effort, never load-bearing
+        self._obex_port: int | None = None
         self._player_path: str | None = None
         self._transport_path: str | None = None
         self._ticker_task: asyncio.Task | None = None
@@ -307,6 +309,11 @@ class BluetoothAvrcp:
             )
             return
         self._set_command_support("Repeat" in values or "Shuffle" in values)
+        # ObexPort is the phone's cover-art (BIP) L2CAP PSM. Present only on BlueZ >= 5.81 with
+        # Experimental enabled AND a device that actually supports AVRCP cover art.
+        port = values.get("ObexPort")
+        if isinstance(port, int) and port > 0:
+            self._obex_port = port
         if "Repeat" in values:
             self._repeat = REPEAT_FROM_BLUEZ.get(str(values["Repeat"]).lower(), RepeatMode.OFF)
         if "Shuffle" in values:
@@ -368,6 +375,16 @@ class BluetoothAvrcp:
         duration = values.get("Duration")
         if isinstance(duration, int) and duration > 0:
             self._duration_ms = duration
+
+        # Album art rides the Track dict as an opaque handle; fetching it is a separate OBEX
+        # conversation, so hand it off and never await it here — art must not delay metadata.
+        img_handle = values.get("ImgHandle")
+        if self.cover_art is not None and img_handle:
+            asyncio.ensure_future(
+                self.cover_art.handle_track(
+                    self.adapter.active_address, self._obex_port, str(img_handle)
+                )
+            )
         # Do NOT assume position 0 here. BlueZ re-sends Track for reasons that are not a new track
         # (ImgHandle arriving late, a re-read when a controller joins), so anchoring 0 on every
         # Track update rewinds the GUI to the start mid-song — visible as "switching to the

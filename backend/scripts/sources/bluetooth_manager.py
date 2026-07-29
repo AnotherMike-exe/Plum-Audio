@@ -32,6 +32,8 @@ from sources.source_manager import DaemonSpec, SourceManagerBase
 
 logger = logging.getLogger("plum.bluetooth_manager")
 
+BUS_SETTLE_S = 0.5  # let dbus-daemon create its socket before obexd tries to connect
+
 
 class BluetoothManager(SourceManagerBase):
     def __init__(
@@ -41,16 +43,25 @@ class BluetoothManager(SourceManagerBase):
         settings_file: str | None = None,
         config_root: str = bluetooth_config.DEFAULT_CONFIG_ROOT,
         binary: str = bluetooth_config.DEFAULT_BLUEALSA_BIN,
+        obexd_binary: str = bluetooth_config.DEFAULT_OBEXD_BIN,
+        dbus_binary: str = bluetooth_config.DEFAULT_DBUS_BIN,
         **kwargs,
     ) -> None:
         super().__init__(server, name="bluetooth", settings_file=settings_file, **kwargs)
         self.config_root = config_root
         self.binary = binary
-        # A survivor of a crashed run still owns org.bluealsa, so the fresh daemon can't acquire the
-        # name and exits. Unlike AirPlay/Spotify there is no per-instance config path to scope the
-        # pattern to (bluealsa is argv-configured), so we match our own distinctive profile flag —
-        # safe because provisioning disables the distro bluealsa.service.
-        self.stale_pattern = f"{os.path.basename(binary)}.*--profile=a2dp-sink"
+        self.obexd_binary = obexd_binary
+        self.dbus_binary = dbus_binary
+        # Sweep survivors of a crashed run. bluealsa still owns org.bluealsa, so a fresh one cannot
+        # acquire the name and exits; the private dbus-daemon detaches and would otherwise pile up
+        # one per restart (as with AirPlay). bluealsa is argv-configured with no per-instance path,
+        # so it is matched by our own distinctive profile flag — safe because provisioning disables
+        # the distro bluealsa.service; obexd and dbus-daemon are scoped to our config root.
+        self.stale_pattern = [
+            f"{os.path.basename(binary)}.*--profile=a2dp-sink",
+            f"dbus-daemon.*{config_root}",
+            f"obexd.*{config_root}",
+        ]
 
     def desired(self, settings: dict) -> dict[str, tuple[tuple, object]]:
         instances = bluetooth_config.instances_from_settings(settings, config_root=self.config_root)
@@ -68,11 +79,31 @@ class BluetoothManager(SourceManagerBase):
         return [instance.fifo_path]
 
     def daemons(self, instance) -> list[DaemonSpec]:
+        # A stale socket from an unclean exit makes dbus-daemon refuse to bind (same as AirPlay).
+        if os.path.exists(instance.obex_socket):
+            try:
+                os.unlink(instance.obex_socket)
+            except OSError as e:
+                logger.warning("[%s] could not clear stale obex socket: %s", instance.source_id, e)
         return [
             DaemonSpec(
                 argv=[self.binary, "--profile=a2dp-sink", "-i", instance.adapter],
                 log_path=os.path.join(instance.config_dir, "bluealsa.log"),
-            )
+            ),
+            # AVRCP cover art only. obexd is a SESSION-bus service, so each endpoint gets its own
+            # private bus rather than us adding system-bus policy for org.bluez.obex — the same
+            # arrangement multi-endpoint AirPlay uses for shairport's fixed MPRIS name.
+            DaemonSpec(
+                argv=[self.dbus_binary, "--session", f"--address={instance.obex_bus_address}",
+                      "--nofork", "--nopidfile"],
+                log_path=os.path.join(instance.config_dir, "obex-dbus.log"),
+                settle_s=BUS_SETTLE_S,
+            ),
+            DaemonSpec(
+                argv=[self.obexd_binary, "-n"],
+                log_path=os.path.join(instance.config_dir, "obexd.log"),
+                env={"DBUS_SESSION_BUS_ADDRESS": instance.obex_bus_address},
+            ),
         ]
 
     async def start_source(self, instance) -> None:

@@ -140,6 +140,16 @@ class BluetoothAdapter:
         should still come up (silent) rather than crash-loop the manager.
         """
         self.instance = instance
+        # Distinguish "no such radio" from "radio blocked" — the GUI can add an endpoint for an
+        # adapter that doesn't exist (there is usually only hci0), and blaming rfkill for that
+        # sends you chasing the wrong thing entirely.
+        if await self._props_iface(instance.adapter_path) is None:
+            logger.error(
+                "[%s] adapter %s does not exist on this host — remove the endpoint, or attach the "
+                "radio it expects. Available adapters appear under /org/bluez/.",
+                instance.source_id, instance.adapter,
+            )
+            return
         if not await self._set_adapter_prop("Powered", Variant("b", True)):
             logger.error(
                 "[%s] could not power on %s — is it rfkill soft-blocked? "

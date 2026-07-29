@@ -31,6 +31,9 @@ logger = logging.getLogger("plum.bluetooth_config")
 DEFAULT_CONFIG_ROOT = os.environ.get("PLUM_BLUETOOTH_CONFIG_DIR", "/data/bluetooth")
 DEFAULT_BLUEALSA_BIN = os.environ.get("PLUM_BLUEALSA_BIN", "bluealsa")
 DEFAULT_ARECORD_BIN = os.environ.get("PLUM_ARECORD_BIN", "arecord")
+# obexd serves AVRCP cover art on a private session bus (see BluetoothInstance.obex_bus_address).
+DEFAULT_OBEXD_BIN = os.environ.get("PLUM_OBEXD_BIN", "/usr/libexec/bluetooth/obexd")
+DEFAULT_DBUS_BIN = os.environ.get("PLUM_DBUS_DAEMON_BIN", "dbus-daemon")
 
 # One endpoint per adapter, and a host has one or two. The cap is a sanity bound, not a design limit.
 MAX_ENDPOINTS = 4
@@ -63,6 +66,21 @@ class BluetoothInstance:
     def agent_path(self) -> str:
         """Our pairing agent's object path. Per instance so two adapters don't collide on the bus."""
         return f"/plum/audio/agent/{self.instance_id}"
+
+    @property
+    def obex_socket(self) -> str:
+        return os.path.join(self.config_dir, "obex.socket")
+
+    @property
+    def obex_bus_address(self) -> str:
+        """Private session-bus address for this endpoint's obexd (AVRCP cover art).
+
+        obexd is a SESSION-bus service (Debian ships it as a user unit owning org.bluez.obex), and
+        putting it on the system bus would need its own policy. Giving each endpoint a private bus
+        instead reuses the exact trick multi-endpoint AirPlay uses for shairport's fixed MPRIS name
+        — see airplay_manager.py — and keeps obexd scoped to the endpoint that spawned it.
+        """
+        return f"unix:path={self.obex_socket}"
 
 
 def fifo_path_for(instance_id: str) -> str:

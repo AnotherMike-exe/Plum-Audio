@@ -2,8 +2,8 @@
 """
 Plum-Audio — integrations API (Flask blueprint).
 
-Serves /api/integrations/* for the GUI's Integrations settings tab. Phase 3 ships AirPlay and
-Spotify (the ported sources); dlna/bluetooth/plexamp slices are added here as those sources land.
+Serves /api/integrations/* for the GUI's Integrations settings tab. Phase 3 ships AirPlay,
+Spotify and Bluetooth (the ported sources); dlna/plexamp slices are added here as those land.
 
 Endpoint CRUD is PURE PERSISTENCE: it writes settings.json via the shared SettingsManager and
 returns. Applying the change — rendering daemon configs, spawning/killing daemons, and bringing the
@@ -25,7 +25,7 @@ import sys
 from flask import Blueprint, jsonify, request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/ on path
-from sources import airplay_config  # noqa: E402
+from sources import airplay_config, bluetooth_config  # noqa: E402
 
 from settings_api import SettingsManager  # noqa: E402
 
@@ -173,6 +173,53 @@ class SpotifyEndpointsManager(EndpointsManager):
                 "warning": "Restarts Spotify endpoints; active playback is interrupted."}
 
 
+class BluetoothEndpointsManager(EndpointsManager):
+    """Bluetooth endpoints — one per ADAPTER, so realistically one.
+
+    Section-level extras are autoPair/discoverable: they describe how the integration pairs, not
+    how one radio behaves, and bluetooth_config carries them onto every instance because the
+    adapter is what applies them.
+    """
+
+    source_key = "bluetooth"
+
+    def _extras(self, section: dict) -> dict:
+        return {
+            "autoPair": bool(section.get("autoPair", True)),
+            "discoverable": bool(section.get("discoverable", True)),
+        }
+
+    def _allocate(self, endpoints: list[dict], instance_id: str) -> dict:
+        # One endpoint per adapter: take the first hciN not already claimed. Adding a second
+        # endpoint without a second radio is allowed but will simply find no adapter at runtime,
+        # which bluetooth_adapter logs rather than crashing on.
+        taken = {e.get("adapter") for e in endpoints}
+        for n in range(bluetooth_config.MAX_ENDPOINTS):
+            candidate = f"hci{n}"
+            if candidate not in taken:
+                return {"adapter": candidate}
+        return {"adapter": bluetooth_config.adapter_for(instance_id)}
+
+    def update_pairing(self, auto_pair: bool | None = None, discoverable: bool | None = None) -> dict:
+        """Update the section-level pairing toggles (GUI: Integrations → Bluetooth)."""
+        section = self._section()
+        extras = self._extras(section)
+        if auto_pair is not None:
+            extras["autoPair"] = bool(auto_pair)
+        if discoverable is not None:
+            extras["discoverable"] = bool(discoverable)
+        self._save(section.get("endpoints", []) or [], extras)
+        logger.info("updated bluetooth pairing settings: %s", extras)
+        return {
+            "success": True,
+            "message": "Updated Bluetooth settings",
+            **extras,
+            # Both toggles are adapter properties applied by the running source, and the manager
+            # respools the endpoint to pick them up — so an active A2DP session is interrupted.
+            "warning": "Restarts Bluetooth; a connected device is disconnected.",
+        }
+
+
 class AirplayEndpointsManager(EndpointsManager):
     """AirPlay endpoints. Each needs its own RAOP port and UDP port block."""
 
@@ -247,9 +294,18 @@ def create_integrations_blueprint(settings_manager: SettingsManager | None = Non
     bp = Blueprint("integrations", __name__, url_prefix="/api/integrations")
     spotify = SpotifyEndpointsManager(settings_manager)
     airplay = AirplayEndpointsManager(settings_manager)
+    bluetooth = BluetoothEndpointsManager(settings_manager)
 
     _register_endpoint_routes(bp, "airplay", airplay)
     _register_endpoint_routes(bp, "spotify", spotify)
+    _register_endpoint_routes(bp, "bluetooth", bluetooth)
+
+    @bp.post("/bluetooth/settings")
+    def bluetooth_settings():
+        """Section-level pairing toggles. The GUI has posted here since the Plum-Snapcast port."""
+        data = request.get_json(silent=True) or {}
+        result = bluetooth.update_pairing(data.get("autoPair"), data.get("discoverable"))
+        return jsonify(result), 200 if result.get("success") else 400
 
     @bp.post("/spotify/bitrate")
     def spotify_bitrate():

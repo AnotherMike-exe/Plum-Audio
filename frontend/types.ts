@@ -65,6 +65,12 @@ export interface Stream {
     // A sender is actively using this source. Idle sources stay routable but drop out of the
     // stream list, so the picker shows what is in use rather than every configured endpoint.
     active?: boolean;
+    // Controller commands this source advertises (Sendspin controller role supported_commands). The
+    // transport UI shows only controls whose command is present here — so repeat/shuffle appear for
+    // sources that support them (Spotify) and are hidden for those that don't (AirPlay).
+    supportedCommands?: string[];
+    repeat?: 'off' | 'one' | 'all'; // current group repeat mode (undefined = not reported)
+    shuffle?: boolean;              // current group shuffle state
 }
 
 export interface Client {
@@ -425,6 +431,15 @@ export interface SpotifyEndpoint {
     zeroconfPort: number;
 }
 
+// Bluetooth Endpoint — one per ADAPTER, so realistically one per unit. Modelled as an array
+// anyway so the source manager, endpoint CRUD and GUI card are shared with AirPlay/Spotify.
+export interface BluetoothEndpoint {
+    id: string;
+    enabled: boolean;
+    deviceName: string;
+    adapter: string;
+}
+
 // DLNA/UPnP Endpoint
 export interface DLNAEndpoint {
     id: string;
@@ -442,11 +457,11 @@ export interface Settings {
             endpoints: AirPlayEndpoint[];
         };
         bluetooth: {
-            enabled: boolean;
-            deviceName: string;
-            adapter: string;
+            // autoPair/discoverable are section-level: they describe how the integration pairs,
+            // not one radio. The endpoints array is keyed by adapter (see BluetoothEndpoint).
             autoPair: boolean;
             discoverable: boolean;
+            endpoints: BluetoothEndpoint[];
         };
         spotify: {
             bitrate: 96 | 160 | 320;

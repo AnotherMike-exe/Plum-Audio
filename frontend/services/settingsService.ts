@@ -35,11 +35,9 @@ const DEFAULT_SERVER_SETTINGS = {
       endpoints: [] as Settings['integrations']['airplay']['endpoints'],
     },
     bluetooth: {
-      enabled: false,
-      deviceName: 'Plum Audio',
-      adapter: 'hci0',
       autoPair: true,
       discoverable: true,
+      endpoints: [] as Settings['integrations']['bluetooth']['endpoints'],
     },
     spotify: {
       bitrate: 320 as 96 | 160 | 320,

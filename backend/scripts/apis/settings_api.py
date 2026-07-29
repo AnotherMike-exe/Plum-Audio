@@ -41,12 +41,20 @@ DEFAULT_SETTINGS = {
                 }
             ]
         },
+        # Endpoints-array shape, keyed by adapter — see sources/bluetooth_config.py. autoPair and
+        # discoverable stay section-level: they describe the integration's pairing behaviour, not
+        # one radio. Files written before this shape are converted by _migrate_bluetooth().
         "bluetooth": {
-            "enabled": False,
-            "deviceName": "Plum Audio",
-            "adapter": "hci0",
             "autoPair": True,
             "discoverable": True,
+            "endpoints": [
+                {
+                    "id": "1",
+                    "enabled": False,
+                    "deviceName": "Plum Audio",
+                    "adapter": "hci0",
+                }
+            ],
         },
         "spotify": {
             "bitrate": 320,
@@ -148,6 +156,37 @@ class SettingsManager:
             logger.error(f"Failed to save settings: {e}")
             raise
 
+    @staticmethod
+    def _migrate_bluetooth(integrations: Dict[str, Any]) -> bool:
+        """Convert a pre-endpoints Bluetooth section in place. Returns True if anything changed.
+
+        Bluetooth used to be a single object ({enabled, deviceName, adapter, autoPair,
+        discoverable}) because there is one radio per unit. It is now an endpoints array keyed by
+        adapter, matching AirPlay/Spotify so the source manager, the endpoint CRUD, and the GUI
+        card are all shared. This has to run for real: BluetoothManager reads `endpoints`, so an
+        un-migrated file resolves to NO endpoints and Bluetooth silently never starts — no error,
+        no log, just a source that never appears.
+        """
+        section = integrations.get("bluetooth")
+        if not isinstance(section, dict) or "endpoints" in section:
+            return False
+        integrations["bluetooth"] = {
+            "autoPair": bool(section.get("autoPair", True)),
+            "discoverable": bool(section.get("discoverable", True)),
+            "endpoints": [
+                {
+                    "id": "1",
+                    # The old flag was the whole integration's on/off switch; it becomes this
+                    # endpoint's, which is the same thing while there is one adapter.
+                    "enabled": bool(section.get("enabled", False)),
+                    "deviceName": section.get("deviceName", "Plum Audio"),
+                    "adapter": section.get("adapter", "hci0"),
+                }
+            ],
+        }
+        logger.info("migrated bluetooth settings to the endpoints-array shape")
+        return True
+
     def get_settings(self) -> Dict[str, Any]:
         """Load settings from the JSON file, merged over defaults so new keys always exist."""
         try:
@@ -161,6 +200,12 @@ class SettingsManager:
                         merged[key].update(settings[key])
                     else:
                         merged[key] = settings[key]
+
+            # The merge above is shallow, so an old-shape section from the file survives verbatim.
+            # Persist the conversion rather than redoing it on every read — the source manager
+            # reads settings.json directly, not through this class.
+            if self._migrate_bluetooth(merged["integrations"]):
+                self._save_settings(merged)
 
             # Keep Plexamp availability in sync with the environment (docker-compose configuration).
             plexamp_enabled = os.getenv("PLEXAMP_ENABLED", "0").strip() in ("1", "true", "True", "TRUE", "yes", "Yes", "YES")

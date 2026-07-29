@@ -318,6 +318,105 @@ export const bluetoothService = {
       throw error;
     }
   },
+
+  /**
+   * List all Bluetooth endpoints (one per adapter, so realistically one).
+   */
+  async listEndpoints(): Promise<{ success: boolean; endpoints: Array<{id: string; enabled: boolean; deviceName: string; adapter: string}>; autoPair?: boolean; discoverable?: boolean }> {
+    try {
+      const response = await fetch(`${API_BASE}/bluetooth/endpoints`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ message: 'Failed to list endpoints' }));
+        throw new Error(errorData.message || `HTTP ${response.status}`);
+      }
+
+      return await response.json();
+    } catch (error) {
+      console.error('Failed to list Bluetooth endpoints:', error);
+      throw error;
+    }
+  },
+
+  /**
+   * Add a new Bluetooth endpoint. The backend allocates the next free adapter (hci0, hci1, …);
+   * adding more endpoints than the host has radios is allowed but that endpoint will never come up.
+   */
+  async addEndpoint(deviceName: string, enabled: boolean = true): Promise<{ success: boolean; message: string; endpoint?: any }> {
+    try {
+      const response = await fetch(`${API_BASE}/bluetooth/endpoints`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ deviceName, enabled }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ message: 'Failed to add endpoint' }));
+        throw new Error(errorData.message || `HTTP ${response.status}`);
+      }
+
+      return await response.json();
+    } catch (error) {
+      console.error('Failed to add Bluetooth endpoint:', error);
+      throw error;
+    }
+  },
+
+  /**
+   * Update an existing Bluetooth endpoint (rename / enable / disable).
+   */
+  async updateEndpoint(endpointId: string, deviceName?: string, enabled?: boolean): Promise<{ success: boolean; message: string; endpoint?: any }> {
+    try {
+      const response = await fetch(`${API_BASE}/bluetooth/endpoints/${endpointId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ deviceName, enabled }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ message: 'Failed to update endpoint' }));
+        throw new Error(errorData.message || `HTTP ${response.status}`);
+      }
+
+      return await response.json();
+    } catch (error) {
+      console.error('Failed to update Bluetooth endpoint:', error);
+      throw error;
+    }
+  },
+
+  /**
+   * Remove a Bluetooth endpoint.
+   */
+  async removeEndpoint(endpointId: string): Promise<{ success: boolean; message: string }> {
+    try {
+      const response = await fetch(`${API_BASE}/bluetooth/endpoints/${endpointId}`, {
+        method: 'DELETE',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ message: 'Failed to remove endpoint' }));
+        throw new Error(errorData.message || `HTTP ${response.status}`);
+      }
+
+      return await response.json();
+    } catch (error) {
+      console.error('Failed to remove Bluetooth endpoint:', error);
+      throw error;
+    }
+  },
 };
 
 /**

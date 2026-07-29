@@ -74,6 +74,7 @@ from sources.airplay_manager import AirplayManager
 from sources.airplay_remote import AirplayRemote
 from sources.bluetooth_adapter import BluetoothAdapter
 from sources.bluetooth_avrcp import BluetoothAvrcp
+from sources.bluetooth_coverart import BluetoothCoverArt
 from sources.bluetooth_manager import BluetoothManager
 from sources.spotify_golibrespot import SpotifyGoLibrespot
 from sources.spotify_manager import SpotifyManager
@@ -301,6 +302,7 @@ class PlumSendspinServer:
         self._spotify_monitors: dict[str, SpotifyGoLibrespot] = {}  # source_id -> go-librespot event monitor
         self._bluetooth_adapters: dict[str, BluetoothAdapter] = {}  # source_id -> BlueZ adapter owner
         self._bluetooth_avrcp: dict[str, BluetoothAvrcp] = {}  # source_id -> AVRCP metadata/transport
+        self._bluetooth_coverart: dict[str, BluetoothCoverArt] = {}  # source_id -> OBEX cover-art fetcher
         # Per-source transport remote (has async play/pause/next_track/previous_track). AirPlay's
         # AirplayRemote and each SpotifyGoLibrespot both satisfy it, so controller events route by source.
         self._source_remotes: dict[str, object] = {}
@@ -329,6 +331,9 @@ class PlumSendspinServer:
         for avrcp in self._bluetooth_avrcp.values():
             await avrcp.stop()
         self._bluetooth_avrcp.clear()
+        for cover_art in self._bluetooth_coverart.values():
+            await cover_art.stop()
+        self._bluetooth_coverart.clear()
         for adapter in self._bluetooth_adapters.values():
             await adapter.stop()
         self._bluetooth_adapters.clear()
@@ -754,8 +759,14 @@ class PlumSendspinServer:
         self.start_source(instance.source_id, instance.fifo_path, name=instance.device_name)
         handle = self.sources[instance.source_id]
         adapter = BluetoothAdapter(instance)
+        # Album art is best-effort and entirely separable: it needs BlueZ >= 5.81 + Experimental +
+        # a phone that supports AVRCP cover art, and it talks to obexd on this endpoint's private
+        # session bus. If any of that is missing it logs once and stays quiet — audio, metadata and
+        # transport never depend on it.
+        cover_art = BluetoothCoverArt(handle.group, instance.instance_id, instance.obex_bus_address)
         avrcp = BluetoothAvrcp(
             handle.group, instance.instance_id, adapter,
+            cover_art=cover_art,
             # Repeat/shuffle support is discovered per connected player, not known up front, so the
             # advertised command set has to be republished when it changes (see bluetooth_avrcp).
             on_commands_changed=functools.partial(self.refresh_source_commands, instance.source_id),
@@ -764,6 +775,7 @@ class PlumSendspinServer:
         await adapter.start()
         self._bluetooth_adapters[instance.source_id] = adapter
         self._bluetooth_avrcp[instance.source_id] = avrcp
+        self._bluetooth_coverart[instance.source_id] = cover_art
         self._wire_transport_control(instance.source_id, avrcp)
         logger.info(
             "[%s] bluetooth source up (name=%r adapter=%s)",
@@ -775,6 +787,9 @@ class PlumSendspinServer:
         avrcp = self._bluetooth_avrcp.pop(source_id, None)
         if avrcp is not None:
             await avrcp.stop()
+        cover_art = self._bluetooth_coverart.pop(source_id, None)
+        if cover_art is not None:
+            await cover_art.stop()
         adapter = self._bluetooth_adapters.pop(source_id, None)
         if adapter is not None:
             await adapter.stop()
