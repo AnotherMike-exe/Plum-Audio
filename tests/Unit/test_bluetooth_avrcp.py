@@ -162,3 +162,42 @@ def test_expected_position_is_none_before_any_anchor():
     """No anchor yet means the ticker has nothing to validate against and must not reject blindly."""
     avrcp, _role = _avrcp()
     assert avrcp._expected_position_ms() is None
+
+
+# -- the two position lies measured on hardware --------------------------------------------------
+#
+# Both of these were got wrong in BOTH directions before they were understood: first over-guarded
+# (rejecting real remote scrubs), then under-guarded (publishing a position past the end of the
+# track). The rule that survives is "check against the track length", because a legitimate scrub is
+# always inside the track and a wall-clock-inflated position never is.
+
+
+def test_position_past_end_of_track_is_rejected():
+    """BlueZ advances Position by wall clock across a pause, so it can exceed track length.
+
+    Observed on hardware: 548733 ms reported for a 190066 ms track — the previous anchor plus the
+    idle time. The role clamps at duration, so publishing it parks every client at 100%.
+    """
+    avrcp, role = _avrcp()
+    avrcp._playing = True
+    avrcp._anchor_progress(150_000, 190_066)          # a good anchor first
+    published_before = len(role.set_metadata_calls)
+
+    avrcp._anchor_progress(548_733, 190_066)          # the inflated reading
+    latest = role.set_metadata_calls[-1]
+    assert latest.track_progress <= 190_066, "a position past the end of the track was published"
+    # It either kept the sane anchor or published nothing new — never the impossible value.
+    assert latest.track_progress != 548_733
+    assert len(role.set_metadata_calls) >= published_before
+
+
+def test_a_scrub_within_the_track_is_always_honoured():
+    """The guard must never reject a real remote seek — that was the previous bug in reverse."""
+    avrcp, role = _avrcp()
+    avrcp._playing = True
+    avrcp._anchor_progress(150_000, 190_066)
+    avrcp._anchor_progress(300, 190_066)              # user scrubbed back to the start
+    assert role.set_metadata_calls[-1].track_progress == 300
+
+    avrcp._anchor_progress(189_000, 190_066)          # and forward to near the end
+    assert role.set_metadata_calls[-1].track_progress == 189_000

@@ -34,11 +34,11 @@ POSITION HANDLING — the fiddliest part of this file, all of it learned on hard
     add the already-elapsed time on top, i.e. double-count: right for a moment, then a jump
     forward, compounding after each pause. This was the actual cause of the timeline bug, and
     airplay_metadata._emit_progress had already found and documented the same library quirk.
-  * TRUST BlueZ's Position; it is accurate to ~2 ms over 13 s (measured). An earlier version made
-    the ticker reject readings that disagreed with our own anchor, on a theory about pause-inflated
-    positions that measurement disproved — all it could ever do was discard the truth, including a
-    real scrub. The single misreport actually observed is a paused device claiming 0, handled at
-    the one place it occurs (_reanchor_now).
+  * BlueZ's Position is accurate DURING PLAYBACK (~2 ms over 13 s, measured) but keeps advancing
+    by wall clock across a pause/idle, so it can report far past the end of the track. Sanity-check
+    it against track_duration — that catches the real lie and can never reject a legitimate remote
+    scrub, which is always inside the track. A paused device reporting exactly 0 is the other
+    observed misreport, handled in _reanchor_now.
   * A remote scrub arrives BOTH as a Position SIGNAL and in the polled property; the signal is
     logged because it is the only way to tell a jump from normal advance.
 """
@@ -79,6 +79,8 @@ PROGRESS_TICK_S = 1.0
 # A paused track sitting past this offset cannot really be at 0 — that is the device lying (see
 # _reanchor_now). Deliberately narrow: it is the only misreport actually observed on hardware.
 POSITION_ZERO_LIE_MS = 2000
+# Slack before a reported position counts as past the end of the track (see _anchor_progress).
+POSITION_OVERRUN_SLACK_MS = 2000
 
 # BlueZ MediaPlayer1.Repeat <-> Sendspin RepeatMode. BlueZ also has "group", which has no Sendspin
 # equivalent; we read it as ALL (closest meaning) and never write it.
@@ -480,6 +482,27 @@ class BluetoothAvrcp:
         role = self._metadata_role()
         if role is None or position_ms is None or not duration_ms:
             return
+        # A position past the end of the track is definitionally a lie, and BlueZ tells it: its
+        # Position keeps advancing by WALL CLOCK across a pause/idle, so after a few minutes idle
+        # it reports far beyond the track length (observed: 548733 ms on a 190066 ms track, which
+        # is exactly the earlier anchor plus the elapsed idle time). The role clamps at duration,
+        # so publishing it parks every client at 100%.
+        #
+        # This supersedes an earlier ticker guard that compared against our own extrapolation. That
+        # one also rejected legitimate remote scrubs, and was removed after a measurement showing
+        # Position accurate to ~2 ms — a measurement taken during CONTINUOUS PLAYBACK, which is the
+        # one case where it never misbehaves. Checking against duration instead catches the real
+        # lie and can never reject a scrub, since a scrub is always inside the track.
+        if position_ms > duration_ms + POSITION_OVERRUN_SLACK_MS:
+            expected = self._expected_position_ms()
+            logger.info(
+                "[bluetooth-%s] position %d ms exceeds track length %d ms; %s",
+                self.instance_id, position_ms, duration_ms,
+                "keeping our anchor" if expected is not None else "ignoring",
+            )
+            if expected is None or expected > duration_ms:
+                return
+            position_ms = int(expected)
         # Log only on a speed TRANSITION: the ticker calls this every second, but what matters for
         # diagnosing timeline drift is whether clients were told to stop extrapolating. A paused
         # timeline that keeps advancing in the GUI means speed 0 never reached them.
