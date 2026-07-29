@@ -415,6 +415,9 @@ class BluetoothAvrcp:
         playing = status.lower() in PLAYING_STATES
         if playing == self._playing:
             return
+        # Compute where we are with the OLD state still in effect: on a pause that means
+        # anchor + elapsed (we were playing until this instant), which is the position to freeze at.
+        position_now = self._expected_position_ms()
         self._playing = playing
         logger.info("[bluetooth-%s] %s", self.instance_id, "playing" if playing else "paused")
         # Re-anchor from the phone's ACTUAL position rather than flipping speed on the spot. A bare
@@ -423,56 +426,59 @@ class BluetoothAvrcp:
         # place and, because the role clamps at track_duration, parks at 100%. This is the identical
         # trap spotify_golibrespot._apply_speed documents — BlueZ just makes it easier to hit,
         # because it reports Position sporadically. Async because it needs a D-Bus round trip.
-        asyncio.ensure_future(self._reanchor_now(fallback_freeze=not playing))
+        asyncio.ensure_future(
+            self._reanchor_now(fallback_freeze=not playing, known_position=position_now)
+        )
 
-    async def _reanchor_now(self, *, fallback_freeze: bool, new_track: bool = False) -> None:
-        """Publish progress using a freshly-read Position, so play/pause lands on the real spot.
+    async def _reanchor_now(
+        self, *, fallback_freeze: bool, new_track: bool = False, known_position: float | None = None
+    ) -> None:
+        """Re-publish progress at a play/pause or track boundary.
 
-        Guarded, because phones lie about Position WHILE PAUSED: the rig device reports 0 when
-        paused and the true offset when playing, so a naive read anchors a part-way track at 0:00
-        (seen as "wrong position on connect, correct after a play/pause"). A genuine track change
-        legitimately IS ~0, so `new_track` is trusted outright. Everything except that one lie is
-        believed — a broader rule would also throw away a real scrub.
+        Prefers OUR OWN anchor. BlueZ's Position drifts (see the module docstring), and consulting
+        it here is what briefly published 80632 ms when the truth was 18983 ms — corrected 8 ms
+        later by the signal, but wrong on the wire in between. The device is only asked when we
+        have nothing of our own: a fresh connection, or a genuine track change where our anchor
+        belongs to the previous track.
         """
         role = self._metadata_role()
         if role is None or role.metadata is None:
             return
-        position = None
-        props = await self._player_props()
-        if props is not None:
-            with contextlib.suppress(Exception):
-                position = int((await props.call_get(PLAYER_IFACE, "Position")).value)
 
-        # Narrowly targeted at the ONE lie measured on hardware: a paused device reporting exactly
-        # 0. Anything else is taken at face value — a broad "must agree with our anchor" rule would
-        # also discard the truth after a scrub, which is the mistake the ticker used to make.
-        if position == 0 and not new_track and not self._playing:
+        position: int | None = None
+        if known_position is not None and not new_track:
+            position = int(known_position)
+        else:
+            position = await self._read_device_position()
             expected = self._expected_position_ms()
-            if expected is not None and expected > POSITION_ZERO_LIE_MS:
+            if position is not None and self._duration_ms and position > self._duration_ms:
+                position = None  # drifted past the end; nothing trustworthy to publish
+            elif position == 0 and not self._playing and expected is not None and expected > POSITION_ZERO_LIE_MS:
+                # The paused-device lie, kept from the earlier fix: a part-way track cannot be at 0.
                 logger.info(
                     "[bluetooth-%s] paused device reports position 0; keeping our anchor (~%d ms)",
                     self.instance_id, int(expected),
                 )
                 position = int(expected)
-            elif expected is None:
-                # Nothing to check against yet AND the classic paused-device lie. Publishing 0 here
-                # is what showed 0:00 for a track already part-way through on first connect;
-                # publishing nothing leaves the timeline blank until the first trustworthy reading,
-                # which is honest rather than wrong.
-                logger.info(
-                    "[bluetooth-%s] paused device reports position 0 with no anchor yet; "
-                    "holding off until a trustworthy reading", self.instance_id,
-                )
-                position = None
 
         if position is not None and self._duration_ms:
             self._anchor_progress(position, self._duration_ms)
             return
-        # No position available. Freezing is only correct for pause; a resume with no known
-        # position is better left alone than re-stamped onto a stale anchor.
+        # Nothing trustworthy. Freezing is only right for a pause; a resume with no known position
+        # is better left alone than re-stamped onto a stale anchor.
         if fallback_freeze:
             with contextlib.suppress(Exception):
                 role.freeze_progress()
+
+    async def _read_device_position(self) -> int | None:
+        """One guarded read of BlueZ's Position. Only for when we have no anchor of our own."""
+        props = await self._player_props()
+        if props is None:
+            return None
+        try:
+            return int((await props.call_get(PLAYER_IFACE, "Position")).value)
+        except Exception:  # noqa: BLE001 - player vanished
+            return None
 
     def _expected_position_ms(self) -> float | None:
         """Where playback should be right now, per our last anchor. None until we have one."""

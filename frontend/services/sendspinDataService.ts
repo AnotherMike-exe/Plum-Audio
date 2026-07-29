@@ -159,6 +159,9 @@ export function mapViewToModel(
           is_stale: !np,
         },
         volume: np?.volume,
+        supportedCommands: np?.supportedCommands ?? [],
+        repeat: np?.repeat,
+        shuffle: np?.shuffle,
       });
     }
   }
@@ -284,6 +287,8 @@ export class SendspinDataService {
     progress: number | null;   // spec position valid at receipt (ms), computed on the server clock
     duration: number | null;   // track duration (ms; 0/unknown for live)
     speed: number | null;      // playback_speed x1000 (spec extrapolation rate; 0/absent = unknown)
+    repeat: 'off' | 'one' | 'all' | null; // group repeat mode (foreign source, e.g. MA)
+    shuffle: boolean | null;   // group shuffle state
     at: number;                // Date.now() at receipt — anchor for onward extrapolation
   } | null = null;
   private consumeCtrlOptimisticUntil = 0;  // ignore relayed `playing` briefly after a local toggle
@@ -341,6 +346,8 @@ export class SendspinDataService {
           progress: typeof m.progress === 'number' ? m.progress : null,
           duration: typeof m.duration === 'number' ? m.duration : null,
           speed: typeof m.speed === 'number' ? m.speed : null,
+          repeat: m.repeat === 'off' || m.repeat === 'one' || m.repeat === 'all' ? m.repeat : null,
+          shuffle: typeof m.shuffle === 'boolean' ? m.shuffle : null,
           at: Date.now(),
         };
         this.emit();
@@ -426,6 +433,9 @@ export class SendspinDataService {
         isPlaying: playing,
         progress: posMs / 1000,
         volume: this.consumeCtrl?.volume ?? undefined,
+        supportedCommands: cc?.commands ?? [],
+        repeat: cc?.repeat ?? undefined,
+        shuffle: cc?.shuffle ?? undefined,
       });
       fc.currentStreamId = sid; // makes it the featured stream for the local page
     }
@@ -480,29 +490,28 @@ export class SendspinDataService {
     canSeek: boolean;
     canGoNext: boolean;
     canGoPrevious: boolean;
+    canRepeat: boolean;
+    canShuffle: boolean;
   } {
-    if (federatedStreamId.startsWith(FOREIGN_PREFIX)) {
-      const cmds = this.consumeCtrl?.commands ?? [];
-      return {
-        canPlay: cmds.includes('play'),
-        canPause: cmds.includes('pause'),
-        canSeek: false,
-        canGoNext: cmds.includes('next'),
-        canGoPrevious: cmds.includes('previous'),
-      };
-    }
-    const { unitId, sourceId } = parseStreamId(federatedStreamId);
-    const src = this.lastView.units
-      .find((u) => u.unit_id === unitId)
-      ?.sources.find((s) => s.source_id === sourceId);
-    const cmds = (src && this.npByGroup.get(src.group_id)?.supportedCommands) || [];
-    return {
+    const caps = (cmds: string[]) => ({
       canPlay: cmds.includes('play'),
       canPause: cmds.includes('pause'),
       canSeek: false, // no seek in the Sendspin controller protocol
       canGoNext: cmds.includes('next'),
       canGoPrevious: cmds.includes('previous'),
-    };
+      // A source advertises the repeat set as three commands (off/one/all) and shuffle as
+      // shuffle+unshuffle; presence of any one is enough to show the control.
+      canRepeat: cmds.some((c) => c.startsWith('repeat')),
+      canShuffle: cmds.includes('shuffle') || cmds.includes('unshuffle'),
+    });
+    if (federatedStreamId.startsWith(FOREIGN_PREFIX)) {
+      return caps(this.consumeCtrl?.commands ?? []);
+    }
+    const { unitId, sourceId } = parseStreamId(federatedStreamId);
+    const src = this.lastView.units
+      .find((u) => u.unit_id === unitId)
+      ?.sources.find((s) => s.source_id === sourceId);
+    return caps((src && this.npByGroup.get(src.group_id)?.supportedCommands) || []);
   }
 
   /**

@@ -98,6 +98,8 @@ export interface NowPlaying {
   // Controller state:
   volume?: number; // source (group) volume 0-100
   muted?: boolean;
+  repeat?: 'off' | 'one' | 'all'; // group repeat mode (undefined = source doesn't report it)
+  shuffle?: boolean; // group shuffle state
   supportedCommands: ControllerCommand[];
 }
 
@@ -290,6 +292,8 @@ export class SendspinControllerClient {
             client_id: this.clientId,
             name: 'Plum Web GUI',
             version: 1,
+            // Optional identity a server/controller can display for this client.
+            device_info: { product_name: 'Plum Web GUI', manufacturer: 'Plum Solutions' },
             supported_roles: [
               'controller@v1',
               'metadata@v1',
@@ -430,6 +434,8 @@ export class SendspinControllerClient {
       if ('supported_commands' in ctrl) this.np.supportedCommands = ctrl.supported_commands ?? [];
       if ('volume' in ctrl) this.np.volume = ctrl.volume;
       if ('muted' in ctrl) this.np.muted = ctrl.muted;
+      if ('repeat' in ctrl) this.np.repeat = ctrl.repeat ?? undefined;
+      if ('shuffle' in ctrl) this.np.shuffle = ctrl.shuffle ?? undefined;
       changed = true;
     }
     if (changed) this.emit();
