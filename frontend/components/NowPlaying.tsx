@@ -1,6 +1,7 @@
 import React, {useEffect, useRef, useState} from 'react';
 import type {Stream} from '../types';
 import {formatTime} from '../utils/time';
+import {ALBUM_ART_PLACEHOLDER} from '../services/albumArtPlaceholder';
 
 interface NowPlayingProps {
     stream: Stream;
@@ -41,6 +42,16 @@ export const NowPlaying: React.FC<NowPlayingProps> = ({stream, canSeek = false, 
         : 0;
     const progressBarRef = useRef<HTMLDivElement>(null);
 
+    // Never hand <img> a src that can fail. An empty albumArtUrl (source published no artwork yet)
+    // or a URL that 404s both draw the browser's broken-image glyph WITH the alt text next to it,
+    // which is what a Bluetooth reconnect and every hard refresh looked like — metadata arrives
+    // seconds before artwork. Reset on each new URL so a later track gets a fresh attempt.
+    const [artFailed, setArtFailed] = useState(false);
+    useEffect(() => setArtFailed(false), [currentTrack.albumArtUrl]);
+    const artSrc = !artFailed && currentTrack.albumArtUrl
+        ? currentTrack.albumArtUrl
+        : ALBUM_ART_PLACEHOLDER;
+
     const handleProgressBarClick = (e: React.MouseEvent<HTMLDivElement>) => {
         if (!canSeek || !onSeek || !progressBarRef.current || currentTrack.duration === 0) {
             return;
@@ -58,8 +69,9 @@ export const NowPlaying: React.FC<NowPlayingProps> = ({stream, canSeek = false, 
         <div className="flex flex-col md:flex-row items-center gap-6 p-4">
             <div className="flex-shrink-0">
                 <img
-                    src={currentTrack.albumArtUrl}
+                    src={artSrc}
                     alt={`Album art for ${currentTrack.album}`}
+                    onError={() => setArtFailed(true)}
                     className={`w-48 h-48 md:w-56 md:h-56 rounded-lg shadow-lg object-cover transition-transform duration-300 hover:scale-105 ${
                         onAlbumArtClick ? 'cursor-pointer' : ''
                     }`}

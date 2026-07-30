@@ -13,6 +13,7 @@
 
 import { Client, Server, Stream, Track } from '../types';
 import { NowPlaying, SendspinControllerClient, currentPositionMs, ControllerCommand, VizFrame } from './sendspinControllerClient';
+import {ALBUM_ART_PLACEHOLDER} from './albumArtPlaceholder';
 
 const MESH_API_PORT = 5001;
 const MESH_API_BASE = import.meta.env.VITE_MESH_API_URL || '/api/mesh';
@@ -133,7 +134,7 @@ export function mapViewToModel(
         title: np?.title ?? '',
         artist: np?.artist ?? '',
         album: np?.album ?? '',
-        albumArtUrl: np?.artworkUrl ?? '',
+        albumArtUrl: np?.artworkUrl || ALBUM_ART_PLACEHOLDER,
         duration: np?.trackDurationMs ? np.trackDurationMs / 1000 : 0,
       };
       // A source pauses by dropping playback_speed to 0 on the metadata role (the group's
@@ -427,7 +428,7 @@ export class SendspinDataService {
           title: fc.foreignServer.title ?? '',
           artist: fc.foreignServer.artist ?? '',
           album: '',
-          albumArtUrl: this.consumeArt ?? '',
+          albumArtUrl: this.consumeArt || ALBUM_ART_PLACEHOLDER,
           duration: durMs / 1000,
         },
         isPlaying: playing,
