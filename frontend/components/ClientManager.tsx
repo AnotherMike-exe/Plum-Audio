@@ -12,6 +12,7 @@ interface ClientManagerProps {
     onGroupVolumeAdjust: (streamId: string, direction: 'up' | 'down') => void;
     onGroupMute: (streamId: string) => void;
     onStartBrowserAudio?: () => void;
+    onStopBrowserAudio?: () => void;
     browserAudioActive?: boolean;
     federationEnabled?: boolean;
 }
@@ -166,9 +167,30 @@ export const ClientManager: React.FC<ClientManagerProps> = ({
                                                                 onGroupVolumeAdjust,
                                                                 onGroupMute,
                                                                 onStartBrowserAudio,
+                                                                onStopBrowserAudio,
                                                                 browserAudioActive,
                                                                 federationEnabled = false,
                                                             }) => {
+    // "Listen in Browser" toggles to "Stop Listening" while this tab is a player. Rendered in both
+    // the empty-state and the populated-list footer.
+    const browserAudioButton =
+        browserAudioActive && onStopBrowserAudio ? (
+            <button
+                onClick={onStopBrowserAudio}
+                className="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] font-bold py-3 px-4 rounded-lg hover:bg-[var(--bg-tertiary-hover)] transition-colors flex items-center justify-center gap-2"
+            >
+                <Icon name="headphones" style={{ color: 'inherit' }} />
+                Stop Listening
+            </button>
+        ) : onStartBrowserAudio && !browserAudioActive ? (
+            <button
+                onClick={onStartBrowserAudio}
+                className="w-full bg-[var(--accent-color)] accent-button-text font-bold py-3 px-4 rounded-lg hover:bg-[var(--accent-color-hover)] transition-colors flex items-center justify-center gap-2"
+            >
+                <Icon name="headphones" style={{ color: 'inherit' }} />
+                Listen in Browser
+            </button>
+        ) : null;
     const groupedClients = clients.reduce((acc, client) => {
         // Treat none streams as idle (no stream selected)
         const streamId = (client.currentStreamId?.includes('none-')) ? 'idle' : (client.currentStreamId ?? 'idle');
@@ -190,15 +212,7 @@ export const ClientManager: React.FC<ClientManagerProps> = ({
                     <Icon name="desktop" className="text-4xl text-[var(--icon-muted)] mb-3" />
                     <p className="text-[var(--text-secondary)]">No other active devices.</p>
                 </div>
-                {onStartBrowserAudio && !browserAudioActive && (
-                    <button
-                        onClick={onStartBrowserAudio}
-                        className="w-full bg-[var(--accent-color)] accent-button-text font-bold py-3 px-4 rounded-lg hover:bg-[var(--accent-color-hover)] transition-colors flex items-center justify-center gap-2"
-                    >
-                        <Icon name="headphones" style={{ color: 'inherit' }} />
-                        Listen in Browser
-                    </button>
-                )}
+                {browserAudioButton}
             </div>
         );
     }
@@ -275,15 +289,7 @@ export const ClientManager: React.FC<ClientManagerProps> = ({
                 </div>
             )}
 
-            {onStartBrowserAudio && !browserAudioActive && (
-                <button
-                    onClick={onStartBrowserAudio}
-                    className="w-full bg-[var(--accent-color)] accent-button-text font-bold py-3 px-4 rounded-lg hover:bg-[var(--accent-color-hover)] transition-colors flex items-center justify-center gap-2"
-                >
-                    <Icon name="headphones" style={{ color: 'inherit' }} />
-                    Listen in Browser
-                </button>
-            )}
+            {browserAudioButton}
         </div>
     );
 };

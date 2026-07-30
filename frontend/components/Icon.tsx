@@ -44,6 +44,8 @@ import stopIcon from '../src/assets/icons/stop.svg?raw';
 import circleCheckIcon from '../src/assets/icons/circle-check.svg?raw';
 import circleExclamationIcon from '../src/assets/icons/circle-exclamation.svg?raw';
 import microphoneIcon from '../src/assets/icons/microphone.svg?raw';
+import shuffleIcon from '../src/assets/icons/shuffle.svg?raw';
+import repeatIcon from '../src/assets/icons/repeat.svg?raw';
 
 export type IconName =
   | 'play'
@@ -88,7 +90,9 @@ export type IconName =
   | 'stop'
   | 'circle-check'
   | 'circle-exclamation'
-  | 'microphone';
+  | 'microphone'
+  | 'shuffle'
+  | 'repeat';
 
 const iconMap: Record<IconName, string> = {
   'play': playIcon,
@@ -134,6 +138,8 @@ const iconMap: Record<IconName, string> = {
   'circle-check': circleCheckIcon,
   'circle-exclamation': circleExclamationIcon,
   'microphone': microphoneIcon,
+  'shuffle': shuffleIcon,
+  'repeat': repeatIcon,
 };
 
 interface IconProps {

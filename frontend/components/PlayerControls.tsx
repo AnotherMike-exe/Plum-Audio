@@ -10,7 +10,43 @@ interface PlayerControlsProps {
     onSourceVolumeChange?: (volume: number) => void;
     onPlayPause: () => void;
     onSkip: (direction: 'next' | 'prev') => void;
+    // Repeat/shuffle are shown ONLY when the source advertises them (canShuffle/canRepeat, derived
+    // from the Sendspin controller supported_commands) — so Spotify shows them and AirPlay doesn't.
+    canShuffle?: boolean;
+    canRepeat?: boolean;
+    shuffle?: boolean;
+    repeat?: 'off' | 'one' | 'all';
+    onToggleShuffle?: () => void;
+    onCycleRepeat?: () => void;
 }
+
+// Icon-only toggle (shuffle/repeat): no filled pill like the transport buttons, just an icon that
+// lights to the accent color when active. `badge` overlays a small glyph (repeat-one's "1").
+const ToggleButton: React.FC<{
+    onClick?: () => void; icon: IconName; active: boolean; label: string; badge?: string;
+}> = ({ onClick, icon, active, label, badge }) => (
+    <button
+        onClick={onClick}
+        aria-label={label}
+        aria-pressed={active}
+        className="relative flex items-center justify-center w-9 h-9 text-base transition-colors duration-200"
+        style={{ color: active ? 'var(--accent-color)' : 'var(--text-secondary)' }}
+    >
+        {/* Wrap the icon in a box sized to the glyph so the badge anchors to the ICON's corner,
+            not the (larger) button. The "1" sits just above the icon's top-right, clear of the loop. */}
+        <span className="relative inline-flex items-center justify-center">
+            <Icon name={icon} style={{ color: 'inherit' }} />
+            {badge && (
+                <span
+                    className="absolute font-bold pointer-events-none leading-none"
+                    style={{ fontSize: '7px', top: '-3px', right: '-4px', color: 'inherit' }}
+                >
+                    {badge}
+                </span>
+            )}
+        </span>
+    </button>
+);
 
 const ControlButton: React.FC<{ onClick?: () => void; icon: IconName; size?: 'sm' | 'md' | 'lg' }> = ({
                                                                                                         onClick,
@@ -40,7 +76,13 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
                                                                   sourceVolume,
                                                                   onSourceVolumeChange,
                                                                   onPlayPause,
-                                                                  onSkip
+                                                                  onSkip,
+                                                                  canShuffle,
+                                                                  canRepeat,
+                                                                  shuffle,
+                                                                  repeat,
+                                                                  onToggleShuffle,
+                                                                  onCycleRepeat
                                                               }) => {
     const volumePercentage = volume;
     const sliderStyle = {
@@ -61,10 +103,27 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
 
             {/* Media Controls - order-2 on mobile, order-1 on desktop */}
             {/* On desktop: flex-shrink-0 w-56 to match album artwork width (14rem = 224px) */}
-            <div className="flex items-center gap-4 order-2 md:order-1 md:flex-shrink-0 md:w-56 justify-center">
+            <div className="flex items-center gap-3 order-2 md:order-1 md:flex-shrink-0 md:w-56 justify-center">
+                {canShuffle && (
+                    <ToggleButton
+                        icon="shuffle"
+                        active={!!shuffle}
+                        onClick={onToggleShuffle}
+                        label={shuffle ? 'Shuffle on' : 'Shuffle off'}
+                    />
+                )}
                 <ControlButton icon="backward-step" onClick={() => onSkip('prev')}/>
                 <ControlButton icon={stream.isPlaying ? 'pause' : 'play'} onClick={onPlayPause} size="lg"/>
                 <ControlButton icon="forward-step" onClick={() => onSkip('next')}/>
+                {canRepeat && (
+                    <ToggleButton
+                        icon="repeat"
+                        active={repeat != null && repeat !== 'off'}
+                        onClick={onCycleRepeat}
+                        label={`Repeat ${repeat ?? 'off'}`}
+                        badge={repeat === 'one' ? '1' : undefined}
+                    />
+                )}
             </div>
 
             {/* Volume Controls - order-1 on mobile, order-2 on desktop */}

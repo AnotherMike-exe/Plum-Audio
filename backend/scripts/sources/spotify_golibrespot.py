@@ -34,6 +34,8 @@ import logging
 import aiohttp
 from PIL import Image
 
+from aiosendspin.models.types import RepeatMode
+
 logger = logging.getLogger("plum.spotify_golibrespot")
 
 ART_TIMEOUT = aiohttp.ClientTimeout(total=8)
@@ -42,6 +44,12 @@ CONTROL_TIMEOUT = aiohttp.ClientTimeout(total=5)
 
 class SpotifyGoLibrespot:
     """Drives one go-librespot instance: events → roles, transport ← controller. Also the source remote."""
+
+    # go-librespot natively exposes repeat/shuffle over its API, so this source advertises the full
+    # controller command set. The server reads this to decide which MediaCommands to advertise on the
+    # group's controller role; a source without it (e.g. AirPlay) stays play/pause/next/previous only,
+    # and the GUI hides the repeat/shuffle controls for it. See sendspin_server._supported_commands_for.
+    supports_repeat_shuffle = True
 
     def __init__(self, group, instance_id: str, api_base: str) -> None:
         self.group = group
@@ -53,6 +61,11 @@ class SpotifyGoLibrespot:
         self._warned_no_role = False
         self._playing = False
         self._last_art_url: str | None = None
+        # go-librespot models repeat as two independent booleans; Sendspin as one RepeatMode
+        # (off/one/all). We track both booleans and derive the mode (see _repeat_mode).
+        self._repeat_context = False
+        self._repeat_track = False
+        self._shuffle_state = False
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -88,6 +101,32 @@ class SpotifyGoLibrespot:
     def _artwork_role(self):
         return self.group.group_role("artwork")
 
+    def _controller_role(self):
+        return self.group.group_role("controller")
+
+    # -- repeat / shuffle ----------------------------------------------------
+
+    def _repeat_mode(self) -> RepeatMode:
+        """Map go-librespot's two booleans onto the Sendspin RepeatMode. repeat_track wins (a track
+        on repeat is 'one' regardless of the context flag)."""
+        if self._repeat_track:
+            return RepeatMode.ONE
+        if self._repeat_context:
+            return RepeatMode.ALL
+        return RepeatMode.OFF
+
+    def push_modes(self) -> None:
+        """Publish the current repeat/shuffle state onto the group's controller role, so every GUI on
+        the group reflects it. Called on each go-librespot repeat/shuffle event, and by the server when
+        a controller (re)joins — the controller role only exists once a controller client is present,
+        so before then this is a harmless no-op and the state is (re)published on join."""
+        controller = self._controller_role()
+        if controller is None:
+            return
+        with contextlib.suppress(Exception):
+            controller.set_repeat(self._repeat_mode())
+            controller.set_shuffle(self._shuffle_state)
+
     # -- event pump ----------------------------------------------------------
 
     async def run(self) -> None:
@@ -121,6 +160,10 @@ class SpotifyGoLibrespot:
                     return
                 status = await resp.json()
             self._playing = not status.get("paused", True) and not status.get("stopped", True)
+            self._repeat_context = bool(status.get("repeat_context"))
+            self._repeat_track = bool(status.get("repeat_track"))
+            self._shuffle_state = bool(status.get("shuffle_context"))
+            self.push_modes()
             track = status.get("track") or {}
             if track:
                 await self._apply_track(track)
@@ -137,6 +180,15 @@ class SpotifyGoLibrespot:
                 await self._apply_speed(False, data)
             elif etype == "seek":
                 self._anchor_progress(data.get("position"), data.get("duration"))
+            elif etype == "repeat_context":
+                self._repeat_context = bool(data.get("value"))
+                self.push_modes()
+            elif etype == "repeat_track":
+                self._repeat_track = bool(data.get("value"))
+                self.push_modes()
+            elif etype == "shuffle_context":
+                self._shuffle_state = bool(data.get("value"))
+                self.push_modes()
             elif etype == "volume":
                 value, vmax = data.get("value"), data.get("max") or 0
                 if vmax:
@@ -154,6 +206,11 @@ class SpotifyGoLibrespot:
             kwargs["artist"] = ", ".join(artists) if isinstance(artists, (list, tuple)) else str(artists)
         if track.get("album_name"):
             kwargs["album"] = str(track["album_name"])
+        # Optional richer metadata the Sendspin metadata role carries (a foreign controller may show
+        # it). go-librespot exposes a track number on most tracks; the role validates track > 0.
+        track_number = track.get("track_number")
+        if isinstance(track_number, int) and track_number > 0:
+            kwargs["track"] = track_number
         if kwargs:
             role.update(**kwargs)
             logger.info("[%s] metadata: %s", self.instance_id, " · ".join(f"{k}={v}" for k, v in kwargs.items()))
@@ -265,3 +322,20 @@ class SpotifyGoLibrespot:
 
     async def previous_track(self) -> None:
         await self._post("/player/prev")
+
+    async def set_repeat(self, mode: RepeatMode) -> None:
+        """Drive go-librespot's two repeat flags from a Sendspin RepeatMode. Set the winning flag on
+        and the other off so the daemon lands in exactly one of off/one/all (the event stream then
+        echoes the confirmed state back through push_modes)."""
+        if mode is RepeatMode.ONE:
+            await self._post("/player/repeat_track", {"repeat_track": True})
+            await self._post("/player/repeat_context", {"repeat_context": False})
+        elif mode is RepeatMode.ALL:
+            await self._post("/player/repeat_context", {"repeat_context": True})
+            await self._post("/player/repeat_track", {"repeat_track": False})
+        else:
+            await self._post("/player/repeat_context", {"repeat_context": False})
+            await self._post("/player/repeat_track", {"repeat_track": False})
+
+    async def set_shuffle(self, shuffle: bool) -> None:
+        await self._post("/player/shuffle_context", {"shuffle_context": bool(shuffle)})

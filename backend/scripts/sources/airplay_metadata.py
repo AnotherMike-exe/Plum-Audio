@@ -248,6 +248,10 @@ class AirplayMetadataReader:
             self._pending["artist"] = value
         elif code == "asal":
             self._pending["album"] = value
+        elif code == "asaa":
+            # daap.songalbumartist — a UTF-8 string like the others, so it decodes the same way (the
+            # numeric DMAP fields year/track are binary and are deliberately not parsed here).
+            self._pending["album_artist"] = value
 
     async def _handle_ssnc(self, code: str, raw_b64: str) -> None:
         if code == "mdst":

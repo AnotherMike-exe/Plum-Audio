@@ -43,6 +43,7 @@ import numpy as np
 
 from aiosendspin.client.client import SendspinClient
 from aiosendspin.client.listener import ClientListener
+from aiosendspin.models.core import DeviceInfo
 from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
 from aiosendspin.models.artwork import ArtworkChannel, ClientHelloArtworkSupport
 from aiosendspin.models.types import ArtworkSource, PictureFormat
@@ -59,6 +60,9 @@ from mesh.avahi import CLIENT_SERVICE, AvahiClient
 logger = logging.getLogger("plum.sendspin_player")
 
 DEFAULT_PORT = 8928
+# Advertised to servers/controllers in client/hello device_info, so a foreign controller (Music
+# Assistant) shows a real identity for this speaker rather than a bare id.
+PLUM_SOFTWARE_VERSION = os.environ.get("PLUM_VERSION", "phase3-dev")
 DEFAULT_RATE = 44100  # AirPlay-native; the server resamples other sources to this
 DEFAULT_CHANNELS = 2
 DEFAULT_BITS = 16
@@ -253,6 +257,11 @@ class SendspinPlayer:
         self.client = SendspinClient(
             client_id=player_id,
             client_name=player_name,
+            device_info=DeviceInfo(
+                product_name="Plum Audio",
+                manufacturer="Plum Solutions",
+                software_version=PLUM_SOFTWARE_VERSION,
+            ),
             # PLAYER renders; METADATA/CONTROLLER/VISUALIZER make this speaker a full CONSUMER of
             # whatever group it plays in — so a foreign server (Music Assistant) serving to us can be
             # observed (title/art), controlled (transport/volume) and visualized, as a group member.
@@ -330,6 +339,9 @@ class SendspinPlayer:
         self._state["commands"] = [getattr(c, "value", c) for c in (cmds or [])]
         self._state["volume"] = getattr(ctrl, "volume", None)
         self._state["muted"] = getattr(ctrl, "muted", None)
+        repeat = getattr(ctrl, "repeat", None)
+        self._state["repeat"] = getattr(repeat, "value", repeat)  # RepeatMode -> "off"/"one"/"all"
+        self._state["shuffle"] = getattr(ctrl, "shuffle", None)
         self._emit_ctrl()
 
     def _emit_ctrl(self) -> None:
@@ -346,6 +358,8 @@ class SendspinPlayer:
             "commands": st.get("commands", []),
             "volume": st.get("volume"),
             "muted": st.get("muted"),
+            "repeat": st.get("repeat"),      # "off" | "one" | "all" (foreign source, e.g. MA)
+            "shuffle": st.get("shuffle"),
             # `playing` is the authoritative play/pause boolean (audio actually flowing); `state`/
             # `speed` are relayed for reference but are unreliable from Music Assistant.
             "playing": self._audio_flowing,

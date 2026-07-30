@@ -53,9 +53,11 @@ newest dialer — and persists nothing. Plum-to-Plum this is indistinguishable f
 we only ever dial `playback`. Against a foreign server running a discovery sweep it is wrong: we
 would hand over a playing speaker.
 
-Not locally fixable. `SendspinClient.server_info` exposes `connection_reason` only *after*
-`attach_websocket`, which refuses a second socket — so "accept both, then decide" cannot be
-expressed. **Upstream item for `aiosendspin`.**
+Not *cleanly* locally fixable. `SendspinClient.server_info` exposes `connection_reason` only *after*
+`attach_websocket`, which refuses a second socket — so "accept both, then decide" cannot be expressed
+on the one client. A throwaway second client could peek at `server/hello` and arbitrate before
+committing, but it's racy and ugly; not worth shipping over a clean library fix. **Tracked as
+upstream ask #1 in [docs/UPSTREAM-AIOSENDSPIN.md](UPSTREAM-AIOSENDSPIN.md).**
 
 Observed live: our unit's boot-time dial took a speaker back off Music Assistant about a minute
 after MA claimed it. This is the gap, not a theory.
@@ -75,17 +77,26 @@ Before this we held a stream from boot and announced `playing` forever, on every
 | Role | Server side | Player | GUI controller |
 |---|---|---|---|
 | player@v1 | ✅ | ✅ PCM, static delay, volume/mute | n/a |
-| metadata@v1 | ✅ emits title/artist/album + progress trio | ✅ consumes (for the self-report) | ✅ consumes; clock-synced |
+| metadata@v1 | ✅ emits title/artist/album (+ **album_artist**; Spotify **track**) + progress trio | ✅ consumes (for the self-report) | ✅ consumes; clock-synced |
 | artwork@v1 | ✅ 512×512 JPEG, channel 0 | n/a | ✅ declares 1 channel, decodes types 8–11 |
-| controller@v1 | ✅ advertises play/pause/next/previous per source | n/a | ✅ sends all commands incl. `switch` (generic client/command) |
-| visualizer@v1 | ❌ not implemented (planned) | ❌ | ❌ |
+| controller@v1 | ✅ advertises play/pause/next/previous per source; **repeat/shuffle for sources that support it (Spotify)** | n/a | ✅ sends all commands incl. `switch`; renders repeat/shuffle when advertised |
+| visualizer@v1 | ✅ computed by the aiosendspin viz role when a viz client is present (library DSP, not ours) | ✅ consumes — incl. from a foreign server it is a group member of (MA) | ✅ decodes spectrum(19)/loudness(16), renders |
 | color@v1 | ❌ not implemented | ❌ | ❌ |
+
+**Repeat/shuffle (added 2026-07-25).** Fully wired for **Spotify** (go-librespot exposes it natively):
+the source advertises the repeat/shuffle commands on the controller role, honours them
+(`/player/repeat_context|repeat_track|shuffle_context`), and publishes state back (`set_repeat`/
+`set_shuffle`) so every GUI reflects it; the same state relays over the foreign consume path (MA).
+**AirPlay deliberately does not advertise them** — shairport-sync's DACP relay of repeat/shuffle is
+unverified, and advertising a command we can't honour is worse than omitting it, so the GUI simply
+hides those controls for AirPlay (capability-gated on `supported_commands`). This is the intended
+per-source shape, not a gap.
 
 ## GUI controller client — the open gaps
 
 | Requirement | Status | Consequence |
 |---|---|---|
-| `client/time` sent continuously; clock via a filter | ✅ `TimeFilter`, best-of-window min-delay; NTP formula verbatim from the library; adaptive 0.2→3 s cadence | done 2026-07-23 |
+| `client/time` sent continuously; clock via a filter | ✅ `TimeFilter`, best-of-window min-delay; NTP formula verbatim from the library; adaptive 0.2→3 s cadence | done 2026-07-23 — see note below |
 | `client/state` with `state` (REQUIRED) | ✅ sends `{state:'synchronized'}` once the clock settles | done 2026-07-23 |
 | Controller `switch` command | ✅ generic `client/command` sends it (all commands MA advertises are sendable) | done |
 | Group volume "preserving relative levels" | ⚠️ naive per-stream volume | REMAINING — quality, not conformance: group volume flattens relative levels |
@@ -94,6 +105,17 @@ Before this we held a stream from boot and announced `playing` forever, on every
 The two REQUIRED items (client/time, client/state) are done and hardware-verified, so the GUI is
 now spec-safe to point at a third-party server for reading state and issuing whatever commands that
 server advertises. The two remaining items are quality-of-life and do not affect conformance.
+
+**Note — the GUI clock filter is display-grade.** `TimeFilter` is a minimum-delay NTP filter (the
+offset/delay formulas match the library verbatim), **not** the library's Kalman filter with a drift
+term. That is correct for a *controller*: it only advances a progress bar and re-anchors from
+metadata ~1×/s, so residual drift is invisible. It would **not** be adequate for a *player* — but
+players use `aiosendspin`'s real filter, never this one. Do not reuse `TimeFilter` for audio timing.
+
+**Polish shipped 2026-07-25.** `client/hello` now carries `device_info` (player and GUI), so a
+foreign controller shows a real identity; the AirPlay reader emits `album_artist` (DMAP `asaa`, a
+text field — the binary numeric fields year/track are still skipped) and Spotify emits the `track`
+number.
 
 ## What we learned about Music Assistant (2.9.9)
 

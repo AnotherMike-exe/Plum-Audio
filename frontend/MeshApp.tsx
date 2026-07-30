@@ -31,8 +31,10 @@ import { Settings } from './components/Settings';
 import { Visualizer } from './components/Visualizer';
 import { Client, Settings as SettingsType, Stream } from './types';
 import { Model, SendspinDataService, FOREIGN_PREFIX } from './services/sendspinDataService';
+import type { ControllerCommand } from './services/sendspinControllerClient';
 import { settingsService } from './services/settingsService';
 import { useThemeSettings } from './hooks/useThemeSettings';
+import { useBrowserPlayer } from './hooks/useBrowserPlayer';
 
 const service = new SendspinDataService();
 const EMPTY: Model = { servers: [], streams: [], clients: [], localPlayerIds: [] };
@@ -50,8 +52,14 @@ const MemoPlayerControls = React.memo(
     a.stream.volume === b.stream.volume &&
     a.volume === b.volume &&
     a.sourceVolume === b.sourceVolume &&
+    a.canShuffle === b.canShuffle &&
+    a.canRepeat === b.canRepeat &&
+    a.shuffle === b.shuffle &&
+    a.repeat === b.repeat &&
     a.onPlayPause === b.onPlayPause &&
     a.onSkip === b.onSkip &&
+    a.onToggleShuffle === b.onToggleShuffle &&
+    a.onCycleRepeat === b.onCycleRepeat &&
     a.onVolumeChange === b.onVolumeChange &&
     a.onSourceVolumeChange === b.onSourceVolumeChange,
 );
@@ -65,6 +73,7 @@ export default function MeshApp(): React.ReactElement {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [visualizerOpen, setVisualizerOpen] = useState(false);
   const [settings, setSettings] = useState<SettingsType>(settingsService.getMergedSettings());
+  const browser = useBrowserPlayer();
 
   useEffect(() => {
     service.start();
@@ -122,6 +131,14 @@ export default function MeshApp(): React.ReactElement {
     [model.streams, featuredId],
   );
 
+  // The local unit's single active source, if exactly one is streaming. Used as the browser player's
+  // join target when the unit's OWN player is idle (auto-switch hasn't grabbed the source), so
+  // "Listen in Browser" still joins what the unit is actually playing rather than starting idle.
+  const localActiveTarget = useMemo(() => {
+    const act = model.streams.filter((s) => s.active && s.serverId === model.localUnitId);
+    return act.length === 1 ? act[0].id : null;
+  }, [model.streams, model.localUnitId]);
+
   // Theme: also drives album-art colors from the featured track's artwork; returns the extracted
   // palette so the visualizer can share it.
   const albumArtColors = useThemeSettings(settings, featured?.currentTrack.albumArtUrl ?? null);
@@ -154,6 +171,10 @@ export default function MeshApp(): React.ReactElement {
   // Latest featured/model for stable handlers that must read current values without re-binding.
   const featuredRef = useRef(featured);
   featuredRef.current = featured;
+  const featuredIdRef = useRef(featuredId);
+  featuredIdRef.current = featuredId;
+  const localActiveTargetRef = useRef(localActiveTarget);
+  localActiveTargetRef.current = localActiveTarget;
   const modelRef = useRef(model);
   modelRef.current = model;
 
@@ -193,6 +214,18 @@ export default function MeshApp(): React.ReactElement {
   const onSkip = useCallback((dir: 'next' | 'prev') => {
     const f = featuredRef.current;
     if (f) service.controlStream(f.id, dir === 'next' ? 'next' : 'previous');
+  }, []);
+  const onToggleShuffle = useCallback(() => {
+    const f = featuredRef.current;
+    if (f) service.controlStream(f.id, f.shuffle ? 'unshuffle' : 'shuffle');
+  }, []);
+  // Cycle off -> all -> one -> off (the Spotify order: repeat context, then repeat track).
+  const onCycleRepeat = useCallback(() => {
+    const f = featuredRef.current;
+    if (!f) return;
+    const next: ControllerCommand =
+      f.repeat == null || f.repeat === 'off' ? 'repeat_all' : f.repeat === 'all' ? 'repeat_one' : 'repeat_off';
+    service.controlStream(f.id, next);
   }, []);
   const onSourceVolume = useCallback((v: number) => {
     const f = featuredRef.current;
@@ -236,6 +269,84 @@ export default function MeshApp(): React.ReactElement {
     const client = modelRef.current.clients.find((c) => c.id === clientId);
     if (client) moveClient(client, streamId);
   }, [moveClient]);
+
+  // -- Listen in Browser: this tab becomes a Sendspin player of the unit that serves it -------------
+  const {
+    active: browserActive,
+    playerId: browserPlayerId,
+    reconnectSeq: browserReconnectSeq,
+    start: browserStart,
+    stop: browserStop,
+  } = browser;
+
+  // The source this tab's player should stay on. Set at Listen; followed to wherever the user
+  // manually re-routes it; null once torn down or started idle. Refs so the reconciler reads latest
+  // without re-subscribing. `routed` = have we ever seen it land on target; `handledReconnect` = the
+  // last reconnectSeq we've reconciled (to tell a reconnect-idle apart from a user route-to-none).
+  const browserTargetRef = useRef<string | null>(null);
+  const browserRoutedRef = useRef(false);
+  const browserHandledReconnectRef = useRef(0);
+
+  const onStartBrowserAudio = useCallback(() => {
+    const m = modelRef.current;
+    const unit = m.servers.find((s) => s.id === m.localUnitId);
+    const host = unit?.host ?? window.location.hostname;
+    // Join whatever the unit is playing: the featured stream, or — if the unit's own player is idle
+    // while a source streams — that single active source. Idle unit (no active source) => start idle.
+    const target = featuredIdRef.current ?? localActiveTargetRef.current;
+    browserTargetRef.current = target && !target.startsWith(FOREIGN_PREFIX) ? target : null;
+    browserRoutedRef.current = false;
+    browserHandledReconnectRef.current = 0;
+    void browserStart(host).catch(() => {
+      browserTargetRef.current = null;
+    });
+  }, [browserStart]);
+
+  const onStopBrowserAudio = useCallback(() => {
+    browserTargetRef.current = null;
+    browserStop();
+  }, [browserStop]);
+
+  // Browser-player reconciler — runs each view tick while the tab is a player. Four jobs:
+  //   1. Initial route: the player can't join until it shows up in the 2s-polled view (route_player
+  //      looks it up there; routing sooner 400s "unknown player"), so we route once our row appears.
+  //   2. Reconnect recovery: the SDK auto-reconnects on a dropped WS, but the reconnected client
+  //      lands in a fresh idle group — re-route it back onto its target (keyed on reconnectSeq).
+  //   3. Follow a manual re-route: if the user moves it onto another source, adopt that as the target.
+  //   4. Route-to-none teardown: if it was on a source and goes idle with NO reconnect, the user
+  //      unrouted it (from this gui or any other) — stop the tab's player.
+  // Reads RAW model.clients (true group membership), not viewClients (which nulls idle-but-routed
+  // streams — a source merely going quiet must not look like an unroute).
+  useEffect(() => {
+    if (!browserActive || !browserPlayerId) return;
+    const row = model.clients.find((c) => c.id === browserPlayerId);
+    if (!row) return; // not in the view yet (or mid-reconnect) — wait
+    const cur = row.currentStreamId;
+    const target = browserTargetRef.current;
+    const reconnected = browserReconnectSeq !== browserHandledReconnectRef.current;
+
+    if (cur && !cur.startsWith(FOREIGN_PREFIX) && cur !== target) {
+      browserTargetRef.current = cur; // (3) user moved it — follow, so reconnects restore THAT
+      browserRoutedRef.current = true;
+      browserHandledReconnectRef.current = browserReconnectSeq;
+      return;
+    }
+    if (cur && cur === target) {
+      browserRoutedRef.current = true; // landed / still on target
+      browserHandledReconnectRef.current = browserReconnectSeq;
+      return;
+    }
+    // cur is null → idle
+    if (!target) return; // (started idle — unit had nothing active)
+    if (!browserRoutedRef.current || reconnected) {
+      void service.routeClient(browserPlayerId, target).catch(() => {
+        /* view lag — retry next tick */
+      }); // (1) initial or (2) reconnect recovery
+      return;
+    }
+    browserTargetRef.current = null; // (4) unrouted by the user → tear down
+    browserStop();
+  }, [model.clients, browserActive, browserPlayerId, browserReconnectSeq, browserStop]);
   const adjustStreamVolume = useCallback((streamId: string, dir: 'up' | 'down') => {
     const s = modelRef.current.streams.find((x) => x.id === streamId);
     service.setStreamVolume(streamId, clampVol((s?.volume ?? 100) + (dir === 'up' ? 5 : -5)));
@@ -254,6 +365,12 @@ export default function MeshApp(): React.ReactElement {
   const serverName = localUnit?.name || settings.deviceName || 'Plum Audio';
   const connected = model.servers.length > 0;
   const shouldShowControls = !!featured;
+
+  // Transport capabilities from the source's advertised Sendspin controller commands. Repeat/shuffle
+  // show only for sources that support them (Spotify) and stay hidden otherwise (AirPlay).
+  const featCmds = featured?.supportedCommands ?? [];
+  const canShuffle = featCmds.includes('shuffle') || featCmds.includes('unshuffle');
+  const canRepeat = featCmds.some((c) => c.startsWith('repeat'));
 
   return (
     <div className="min-h-screen bg-[var(--bg-primary)] text-[var(--text-primary)] font-sans p-4 md:p-8 flex flex-col">
@@ -297,6 +414,12 @@ export default function MeshApp(): React.ReactElement {
                   onSourceVolumeChange={onSourceVolume}
                   onPlayPause={onPlayPause}
                   onSkip={onSkip}
+                  canShuffle={canShuffle}
+                  canRepeat={canRepeat}
+                  shuffle={featured.shuffle}
+                  repeat={featured.repeat}
+                  onToggleShuffle={onToggleShuffle}
+                  onCycleRepeat={onCycleRepeat}
                 />
               </div>
               <MemoSyncedDevices
@@ -353,6 +476,9 @@ export default function MeshApp(): React.ReactElement {
               onStreamChange={onClientStreamChange}
               onGroupVolumeAdjust={adjustStreamVolume}
               onGroupMute={muteStream}
+              onStartBrowserAudio={onStartBrowserAudio}
+              onStopBrowserAudio={onStopBrowserAudio}
+              browserAudioActive={browserActive}
               federationEnabled={false}
             />
           </div>
