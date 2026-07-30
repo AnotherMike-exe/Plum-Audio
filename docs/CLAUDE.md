@@ -190,6 +190,14 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
   `group/update`), never `stop_stream()` (which keeps clients logically PLAYING). The spec has no
   distinct idle/unrouted state — `stopped` is it. Groups/anchors persist, so routing survives.
 - **WiFi/host concerns** (NetworkManager owns `wlan0`) live on the host, not the container (as Plum-Snapcast).
+- **Bluetooth needs a PATCHED host `bluetoothd`** — `backend/config/bluez/` (two DEP-3 patches +
+  `install_patched_bluez.sh`, which rebuilds the distro package at `<version>+plumN` and holds it).
+  Stock BlueZ registers AVRCP position-changed with a 49.7-day interval and never polls
+  `GetPlayStatus`, so a scrub on the phone cannot reach us at all. This is **host provisioning, not
+  a container concern** — the host owns the radio and the AVCTP channel, exactly like the rfkill
+  unblock and the D-Bus policy. Also `systemctl --user mask obex.service`: a phone serves ONE AVRCP
+  cover-art session, and the distro's obexd steals it from ours. Nothing in our Python depends on
+  the patches; an unpatched unit just loses scrub reporting. See ARCHITECTURE §8 Phase 3.
 
 ---
 

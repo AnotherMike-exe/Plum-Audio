@@ -39,6 +39,22 @@ POSITION HANDLING — the fiddliest part of this file, all of it learned on hard
     on a 400346 ms track, climbing, and NOT returning when the user scrubbed back. Do not build on
     it. The authoritative source is the Position SIGNAL (a relayed AVRCP notification), which is
     what carries a scrub; between signals we advance our OWN anchor, as airplay_metadata.py does.
+  * A BARE MID-TRACK SCRUB ON THE PHONE CANNOT REACH US, AND NOT FOR ANY REASON IN THIS FILE. BlueZ
+    registers EVENT_PLAYBACK_POS_CHANGED (0x05) with an interval of `UINT32_MAX / 1000` — 49.7 days
+    — "as we only use it to resync" (profiles/audio/avrcp.c, avrcp_register_notification; unchanged
+    through 5.82). AVRCP's interval trigger therefore never fires, leaving only play-status change,
+    track change and end/start of track: hence Position arriving ONLY bundled with those. It kills
+    seek detection too, because TGs size their jump-detection window from that same interval (AOSP
+    notifies when position leaves [pos +/- interval], so every in-track seek looks like no change).
+    Nor is there a fallback: BlueZ calls GetPlayStatus (PDU 0x30 — a real measured position) only on
+    connect, status change, track change and the media-player-list parse, and exposes no D-Bus
+    method that triggers one. Fixable only by patching bluetoothd, which is host provisioning; do
+    not go looking for it in the relay again. When a signal DOES arrive we handle it in ~10 ms.
+    The patches and their installer live in backend/config/bluez/ — a patched unit polls
+    GetPlayStatus every 2 s while playing, so scrubs land within ~2 s. NOTHING HERE DEPENDS ON
+    THEM: _apply_position_signal compares against our own anchor, so a re-read that merely confirms
+    where we already are is discarded whatever the cadence, and an unpatched unit behaves exactly as
+    it did before (bundled-only positions, no scrub).
   * Sanity-check any position against track_duration. That catches the drift and can never reject
     a legitimate scrub, which is always inside the track.
   * THE PROGRESS TICKER MUST NEVER BE ABLE TO DIE. Clients extrapolate locally between anchors, so
@@ -83,6 +99,14 @@ PLAYING_STATES = {"playing", "forward-seek", "reverse-seek"}
 SEED_ATTEMPTS = 5
 SEED_RETRY_S = 0.5
 
+# Opening the BIP session races our OWN obexd, which the source manager starts separately — 10 s
+# after the player bind on `.201.113`. Cover ~30 s of that (see _reopen_cover_art).
+COVER_ART_PREPARE_ATTEMPTS = 10
+COVER_ART_PREPARE_RETRY_S = 3.0
+# After the session opens, re-read Track at these offsets to catch art for the track already
+# playing (see _reopen_cover_art). A tuple so tests can empty it instead of sleeping.
+ART_REFRESH_DELAYS_S = (1.0, 3.0)
+
 # How often we re-anchor progress from BlueZ's Position (see _progress_ticker). Matches
 # airplay_metadata.PROGRESS_TICK_S — same problem, same cadence.
 PROGRESS_TICK_S = 1.0
@@ -121,6 +145,8 @@ class BluetoothAvrcp:
         self._on_commands_changed = on_commands_changed
         self.cover_art = cover_art  # BluetoothCoverArt | None — best-effort, never load-bearing
         self._obex_port: int | None = None
+        self._track_key: str | None = None  # identity of the last REAL track dict (see _apply_track)
+        self._cover_art_task: asyncio.Task | None = None
         self._player_path: str | None = None
         self._transport_path: str | None = None
         self._ticker_task: asyncio.Task | None = None
@@ -192,6 +218,7 @@ class BluetoothAvrcp:
         self._ticks = 0
         self._warned_overrun = False
         self._pending_position_ms = None
+        self._track_key = None
 
     async def _progress_ticker(self) -> None:
         """Re-emit OUR OWN advancing anchor once a second. Never polls the device.
@@ -307,9 +334,21 @@ class BluetoothAvrcp:
             return
         if interface != PLAYER_IFACE:
             return
-        # A player can appear via PropertiesChanged before InterfacesAdded is dispatched.
+        # A player can appear via PropertiesChanged before InterfacesAdded is dispatched. ADOPTING IT
+        # HERE MUST ALSO SEED IT. This branch used to just record the path, and everything that only
+        # _seed_from_player reads was then never read at all: repeat/shuffle support (so the GUI hid
+        # both controls) and ObexPort (so album art never even attempted a fetch — zero session
+        # attempts in the log, which reads like "the device has no cover art" rather than "we never
+        # asked"). Track/Status/Position kept working, because they arrive in these very signals, so
+        # the source looked healthy. Observed on hardware 2026-07-29 after reconnecting a phone with
+        # Device1.ConnectProfile(A2DP), which lands the player's first PropertiesChanged ahead of
+        # InterfacesAdded — a bind order we had simply never hit before.
         if self._player_path is None:
             self._player_path = path
+            logger.info("[bluetooth-%s] AVRCP player adopted via PropertiesChanged: %s",
+                        self.instance_id, path)
+            self._ensure_ticker()
+            asyncio.ensure_future(self._seed_from_player())
         if path != self._player_path:
             return
         if "Track" in changed:
@@ -431,12 +470,23 @@ class BluetoothAvrcp:
         port = values.get("ObexPort")
         if isinstance(port, int) and port > 0:
             self._obex_port = port
-            # Open the BIP session NOW rather than waiting for an ImgHandle — many phones only
-            # start publishing the handle once a session exists. See BluetoothCoverArt.prepare.
-            if self.cover_art is not None:
-                asyncio.ensure_future(
-                    self.cover_art.prepare(self.adapter.active_address, self._obex_port)
-                )
+        # Rebuild the BIP session on EVERY bind, port or no port. Two reasons it cannot be gated on
+        # this GetAll: (1) a session cached from a previous AVRCP session makes prepare() a no-op,
+        # and a bluetoothd restart invalidates it WITHOUT giving us a player-gone event to clear it
+        # on (see BluetoothCoverArt.reset_for_new_session); (2) ObexPort frequently is not here yet —
+        # BlueZ fills it in from the AVRCP SDP record, and media_player_set_obex_port() in player.c
+        # does NOT emit PropertiesChanged (every sibling setter does), so a client that read GetAll
+        # before the SDP parse completed is NEVER told the port arrived. _reopen_cover_art therefore
+        # re-reads it itself. Observed on `.201.113` 2026-07-30: rebind after an A2DP re-negotiation
+        # seeded cleanly with no ObexPort, and album art stayed dead with nothing logged.
+        if self.cover_art is not None:
+            # ONE rebuild at a time. _reopen_cover_art runs for up to ~30 s (it waits for our obexd),
+            # and binds arrive in bursts — an A2DP re-negotiation produced three within 20 s on the
+            # rig. Overlapping tasks would each reset_for_new_session() the session the previous one
+            # had just opened, so the last bind wins and the earlier ones stop wasting round trips.
+            if self._cover_art_task is not None and not self._cover_art_task.done():
+                self._cover_art_task.cancel()
+            self._cover_art_task = asyncio.ensure_future(self._reopen_cover_art())
         if "Repeat" in values:
             self._repeat = REPEAT_FROM_BLUEZ.get(str(values["Repeat"]).lower(), RepeatMode.OFF)
         if "Shuffle" in values:
@@ -448,6 +498,82 @@ class BluetoothAvrcp:
         if "Position" in values:
             self._anchor_progress(int(values["Position"]), self._duration_ms)
         self.push_modes()
+
+    async def _reopen_cover_art(self) -> None:
+        """Rebuild the BIP session for the player we just bound. Order matters, hence one coroutine.
+
+        RETRIED, because losing the race against our own obexd is fatal rather than transient: the
+        source manager starts that daemon independently (10 s after the bind on `.201.113`), nothing
+        else calls prepare(), and without a session the phone withholds ImgHandle — so handle_track
+        never runs to retry either. One missed window meant no album art for the life of the process.
+        """
+        if self.cover_art is None:
+            return
+        with contextlib.suppress(Exception):
+            await self.cover_art.reset_for_new_session()
+            for _ in range(COVER_ART_PREPARE_ATTEMPTS):
+                if self._obex_port is None:
+                    await self._read_obex_port()
+                if self._obex_port is not None and await self.cover_art.prepare(
+                    self.adapter.active_address, self._obex_port
+                ):
+                    # A session opened mid-track gets NO art until the next track change, because
+                    # the phone publishes ImgHandle when it feels like it and BlueZ has already sent
+                    # the Track dict we would have read it from. Verified from `.201.113`'s log
+                    # 2026-07-29: session opened at 16:22:47 over "Ball and Chain", a play event at
+                    # 16:22:59 produced nothing, and the first art of the session arrived at
+                    # 16:23:28 — one second after the track changed. So ASK. Twice, spaced, because
+                    # the handle often appears a moment after the session does; both re-reads are
+                    # idempotent (the fetch dedups on the track key).
+                    for delay in ART_REFRESH_DELAYS_S:
+                        await asyncio.sleep(delay)
+                        await self._refresh_art_for_current_track()
+                    return
+                await asyncio.sleep(COVER_ART_PREPARE_RETRY_S)
+            logger.info(
+                "[bluetooth-%s] no cover-art session after %d attempts; art stays off until the next "
+                "player bind", self.instance_id, COVER_ART_PREPARE_ATTEMPTS,
+            )
+
+    async def _refresh_art_for_current_track(self) -> None:
+        """Re-read Track and run it through the normal path, in case an ImgHandle landed since the seed.
+
+        LIMITED ON PURPOSE, and worth knowing why: this reads BlueZ's CACHED Track property. It does
+        not make BlueZ re-query the phone — `avrcp_get_element_attributes()` is only issued when a
+        track-change notification arrives, and no D-Bus method triggers one. So this catches a handle
+        BlueZ already holds; it cannot conjure art for a track that was already playing when the BIP
+        session opened. Verified on `.201.113` 2026-07-30: with a session open and the phone playing,
+        Track carried Title/Album/Artist/Duration/Item and no ImgHandle, and none ever arrived until
+        the track changed. Closing that gap needs a bluetoothd patch that re-issues the query.
+        """
+        props = await self._player_props()
+        if props is None:
+            return
+        with contextlib.suppress(Exception):
+            value = await props.call_get(PLAYER_IFACE, "Track")
+            track = value.value if isinstance(value, Variant) else value
+            if track:
+                self._apply_track(track)
+
+    async def _read_obex_port(self) -> None:
+        """Re-read ObexPort on its own, because nothing will tell us when it appears.
+
+        BlueZ fills the port in from the AVRCP TG's SDP record, which routinely lands after the
+        player object is exported — and `media_player_set_obex_port()` stores it withOUT a
+        `g_dbus_emit_property_changed`, unlike every sibling setter in player.c. The property is also
+        hidden while it is 0 (`obexport_exists`), so an early GetAll shows no ObexPort key at all and
+        no signal ever follows. Polling it for a short while after a bind is the only way to notice.
+        """
+        props = await self._player_props()
+        if props is None:
+            return
+        with contextlib.suppress(Exception):
+            value = await props.call_get(PLAYER_IFACE, "ObexPort")
+            port = value.value if isinstance(value, Variant) else value
+            if isinstance(port, int) and port > 0:
+                self._obex_port = port
+                logger.info("[bluetooth-%s] cover-art ObexPort arrived late: %d",
+                            self.instance_id, port)
 
     async def _seed_from_transport(self) -> None:
         bus = self.adapter.bus
@@ -508,13 +634,31 @@ class BluetoothAvrcp:
 
         # Album art rides the Track dict as an opaque handle; fetching it is a separate OBEX
         # conversation, so hand it off and never await it here — art must not delay metadata.
+        # Pass the TRACK IDENTITY alongside the handle. iOS reuses one ImgHandle value for whatever
+        # is playing, so cover art deduped on the handle alone never refetches: play, disconnect,
+        # skip a few tracks on the phone, reconnect — correct metadata, previous track's cover
+        # (reported from hardware 2026-07-30). Combine every field that moves with the track; Item is
+        # usually a per-track object path, but iOS also emits the all-ones "no UID" sentinel.
         img_handle = values.get("ImgHandle")
-        if self.cover_art is not None and img_handle:
-            asyncio.ensure_future(
-                self.cover_art.handle_track(
-                    self.adapter.active_address, self._obex_port, str(img_handle)
+        if self.cover_art is not None:
+            # Only a dict carrying a Title describes a TRACK. BlueZ also sends partial Track dicts —
+            # most importantly a late ImgHandle on its own, which is how a phone hands over the
+            # handle once a BIP session exists. Those must still fetch (dropping them means no art
+            # until the next track change), but they must NOT be treated as a track change: a key
+            # built from a partial dict differs from the real one, which would read as a new track
+            # and clear perfectly good art. So remember the last real key and reuse it.
+            if values.get("Title"):
+                self._track_key = "|".join(
+                    str(values.get(k, "")) for k in ("Item", "Title", "Album", "TrackNumber")
                 )
-            )
+                self.cover_art.note_track(self._track_key)
+            if img_handle:
+                asyncio.ensure_future(
+                    self.cover_art.handle_track(
+                        self.adapter.active_address, self._obex_port, str(img_handle),
+                        self._track_key or "",
+                    )
+                )
         # Do NOT assume position 0 here. BlueZ re-sends Track for reasons that are not a new track
         # (ImgHandle arriving late, a re-read when a controller joins), so anchoring 0 on every
         # Track update rewinds the GUI to the start mid-song — visible as "switching to the

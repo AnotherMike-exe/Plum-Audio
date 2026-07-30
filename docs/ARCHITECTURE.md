@@ -489,6 +489,79 @@ never ourselves. The source picker is a CONTROL: choosing a source routes this u
 along with everyone sharing its group, so a synced room moves together. Only sources with a sender
 on them are listed; idle ones drop out and their devices read as idle, while staying routable.
 
+**BLUETOOTH: THE POSITION/SEEK CEILING IS IN `bluetoothd`, AND WE PATCH IT (2026-07-29).**
+
+The A2DP slice relays BlueZ's `org.bluez.MediaPlayer1` into the metadata/artwork roles
+(`sources/bluetooth_avrcp.py`) — A2DP itself carries no metadata or position, so everything but the
+audio comes over AVRCP. Three separate hunts went looking for "a scrub on the phone never reaches the
+timeline" in our relay, the GUI and the metadata role. It is in none of them:
+
+- `avrcp.c: avrcp_register_notification()` registers `EVENT_PLAYBACK_POS_CHANGED` with an interval of
+  `UINT32_MAX / 1000` — **49.7 days** — "as we only use it to resync". AVRCP 1.5 §6.7.2 trigger
+  condition 1 (registered interval reached) therefore never fires, leaving play-status change, track
+  change and end/start of track: exactly the "position only ever arrives bundled with something else"
+  pattern observed on hardware. It also kills **seek** detection, because targets size their
+  jump-detection window from that same interval (AOSP notifies when the position leaves
+  `[pos ± interval]`), so an in-track scrub reads as no change at all.
+- There is no fallback. `GetPlayStatus` (PDU 0x30, the only *measured* position) is issued only from
+  the GetCapabilities response, a status change, a track change and the media-player-list parse, and
+  no D-Bus method triggers one. `MediaPlayer1.Position` is a local wall-clock interpolation from the
+  last notification, unclamped — hence 454520 ms reported on a 400346 ms track.
+
+`backend/config/bluez/` therefore carries two DEP-3 patches and `install_patched_bluez.sh`, which
+rebuilds the **distro** source package for the version already installed (so Raspberry Pi's `+rptN`
+patches are kept) at `<version>+plumN`, installs the `bluez` binary package and holds it. Patch 1
+polls `GetPlayStatus` every 2 s while the player is playing — it works even against a target that
+never advertises event 0x05, which iOS commonly does not, and it also corrects the interpolation
+drift. Patch 2 registers position-changed with a 1 s interval, restoring 1 Hz push ticks and ~1 s
+jump detection on targets that *do* advertise 0x05; it is last in series because it is the droppable
+half. This is **host provisioning**, in the same class as the rfkill unblock and the D-Bus policy: the
+host owns the radio and the AVCTP channel, so a second `bluetoothd` in the container would only fight
+it for hci0. Nothing in our Python depends on the patch — `_apply_position_signal` compares an
+incoming position against our own anchor, so extra re-reads are discarded and an unpatched unit
+behaves exactly as before.
+
+Still genuinely impossible: **absolute** seek toward the phone. AVRCP has no such command at any
+version — only press-and-hold FF/REW (`MediaPlayer1.Hold(0x49/0x48)` + `Release()`), which is a
+coarse seek we do not currently expose.
+
+**BLUETOOTH ALBUM ART — three silent failure modes (2026-07-30).** Cover art rides a separate OBEX
+(BIP) conversation: `MediaPlayer1.ObexPort` is the phone's L2CAP PSM, `Track.ImgHandle` names the
+image, and `sources/bluetooth_coverart.py` fetches it over a private per-endpoint obexd. Every way
+this breaks looks identical from outside — a stale image (or none) with **nothing in the log**,
+because nothing was ever attempted. "No art and no errors" means *we never asked*:
+
+1. *A replaced bluetoothd gives no teardown event.* Its objects do not depart with
+   `InterfacesRemoved`; the service vanishes. So the relay sees no "player gone", the cached session
+   path is never invalidated, and `prepare()` early-returns forever. The rebuild is therefore keyed
+   off the player **BIND** — the one event that reliably follows any disruption — and only one
+   rebuild runs at a time, since binds arrive in bursts.
+2. *`ObexPort` is never signalled.* BlueZ fills it from the AVRCP SDP record, which routinely lands
+   after the player is exported, and `media_player_set_obex_port()` is the one setter in `player.c`
+   with no `g_dbus_emit_property_changed`. `obexport_exists()` also hides it while 0, so an early
+   `GetAll` shows no key and no signal follows — it has to be polled after a bind.
+3. *Our own obexd starts after the bind* (10 s, on `.201.113`). Losing that race is permanent, not
+   transient, so `prepare()` is retried for ~30 s.
+
+Underneath all three: **a phone publishes `ImgHandle` only while a BIP session exists** — no session,
+no handle, no fetch, no session. And two device-side facts worth not re-deriving: the handle is **not
+a track identity** (iOS reuses one value, so fetches are keyed on handle *plus* track), and a phone
+serves **one BIP session at a time**, so the distro's D-Bus-activated user `obexd` steals the channel
+and ours is refused with `ECONNREFUSED` — mask `obex.service`, as we already disable
+`bluealsa-aplay.service`.
+
+*Stale art is worse than none*: a track change with no art clears the artwork role rather than
+leaving the last album's cover under the new title, after a short grace period (handles arrive late,
+and BlueZ re-sends partial `Track` dicts). The GUI defaults `albumArtUrl` to an inline SVG
+placeholder for the same reason — an empty `src` drew the browser's broken-image glyph on every
+reconnect and hard refresh.
+
+**Known gap:** art cannot appear for the track already playing when a session opens. BlueZ issues
+`GetElementAttributes` (which does request cover art) only on a *track change*, and no D-Bus method
+triggers a re-query, so the phone is never re-asked once the session exists. Art therefore lands on
+the first track change. Closing it needs a third bluetoothd patch exposing a metadata re-query —
+the same shape as the position pair above.
+
 ### Phase 4 — Cutover
 14. Migrate the two production units (`.200`/`.203`) once ≥3-unit soak passes; freeze the
     Snapcast codebase on a tag for rollback.

@@ -59,6 +59,10 @@ FETCH_TIMEOUT_S = 15.0
 TRANSFER_POLL_S = 0.2
 TRANSFER_POLL_ATTEMPTS = 25
 MIN_IMAGE_BYTES = 100
+# How long a new track may go without art before the previous cover is cleared (see note_track).
+# Long enough for a late ImgHandle plus its fetch, short enough that nobody reads the old cover
+# as belonging to the new track.
+ART_CLEAR_GRACE_S = 2.5
 
 
 class BluetoothCoverArt:
@@ -73,8 +77,14 @@ class BluetoothCoverArt:
         self._session_device: str | None = None
         self._image_iface = None
         self._fetch_method: str | None = None
-        self._last_handle: str | None = None
+        # (ImgHandle, track key). The HANDLE ALONE IS NOT A TRACK IDENTITY — iOS reuses one value
+        # (e.g. 1000097) for whatever is currently playing, so deduping on it alone means a new
+        # track carrying the same handle is skipped and the previous cover stays on screen.
+        self._last_key: tuple[str, str] | None = None
         self._fetching = False
+        self._shown_key: str | None = None   # the track whose art the role is currently serving
+        self._clear_task: asyncio.Task | None = None
+        self._clearing_key: str | None = None  # which track the pending clear is for
         self._warned_unavailable = False
         self._warned_skipped = False
 
@@ -111,7 +121,11 @@ class BluetoothCoverArt:
             self._bus = None
             self._session_path = None  # the session lived on the old daemon
             self._session_device = None
-            self._image = None
+            # `self._image` was a typo for these two: it created a stray attribute and left the
+            # interface proxy pointing at the dead bus. Harmless only because rebuilding the session
+            # rebinds it — but say what is meant.
+            self._image_iface = None
+            self._fetch_method = None
             self._warned_unavailable = False  # a new generation deserves a fresh complaint
         try:
             self._bus = await asyncio.wait_for(
@@ -135,12 +149,34 @@ class BluetoothCoverArt:
 
     # -- OBEX session --------------------------------------------------------
 
+    async def reset_for_new_session(self) -> None:
+        """Drop everything tied to the PREVIOUS AVRCP session, so the next prepare() opens a fresh one.
+
+        Called on every player bind, and it has to be, because the event we would rather key off does
+        not exist: when bluetoothd is REPLACED (an upgrade, or installing our own patched build) its
+        objects do not depart with InterfacesRemoved — the service simply vanishes, so the relay sees
+        no "player gone" and nothing here is invalidated. Verified on hardware 2026-07-30: `.201.113`
+        had a session opened the previous afternoon, was restarted underneath, rebound its player
+        cleanly the next morning — and prepare() returned early on the dead `_session_path`, so no
+        session was ever reopened. The phone then withheld ImgHandle (it only publishes one while a
+        BIP session exists — see prepare), no fetch was ever attempted, and the artwork role kept
+        serving the previous day's last image against every new track. Entirely silent: no failure to
+        log, because nothing was tried.
+
+        Cheap enough to do unconditionally: one CreateSession round trip per bind. We cannot tell a
+        live session from a zombie by looking at it, so do not try — just rebuild it.
+        """
+        await self._close_session()
+        self._warned_skipped = False
+
     async def _ensure_session(self, address: str, obex_port: int) -> bool:
+        # _connect() FIRST: it is what notices a replaced obex daemon, and the early-return below
+        # used to skip past it, handing a cached session to a bus nobody was serving.
+        if not await self._connect():
+            return False
         if self._session_path is not None and self._session_device == address:
             return True
         await self._close_session()
-        if not await self._connect():
-            return False
         assert self._bus is not None
         try:
             intro = await self._bus.introspect(OBEX_BUS, OBEX_ROOT)
@@ -159,15 +195,25 @@ class BluetoothCoverArt:
                 ),
                 timeout=CONNECT_TIMEOUT_S,
             )
-        except Exception:  # noqa: BLE001 - phone refused BIP, or obexd can't reach the port
+        except Exception as exc:  # noqa: BLE001 - phone refused BIP, or obexd can't reach the port
             # Distinguish "the phone said no" from "we are talking to a corpse". The second used to
             # be reported as the first, which is how a dead bus masqueraded as an unsupported device.
             dead = self._bus is None or not self._bus.connected
+            # And distinguish BOTH from "someone else already holds the channel". ECONNREFUSED on the
+            # BIP PSM is not a device that lacks cover art: a phone serves one BIP session at a time,
+            # so a SECOND obexd on the host takes the channel and ours is refused. Seen on hardware
+            # 2026-07-29 — a D-Bus-activated user-session obexd (systemd --user, not ours: no `-n`)
+            # appeared the instant the phone connected and art failed with exactly this, on a port we
+            # had correctly discovered. Killing it made art work on the next track. Mask the distro's
+            # user obex.service on a unit, the same way we disable bluealsa-aplay.service.
+            refused = "refused" in str(exc).lower()
             logger.info(
                 "[bluetooth-%s] could not open a cover-art session to %s (port %s); %s",
                 self.instance_id, address, obex_port,
-                "the obex bus is gone — will reconnect on the next track"
-                if dead else "the device may not support AVRCP cover art",
+                "the obex bus is gone — will reconnect on the next track" if dead
+                else "the device REFUSED the BIP port — check for a second obexd on this host "
+                     "(pgrep -af obexd; ours is the one started with -n)" if refused
+                else "the device may not support AVRCP cover art",
                 exc_info=True,
             )
             if dead and self._bus is not None:
@@ -210,6 +256,10 @@ class BluetoothCoverArt:
         return False
 
     async def _close_session(self) -> None:
+        # Clear the dedup key FIRST, on every path. It used to be cleared only where a live session
+        # was torn down, so resetting with no session left yesterday's key in place and the next
+        # fetch was deduped away — stale art on a fresh connection.
+        self._last_key = None
         if self._session_path is None or self._bus is None:
             self._session_path = self._session_device = self._image_iface = self._fetch_method = None
             return
@@ -218,11 +268,47 @@ class BluetoothCoverArt:
             client = self._bus.get_proxy_object(OBEX_BUS, OBEX_ROOT, intro).get_interface(CLIENT_IFACE)
             await client.call_remove_session(self._session_path)
         self._session_path = self._session_device = self._image_iface = self._fetch_method = None
-        self._last_handle = None
+
+    # -- stale art -----------------------------------------------------------
+
+    def note_track(self, track_key: str) -> None:
+        """Start the clock on clearing the previous cover, for a track we may have no art for.
+
+        Stale art is worse than none: the previous album's cover beside the new title reads as a bug,
+        where an empty slot reads as "this track has no art". But do NOT clear on the spot. BlueZ
+        re-sends Track for reasons that are not a new track, and ImgHandle legitimately arrives a
+        moment AFTER the title — clearing immediately would blink the cover on every normal track
+        change. So arm a grace period instead, and let a successful fetch cancel it.
+        """
+        if not track_key or track_key == self._shown_key:
+            return
+        if self._clearing_key == track_key and self._clear_task is not None and not self._clear_task.done():
+            return  # already counting down for this track; restarting would postpone the clear
+        if self._clear_task is not None and not self._clear_task.done():
+            self._clear_task.cancel()
+        self._clearing_key = track_key
+        with contextlib.suppress(RuntimeError):  # no running loop (sync unit test)
+            self._clear_task = asyncio.ensure_future(self._clear_after_grace(track_key))
+
+    async def _clear_after_grace(self, track_key: str) -> None:
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.sleep(ART_CLEAR_GRACE_S)
+            if track_key == self._shown_key:
+                return  # the fetch won the race; nothing stale on screen
+            role = self._artwork_role()
+            if role is None:
+                return
+            with contextlib.suppress(Exception):
+                await role.set_album_artwork(None)
+                self._shown_key = track_key
+                logger.info(
+                    "[bluetooth-%s] no art for this track; cleared the previous cover",
+                    self.instance_id,
+                )
 
     # -- fetch ---------------------------------------------------------------
 
-    async def prepare(self, address: str | None, obex_port: int | None) -> None:
+    async def prepare(self, address: str | None, obex_port: int | None) -> bool:
         """Open the BIP session as soon as we know the device supports cover art.
 
         THIS IS NOT AN OPTIMISATION — it is what makes cover art work at all. Phones commonly
@@ -232,16 +318,26 @@ class BluetoothCoverArt:
         control script had already found this and opened the session proactively on track change;
         its comment ("some devices may only provide ImgHandle after session is established") is the
         only surviving record of it, since that code could never actually run on BlueZ 5.70.
+
+        Returns True once a session exists, so the caller can retry: our own obexd is started by the
+        source manager and may not be up yet when the player binds (10 s apart on `.201.113`), and a
+        prepare that loses that race is fatal rather than transient — nothing else calls prepare, the
+        phone therefore never publishes ImgHandle, and handle_track never runs to retry the session.
         """
-        if not address or not obex_port or self._session_path is not None:
-            return
+        if not address or not obex_port:
+            return False
+        if self._session_path is not None:
+            return True
         if await self._ensure_session(address, int(obex_port)):
             logger.info(
                 "[bluetooth-%s] cover-art session open; the device may now publish ImgHandle",
                 self.instance_id,
             )
+            return True
+        return False
 
-    async def handle_track(self, address: str | None, obex_port: int | None, img_handle: str | None) -> None:
+    async def handle_track(self, address: str | None, obex_port: int | None, img_handle: str | None,
+                           track_key: str = "") -> None:
         """Fetch and publish art for the current track, if this device offers any."""
         if not address or not obex_port or not img_handle:
             # Log the reason ONCE: a silent return here is indistinguishable from "no art exists",
@@ -253,7 +349,11 @@ class BluetoothCoverArt:
                     self.instance_id, address, obex_port, img_handle,
                 )
             return
-        if img_handle == self._last_handle or self._fetching:
+        # Dedupe on the handle AND the track it arrived with: see _last_key. Repro that found it —
+        # play, disconnect, skip several tracks on the phone, reconnect and play: metadata was
+        # correct and the artwork was the one from before the disconnect.
+        key = (img_handle, track_key)
+        if key == self._last_key or self._fetching:
             return
         if self._artwork_role() is None:
             return
@@ -264,7 +364,10 @@ class BluetoothCoverArt:
             image = await self._fetch(img_handle)
             if image is None:
                 return
-            self._last_handle = img_handle
+            self._last_key = key
+            self._shown_key = track_key
+            if self._clear_task is not None and not self._clear_task.done():
+                self._clear_task.cancel()  # art landed for this track; nothing to clear
             role = self._artwork_role()
             if role is not None:
                 with contextlib.suppress(Exception):

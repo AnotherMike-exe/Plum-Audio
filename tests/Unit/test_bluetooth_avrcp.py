@@ -83,6 +83,7 @@ class FakeGroup:
 
 class FakeAdapter:
     bus = None
+    active_address = "AA:BB:CC:DD:EE:99"
 
 
 def _avrcp():
@@ -398,7 +399,8 @@ def test_coverart_reconnects_when_its_private_bus_died():
     ca._bus = dead
     ca._session_path = "/org/bluez/obex/session0"
     ca._session_device = "AA:BB:CC:DD:EE:FF"
-    ca._image = object()
+    ca._image_iface = object()
+    ca._fetch_method = "call_get_thumbnail"
     ca._warned_unavailable = True
 
     # The reconnect attempt fails (no such socket), but what matters is that the corpse was released
@@ -407,7 +409,10 @@ def test_coverart_reconnects_when_its_private_bus_died():
     assert dead.disconnected, "the dead bus was not disconnected"
     assert ca._bus is None, "the dead bus was kept and would be reused"
     assert ca._session_path is None and ca._session_device is None
-    assert ca._image is None
+    # The interface proxy belonged to the dead bus; keeping it would hand a corpse to the next
+    # fetch. (This asserted on `_image` — a typo'd stray attribute that was never the one the
+    # fetch path reads, so the check passed while the real field was left dangling.)
+    assert ca._image_iface is None and ca._fetch_method is None
 
 
 def test_coverart_reuses_a_live_bus():
@@ -425,3 +430,212 @@ def test_coverart_reuses_a_live_bus():
     ca._session_path = "/org/bluez/obex/session0"
     assert asyncio.run(ca._connect()) is True
     assert ca._session_path == "/org/bluez/obex/session0", "a live bus lost its session"
+
+
+# -- adopting a player via PropertiesChanged must still seed it -----------------------------------
+
+
+def test_props_adoption_seeds_the_player(monkeypatch):
+    """A player whose first signal is PropertiesChanged (not InterfacesAdded) must still be seeded.
+
+    Hardware 2026-07-29: reconnecting a phone with Device1.ConnectProfile(A2DP) delivered the
+    player's PropertiesChanged ahead of InterfacesAdded. The adoption branch recorded the path and
+    nothing else, so _seed_from_player never ran — and everything only it reads was silently lost:
+    repeat/shuffle support (the GUI hid both controls) and ObexPort (album art never even ATTEMPTED
+    a fetch, so the log showed no failures at all). Track/Status/Position kept flowing through these
+    same signals, so the source looked perfectly healthy.
+    """
+    avrcp, _ = _avrcp()
+    path = "/org/bluez/hci0/dev_X/player0"
+    seeded = []
+
+    async def fake_seed():
+        seeded.append(avrcp._player_path)
+
+    async def drive():
+        monkeypatch.setattr(avrcp, "_seed_from_player", fake_seed)
+        monkeypatch.setattr(avrcp, "_ensure_ticker", lambda: None)
+        avrcp._on_props(path, avrcp_mod.PLAYER_IFACE, {})
+        await asyncio.sleep(0)  # let the scheduled seed run
+
+    asyncio.run(drive())
+
+    assert avrcp._player_path == path
+    assert seeded == [path], "adopting a player via PropertiesChanged did not seed it"
+
+
+def test_props_adoption_does_not_reseed_a_bound_player():
+    """Only the FIRST sighting adopts; every later signal on the same path must be a plain update."""
+    avrcp, _ = _avrcp()
+    path = "/org/bluez/hci0/dev_X/player0"
+    avrcp._player_path = path
+    calls = []
+    avrcp._seed_from_player = lambda: calls.append(1)  # would raise if awaited/scheduled
+
+    avrcp._on_props(path, avrcp_mod.PLAYER_IFACE, {})
+
+    assert calls == [], "re-seeded a player that was already bound"
+
+
+# -- a player bind must rebuild the cover-art session ---------------------------------------------
+
+
+def test_player_bind_rebuilds_the_cover_art_session(monkeypatch):
+    """Reset BEFORE prepare, in that order — prepare() is a no-op while a session is cached.
+
+    Hardware 2026-07-30 (.201.113): bluetoothd was replaced under a running server. Its objects did
+    NOT depart with InterfacesRemoved, so there was no player-gone event to invalidate anything; the
+    player rebound cleanly the next morning and prepare() returned early on the previous day's dead
+    session path. The phone withholds ImgHandle without a live BIP session, so no fetch was ever
+    attempted and the artwork role served the previous day's image against every new track — with
+    nothing in the log, because nothing was tried.
+    """
+    avrcp, _ = _avrcp()
+    calls = []
+
+    class FakeCoverArt:
+        async def reset_for_new_session(self):
+            calls.append("reset")
+
+        async def prepare(self, address, obex_port):
+            calls.append(("prepare", address, obex_port))
+            return True
+
+    avrcp.cover_art = FakeCoverArt()
+    avrcp._obex_port = 4105
+    monkeypatch.setattr(avrcp_mod, "ART_REFRESH_DELAYS_S", ())  # do not sleep in a unit test
+
+    asyncio.run(avrcp._reopen_cover_art())
+
+    assert calls == ["reset", ("prepare", avrcp.adapter.active_address, 4105)], (
+        "cover art must be reset before prepare, or the stale session makes prepare a no-op"
+    )
+
+
+def test_cover_art_prepare_is_retried_until_our_obexd_is_up(monkeypatch):
+    """Losing the race against our own obexd must not be permanent.
+
+    The source manager starts obexd independently of the player bind — 10 s apart on `.201.113`,
+    where prepare() failed on a bus with no org.bluez.obex yet. Nothing else calls prepare(), and
+    without a session the phone withholds ImgHandle, so handle_track never runs to retry: one lost
+    race meant no album art for the life of the process.
+    """
+    avrcp, _ = _avrcp()
+    attempts = []
+
+    class LateCoverArt:
+        async def reset_for_new_session(self):
+            pass
+
+        async def prepare(self, address, obex_port):
+            attempts.append(obex_port)
+            return len(attempts) >= 3  # obexd finally answers on the third try
+
+    avrcp.cover_art = LateCoverArt()
+    avrcp._obex_port = 4105
+    monkeypatch.setattr(avrcp_mod, "COVER_ART_PREPARE_RETRY_S", 0)  # do not sleep in a unit test
+    monkeypatch.setattr(avrcp_mod, "ART_REFRESH_DELAYS_S", ())
+
+    asyncio.run(avrcp._reopen_cover_art())
+
+    assert len(attempts) == 3, f"gave up after {len(attempts)} attempt(s); a lost race is permanent"
+
+
+# -- cover art must refetch when the TRACK changes, not only when the handle does -----------------
+
+
+def test_cover_art_is_keyed_on_the_track_not_just_the_handle():
+    """iOS reuses one ImgHandle for whatever is playing, so the handle alone is not a track identity.
+
+    Reported from hardware 2026-07-30: play, disconnect, skip several tracks on the phone, reconnect
+    and play — metadata was correct and the artwork was still the one from before the disconnect,
+    because the incoming handle matched the last one fetched and the fetch was deduped away.
+    """
+    avrcp, _ = _avrcp()
+    seen = []
+
+    class FakeCoverArt:
+        def note_track(self, track_key):
+            pass
+
+        async def handle_track(self, address, obex_port, img_handle, track_key=""):
+            seen.append((img_handle, track_key))
+
+    avrcp.cover_art = FakeCoverArt()
+    avrcp._obex_port = 4105
+
+    async def drive():
+        avrcp._apply_track({"Title": "First", "Album": "A", "TrackNumber": 1, "ImgHandle": "1000097",
+                            "Duration": 200_000})
+        avrcp._apply_track({"Title": "Second", "Album": "B", "TrackNumber": 2, "ImgHandle": "1000097",
+                            "Duration": 200_000})
+        await asyncio.sleep(0)
+
+    asyncio.run(drive())
+
+    assert len(seen) == 2, "both tracks must reach the cover-art fetcher"
+    assert seen[0][0] == seen[1][0] == "1000097", "the phone reused the handle, as iOS does"
+    assert seen[0][1] != seen[1][1], (
+        "the two tracks produced the SAME cover-art key, so the second fetch will be deduped away "
+        "and the previous track's artwork will stay on screen"
+    )
+
+
+# -- stale art is worse than none -----------------------------------------------------------------
+
+
+def test_a_track_with_no_art_clears_the_previous_cover():
+    """A new track we cannot fetch art for must not keep showing the last album's cover."""
+    import importlib
+    ca_mod = importlib.import_module("sources.bluetooth_coverart")
+
+    class Role:
+        def __init__(self): self.calls = []
+        async def set_album_artwork(self, image): self.calls.append(image)
+
+    class Group:
+        def __init__(self, role): self._role = role
+        def group_role(self, name): return self._role if name == "artwork" else None
+
+    role = Role()
+    # Real constructor: it only assigns fields (no I/O), so the test cannot drift out of sync with
+    # __init__ the way hand-built instances do.
+    ca = ca_mod.BluetoothCoverArt(Group(role), "1", "unix:path=/nonexistent/obex.socket")
+    ca._shown_key = "old|Previous Track|Old Album|1"
+
+    async def drive():
+        ca_mod.ART_CLEAR_GRACE_S = 0
+        ca.note_track("new|Fresh Track|New Album|2")
+        await asyncio.sleep(0.05)
+
+    asyncio.run(drive())
+
+    assert role.calls == [None], "the previous album's cover survived a track change with no art"
+
+
+def test_art_that_arrives_within_the_grace_period_cancels_the_clear():
+    """The clear must not blink art off when ImgHandle simply arrived a moment after the title."""
+    import importlib
+    ca_mod = importlib.import_module("sources.bluetooth_coverart")
+
+    class Role:
+        def __init__(self): self.calls = []
+        async def set_album_artwork(self, image): self.calls.append(image)
+
+    class Group:
+        def __init__(self, role): self._role = role
+        def group_role(self, name): return self._role if name == "artwork" else None
+
+    role = Role()
+    ca = ca_mod.BluetoothCoverArt(Group(role), "1", "unix:path=/nonexistent/obex.socket")
+    ca._shown_key = "old|Previous|Old|1"
+
+    async def drive():
+        ca_mod.ART_CLEAR_GRACE_S = 0.2
+        ca.note_track("new|Fresh|New|2")
+        ca._shown_key = "new|Fresh|New|2"      # the fetch landed first
+        await asyncio.sleep(0.35)
+
+    asyncio.run(drive())
+
+    assert role.calls == [], "art for the new track landed, but the pending clear still fired"
