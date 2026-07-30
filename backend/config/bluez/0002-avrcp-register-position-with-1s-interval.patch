@@ -1,0 +1,51 @@
+Description: avrcp: register EVENT_PLAYBACK_POS_CHANGED with a 1 second interval
+ Upstream registers position-changed with an interval of UINT32_MAX / 1000 -- 49.7 days -- "as we
+ only use it to resync". That disables AVRCP 1.5 6.7.2 trigger condition 1 (registered interval
+ reached) outright, so position only ever arrives bundled with a play-status change, a track
+ change, or end/start of track. It also disables SEEK detection, because targets size their
+ jump-detection window from that same interval (AOSP notifies when the position leaves
+ [pos - interval, pos + interval]), so an in-track scrub inside a 49 day window looks like no
+ change at all.
+ .
+ A 1 second interval restores both: 1 Hz ticks and ~1 s jump detection. BlueZ re-registers after
+ every CHANGED response, so it self-sustains. Only effective on targets that list event 0x05 in
+ their GetCapabilities response; the GetPlayStatus poll patch covers the ones that do not, so this
+ patch is the droppable half of the pair (it is last in series for that reason).
+Author: Plum Solutions <65366363+AnotherMike-exe@users.noreply.github.com>
+Origin: vendor, https://github.com/Mprice12337/Plum-Audio
+Forwarded: no
+Last-Update: 2026-07-29
+--- a/profiles/audio/avrcp.c
++++ b/profiles/audio/avrcp.c
+@@ -137,6 +137,8 @@
+ #define AVRCP_CHARSET_UTF8		106
+ 
+ #define AVRCP_BROWSING_TIMEOUT		1
++/* Plum-Audio: playback interval (seconds) registered for EVENT_PLAYBACK_POS_CHANGED. */
++#define AVRCP_POSITION_INTERVAL		1
+ /* Plum-Audio: how often (seconds) to poll GetPlayStatus while a player is playing. */
+ #define AVRCP_POSITION_POLL		2
+ #define AVRCP_CT_VERSION		0x0106
+@@ -4064,11 +4066,19 @@
+ 	pdu->params[0] = event;
+ 
+ 	/*
+-	 * Set maximum interval possible for position changed as we only
+-	 * use it to resync.
++	 * Plum-Audio: register position changed with a 1 second interval.
++	 *
++	 * Upstream asks for UINT32_MAX / 1000 (~49.7 days) "as we only use it
++	 * to resync", which disables AVRCP 1.5 6.7.2 trigger condition 1
++	 * outright: position then only ever arrives bundled with a play status
++	 * change, a track change, or end/start of track. It also disables SEEK
++	 * detection, because targets size their jump-detection window from this
++	 * same interval (AOSP notifies when the position leaves
++	 * [pos - interval, pos + interval]), so a scrub inside a 49 day window
++	 * is never reported at all.
+ 	 */
+ 	if (event == AVRCP_EVENT_PLAYBACK_POS_CHANGED)
+-		bt_put_be32(UINT32_MAX / 1000, &pdu->params[1]);
++		bt_put_be32(AVRCP_POSITION_INTERVAL, &pdu->params[1]);
+ 
+ 	pdu->params_len = cpu_to_be16(AVRCP_REGISTER_NOTIFICATION_PARAM_LENGTH);
+ 

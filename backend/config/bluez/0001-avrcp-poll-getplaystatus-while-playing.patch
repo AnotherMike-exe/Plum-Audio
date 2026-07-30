@@ -1,0 +1,111 @@
+Description: avrcp: poll GetPlayStatus while a controller player is playing
+ A mid-track scrub on a connected phone can never reach a D-Bus client on stock BlueZ.
+ GetPlayStatus (PDU 0x30) is the only source of a REAL measured position -- MediaPlayer1.Position
+ is otherwise a local wall-clock interpolation from the last notification, and unclamped, so it
+ drifts past the end of the track (observed: 454520 ms on a 400346 ms track). Upstream issues
+ GetPlayStatus only from the GetCapabilities response, a status change, a track change and the
+ media-player-list parse, and exposes no D-Bus method that triggers one.
+ .
+ This adds a 2 second timer, armed when the controller player is known and dropped with the
+ session, that re-reads the position while the player reports "playing". It works even against a
+ target that never advertises EVENT_PLAYBACK_POS_CHANGED (0x05) -- which iOS commonly does not --
+ and it also corrects the interpolation drift.
+ .
+ Plum-Audio relays MediaPlayer1 into Sendspin metadata roles
+ (backend/scripts/sources/bluetooth_avrcp.py); a re-read that merely confirms our own anchor is
+ discarded there, so the extra signals are free.
+Author: Plum Solutions <65366363+AnotherMike-exe@users.noreply.github.com>
+Origin: vendor, https://github.com/Mprice12337/Plum-Audio
+Forwarded: no
+Last-Update: 2026-07-29
+--- a/profiles/audio/avrcp.c
++++ b/profiles/audio/avrcp.c
+@@ -137,6 +137,8 @@
+ #define AVRCP_CHARSET_UTF8		106
+ 
+ #define AVRCP_BROWSING_TIMEOUT		1
++/* Plum-Audio: how often (seconds) to poll GetPlayStatus while a player is playing. */
++#define AVRCP_POSITION_POLL		2
+ #define AVRCP_CT_VERSION		0x0106
+ #define AVRCP_TG_VERSION		0x0106
+ 
+@@ -279,6 +281,7 @@
+ 	unsigned int control_id;
+ 	unsigned int browsing_id;
+ 	unsigned int browsing_timer;
++	unsigned int pos_timer;		/* Plum-Audio: GetPlayStatus poll */
+ 	uint16_t supported_events;
+ 	uint16_t registered_events;
+ 	uint8_t transaction;
+@@ -2295,8 +2298,51 @@
+ 					AVC_SUBUNIT_PANEL, buf, sizeof(buf),
+ 					avrcp_get_play_status_rsp,
+ 					session);
++}
++
++/*
++ * Plum-Audio: poll GetPlayStatus while playing.
++ *
++ * GetPlayStatus (PDU 0x30) is the only way to obtain a REAL measured position from the target;
++ * MediaPlayer1.Position is otherwise a local wall-clock interpolation from the last notification
++ * (and is unclamped, so it drifts past the end of the track). Upstream issues GetPlayStatus only
++ * from the GetCapabilities response, a status change, a track change and the media player list
++ * parse, and exposes no D-Bus method that triggers one, so a mid-track scrub on the phone can
++ * never reach a D-Bus client. Polling closes that hole even against a target that does not
++ * support EVENT_PLAYBACK_POS_CHANGED at all (iOS commonly does not advertise it).
++ *
++ * Only while the player reports "playing": a scrub made while paused is picked up by the
++ * status change that resumption produces, and an idle link stays quiet.
++ */
++static bool poll_play_status(gpointer user_data)
++{
++	struct avrcp *session = user_data;
++	struct avrcp_player *player;
++	struct media_player *mp;
++
++	if (!session->controller || !session->controller->player) {
++		session->pos_timer = 0;
++		return FALSE;
++	}
++
++	player = session->controller->player;
++	mp = player->user_data;
++
++	if (mp && g_strcmp0(media_player_get_status(mp), "playing") == 0)
++		avrcp_get_play_status(session);
++
++	return TRUE;
+ }
+ 
++static void avrcp_start_position_poll(struct avrcp *session)
++{
++	if (session->pos_timer > 0)
++		return;
++
++	session->pos_timer = timeout_add_seconds(AVRCP_POSITION_POLL,
++						poll_play_status, session, NULL);
++}
++
+ static const char *status_to_str(uint8_t status)
+ {
+ 	switch (status) {
+@@ -4098,6 +4144,9 @@
+ 
+ 	if (!(events & (1 << AVRCP_EVENT_STATUS_CHANGED)))
+ 		avrcp_get_element_attributes(session);
++
++	/* Plum-Audio: keep a real position coming (see poll_play_status). */
++	avrcp_start_position_poll(session);
+ 
+ 	return FALSE;
+ }
+@@ -4404,6 +4453,9 @@
+ 	if (session->browsing_timer > 0)
+ 		timeout_remove(session->browsing_timer);
+ 
++	if (session->pos_timer > 0)
++		timeout_remove(session->pos_timer);
++
+ 	if (session->controller != NULL)
+ 		controller_destroy(session);
+ 

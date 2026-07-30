@@ -22,6 +22,7 @@ tier 4, which runs against live third-party devices in someone's home.
 | `t2_endpoint_crud.sh` | any one unit (config API on :5002) | `./t2_endpoint_crud.sh <host> [spotify\|airplay]` |
 | `t3_mesh_roam.sh` | **two** Plum units on one segment | `./t3_mesh_roam.sh <unit-a> <unit-b>` |
 | `t3_autofollow.sh` | **two** Plum units on one segment | `./t3_autofollow.sh <unit-a> <unit-b>` |
+| `t2_bt_avrcp_position.sh` | one unit + **a phone connected and playing** | `./t2_bt_avrcp_position.sh <host>` |
 | `t4_interop_ma.sh` | a unit **on Music Assistant's L2 segment** | `./t4_interop_ma.sh <host>` |
 | `t4_adopt_release.sh` | a unit + a foreign Sendspin speaker on-segment | `./t4_adopt_release.sh <host> [speaker-url]` |
 
@@ -40,5 +41,11 @@ Run everything for one rig via `./run.sh`:
 
 - Tier 4's `t4_interop_ma.sh` reports `SKIP` for the "MA claimed our speaker" check unless MA is
   actively playing to the unit — start playback in MA to exercise that path.
+- `t2_bt_avrcp_position.sh` needs a phone paired, connected and **playing**, and needs the host's
+  `bluetoothd` to carry the patches in `backend/config/bluez/` (it SKIPs with the install command
+  otherwise). It is the one script that is not read-only: it bounces the AVRCP profile inside its
+  `btmon` window, because btmon decodes AVCTP only on a channel whose L2CAP setup it witnessed —
+  attach it to a live session and every AVRCP frame reads as undecoded ACL data, which looks exactly
+  like a broken patch. A2DP audio is untouched and the AVRCP session rebuilds in ~1 s.
 - The pure-logic tests live in `tests/Unit` (pytest, no hardware) and run in CI; see `docs/TESTING.md`
   for the full tier map and what is still not covered (tier 5 soak, tier 6 container).

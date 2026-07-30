@@ -40,6 +40,9 @@ Everything that needs a real FIFO, a real daemon, or a real DAC. Target: one Pi,
   daemon set respools and the other endpoints are untouched.
 - AirPlay per-endpoint MPRIS: each endpoint owns `org.mpris.MediaPlayer2.ShairportSync` on its own
   private bus.
+- Bluetooth AVRCP position: on a unit carrying the `backend/config/bluez/` patches, `GetPlayStatus`
+  is polled every ~2 s while the phone is playing and `Position` reaches D-Bus clients on that beat,
+  so a scrub lands within ~2 s. Needs a phone connected and playing; `t2_bt_avrcp_position.sh`.
 - Config API + GUI served by nginx; settings persist across a restart.
 
 ## Tier 3 — two-unit mesh (the 192.0.2.0/24 rig)
@@ -102,6 +105,7 @@ non-negotiable for tier 4's live third-party devices. `run.sh` drives a whole ri
 | `t2_endpoint_crud.sh` | ✅ passing — live add/rename/remove, others untouched |
 | `t4_interop_ma.sh` | ✅ passing — MA discovered, we advertise both ways, claim self-reported |
 | `t4_adopt_release.sh` | ✅ passing — adopt an HA Voice PE, release incl. the socket-closed check |
+| `t2_bt_avrcp_position.sh` | ✅ passing (VLAN-7 unit + iPhone, 2026-07-29) — 8 polls / 12 s, 4 Position signals / 9 s |
 | `t3_mesh_roam.sh` | ✅ passing (`.201` rig, 2026-07-24) |
 | `t3_autofollow.sh` | written, syntax-checked; **pending** a run on the `.201` rig |
 
