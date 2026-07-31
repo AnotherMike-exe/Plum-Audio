@@ -166,7 +166,7 @@ export const AudioTab: React.FC<AudioTabProps> = ({settings, onSettingsChange}) 
 
               // Replace generic names with deviceName from settings
               if (genericNames.includes(clientName.toLowerCase()) || clientName === client.id) {
-                clientName = settings.deviceName || 'Plum Snapcast';
+                clientName = settings.deviceName || 'Plum Sendspin';
               }
 
               clientList.push({

@@ -80,7 +80,12 @@ unit_field() {  # unit_field <host> <1-based field>
 }
 
 if [[ " ${HOSTS[*]} " == *" all "* ]]; then
-    mapfile -t HOSTS < <(units_all)
+    # Plain read loop, not `mapfile`: this is normally run from macOS, whose /bin/bash is 3.2 and
+    # has no mapfile. The failure only ever showed on `deploy.sh all`, since single-host runs skip it.
+    HOSTS=()
+    while IFS= read -r _h; do
+        [[ -n "$_h" ]] && HOSTS+=("$_h")
+    done < <(units_all)
 fi
 
 # --- per-unit deploy ---------------------------------------------------------------------------

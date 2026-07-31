@@ -61,6 +61,18 @@ class Neighbourhood:
         await self._avahi.browse(SERVER_SERVICE, self._on_server, self._on_gone)
         logger.info("neighbourhood up: advertising %s as %r", SERVER_SERVICE, self.unit_name)
 
+    async def rename(self, unit_name: str) -> None:
+        """Re-advertise under a new friendly name (the user renamed the unit in Settings).
+
+        The service INSTANCE stays keyed on unit_id — only the TXT `name` changes — so peers and
+        third-party servers see a rename rather than the old unit vanishing and a new one appearing,
+        which would drop routing that referenced it.
+        """
+        self.unit_name = unit_name
+        await self._avahi.republish(
+            self.unit_id, SERVER_SERVICE, self.server_port, {"path": DEFAULT_PATH, "name": unit_name}
+        )
+
     async def stop(self) -> None:
         await self._avahi.close()
         self._players.clear()

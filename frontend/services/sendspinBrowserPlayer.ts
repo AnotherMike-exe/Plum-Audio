@@ -10,8 +10,11 @@
  * Codec: prefer FLAC (lossless, ~half PCM's bandwidth, cheaper to encode on a Pi than Opus), fall
  * back to PCM. The server transcodes the group's PCM per player, so this "just works" — verified in
  * the spike. Opus is deliberately not advertised, which also keeps the opus-encdec WASM off the wire.
- * Sync: `quality-local` (loose sync, no pitch/resample artifacts) — a browser is a casual/second-room
- * listen, not lip-synced to the room speakers.
+ * Sync: `sync` — the tab tracks the group clock like any other player. This was `quality-local`
+ * (loose sync, no pitch/resample artifacts) on the assumption a browser is a casual second-room
+ * listen; on hardware that assumption was wrong. People listen in the browser while standing in the
+ * same room as the speaker, where `quality-local` drifts ~1 s behind and reads as broken sync rather
+ * than as cleaner audio. `sync` trades a possible resample artifact for staying with the room.
  */
 
 import type { Codec, GoodbyeReason, SendspinPlayer } from '@sendspin/sendspin-js';
@@ -57,7 +60,7 @@ export class SendspinBrowserPlayer {
       baseUrl: `http://${this.host}:${SERVER_PORT}`, // -> ws://<host>:8927/sendspin
       clientName: this.name,
       codecs: this.codecs,
-      correctionMode: 'quality-local',
+      correctionMode: 'sync',
       storage: null, // don't share per-tab sync-delay via localStorage across tabs
       // The SDK auto-reconnects on an unexpected WS drop, but the reconnected client lands in a
       // fresh idle group (the old one was cleaned up after the server's ~30s grace). Surface the

@@ -57,6 +57,8 @@ except Exception:  # noqa: BLE001 - allows --probe-config / import without PortA
 
 from mesh.avahi import CLIENT_SERVICE, AvahiClient
 
+import unit_identity
+
 logger = logging.getLogger("plum.sendspin_player")
 
 DEFAULT_PORT = 8928
@@ -694,7 +696,12 @@ async def main() -> None:
 
     unit_id = os.environ.get("PLUM_UNIT_ID", "unit-local")
     player_id = os.environ.get("PLUM_PLAYER_ID", f"{unit_id}-player")
-    player_name = os.environ.get("PLUM_PLAYER_NAME", os.environ.get("PLUM_UNIT_NAME", "Plum Audio"))
+    # A unit and its speaker are one thing to the user, so the player carries the unit's configured
+    # device name. Env is the pre-naming default only (see unit_identity).
+    env_player_name = os.environ.get(
+        "PLUM_PLAYER_NAME", os.environ.get("PLUM_UNIT_NAME", unit_identity.DEFAULT_DEVICE_NAME)
+    )
+    player_name = unit_identity.device_name(env_player_name)
     port = int(os.environ.get("PLUM_PLAYER_PORT", DEFAULT_PORT))
     device = os.environ.get("PLUM_DAC_DEVICE") or None
     rate = int(os.environ.get("PLUM_PLAYER_RATE", DEFAULT_RATE))
@@ -719,12 +726,30 @@ async def main() -> None:
     )
     await player.start(home_server_url=home_server)
 
+    # Follow a rename from Settings: update the friendly name we report in player state and
+    # re-advertise it over mDNS, so the GUI, peer units and third-party servers all see the new
+    # name. The Sendspin client name presented at handshake is fixed for the life of the
+    # connection — it catches up on the next restart rather than dropping the audio to rename.
+    async def _apply_player_name(new_name: str) -> None:
+        player.player_name = new_name
+        if player._avahi is not None:
+            await player._avahi.republish(
+                player.player_id, CLIENT_SERVICE, player.port, {"path": "/sendspin", "name": new_name}
+            )
+
+    rename_watch = asyncio.ensure_future(
+        unit_identity.watch_device_name(_apply_player_name, fallback=env_player_name)
+    )
+
     stop = asyncio.Event()
     try:
         await stop.wait()  # run forever; supervisord manages the process lifecycle
     except asyncio.CancelledError:
         pass
     finally:
+        rename_watch.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await rename_watch
         await player.stop()
 
 

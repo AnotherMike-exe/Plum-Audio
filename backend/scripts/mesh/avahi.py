@@ -211,6 +211,22 @@ class AvahiClient:
         logger.info("mDNS published %s.%s on :%d (%s)", name, service_type, port, txt)
         return True
 
+    async def republish(self, name: str, service_type: str, port: int, txt: dict[str, str]) -> bool:
+        """Replace everything this client has published with this one record.
+
+        Avahi has no "rename a record" — the group has to be reset and re-committed. Note this drops
+        ALL of this client's publications, which is correct only because each publisher here owns one
+        record (the unit's server advert, or the player's). It deliberately does NOT close the bus:
+        the Neighbourhood publishes and BROWSES on the same connection, so tearing it down to rename
+        ourselves would silently stop peer discovery.
+        """
+        for group in self._groups:
+            with contextlib.suppress(Exception):
+                await group.call_reset()
+                await group.call_free()
+        self._groups.clear()
+        return await self.publish(name, service_type, port, txt)
+
     # -- browse --------------------------------------------------------------
 
     async def browse(

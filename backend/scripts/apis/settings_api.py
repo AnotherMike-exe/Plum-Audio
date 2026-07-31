@@ -11,12 +11,12 @@ Served by the standalone Flask host in ``apis/server.py`` on port 5002 (the mesh
 stay aiohttp — it runs in the audio event loop).
 """
 
+import asyncio
 import copy
 import json
 import logging
 import os
 import re
-import subprocess
 from typing import Dict, Any
 
 from flask import Blueprint, jsonify, request
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # shape); `version` increments on every update so the GUI's poller detects changes.
 DEFAULT_SETTINGS = {
     "version": 1,
-    "deviceName": "Plum Audio",
+    "deviceName": "Plum Sendspin",
     "hostname": "plum-audio",
     "integrations": {
         "airplay": {
@@ -268,55 +268,83 @@ class SettingsManager:
 
     @staticmethod
     def update_avahi_hostname(hostname: str) -> tuple[bool, str]:
-        """Update Avahi's host-name and restart the service. Returns (success, message).
+        """Set the mDNS hostname on the HOST's Avahi, over D-Bus. Returns (success, message).
 
-        Container-only: writing /etc/avahi and restarting via supervisorctl both require the
-        container environment. Degrades gracefully (returns False) on the Pi test rig / non-root.
+        This used to rewrite /etc/avahi/avahi-daemon.conf and run `supervisorctl restart avahi`,
+        which cannot work in this architecture and always reported "mDNS restart failed": Avahi runs
+        on the HOST (we only reach it through the mounted system bus — see CLAUDE.md), and there is
+        no `avahi` supervisord program to restart. The config it rewrote was the CONTAINER's, which
+        nothing reads.
+
+        `SetHostName` is the runtime equivalent and needs neither a config file nor a restart —
+        Avahi re-announces its records itself. Two honest caveats, both reported to the caller:
+          * It is RUNTIME state. A host reboot (or an Avahi restart) reverts to the host's own
+            hostname. We deliberately do NOT re-apply it at container start: every unit ships with
+            the same default hostname, so replaying it on boot would rename all three units to the
+            same thing and leave Avahi resolving the collision with -2/-3 suffixes.
+          * Avahi may hand back a de-conflicted name, so we report what it actually took, not what
+            we asked for.
         """
         try:
-            avahi_conf = "/etc/avahi/avahi-daemon.conf"
-            with open(avahi_conf, "r") as f:
-                lines = f.readlines()
+            from dbus_next.aio import MessageBus
+            from dbus_next.constants import BusType
+        except ImportError:
+            return False, "Hostname saved, but mDNS was not updated: dbus-next is unavailable"
 
-            in_server_section = False
-            hostname_updated = False
-            new_lines = []
-            for line in lines:
-                if line.strip() == "[server]":
-                    in_server_section = True
-                    new_lines.append(line)
-                elif line.strip().startswith("[") and in_server_section:
-                    if not hostname_updated:
-                        new_lines.append(f"host-name={hostname}\n")
-                        hostname_updated = True
-                    in_server_section = False
-                    new_lines.append(line)
-                elif in_server_section and line.strip().startswith("host-name="):
-                    new_lines.append(f"host-name={hostname}\n")
-                    hostname_updated = True
-                else:
-                    new_lines.append(line)
-            if in_server_section and not hostname_updated:
-                new_lines.append(f"host-name={hostname}\n")
-
-            with open(avahi_conf, "w") as f:
-                f.writelines(new_lines)
-            logger.info(f"Updated Avahi hostname to: {hostname}")
-
-            result = subprocess.run(
-                ["supervisorctl", "-c", "/app/supervisord/supervisord.conf", "restart", "avahi"],
-                capture_output=True,
-                text=True,
-                timeout=15,
+        async def _connect():
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            intro = await bus.introspect("org.freedesktop.Avahi", "/")
+            server = bus.get_proxy_object("org.freedesktop.Avahi", "/", intro).get_interface(
+                "org.freedesktop.Avahi.Server"
             )
-            if result.returncode == 0:
-                logger.info("Avahi service restarted successfully")
-                return True, f"Hostname updated to '{hostname}.local' and mDNS restarted"
-            logger.error(f"Failed to restart Avahi: {result.stderr}")
-            return False, f"Hostname updated but mDNS restart failed: {result.stderr}"
-        except Exception as e:
-            logger.error(f"Failed to update Avahi hostname: {e}")
-            return False, f"Failed to update hostname: {str(e)}"
+            return bus, server
+
+        async def _apply() -> tuple[bool, str]:
+            """Returns (changed, hostname-now). Verified on the rig against a real Avahi.
+
+            Two behaviours drive the shape of this, and both look like failures if taken at face
+            value:
+              * Setting the name it already has raises "invalid because redundant". That is a
+                no-op, not an error — report success.
+              * A genuine change makes Avahi RESET its server, which drops our bus connection
+                mid-call: the SetHostName reply never arrives and dbus-next raises "Message
+                recipient disconnected from message bus without replying" for a call that
+                SUCCEEDED. So the set is never trusted — we reconnect on a fresh bus and read the
+                name back to find out what actually happened.
+            """
+            bus, server = await _connect()
+            try:
+                if await server.call_get_host_name() == hostname:
+                    return False, hostname
+                try:
+                    await server.call_set_host_name(hostname)
+                except Exception as set_error:  # noqa: BLE001 - the read-back is the source of truth
+                    logger.debug(f"SetHostName raised (verifying by read-back): {set_error}")
+            finally:
+                bus.disconnect()
+
+            await asyncio.sleep(2)  # let Avahi finish restarting before we ask it anything
+            bus2, server2 = await _connect()
+            try:
+                return True, await server2.call_get_host_name()
+            finally:
+                bus2.disconnect()
+
+        try:
+            changed, applied = asyncio.run(asyncio.wait_for(_apply(), 20))
+        except Exception as e:  # noqa: BLE001 - any bus/policy/validation failure is the same answer here
+            logger.error(f"Avahi SetHostName failed: {e}")
+            return False, f"Hostname saved, but mDNS was not updated: {e}"
+
+        if not changed:
+            return True, f"Hostname already '{applied}.local'"
+        if applied != hostname:
+            # Either Avahi de-conflicted it (-2, -3 … when the name is claimed on the segment) or it
+            # refused and kept the old one. Either way the user needs the name it actually answers to.
+            logger.warning(f"Avahi reports '{applied}' after being asked for '{hostname}'")
+            return True, f"mDNS name is now '{applied}.local' (asked for '{hostname}')"
+        logger.info(f"Avahi hostname set to: {applied}")
+        return True, f"Hostname updated to '{applied}.local'"
 
 
 def create_settings_blueprint(settings_manager: SettingsManager = None) -> Blueprint:

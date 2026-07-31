@@ -18,13 +18,13 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
 
   // Initialize form from settings
   useEffect(() => {
-    setDeviceName(settings.deviceName || 'Plum Snapcast');
+    setDeviceName(settings.deviceName || 'Plum Sendspin');
     setHostname(settings.hostname || 'plum-snapcast');
   }, [settings.deviceName, settings.hostname]);
 
   // Check if settings have changed
   const hasChanges =
-    deviceName !== (settings.deviceName || 'Plum Snapcast') ||
+    deviceName !== (settings.deviceName || 'Plum Sendspin') ||
     hostname !== (settings.hostname || 'plum-snapcast');
 
   // Validate hostname on change
@@ -64,7 +64,7 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
       // Only send fields that have changed to avoid unnecessary Avahi restarts
       const updates: { deviceName?: string; hostname?: string } = {};
 
-      if (deviceName.trim() !== (settings.deviceName || 'Plum Snapcast')) {
+      if (deviceName.trim() !== (settings.deviceName || 'Plum Sendspin')) {
         updates.deviceName = deviceName.trim();
       }
 
@@ -111,7 +111,7 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
                   onChange={(e) => handleDeviceNameChange(e.target.value)}
                   disabled={saving}
                   className="w-full px-3 py-2 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-md text-[var(--text-primary)] text-sm focus:outline-none focus:ring-2 focus:ring-[var(--accent-color)] disabled:opacity-50"
-                  placeholder="Plum Snapcast"
+                  placeholder="Plum Sendspin"
                 />
                 <p className="mt-1 text-xs text-[var(--text-muted)]">
                   Display name used in Federation and the browser title

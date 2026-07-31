@@ -30,7 +30,7 @@ import { Icon } from './components/Icon';
 import { Settings } from './components/Settings';
 import { Visualizer } from './components/Visualizer';
 import { Client, Settings as SettingsType, Stream } from './types';
-import { Model, SendspinDataService, FOREIGN_PREFIX } from './services/sendspinDataService';
+import { Model, SendspinDataService, FOREIGN_PREFIX, parseStreamId } from './services/sendspinDataService';
 import type { ControllerCommand } from './services/sendspinControllerClient';
 import { settingsService } from './services/settingsService';
 import { useThemeSettings } from './hooks/useThemeSettings';
@@ -289,12 +289,23 @@ export default function MeshApp(): React.ReactElement {
 
   const onStartBrowserAudio = useCallback(() => {
     const m = modelRef.current;
-    const unit = m.servers.find((s) => s.id === m.localUnitId);
-    const host = unit?.host ?? window.location.hostname;
     // Join whatever the unit is playing: the featured stream, or — if the unit's own player is idle
     // while a source streams — that single active source. Idle unit (no active source) => start idle.
     const target = featuredIdRef.current ?? localActiveTargetRef.current;
-    browserTargetRef.current = target && !target.startsWith(FOREIGN_PREFIX) ? target : null;
+    const validTarget = target && !target.startsWith(FOREIGN_PREFIX) ? target : null;
+
+    // Dial the unit that OWNS the target stream, NOT the one serving this page. A browser player is
+    // a plain client of one server and has no listening URL of its own, so it can never be reclaimed
+    // across servers the way a hardware player is — it can only ever join a group on the server it
+    // connected to. Dialling the local unit while listening to a peer's stream is what left the
+    // player visible-but-unroutable, with "Join Stream" doing nothing from either GUI.
+    const ownerId = validTarget ? parseStreamId(validTarget).unitId : m.localUnitId;
+    const host =
+      m.servers.find((s) => s.id === ownerId)?.host ||
+      m.servers.find((s) => s.id === m.localUnitId)?.host ||
+      window.location.hostname;
+
+    browserTargetRef.current = validTarget;
     browserRoutedRef.current = false;
     browserHandledReconnectRef.current = 0;
     void browserStart(host).catch(() => {

@@ -79,6 +79,8 @@ from sources.bluetooth_manager import BluetoothManager
 from sources.spotify_golibrespot import SpotifyGoLibrespot
 from sources.spotify_manager import SpotifyManager
 
+import unit_identity
+
 logger = logging.getLogger("plum.sendspin_server")
 
 SERVER_PORT = 8927
@@ -1015,7 +1017,9 @@ async def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     unit_id = os.environ.get("PLUM_UNIT_ID", "unit-local")
-    unit_name = os.environ.get("PLUM_UNIT_NAME", "Plum Audio")
+    # The name the user typed in Settings wins; the env var is what an unnamed unit boots with.
+    env_unit_name = os.environ.get("PLUM_UNIT_NAME", unit_identity.DEFAULT_DEVICE_NAME)
+    unit_name = unit_identity.device_name(env_unit_name)
     # Single-unit glue: auto-attach our own player to this source once it comes up. Empty URL
     # disables it (Phase 2: the mesh orchestrator drives routing instead).
     home_source = os.environ.get("PLUM_LOCAL_PLAYER_SOURCE", "airplay-1")
@@ -1074,12 +1078,28 @@ async def main() -> None:
         )
         follow.start()
 
+    # Follow renames from Settings without a restart: the mesh snapshot reads srv.unit_name on every
+    # request, so updating it is enough for the GUI and every peer's aggregated view, and the mDNS
+    # record is re-advertised under the same service instance. The Sendspin server_name handed to
+    # aiosendspin at construction keeps the boot-time value until the next restart (see unit_identity).
+    async def _apply_unit_name(new_name: str) -> None:
+        srv.unit_name = new_name
+        if mesh is not None:
+            await mesh.neighbourhood.rename(new_name)
+
+    rename_watch = asyncio.ensure_future(
+        unit_identity.watch_device_name(_apply_unit_name, fallback=env_unit_name)
+    )
+
     stop = asyncio.Event()
     try:
         await stop.wait()  # run forever; supervisord manages the process lifecycle
     except asyncio.CancelledError:
         pass
     finally:
+        rename_watch.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await rename_watch
         if follow is not None:
             await follow.stop()
         if mesh is not None:

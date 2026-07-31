@@ -195,6 +195,19 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
   `group/update`), never `stop_stream()` (which keeps clients logically PLAYING). The spec has no
   distinct idle/unrouted state — `stopped` is it. Groups/anchors persist, so routing survives.
 - **WiFi/host concerns** (NetworkManager owns `wlan0`) live on the host, not the container (as Plum-Snapcast).
+- **The unit's display name comes from `settings.json` `deviceName`** (`scripts/unit_identity.py`),
+  NOT from `PLUM_UNIT_NAME`/`PLUM_PLAYER_NAME` — those are only what an unnamed unit boots with.
+  A rename applies live (mesh view + mDNS TXT, via `Neighbourhood.rename`/`AvahiClient.republish`);
+  the Sendspin-level `server_name`/client name are fixed at connect and catch up on the next
+  restart, deliberately — restarting the audio process to apply a rename would drop playback.
+- **mDNS hostname changes go through Avahi's D-Bus `SetHostName`** on the HOST bus, never by
+  writing `/etc/avahi` or restarting a service (there is no `avahi` program in our supervisord —
+  Avahi is the host's). Two verified behaviours the code must handle: setting the name it already
+  has raises *"invalid because redundant"* (a no-op, not an error), and a real change makes Avahi
+  reset and **drop the D-Bus connection mid-call**, so a successful set surfaces as "recipient
+  disconnected" — always reconnect and read the name back rather than trusting the set. It is
+  runtime state: a host reboot reverts it, and we do NOT re-apply on boot (every unit ships with
+  the same default hostname, so replaying it would collide all units onto one name).
 - **Bluetooth needs a PATCHED host `bluetoothd`** — `backend/config/bluez/` (two DEP-3 patches +
   `install_patched_bluez.sh`, which rebuilds the distro package at `<version>+plumN` and holds it).
   Stock BlueZ registers AVRCP position-changed with a 49.7-day interval and never polls
