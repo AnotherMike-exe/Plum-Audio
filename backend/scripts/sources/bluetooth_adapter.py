@@ -69,6 +69,17 @@ CAPTURE_RENEGOTIATE_AFTER = 3  # immediate failures before we ask BlueZ to re-co
 BLUEALSA_NAME = "org.bluealsa"
 BLUEALSA_WAIT_S = 20.0  # how long to wait for the daemon before falling back to plain retries
 
+# STALE BOND RECOVERY. A bond can die on the phone's side alone ("Forget This Device"): we keep a
+# link key the phone no longer honours, so every connection fails authentication and drops within
+# seconds — observed on the rig as `auth failed with status 0x05` / `br-connection-key-missing`,
+# while BlueZ still reports the device Paired, Bonded and Trusted. To the user the phone just says
+# "pairing unsuccessful"; the unit looks fine. Nothing in Device1's properties says "auth failed",
+# so the signal we key on is the SHAPE of the failure: connects that die almost immediately and
+# never carry audio. A phone that is merely connected and idle holds its link for minutes, which is
+# what keeps this from unpairing working devices.
+STALE_BOND_MAX_CONNECTION_S = 15.0  # a connection shorter than this never really came up
+STALE_BOND_STRIKES = 3  # consecutive such connections before we drop the bond
+
 
 class BluetoothAdapter:
     """Owns one adapter: its BlueZ config, the pairing agent, device tracking, and A2DP capture.
@@ -89,6 +100,11 @@ class BluetoothAdapter:
         self._capture_log = None
         self._props_listeners: list[Callable[[str, str, dict], None]] = []
         self._object_listeners: list[Callable[[str, list[str], bool], None]] = []
+        # Stale-bond tracking (see STALE_BOND_STRIKES): when each device connected, whether that
+        # connection ever carried audio, and how many failed connections it has had in a row.
+        self._connected_at: dict[str, float] = {}  # device object path -> monotonic connect time
+        self._carried_audio: set[str] = set()  # addresses whose CURRENT connection reached capture
+        self._stale_strikes: dict[str, int] = {}  # address -> consecutive failed connections
 
     # -- listener registration (bluetooth_avrcp hooks in here) ----------------
 
@@ -349,6 +365,8 @@ class BluetoothAdapter:
 
         address = await self._address_of(props, path)
         self._connected[path] = address
+        self._connected_at[path] = time.monotonic()
+        self._carried_audio.discard(address)  # this connection has not proven itself yet
         logger.info("[%s] A2DP device connected: %s (%s)", self.instance.source_id, address, path)
         await self._persist_pairing(path, props)
         # Most-recently-connected wins, matching the ALSA plugin's own default device semantics
@@ -357,9 +375,11 @@ class BluetoothAdapter:
 
     async def _drop_device(self, path: str) -> None:
         address = self._connected.pop(path, None)
+        connected_at = self._connected_at.pop(path, None)
         if address is None:
             return
         logger.info("[%s] A2DP device disconnected: %s", self.instance.source_id, address)
+        await self._judge_connection(path, address, connected_at)
         if self._active != address:
             return
         if self._connected:
@@ -367,6 +387,58 @@ class BluetoothAdapter:
             await self._start_capture(next(iter(self._connected.values())))
         else:
             await self._stop_capture()
+
+    async def _judge_connection(self, path: str, address: str, connected_at: float | None) -> None:
+        """Decide whether the connection that just ended was a real session or a stale-bond failure.
+
+        Anything that carried audio, or that simply lasted (an idle but healthy connection), clears
+        the slate. Only the short-and-silent kind counts against the bond — see STALE_BOND_STRIKES.
+        """
+        carried_audio = address in self._carried_audio
+        self._carried_audio.discard(address)
+        lasted = time.monotonic() - connected_at if connected_at is not None else None
+
+        if carried_audio or lasted is None or lasted >= STALE_BOND_MAX_CONNECTION_S:
+            if self._stale_strikes.pop(address, 0):
+                logger.info("[%s] %s connected properly; clearing its stale-bond strikes",
+                            self.instance.source_id, address)
+            return
+
+        strikes = self._stale_strikes.get(address, 0) + 1
+        self._stale_strikes[address] = strikes
+        logger.warning(
+            "[%s] %s dropped after %.1fs without audio (strike %d/%d)",
+            self.instance.source_id, address, lasted, strikes, STALE_BOND_STRIKES,
+        )
+        if strikes >= STALE_BOND_STRIKES:
+            await self._forget_stale_bond(path, address)
+
+    async def _forget_stale_bond(self, path: str, address: str) -> None:
+        """Drop the bond so the phone can pair cleanly again.
+
+        This is the one place we destroy state the user did not ask us to, so it is logged at
+        WARNING with the reason: without it the unit sits in a loop only `bluetoothctl remove` over
+        SSH can break, and the phone's own advice ("forget this device") cannot fix it — the stale
+        key is on OUR side. Re-pairing is then a normal auto-pair, since we stay pairable.
+        """
+        self._stale_strikes.pop(address, None)
+        if self._bus is None:
+            return
+        try:
+            intro = await self._bus.introspect(BLUEZ, self.instance.adapter_path)
+            adapter = self._bus.get_proxy_object(BLUEZ, self.instance.adapter_path, intro).get_interface(
+                ADAPTER_IFACE
+            )
+            await adapter.call_remove_device(path)
+        except Exception:  # noqa: BLE001
+            logger.warning("[%s] could not remove the stale bond for %s", self.instance.source_id, address,
+                           exc_info=True)
+            return
+        logger.warning(
+            "[%s] removed the bond for %s after %d failed connections — its link key was stale "
+            "(the device was forgotten on its own side). Pair it again to use it.",
+            self.instance.source_id, address, STALE_BOND_STRIKES,
+        )
 
     async def _is_audio_source(self, props) -> bool:
         try:
@@ -455,12 +527,23 @@ class BluetoothAdapter:
             if proc is None:
                 attempt += 1
             else:
-                await proc.wait()
+                # Surviving the health threshold is itself the proof that the A2DP transport is
+                # real, so record it HERE rather than when the process exits: a genuine but short
+                # session ended by the phone disconnecting would otherwise never be credited, and
+                # three of those in a row would drop a perfectly good bond (see _judge_connection).
+                try:
+                    await asyncio.wait_for(asyncio.shield(proc.wait()), CAPTURE_HEALTHY_S)
+                except asyncio.TimeoutError:
+                    self._carried_audio.add(address)
+                    await proc.wait()
                 if self._active != address:
                     return  # we were stopped or retargeted; not a failure
                 if time.monotonic() - started >= CAPTURE_HEALTHY_S:
                     # A real session that ended (phone stopped sending). Retry promptly.
                     attempt = 0
+                    # Proof the bond is good: the transport existed and we read from it. Clears any
+                    # stale-bond strikes when this connection ends (see _judge_connection).
+                    self._carried_audio.add(address)
                     logger.info("[%s] capture for %s ended; reopening", self.instance.source_id, address)
                 else:
                     attempt += 1

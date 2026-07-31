@@ -1,7 +1,8 @@
-import React, {useState, useEffect} from 'react';
+import React, {useState, useEffect, useCallback} from 'react';
 import type {Settings as SettingsType} from '../../types';
 import {Switch} from '../Switch';
 import {airplayService, bluetoothService, spotifyService, dlnaService, plexampService} from '../../services/integrationsService';
+import type {PairedDevice} from '../../services/integrationsService';
 import { Icon } from '../Icon';
 
 interface IntegrationsTabProps {
@@ -69,6 +70,14 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
   const [bluetoothNameStatus, setBluetoothNameStatus] = useState<ApplyStatus>('idle');
   const [bluetoothNameMessage, setBluetoothNameMessage] = useState('');
   const [isTogglingBluetooth, setIsTogglingBluetooth] = useState(false);
+
+  // Paired devices come from BlueZ, not settings.json — they are the radio's state, and the whole
+  // point of showing them is to forget a bond that has gone stale (the phone forgot us, we kept the
+  // link key, so it can no longer connect and says "pairing unsuccessful").
+  const [pairedDevices, setPairedDevices] = useState<PairedDevice[]>([]);
+  const [pairedError, setPairedError] = useState('');
+  const [pairedLoading, setPairedLoading] = useState(false);
+  const [forgettingAddress, setForgettingAddress] = useState<string | null>(null);
 
   // DLNA endpoints state
   const [dlnaEndpoints, setDlnaEndpoints] = useState<any[]>([]);
@@ -158,6 +167,41 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
 
   const toggleSection = (section: string) => {
     setExpandedSection(expandedSection === section ? null : section);
+  };
+
+  const refreshPairedDevices = useCallback(async () => {
+    setPairedLoading(true);
+    const result = await bluetoothService.listPairedDevices();
+    // On failure keep whatever we last showed and say why: an empty list would read as "nothing is
+    // paired", which is a worse answer than "the radio could not be reached".
+    if (result.success) {
+      setPairedDevices(result.devices ?? []);
+      setPairedError('');
+    } else {
+      setPairedError(result.message || 'Could not read paired devices');
+    }
+    setPairedLoading(false);
+  }, []);
+
+  // Only while the card is open: bonds change rarely, and polling a D-Bus round trip behind a
+  // collapsed panel buys nothing.
+  useEffect(() => {
+    if (expandedSection === 'bluetooth' && btEnabled) void refreshPairedDevices();
+  }, [expandedSection, btEnabled, refreshPairedDevices]);
+
+  const handleForgetDevice = async (device: PairedDevice) => {
+    setForgettingAddress(device.address);
+    const result = await bluetoothService.forgetPairedDevice(device.address);
+    if (result.success) {
+      // Drop it locally for immediate feedback, then re-read so the list reflects what BlueZ
+      // actually holds rather than what we hoped it would.
+      setPairedDevices((prev) => prev.filter((d) => d.address !== device.address));
+      setPairedError('');
+      await refreshPairedDevices();
+    } else {
+      setPairedError(result.message || `Could not forget ${device.name}`);
+    }
+    setForgettingAddress(null);
   };
 
   // AirPlay endpoint handlers
@@ -957,6 +1001,62 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                 <label htmlFor="bt-discoverable" className="text-sm text-[var(--text-secondary)]">
                   Always discoverable
                 </label>
+              </div>
+
+              {/* Paired devices. Forgetting one drops its link key on this unit, which is the only
+                  way to recover a bond the phone has already forgotten on its side. */}
+              <div className="pt-2 border-t border-[var(--border-color)]">
+                <div className="flex items-center justify-between mb-2">
+                  <label className="block text-sm text-[var(--text-secondary)]">
+                    Paired devices
+                  </label>
+                  <button
+                    onClick={() => void refreshPairedDevices()}
+                    disabled={pairedLoading}
+                    className="text-xs text-[var(--text-muted)] hover:text-[var(--text-secondary)] disabled:opacity-50"
+                  >
+                    {pairedLoading ? 'Refreshing…' : 'Refresh'}
+                  </button>
+                </div>
+
+                {pairedError && (
+                  <p className="text-xs text-red-500 mb-2">{pairedError}</p>
+                )}
+
+                {pairedDevices.length === 0 && !pairedLoading && !pairedError && (
+                  <p className="text-xs text-[var(--text-muted)]">
+                    No paired devices. Make this unit discoverable and pair from your phone.
+                  </p>
+                )}
+
+                <ul className="space-y-1">
+                  {pairedDevices.map((device) => (
+                    <li
+                      key={device.address}
+                      className="flex items-center justify-between gap-3 px-3 py-2 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded"
+                    >
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm text-[var(--text-secondary)] truncate">{device.name}</span>
+                          {device.connected && (
+                            <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-green-500/15 text-green-500 flex-shrink-0">
+                              Connected
+                            </span>
+                          )}
+                        </div>
+                        <span className="text-xs text-[var(--text-muted)]">{device.address}</span>
+                      </div>
+                      <button
+                        onClick={() => void handleForgetDevice(device)}
+                        disabled={forgettingAddress === device.address}
+                        title={`Forget ${device.name} — removes its pairing key from this unit`}
+                        className="px-3 py-1 text-xs rounded border border-red-500/40 text-red-500 hover:bg-red-500/10 disabled:opacity-50 flex-shrink-0"
+                      >
+                        {forgettingAddress === device.address ? 'Forgetting…' : 'Forget'}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
               </div>
             </div>
           )}

@@ -5,6 +5,14 @@
 
 const API_BASE = `${window.location.protocol}//${window.location.hostname}:${window.location.port}/api/integrations`;
 
+/** A device bonded to this unit's Bluetooth adapter, as BlueZ reports it. */
+export interface PairedDevice {
+  address: string;
+  name: string;
+  connected: boolean;
+  trusted: boolean;
+}
+
 /**
  * AirPlay Control
  */
@@ -266,6 +274,37 @@ export const bluetoothService = {
     } catch (error) {
       console.error('Failed to get Bluetooth status:', error);
       throw error;
+    }
+  },
+
+  /**
+   * Paired devices, read live from BlueZ (not from settings.json — bonds are the radio's state).
+   * A 503 means the radio could not be reached, which is deliberately NOT reported as "none paired".
+   */
+  async listPairedDevices(): Promise<{ success: boolean; devices: PairedDevice[]; message?: string }> {
+    try {
+      const response = await fetch(`${API_BASE}/bluetooth/devices`);
+      return await response.json();
+    } catch (error) {
+      console.error('Failed to list paired Bluetooth devices:', error);
+      return { success: false, devices: [], message: 'Could not reach the unit' };
+    }
+  },
+
+  /**
+   * Forget one paired device: drops its link key so it can pair cleanly again. This is the manual
+   * escape hatch for a bond that has gone stale on the phone's side — the unit keeps a key the
+   * phone no longer honours, and every connection then fails authentication.
+   */
+  async forgetPairedDevice(address: string): Promise<{ success: boolean; message: string }> {
+    try {
+      const response = await fetch(`${API_BASE}/bluetooth/devices/${encodeURIComponent(address)}`, {
+        method: 'DELETE',
+      });
+      return await response.json();
+    } catch (error) {
+      console.error('Failed to forget Bluetooth device:', error);
+      return { success: false, message: 'Could not reach the unit' };
     }
   },
 

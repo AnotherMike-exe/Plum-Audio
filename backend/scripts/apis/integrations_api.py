@@ -27,6 +27,7 @@ from flask import Blueprint, jsonify, request
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/ on path
 from sources import airplay_config, bluetooth_config  # noqa: E402
 
+import bluetooth_bonds  # noqa: E402
 from settings_api import SettingsManager  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -299,6 +300,25 @@ def create_integrations_blueprint(settings_manager: SettingsManager | None = Non
     _register_endpoint_routes(bp, "airplay", airplay)
     _register_endpoint_routes(bp, "spotify", spotify)
     _register_endpoint_routes(bp, "bluetooth", bluetooth)
+
+    @bp.get("/bluetooth/devices")
+    def bluetooth_devices():
+        """Paired devices, straight from BlueZ — see apis/bluetooth_bonds.py for why not settings.json."""
+        try:
+            return jsonify({"success": True, "devices": bluetooth_bonds.list_paired_devices()}), 200
+        except bluetooth_bonds.BlueZUnavailable as e:
+            # An empty list would read as "nothing is paired", which is a different and worse lie
+            # than saying the radio could not be reached.
+            return jsonify({"success": False, "devices": [], "message": f"Bluetooth unavailable: {e}"}), 503
+
+    @bp.delete("/bluetooth/devices/<address>")
+    def bluetooth_forget_device(address: str):
+        """Forget one device: drops its link key so the phone can pair cleanly again."""
+        try:
+            ok, message = bluetooth_bonds.forget_device(address)
+        except bluetooth_bonds.BlueZUnavailable as e:
+            return jsonify({"success": False, "message": f"Bluetooth unavailable: {e}"}), 503
+        return jsonify({"success": ok, "message": message, "address": address}), 200 if ok else 400
 
     @bp.post("/bluetooth/settings")
     def bluetooth_settings():
