@@ -82,12 +82,23 @@ Not yet run; the reliability work Phase 4 gates on.
 
 ## Tier 6 — container
 
-Untested: **the image has never been built.** Before any deployment claim —
+**Built and deployed to all three units, 2026-07-31** (`docker/build.sh` → `docker/deploy.sh`).
+Verified on the rig:
 
-- multi-arch build (amd64 + arm64); frontend build stage; go-librespot fetched for the target arch.
-- supervisord brings up server, player, config API, nginx — and NOT shairport (the manager owns it).
-- Host Avahi + system D-Bus sockets mounted; host networking; mDNS still works from inside.
-- `/config`, `/data`, `/media` volumes; PUID/PGID/UMASK honoured; settings survive recreation.
+- arm64 build (native on an Apple Silicon host, no qemu); frontend build stage; go-librespot
+  fetched per arch. Image ~549 MB, ~208 MB compressed for transfer.
+- supervisord brings up server, player, config API and nginx — and **not** the source daemons: the
+  managers own those. Confirmed by `supervisorctl status` (4 programs) plus `ps` inside the
+  container showing shairport, its private `dbus-daemon` and the go-librespot instances.
+- Host Avahi + system D-Bus mounted, host networking: the container's shairport advertises
+  `_raop._tcp`, Spotify endpoints register Connect, and the mesh both publishes
+  `_sendspin-server._tcp` and discovers its peer — all through the **host** responder.
+- `/config`, `/data`, `/media` volumes; PUID/PGID/UMASK honoured; `deploy.sh` imports the unit's
+  existing `settings.json` and go-librespot auth state on first deploy, and leaves both alone on
+  every later one, so a rebuild is not a re-authorisation.
+
+Still unverified at this tier: an **amd64** build (only arm64 has been built), container restart
+under live playback, and behaviour across a host reboot.
 
 ---
 

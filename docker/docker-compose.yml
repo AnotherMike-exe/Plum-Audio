@@ -1,25 +1,41 @@
-# Plum-Audio — Binhex-standard compose. Host networking required for mDNS/Avahi + Sendspin discovery.
+# Plum-Audio — Binhex-standard compose for ONE unit. This file is what `docker/deploy.sh` installs
+# on each Pi (at /opt/plum-audio/docker-compose.yml, beside the per-unit plum-audio.env), so the
+# volume paths are relative to the compose file's own directory and the same file works unmodified
+# on every unit and in the repo.
+#
+# Build locally from the repo root:  docker compose -f docker/docker-compose.yml build
+# Deploy to the rig:                 docker/build.sh && docker/deploy.sh all
 services:
   plum-audio:
     build:
       context: ..
       dockerfile: backend/Dockerfile
+    image: plum-audio:${PLUM_TAG:-latest}
     container_name: plum-audio
     restart: unless-stopped
-    # Host networking: Sendspin WS (8927/8928), mDNS (5353), source ports all need L2 visibility.
+    # Host networking, non-negotiable: Sendspin WS (8927/8928), the mesh beacon (8929), mDNS/Avahi
+    # (5353), AirPlay's RAOP + UDP blocks and Spotify's zeroconf ports all need L2 visibility, and
+    # the mesh discovers peers by real LAN address. See CLAUDE.md "Key Ports".
     network_mode: host
     volumes:
-      - ./app-config:/config      # config, logs, settings.json
-      - ./app-data:/data          # app data
-      - ./app-media:/media        # media (Plexamp etc.)
-      # AirPlay advertising uses the HOST's Avahi/D-Bus (host concerns live on the host).
+      - ./config:/config          # logs (supervisord.log first), unit config
+      - ./data:/data              # settings.json + per-source state (go-librespot auth lives here)
+      - ./media:/media            # media (Plexamp etc.)
+      # The HOST owns the daemons we only talk to: Avahi (mDNS for AirPlay/Spotify/Sendspin
+      # advertising) and bluetoothd (the radio + the patched AVRCP path). Both are reached over the
+      # host's SYSTEM D-Bus, so its socket is mounted rather than duplicated in here.
       - /var/run/dbus:/var/run/dbus
       - /var/run/avahi-daemon:/var/run/avahi-daemon
-    environment:
-      - PUID=1000
-      - PGID=29                   # audio group (RPi standard)
-      - UMASK=002
-      - TZ=America/New_York
-      - DEBUG=false
     devices:
-      - /dev/snd:/dev/snd         # ALSA audio out
+      - /dev/snd:/dev/snd         # ALSA out for the local player, in for the Bluetooth capture
+    # Audio reliability over container purity: the player's PortAudio thread and shairport-sync both
+    # want to raise their scheduling priority, which Docker's default capability set forbids. Without
+    # these the stack still runs, but every priority bump logs a failure and the jitter buffer is one
+    # scheduling hiccup closer to an xrun.
+    cap_add:
+      - SYS_NICE
+    ulimits:
+      rtprio: 95
+      memlock: -1
+    env_file:
+      - ./plum-audio.env

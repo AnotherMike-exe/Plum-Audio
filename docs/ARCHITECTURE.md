@@ -562,6 +562,50 @@ triggers a re-query, so the phone is never re-asked once the session exists. Art
 the first track change. Closing it needs a third bluetoothd patch exposing a metadata re-query —
 the same shape as the position pair above.
 
+**CONTAINER BUILD DONE (2026-07-31).** `backend/Dockerfile` + `docker/{build,deploy}.sh` +
+`docker/units.conf`. All three R&D Pis now run the unit as a container; the `~/plum-test` dev stack
+is stopped on each (left on disk, so reverting is `docker compose down` + `run_*.sh`).
+
+*The base image is pinned to the units' Debian release, not "some slim base".* Two integrations
+depend on exactly what **trixie** ships: bluez-alsa 4.3.1-3 still installs its daemon as `bluealsa`
+(upstream renamed it `bluealsad` in 4.0), and shairport-sync **4.3.7** is the build whose MPRIS
+behaviour multi-endpoint AirPlay was verified against. Bookworm would silently hand us shairport 4.1
+and a different bluez-alsa. The Dockerfile therefore asserts `shairport-sync -V | grep -- -mpris`
+plus the `bluealsa`/`obexd` paths **at build time** — each of those failures is invisible at runtime
+(transport controls that do nothing; a Bluetooth source that never appears; cover art that never
+loads), so the build is the only place they can be caught cheaply.
+
+*What stays on the host, and why the split is not arbitrary:* Avahi, the system D-Bus and
+`bluetoothd` (with the AVRCP patches) run on the host and are reached through mounted sockets under
+host networking. The host owns the radio, the AVCTP channel and the mDNS responder — a second
+responder in the container is the exact collision `start_server(advertise_addresses=[])` exists to
+avoid. Verified on `.201.133`: shairport in the container advertises `_raop._tcp` through the host
+Avahi (`6E1713303D0B@Plum Audio` on :5050), both go-librespot endpoints register Spotify Connect,
+and the mesh publishes `_sendspin-server._tcp` while discovering its peer.
+
+*Three conflicts the cutover has to clear, all of which fail deceptively:*
+
+1. **The host's nginx served the pre-container GUI** (`/var/www/plum-audio`, the same proxy config
+   the image now ships). Under host networking the container's nginx crash-loops on `bind()` while
+   the host keeps answering :80 — so the GUI looks *fine* and serves a stale build. `deploy.sh`
+   disables the host unit and treats a bound port as a hard failure rather than a warning.
+2. **A `SIGTERM`-deaf shairport.** Once its private session bus is killed, shairport-sync traps
+   SIGTERM and hangs in shutdown: `pkill` reports success, the process survives, and it keeps RAOP
+   port 5050. Endpoint ports are configurable so the port sweep cannot enumerate them — the deploy
+   escalates every dev-stack pattern to `SIGKILL` unconditionally.
+3. **Identity defaults.** `sendspin_server.py` defaults to `unit-local` and a `127.0.0.1` player
+   URL, which are wrong for every unit in a mesh: peers *reclaim this player by the URL it
+   registers*, so a loopback default advertises an endpoint no peer can reach and the roam silently
+   never lands. The entrypoint derives the unit id from the hostname and the player URL from the
+   real LAN address; `units.conf` pins the ids the rig already uses, so a unit keeps its routes.
+
+*Compose reaches the units two ways and that is fine:* `.7.122` runs Docker CE from Docker's repo
+(compose as a CLI plugin), the Debian-packaged units run trixie's `docker-compose` 2.26 standalone.
+Same compose file; `deploy.sh` detects the invocation. Note trixie has **no** `docker-compose-v2`
+package — the name is `docker-compose`, and it is v2, not the retired Python v1.
+
+*Still outside the image:* DLNA (gmrender) and Plexamp, which land with their slices.
+
 ### Phase 4 — Cutover
 14. Migrate the two production units (`.200`/`.203`) once ≥3-unit soak passes; freeze the
     Snapcast codebase on a tag for rollback.

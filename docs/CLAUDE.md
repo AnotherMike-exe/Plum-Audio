@@ -9,8 +9,9 @@
 > **Multi-endpoint AirPlay** (private D-Bus session per endpoint for MPRIS), the **per-unit nginx
 > GUI**, and **third-party interop** (Sendspin mDNS via Avahi; adopt/release of foreign speakers —
 > proven against Music Assistant + a Home Assistant Voice PE) are in and hardware-verified.
-> Remaining: DLNA/Bluetooth/Plexamp, the container build, and the conformance gaps in
-> docs/SPEC-CONFORMANCE.md.
+> **The container build is DONE (2026-07-31)** — all three R&D Pis run the unit as a container
+> (`docker/build.sh` → `docker/deploy.sh`), with the `~/plum-test` dev stack stopped but left on
+> disk. Remaining: DLNA/Plexamp and the conformance gaps in docs/SPEC-CONFORMANCE.md.
 
 ## Project Overview
 
@@ -46,9 +47,13 @@ React/TS GUI are **ported** from Plum-Snapcast, not rewritten.
 ## Technology Stack
 
 ### Backend
-- **Base image**: **Debian-slim (glibc)** — NOT Alpine/musl. Deliberate: glibc makes PyAV /
-  PortAudio / numpy wheels trivial and removes the Alpine packaging pain Plum-Snapcast had.
+- **Base image**: **`python:3.13-slim-trixie`** (glibc) — NOT Alpine/musl. Deliberate: glibc makes
+  PyAV / PortAudio / numpy wheels trivial and removes the Alpine packaging pain Plum-Snapcast had.
   **Do not "optimize" this back to Alpine.** Multi-arch amd64 + arm64.
+  **Trixie specifically, matching the units' Debian 13**: bluez-alsa 4.3.1-3 still names its daemon
+  `bluealsa` (renamed `bluealsad` upstream in 4.0) and shairport-sync **4.3.7** is the MPRIS build
+  multi-endpoint AirPlay was verified against. The Dockerfile asserts both at BUILD time — each
+  failure is invisible at runtime (dead transport controls, a Bluetooth source that never appears).
 - **Language**: Python 3.13
 - **Sync engine**: `aiosendspin` (**pinned 6.0.5**; fast-moving — pin + smoke-test on bump), PyAV, numpy
 - **APIs**: Flask REST on **:5002** (settings, integrations, audio); **mesh API is aiohttp on :5001**
@@ -88,7 +93,7 @@ React/TS GUI are **ported** from Plum-Snapcast, not rewritten.
 │   │   └── apis/                # settings/integrations/audio Flask APIs (mesh API lives in mesh/api.py, aiohttp)
 │   └── supervisord/       # process .ini configs
 ├── frontend/src/{components,services,hooks,assets}/
-├── docker/                # docker-compose.yml + build-and-push.sh
+├── docker/                # compose + build.sh/deploy.sh + units.conf (the rig's unit table)
 └── tests/{Unit,Integration}/
 ```
 
@@ -217,12 +222,33 @@ the API — that process can't reach the audio loop, and the dev rig has no supe
    `Settings.tsx`.
 6. Test: deploy to the RPi rig → verify live add/rename/disable/remove → then build the image.
 
+### Building + deploying to the rig
+```bash
+docker/build.sh                    # arm64 image (native on Apple Silicon) -> dist/*.tar.gz
+docker/deploy.sh all               # every unit in docker/units.conf
+docker/deploy.sh 192.0.2.10   # one unit
+```
+`deploy.sh` is re-runnable and stops the pre-container `~/plum-test` stack itself. It imports that
+unit's existing `settings.json` + go-librespot auth on FIRST deploy only, then never touches
+`/opt/plum-audio/{config,data}` again — so a rebuild is not a re-authorisation. Reverting a unit to
+the dev stack is `docker compose down` in `/opt/plum-audio` plus `~/plum-test/run_*.sh`, which is
+still on disk.
+
+Two conflicts it clears, both of which fail deceptively — see ARCHITECTURE §8 Phase 3: the **host's
+nginx** (it answers :80 while the container's nginx crash-loops, serving a stale GUI that looks
+fine), and a **SIGTERM-deaf shairport** that survives `pkill` still holding RAOP 5050.
+
 ### Debugging
 ```bash
-docker logs plum-audio
-docker exec plum-audio supervisorctl -c /app/supervisord/supervisord.conf tail -f <service>
+docker logs plum-audio                                    # entrypoint: the derived unit identity
+docker exec plum-audio supervisorctl -c /app/supervisord/supervisord.conf status
+docker exec plum-audio tail -f /config/logs/sendspin_server.log   # + sendspin_player/config_api/nginx
+docker exec plum-audio tail -f /data/shairport/1/shairport-sync.log   # per-endpoint daemon logs
 docker exec plum-audio aplay -l
 ```
+Source daemons are NOT supervisord programs — the managers own them, so `ps` inside the container
+is how you confirm shairport/go-librespot/bluealsa are up. A source missing there but enabled in
+settings.json is a manager problem, not a supervisord one.
 
 ---
 
