@@ -21,20 +21,6 @@ export interface BrowserPlayerState {
   start: (host: string) => Promise<string | null>;
   /** Tear the tab's player down (explicit Stop, or routed to none). */
   stop: () => void;
-  /** Manual trim against the room, in ms. Positive = play earlier. Persisted per browser. */
-  syncDelayMs: number;
-  setSyncDelayMs: (ms: number) => void;
-}
-
-// The residual offset after the SDK's own latency compensation belongs to THIS machine's output
-// path (browser, OS mixer, USB/Bluetooth headphones), not to the unit — so it is stored per browser
-// rather than in the unit's settings, where it would follow the wrong device around.
-const SYNC_DELAY_KEY = 'plum.browserSyncDelayMs';
-const SYNC_DELAY_MAX_MS = 2000; // the SDK's own ceiling is 5000; beyond ~2s is a different problem
-
-function loadSyncDelay(): number {
-  const raw = Number(localStorage.getItem(SYNC_DELAY_KEY));
-  return Number.isFinite(raw) ? Math.min(Math.max(raw, 0), SYNC_DELAY_MAX_MS) : 0;
 }
 
 export function useBrowserPlayer(): BrowserPlayerState {
@@ -43,14 +29,6 @@ export function useBrowserPlayer(): BrowserPlayerState {
   const [starting, setStarting] = useState(false);
   const [playerId, setPlayerId] = useState<string | null>(null);
   const [reconnectSeq, setReconnectSeq] = useState(0);
-  const [syncDelayMs, setSyncDelayMsState] = useState(loadSyncDelay);
-
-  const setSyncDelayMs = useCallback((ms: number) => {
-    const clamped = Math.min(Math.max(Math.round(ms), 0), SYNC_DELAY_MAX_MS);
-    setSyncDelayMsState(clamped);
-    localStorage.setItem(SYNC_DELAY_KEY, String(clamped));
-    ref.current?.setSyncDelay(clamped); // live, so it can be dialled in by ear while playing
-  }, []);
 
   // Warm the module once so the first click's dynamic import is already resolved (keeps unlock() in
   // the gesture window). Does not load the opus WASM (we use flac/pcm).
@@ -69,10 +47,7 @@ export function useBrowserPlayer(): BrowserPlayerState {
 
   const start = useCallback(async (host: string): Promise<string | null> => {
     if (ref.current) return ref.current.playerId; // already listening in this tab
-    const p = new SendspinBrowserPlayer(host, {
-      onReconnected: () => setReconnectSeq((n) => n + 1),
-      syncDelayMs,
-    });
+    const p = new SendspinBrowserPlayer(host, { onReconnected: () => setReconnectSeq((n) => n + 1) });
     ref.current = p;
     setPlayerId(p.playerId); // expose the id up-front so the caller can watch its own row
     setStarting(true);
@@ -90,10 +65,10 @@ export function useBrowserPlayer(): BrowserPlayerState {
     } finally {
       setStarting(false);
     }
-  }, [syncDelayMs]);
+  }, []);
 
   // Tear down if the component using the hook unmounts.
   useEffect(() => () => ref.current?.stop('shutdown'), []);
 
-  return { active, starting, playerId, reconnectSeq, start, stop, syncDelayMs, setSyncDelayMs };
+  return { active, starting, playerId, reconnectSeq, start, stop };
 }

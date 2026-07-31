@@ -490,8 +490,6 @@ export default function MeshApp(): React.ReactElement {
               onStartBrowserAudio={onStartBrowserAudio}
               onStopBrowserAudio={onStopBrowserAudio}
               browserAudioActive={browserActive}
-              browserSyncDelayMs={browser.syncDelayMs}
-              onBrowserSyncDelayChange={browser.setSyncDelayMs}
               federationEnabled={false}
             />
           </div>

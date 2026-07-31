@@ -7,9 +7,16 @@
  * endpoint ("Browser Audio") — routing/volume/removal all ride the existing /api/mesh/* path, no
  * special backend handling (see docs/LISTEN-IN-BROWSER-PLAN.md).
  *
- * Codec: prefer FLAC (lossless, ~half PCM's bandwidth, cheaper to encode on a Pi than Opus), fall
- * back to PCM. The server transcodes the group's PCM per player, so this "just works" — verified in
- * the spike. Opus is deliberately not advertised, which also keeps the opus-encdec WASM off the wire.
+ * Codec: PCM FIRST, and that ordering is a sync decision, not a bandwidth one. The server caches
+ * outgoing audio per TRANSFORM KEY (codec + rate + depth + channels + frame size), and a client
+ * joining a live stream is only handed the live timeline if it shares a key with what is already
+ * flowing. The unit's own player takes PCM, so a browser asking for FLAC became the first user of a
+ * second key: instead of joining at the playhead it got a fresh transcode fed by a REPLAY of cached
+ * PCM, and played out from the start of that replay — landing a variable 0.5-2s behind the speaker
+ * depending on how much was cached when Listen was pressed. Sharing the key removes the replay.
+ * FLAC stays as a fallback for a link that cannot carry 1.4 Mbit/s; on a LAN, PCM is what the
+ * hardware player already receives. Opus is deliberately not advertised, which also keeps the
+ * opus-encdec WASM off the wire. The spec orders supported_formats by preference, first wins.
  * Sync: `sync` — the tab tracks the group clock like any other player. This was `quality-local`
  * (loose sync, no pitch/resample artifacts) on the assumption a browser is a casual second-room
  * listen; on hardware that assumption was wrong. People listen in the browser while standing in the
@@ -38,33 +45,15 @@ export class SendspinBrowserPlayer {
   private readonly name: string;
   private readonly codecs: Codec[];
   private readonly onReconnected?: () => void;
-  private syncDelayMs: number;
   private player: SendspinPlayer | null = null;
   private onUnload: (() => void) | null = null;
 
-  constructor(
-    host: string,
-    opts: { name?: string; codecs?: Codec[]; onReconnected?: () => void; syncDelayMs?: number } = {},
-  ) {
+  constructor(host: string, opts: { name?: string; codecs?: Codec[]; onReconnected?: () => void } = {}) {
     this.host = host;
     this.name = opts.name ?? 'Browser Audio';
-    this.codecs = opts.codecs ?? ['flac', 'pcm'];
+    this.codecs = opts.codecs ?? ['pcm', 'flac'];
     this.onReconnected = opts.onReconnected;
-    this.syncDelayMs = opts.syncDelayMs ?? 0;
     this.playerId = 'browser:' + Math.random().toString(36).slice(2, 8);
-  }
-
-  /**
-   * Trim this tab's playback against the room, in ms. Positive = play EARLIER, which is the
-   * direction that pulls a late browser back onto the speaker. Applies live.
-   */
-  setSyncDelay(delayMs: number): void {
-    this.syncDelayMs = delayMs;
-    try {
-      this.player?.setSyncDelay(delayMs);
-    } catch {
-      /* not connected yet — start() passes it in the config */
-    }
   }
 
   /**
@@ -79,7 +68,6 @@ export class SendspinBrowserPlayer {
       clientName: this.name,
       codecs: this.codecs,
       correctionMode: 'sync',
-      syncDelay: this.syncDelayMs,
       // Persistence left at the SDK default (localStorage). It caches this machine's MEASURED
       // output latency, which is a property of the device and its output path, so re-measuring it
       // per tab was throwing away the one number that most affects how closely we land on the room.
