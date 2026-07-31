@@ -38,15 +38,33 @@ export class SendspinBrowserPlayer {
   private readonly name: string;
   private readonly codecs: Codec[];
   private readonly onReconnected?: () => void;
+  private syncDelayMs: number;
   private player: SendspinPlayer | null = null;
   private onUnload: (() => void) | null = null;
 
-  constructor(host: string, opts: { name?: string; codecs?: Codec[]; onReconnected?: () => void } = {}) {
+  constructor(
+    host: string,
+    opts: { name?: string; codecs?: Codec[]; onReconnected?: () => void; syncDelayMs?: number } = {},
+  ) {
     this.host = host;
     this.name = opts.name ?? 'Browser Audio';
     this.codecs = opts.codecs ?? ['flac', 'pcm'];
     this.onReconnected = opts.onReconnected;
+    this.syncDelayMs = opts.syncDelayMs ?? 0;
     this.playerId = 'browser:' + Math.random().toString(36).slice(2, 8);
+  }
+
+  /**
+   * Trim this tab's playback against the room, in ms. Positive = play EARLIER, which is the
+   * direction that pulls a late browser back onto the speaker. Applies live.
+   */
+  setSyncDelay(delayMs: number): void {
+    this.syncDelayMs = delayMs;
+    try {
+      this.player?.setSyncDelay(delayMs);
+    } catch {
+      /* not connected yet — start() passes it in the config */
+    }
   }
 
   /**
@@ -61,7 +79,11 @@ export class SendspinBrowserPlayer {
       clientName: this.name,
       codecs: this.codecs,
       correctionMode: 'sync',
-      storage: null, // don't share per-tab sync-delay via localStorage across tabs
+      syncDelay: this.syncDelayMs,
+      // Persistence left at the SDK default (localStorage). It caches this machine's MEASURED
+      // output latency, which is a property of the device and its output path, so re-measuring it
+      // per tab was throwing away the one number that most affects how closely we land on the room.
+      // (It also persists server-commanded static delays; nothing here sends those.)
       // The SDK auto-reconnects on an unexpected WS drop, but the reconnected client lands in a
       // fresh idle group (the old one was cleaned up after the server's ~30s grace). Surface the
       // event so the app can re-route us back onto our source. See MeshApp's browser reconciler.

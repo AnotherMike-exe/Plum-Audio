@@ -12,6 +12,9 @@ interface ClientManagerProps {
     onGroupVolumeAdjust: (streamId: string, direction: 'up' | 'down') => void;
     onGroupMute: (streamId: string) => void;
     onStartBrowserAudio?: () => void;
+    /** Manual sync trim for the browser player, in ms (see the slider below). */
+    browserSyncDelayMs?: number;
+    onBrowserSyncDelayChange?: (ms: number) => void;
     onStopBrowserAudio?: () => void;
     browserAudioActive?: boolean;
     federationEnabled?: boolean;
@@ -167,6 +170,8 @@ export const ClientManager: React.FC<ClientManagerProps> = ({
                                                                 onGroupVolumeAdjust,
                                                                 onGroupMute,
                                                                 onStartBrowserAudio,
+                                                                browserSyncDelayMs,
+                                                                onBrowserSyncDelayChange,
                                                                 onStopBrowserAudio,
                                                                 browserAudioActive,
                                                                 federationEnabled = false,
@@ -175,13 +180,40 @@ export const ClientManager: React.FC<ClientManagerProps> = ({
     // the empty-state and the populated-list footer.
     const browserAudioButton =
         browserAudioActive && onStopBrowserAudio ? (
-            <button
-                onClick={onStopBrowserAudio}
-                className="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] font-bold py-3 px-4 rounded-lg hover:bg-[var(--bg-tertiary-hover)] transition-colors flex items-center justify-center gap-2"
-            >
-                <Icon name="headphones" style={{ color: 'inherit' }} />
-                Stop Listening
-            </button>
+            <div className="w-full flex flex-col gap-2">
+                <button
+                    onClick={onStopBrowserAudio}
+                    className="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] font-bold py-3 px-4 rounded-lg hover:bg-[var(--bg-tertiary-hover)] transition-colors flex items-center justify-center gap-2"
+                >
+                    <Icon name="headphones" style={{ color: 'inherit' }} />
+                    Stop Listening
+                </button>
+                {/* Residual offset against the room. The SDK compensates the browser's reported
+                    output latency automatically, but what is left over belongs to this machine's
+                    output path and can only be judged by ear — so it is a trim, not a setting we
+                    could pick for the user. Higher = this tab plays earlier. */}
+                {onBrowserSyncDelayChange && (
+                    <div className="flex items-center gap-3 px-1">
+                        <label htmlFor="browser-sync-trim" className="text-xs text-[var(--text-muted)] whitespace-nowrap">
+                            Sync trim
+                        </label>
+                        <input
+                            id="browser-sync-trim"
+                            type="range"
+                            min={0}
+                            max={1000}
+                            step={10}
+                            value={browserSyncDelayMs ?? 0}
+                            onChange={(e) => onBrowserSyncDelayChange(Number(e.target.value))}
+                            className="flex-1 accent-[var(--accent-color)]"
+                            title="Nudge this tab earlier to line it up with the speakers"
+                        />
+                        <span className="text-xs text-[var(--text-muted)] tabular-nums w-14 text-right">
+                            {browserSyncDelayMs ?? 0} ms
+                        </span>
+                    </div>
+                )}
+            </div>
         ) : onStartBrowserAudio && !browserAudioActive ? (
             <button
                 onClick={onStartBrowserAudio}
