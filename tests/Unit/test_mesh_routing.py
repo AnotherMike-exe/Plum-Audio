@@ -119,3 +119,48 @@ def test_find_player_prefers_connected_over_stale_stub():
 def test_unit_snapshot_wire_roundtrip():
     snap = _view().units[0]
     assert UnitSnapshot.from_dict(snap.to_dict()).to_dict() == snap.to_dict()
+
+
+def _view_with_idle_player():
+    """unitB's speaker is attached to nothing: absent from every `players` list, present only in
+    its own unit's `local_player` self-report. This is the state a player lands in after being sent
+    to none, or after its unit reboots."""
+    local = UnitSnapshot(
+        "unitA",
+        "A",
+        host="10.0.0.1",
+        sources=[SourceState("airplay", "g1", "AirPlay", True, [])],
+    )
+    peer = UnitSnapshot(
+        "unitB",
+        "B",
+        host="10.0.0.2",
+        local_player={"player_id": "playerB", "url": "ws://10.0.0.2:8928/sendspin", "attached": False},
+    )
+    return MeshView([local, peer])
+
+
+def test_idle_player_is_routable_via_its_units_self_report():
+    # Regression: routing an idle player raised "unknown player (not on any unit)", and since
+    # routing is the only thing that attaches a player, nothing could get it out of that state —
+    # auto-follow retried forever while the speaker stayed silent.
+    engine = FakeEngine()
+    router = Router("unitA", engine, view_provider=_view_with_idle_player, peer_provider=PEERS.get)
+    assert asyncio.run(router.route_player("playerB", "airplay")) is True
+    assert engine.calls == [("reclaim", "airplay", "playerB", "ws://10.0.0.2:8928/sendspin")]
+
+
+def test_idle_player_loopback_url_is_rewritten_to_the_units_host():
+    # A unit that registered itself as ws://127.0.0.1 must not be dialled on OUR loopback.
+    view = _view_with_idle_player()
+    view.units[1].local_player["url"] = "ws://127.0.0.1:8928/sendspin"
+    engine = FakeEngine()
+    router = Router("unitA", engine, view_provider=lambda: view, peer_provider=PEERS.get)
+    asyncio.run(router.route_player("playerB", "airplay"))
+    assert engine.calls == [("reclaim", "airplay", "playerB", "ws://10.0.0.2:8928/sendspin")]
+
+
+def test_genuinely_unknown_player_still_raises():
+    router = Router("unitA", FakeEngine(), view_provider=_view_with_idle_player, peer_provider=PEERS.get)
+    with pytest.raises(RouteError):
+        asyncio.run(router.route_player("ghost", "airplay"))

@@ -43,6 +43,20 @@ class RouteError(Exception):
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]", "::1")
 
 
+def _idle_player_url(view, player_id: str) -> str | None:
+    """Reclaim URL for a player that is attached to nothing, from its unit's self-report.
+
+    `UnitSnapshot.players` lists only clients attached to that server, so a player sitting idle is
+    absent from every one of them. Its own unit still reports it under `local_player`, which is how
+    the GUI keeps showing an unattached speaker — this is the routing counterpart of that.
+    """
+    for unit in view.units:
+        lp = unit.local_player or {}
+        if lp.get("player_id") == player_id:
+            return _reachable_url(lp.get("url"), unit.host)
+    return None
+
+
 def _reachable_url(url: str | None, unit_host: str | None) -> str | None:
     """Rewrite a peer player's loopback reclaim URL onto the host we reach that unit at.
 
@@ -110,7 +124,18 @@ class Router:
         # Reclaim against the player's OWN listener URL (fixed to the host the player process runs
         # on), not the unit it's currently attached to — after a roam those differ.
         if pfound is None:
-            raise RouteError(f"unknown player {player_id!r} (not on any unit)")
+            # An IDLE player is attached to nothing, so it appears in no unit's `players` list —
+            # only in its own unit's `local_player` self-report (see UnitSnapshot). Without this
+            # fallback an idle speaker cannot be routed at all, and since routing is the only thing
+            # that would attach it, "idle" was a state nothing could get it out of: sending a player
+            # to none, or rebooting its unit, left auto-follow retrying a route that could never
+            # succeed ("unknown player") while the speaker sat silent. The self-report carries the
+            # player's own listener URL, which is exactly what the reclaim below needs.
+            url = _idle_player_url(view, player_id)
+            if not url:
+                raise RouteError(f"unknown player {player_id!r} (not on any unit)")
+            logger.info("reclaiming idle player=%s onto source=%s via %s", player_id, source_id, url)
+            return await self._engine.reclaim_remote_player(source_id, player_id, url)
         url = _reachable_url(pfound[1].url, pfound[0].host)
         if not url:
             raise RouteError(f"no reclaim URL known for player {player_id!r}")
