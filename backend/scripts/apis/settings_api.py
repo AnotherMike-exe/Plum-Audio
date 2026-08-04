@@ -90,11 +90,11 @@ DEFAULT_SETTINGS = {
         "slave": {"enabled": False, "masterUnitId": None},
     },
     "audio": {
-        "output": {
-            "device": "hw:Headphones",
-            "device_type": "BUILTIN_HEADPHONES",
-            "fallback_device": "hw:Headphones",
-        },
+        # Deliberately EMPTY. An empty device means "whatever PLUM_DAC_DEVICE says", which is how a
+        # unit that has never been near the GUI keeps the output it booted with. A concrete-looking
+        # default here outranks that env on every unit at once — see _migrate_audio_output, which
+        # exists to undo exactly that on units already carrying the old placeholder.
+        "output": {"device": None, "device_type": None},
         "input": {"devices": []},
         "calibration": {
             # Per-endpoint volume calibration; keys are mesh player IDs, values are calibration data.
@@ -103,6 +103,11 @@ DEFAULT_SETTINGS = {
 }
 
 SETTINGS_FILE = os.environ.get("PLUM_SETTINGS_FILE", "/data/settings.json")
+
+# Output specs that mean "nobody has chosen one". `hw:Headphones` was the shipped default of a tab
+# that was never reachable, so it can be cleared without losing a real user choice — see
+# SettingsManager._migrate_audio_output.
+LEGACY_OUTPUT_PLACEHOLDERS = {"hw:Headphones", "hw:headphones", ""}
 
 
 class SettingsManager:
@@ -187,6 +192,36 @@ class SettingsManager:
         logger.info("migrated bluetooth settings to the endpoints-array shape")
         return True
 
+    @staticmethod
+    def _migrate_audio_output(audio: Dict[str, Any]) -> bool:
+        """Clear the pre-picker output placeholder in place. Returns True if anything changed.
+
+        Every unit built before the output picker carries `audio.output.device = "hw:Headphones"`,
+        a Plum-Snapcast leftover that no GUI could ever have set — the Audio tab was never wired in.
+        It is not a valid spec here (the identity is `<card_name>:<device>`), and it is actively
+        dangerous the moment the player starts preferring settings.json over PLUM_DAC_DEVICE: it
+        would outrank the env on every existing unit simultaneously and resolve to nothing. Treat it
+        as the "unset" it always was.
+
+        `fallback_device` goes with it. A second device id is not what recovery looks like here —
+        the player's fallback is to keep the stream it already has open rather than to switch
+        somewhere else, because a failed switch must never end in silence.
+        """
+        output = audio.get("output")
+        if not isinstance(output, dict):
+            return False
+        changed = False
+        if (output.get("device") or "").strip() in LEGACY_OUTPUT_PLACEHOLDERS:
+            output["device"] = None
+            output["device_type"] = None
+            changed = True
+        if "fallback_device" in output:
+            output.pop("fallback_device")
+            changed = True
+        if changed:
+            logger.info("cleared the pre-picker audio output placeholder")
+        return changed
+
     def get_settings(self) -> Dict[str, Any]:
         """Load settings from the JSON file, merged over defaults so new keys always exist."""
         try:
@@ -204,7 +239,9 @@ class SettingsManager:
             # The merge above is shallow, so an old-shape section from the file survives verbatim.
             # Persist the conversion rather than redoing it on every read — the source manager
             # reads settings.json directly, not through this class.
-            if self._migrate_bluetooth(merged["integrations"]):
+            migrated = self._migrate_bluetooth(merged["integrations"])
+            migrated = self._migrate_audio_output(merged["audio"]) or migrated
+            if migrated:
                 self._save_settings(merged)
 
             # Keep Plexamp availability in sync with the environment (docker-compose configuration).

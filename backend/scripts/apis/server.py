@@ -14,6 +14,7 @@ import os
 from flask import Flask
 from flask_cors import CORS
 
+from audio_api import create_audio_blueprint
 from integrations_api import create_integrations_blueprint
 from settings_api import SettingsManager, create_settings_blueprint
 
@@ -27,7 +28,7 @@ def create_app() -> Flask:
     settings_manager = SettingsManager()
     app.register_blueprint(create_settings_blueprint(settings_manager))
     app.register_blueprint(create_integrations_blueprint(settings_manager))
-    # Future: create_audio_blueprint() slots in here with the Phase-3 audio-device control.
+    app.register_blueprint(create_audio_blueprint(settings_manager))
     return app
 
 

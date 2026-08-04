@@ -44,12 +44,15 @@ is exactly the kind of quieter-than-the-GUI-claims failure that model is meant t
 from __future__ import annotations
 
 import glob
+import json
 import logging
 import os
 import re
 import subprocess
 from dataclasses import dataclass
 from enum import Enum
+
+import unit_identity
 
 logger = logging.getLogger("plum.audio_devices")
 
@@ -295,6 +298,27 @@ def _run(cmd: list[str], timeout: int = 10) -> tuple[bool, str]:
         return False, "timed out"
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)
+
+
+def configured_output_spec(fallback: str | None = None) -> str | None:
+    """The output this unit should render to: settings.json > PLUM_DAC_DEVICE > fallback.
+
+    One definition of the precedence, shared by the config API (which needs to know which device to
+    mark active) and the player (which needs to know what to open). Same never-raise contract as
+    unit_identity.device_name(): the audio process must come up and play even if settings.json is
+    missing, unreadable, or being rewritten by the other process mid-read.
+
+    Env stays meaningful as the value a unit boots with before anyone has chosen an output — which
+    is why settings.json ships with no device rather than a plausible-looking one.
+    """
+    try:
+        with open(unit_identity.settings_path(), encoding="utf-8") as f:
+            output = ((json.load(f).get("audio") or {}).get("output") or {}).get("device")
+        if output and str(output).strip():
+            return str(output).strip()
+    except (OSError, ValueError):
+        pass
+    return (os.environ.get("PLUM_DAC_DEVICE") or "").strip() or fallback
 
 
 def list_output_devices(active_spec: str | None = None) -> list[AudioDevice]:
