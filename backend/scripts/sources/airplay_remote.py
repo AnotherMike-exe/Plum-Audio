@@ -18,6 +18,7 @@ any call failure, so a shairport restart self-heals on the next command.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from collections.abc import Callable
@@ -34,7 +35,7 @@ PROPS_IFACE = "org.freedesktop.DBus.Properties"
 
 
 class AirplayRemote:
-    """Drives shairport-sync's MPRIS Player interface (transport, and volume for later)."""
+    """Drives shairport-sync's MPRIS Player interface (transport + the SENDER's volume)."""
 
     def __init__(
         self,
@@ -46,6 +47,11 @@ class AirplayRemote:
         self._bus: MessageBus | None = None
         self._player = None  # cached Player proxy interface; None = not yet bound / needs re-resolve
         self._on_source_volume = on_source_volume
+        self._watch_task: asyncio.Task | None = None
+        # Whether a sender is actually connected. Between sessions shairport reports
+        # PlaybackStatus=Stopped and Volume=0.0 — a truthful read of nothing, which as a source
+        # volume would show the user a 0% slider for an endpoint no phone is even using.
+        self._has_session = False
 
     async def connect(self) -> None:
         """Connect to the bus (idempotent). Binding to shairport happens lazily per command."""
@@ -116,25 +122,90 @@ class AirplayRemote:
     async def previous_track(self) -> None:
         await self._invoke("call_previous")
 
+    @property
+    def supports_source_volume(self) -> bool:
+        """MPRIS Volume on shairport is the AirPlay sender's own level — it relays to and from the
+        phone, and applies it to the PCM it hands us (`ignore_volume_control = "no"`). There is no
+        mute. Claimed only while bound to the daemon AND a sender is connected: an idle endpoint
+        reports 0.0, which would otherwise show as a 0% source slider for a phone that isn't
+        there."""
+        return self._player is not None and self._has_session
+
     async def set_source_volume(self, percent: int) -> None:
+        """Push a volume back to the AirPlay sender.
+
+        shairport-sync exposes MPRIS `Volume` as **READ-ONLY** and takes writes through a custom
+        `SetVolume` METHOD on the Player interface (verified by introspection against 4.3.7). A
+        Properties.Set is simply refused — which presents as the GUI slider moving happily while the
+        phone never changes, since our own readback is a different call. So drive the method, and
+        fall back to the property write for a standard MPRIS player that lacks it.
+        """
         player = await self._player_iface()
         if player is None:
             return
+        level = max(0.0, min(1.0, percent / 100))
         try:
-            await player.set_volume(max(0.0, min(1.0, percent / 100)))
-            logger.info("airplay remote: set_volume %d%%", percent)
+            await player.call_set_volume(level)
+            logger.info("airplay remote: SetVolume %d%%", percent)
+            return
+        except Exception:  # noqa: BLE001 - no SetVolume method (not shairport), or the call failed
+            logger.debug("airplay remote: SetVolume method failed; trying the property", exc_info=True)
+        try:
+            await player.set_volume(level)
+            logger.info("airplay remote: set Volume property %d%%", percent)
         except Exception:  # noqa: BLE001
             self._player = None
-            logger.debug("airplay remote: set_volume failed", exc_info=True)
+            logger.warning("airplay remote: could not set source volume to %d%%", percent)
+
+    def start_volume_watch(self, interval: float = 5.0) -> None:
+        """Keep the sender's volume flowing to `on_source_volume` without waiting for a command.
+
+        Two reasons this can't be left to the PropertiesChanged signal alone: the proxy (and with it
+        the signal subscription) is bound LAZILY on the first command, so a phone's slider would be
+        invisible until someone pressed play in the GUI; and `_drop()` tears the subscription down on
+        any failure or shairport respool. The loop binds as soon as the daemon appears, re-binds
+        after a drop, and re-reads the property each pass so a missed signal self-corrects.
+        """
+        if self._watch_task is not None:
+            return
+        self._watch_task = asyncio.ensure_future(self._volume_watch(interval))
+
+    async def _volume_watch(self, interval: float) -> None:
+        while True:
+            player = await self._player_iface()  # binds (and subscribes) as soon as shairport is up
+            if player is not None:
+                with contextlib.suppress(Exception):
+                    status = await player.get_playback_status()
+                    self._has_session = str(getattr(status, "value", status)) != "Stopped"
+                    if self._has_session:
+                        vol = await player.get_volume()
+                        self._report_volume(getattr(vol, "value", vol))
+            await asyncio.sleep(interval)
 
     def _on_props_changed(self, iface: str, changed: dict, _invalidated: list) -> None:
-        if iface != PLAYER_IFACE or "Volume" not in changed or self._on_source_volume is None:
+        if iface != PLAYER_IFACE:
             return
-        val = changed["Volume"]
-        vol = val.value if isinstance(val, Variant) else val
-        self._on_source_volume(int(round(float(vol) * 100)))
+        if "PlaybackStatus" in changed:
+            status = changed["PlaybackStatus"]
+            self._has_session = str(getattr(status, "value", status)) != "Stopped"
+        if "Volume" in changed:
+            val = changed["Volume"]
+            # A volume signal is itself proof of a sender: shairport only relays one from a session.
+            self._has_session = True
+            self._report_volume(val.value if isinstance(val, Variant) else val)
+
+    def _report_volume(self, mpris_volume) -> None:
+        if self._on_source_volume is None:
+            return
+        with contextlib.suppress(TypeError, ValueError):
+            self._on_source_volume(int(round(float(mpris_volume) * 100)))
 
     async def close(self) -> None:
+        if self._watch_task is not None:
+            self._watch_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._watch_task
+            self._watch_task = None
         if self._bus is not None:
             self._bus.disconnect()
             self._bus = None

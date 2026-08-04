@@ -309,6 +309,10 @@ class PlumSendspinServer:
         # AirplayRemote and each SpotifyGoLibrespot both satisfy it, so controller events route by source.
         self._source_remotes: dict[str, object] = {}
         self._wired_sources: set[str] = set()  # source_ids whose group already has the control listener
+        # source_id -> {"volume": int|None, "muted": bool|None} as the SENDER last reported it (the
+        # phone's AirPlay/BT slider, Spotify Connect device volume). Fed by each remote's readback
+        # callback and served in the snapshot; the protocol carries no such state, so this is ours.
+        self._source_volumes: dict[str, dict] = {}
         self._stop_evt = asyncio.Event()
 
     async def start(self) -> None:
@@ -497,6 +501,48 @@ class PlumSendspinServer:
             role.set_mute(muted)
         logger.info("[vol] player %s -> %d%%%s", player_id, volume, " (muted)" if muted else "")
 
+    # -- source volume (the level ON THE SENDING DEVICE) ----------------------
+    #
+    # Distinct from everything above: player volume (and the controller role's group volume, which
+    # the library derives from it) is OUR output gain. This is the phone's own AirPlay/Bluetooth
+    # slider, or the Spotify Connect device volume — it changes what the sender transmits, and it is
+    # visible on the sender's screen. The Sendspin spec has no concept of it, so it travels over our
+    # mesh API and snapshot rather than the protocol.
+
+    def _supports_source_volume(self, source_id: str) -> bool:
+        remote = self._source_remotes.get(source_id)
+        return remote is not None and getattr(remote, "supports_source_volume", False)
+
+    def note_source_volume(self, source_id: str, volume: int | None = None, muted: bool | None = None) -> None:
+        """Record what the sender reports its volume/mute to be (the readback half)."""
+        state = self._source_volumes.setdefault(source_id, {"volume": None, "muted": None})
+        if volume is not None:
+            state["volume"] = max(0, min(100, int(volume)))
+        if muted is not None:
+            state["muted"] = bool(muted)
+        logger.debug("[srcvol] %s reports %s", source_id, state)
+
+    async def set_source_volume(
+        self, source_id: str, volume: int | None = None, muted: bool | None = None
+    ) -> None:
+        """Drive the sending device's own volume/mute through this source's remote.
+
+        Optimistically caches the requested value so the GUI holds it: the sender confirms with its
+        own event a moment later (MPRIS PropertiesChanged / AVRCP / go-librespot), which overwrites
+        this with the truth.
+        """
+        if source_id not in self.sources:
+            raise KeyError(f"unknown source {source_id!r}")
+        remote = self._source_remotes.get(source_id)
+        if remote is None or not getattr(remote, "supports_source_volume", False):
+            raise RuntimeError(f"source {source_id!r} has no source-volume control")
+        if volume is not None:
+            await remote.set_source_volume(max(0, min(100, int(volume))))
+        if muted is not None and hasattr(remote, "set_source_mute"):
+            await remote.set_source_mute(bool(muted))
+        self.note_source_volume(source_id, volume, muted)
+        logger.info("[srcvol] %s -> vol=%s muted=%s", source_id, volume, muted)
+
     async def reclaim_remote_player(
         self, source_id: str, player_id: str, player_url: str, timeout_s: float = 10.0
     ) -> bool:
@@ -630,6 +676,7 @@ class PlumSendspinServer:
                 for c in group.clients
                 if not c.client_id.startswith(ANCHOR_PREFIX) and has_role_family("player", c.negotiated_roles)
             ]
+            src_vol = self._source_volumes.get(source_id, {})
             sources.append(
                 SourceState(
                     source_id=source_id,
@@ -639,6 +686,9 @@ class PlumSendspinServer:
                     player_ids=player_ids,
                     name=handle.name,
                     active=handle.feeder.is_active,
+                    source_volume=src_vol.get("volume"),
+                    source_muted=src_vol.get("muted"),
+                    supports_source_volume=self._supports_source_volume(source_id),
                 )
             )
 
@@ -653,6 +703,10 @@ class PlumSendspinServer:
                     # (and the router's find_player) think the player is still on this unit.
                 if not has_role_family("player", client.negotiated_roles):
                     continue  # controller/display clients (the GUI WS) are grouped for metadata, not players
+                # The level the PLAYER reported (client/state), which is what the role object holds —
+                # set_volume() alone does not move it, so this is the endpoint's real gain, not our
+                # last command. See sendspin_player._publish_render_state.
+                role = next((r for r in client.roles_by_family("player") if isinstance(r, PlayerV1Role)), None)
                 players.append(
                     PlayerState(
                         player_id=client.client_id,
@@ -660,6 +714,8 @@ class PlumSendspinServer:
                         connected=True,
                         group_id=client.group.group_id if client.group is not None else None,
                         url=self.server.get_client_url(client.client_id),
+                        volume=int(getattr(role, "volume", 100)) if role is not None else 100,
+                        muted=bool(getattr(role, "muted", False)) if role is not None else False,
                     )
                 )
 
@@ -683,15 +739,22 @@ class PlumSendspinServer:
         Advertises play/pause/next/previous on the source group's controller role and forwards the
         resulting controller events to the AirPlay sender (phone/Mac) via the MPRIS remote. Each
         endpoint has its own remote bound to its own session bus (`bus_address`) — the MPRIS name is
-        fixed, so instances would otherwise fight over it on the system bus. Volume stays the
-        group/render volume for now; source-volume sync is a later step.
+        fixed, so instances would otherwise fight over it on the system bus.
+
+        The remote also reports the SENDER's volume (MPRIS Volume PropertiesChanged, i.e. the slider
+        on the phone) into our source-volume cache — that is a different quantity from any endpoint's
+        gain, and shairport applies it to the PCM it hands us (`ignore_volume_control = "no"`).
         """
-        remote = AirplayRemote(bus_address=bus_address)
+        remote = AirplayRemote(
+            bus_address=bus_address,
+            on_source_volume=functools.partial(self.note_source_volume, source_id),
+        )
         # Do NOT connect eagerly: with a private per-endpoint bus, the source comes up BEFORE the
         # bus daemon (the manager starts us first so the FIFO exists), so the socket may not exist
         # yet. The remote connects lazily on the first command and re-resolves after a restart.
         with contextlib.suppress(Exception):
             await remote.connect()
+        remote.start_volume_watch()
         self._airplay_remotes[source_id] = remote
         self._wire_transport_control(source_id, remote)
         logger.info("[%s] airplay MPRIS transport control wired (%s)", source_id, bus_address or "system bus")
@@ -720,6 +783,7 @@ class PlumSendspinServer:
         if remote is not None:
             await remote.close()
         self._source_remotes.pop(source_id, None)
+        self._source_volumes.pop(source_id, None)
         await self.stop_source(source_id)
         logger.info("[%s] airplay source stopped", source_id)
 
@@ -733,7 +797,10 @@ class PlumSendspinServer:
         """
         self.start_source(instance.source_id, instance.fifo_path, name=instance.device_name)
         handle = self.sources[instance.source_id]
-        monitor = SpotifyGoLibrespot(handle.group, instance.instance_id, instance.api_base)
+        monitor = SpotifyGoLibrespot(
+            handle.group, instance.instance_id, instance.api_base,
+            on_source_volume=functools.partial(self.note_source_volume, instance.source_id),
+        )
         await monitor.connect()
         monitor.start()
         self._spotify_monitors[instance.source_id] = monitor
@@ -746,6 +813,7 @@ class PlumSendspinServer:
         if monitor is not None:
             await monitor.stop()
         self._source_remotes.pop(source_id, None)
+        self._source_volumes.pop(source_id, None)
         await self.stop_source(source_id)
         logger.info("[%s] spotify source stopped", source_id)
 
@@ -772,6 +840,7 @@ class PlumSendspinServer:
             # Repeat/shuffle support is discovered per connected player, not known up front, so the
             # advertised command set has to be republished when it changes (see bluetooth_avrcp).
             on_commands_changed=functools.partial(self.refresh_source_commands, instance.source_id),
+            on_source_volume=functools.partial(self.note_source_volume, instance.source_id),
         )
         avrcp.start()  # register the BlueZ listeners BEFORE start() replays existing objects
         await adapter.start()
@@ -796,6 +865,7 @@ class PlumSendspinServer:
         if adapter is not None:
             await adapter.stop()
         self._source_remotes.pop(source_id, None)
+        self._source_volumes.pop(source_id, None)
         await self.stop_source(source_id)
         logger.info("[%s] bluetooth source stopped", source_id)
 

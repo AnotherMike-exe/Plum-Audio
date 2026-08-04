@@ -138,11 +138,17 @@ REPEAT_TO_BLUEZ = {
 class BluetoothAvrcp:
     """Drives one Bluetooth source's metadata/transport. Also the source's transport remote."""
 
-    def __init__(self, group, instance_id: str, adapter, *, on_commands_changed=None, cover_art=None) -> None:
+    def __init__(
+        self, group, instance_id: str, adapter, *, on_commands_changed=None, cover_art=None,
+        on_source_volume=None,
+    ) -> None:
         self.group = group
         self.instance_id = instance_id
         self.adapter = adapter  # BluetoothAdapter — owns the bus and the BlueZ signal fan-out
         self._on_commands_changed = on_commands_changed
+        # Reports the PHONE's own volume (AVRCP absolute volume on the transport) to the server's
+        # source-volume cache — a different quantity from any endpoint's output gain.
+        self._on_source_volume = on_source_volume
         self.cover_art = cover_art  # BluetoothCoverArt | None — best-effort, never load-bearing
         self._obex_port: int | None = None
         self._track_key: str | None = None  # identity of the last REAL track dict (see _apply_track)
@@ -819,6 +825,8 @@ class BluetoothAvrcp:
         except (TypeError, ValueError):
             return
         logger.debug("[bluetooth-%s] source volume %d%%", self.instance_id, percent)
+        if self._on_source_volume is not None:
+            self._on_source_volume(percent)
 
     # -- transport control (controller → the phone, over AVRCP) --------------
 
@@ -853,6 +861,36 @@ class BluetoothAvrcp:
 
     async def previous_track(self) -> None:
         await self._invoke("call_previous")
+
+    @property
+    def supports_source_volume(self) -> bool:
+        """AVRCP absolute volume rides the media TRANSPORT, so it exists only while one does."""
+        return self._transport_path is not None
+
+    async def set_source_volume(self, percent: int) -> None:
+        """Set the phone's own volume over AVRCP absolute volume (MediaTransport1.Volume, 0-127).
+
+        A phone that never negotiated absolute volume simply refuses the write; that is a debug-level
+        non-event, not an error — the endpoint's own gain still works.
+        """
+        bus = self.adapter.bus
+        if bus is None or self._transport_path is None:
+            logger.warning("[bluetooth-%s] set_source_volume ignored — no transport", self.instance_id)
+            return
+        raw = max(0, min(AVRCP_VOLUME_MAX, round(percent * AVRCP_VOLUME_MAX / 100)))
+        try:
+            intro = await bus.introspect(BLUEZ, self._transport_path)
+            props = bus.get_proxy_object(BLUEZ, self._transport_path, intro).get_interface(PROPS_IFACE)
+            await props.call_set(TRANSPORT_IFACE, "Volume", Variant("q", raw))
+            logger.info("[bluetooth-%s] source volume -> %d%% (%d/127)", self.instance_id, percent, raw)
+        except Exception as e:  # noqa: BLE001 - no absolute volume, stale AVRCP session, link gone
+            # WARNING, not debug: BlueZ refuses the write on a half-registered AVRCP session
+            # ("transport.c:set_volume() Unable to..."), and readback keeps working throughout — so
+            # the GUI slider moves, the local gain follows, and only the phone never changes. Silent
+            # here, that costs a btmon capture to diagnose; logged, it names itself. Reconnecting the
+            # phone re-registers the session and clears it (cf. the stale-bond recovery above).
+            logger.warning("[bluetooth-%s] source volume -> %d%% REFUSED by BlueZ: %s",
+                           self.instance_id, percent, e)
 
     async def set_repeat(self, mode: RepeatMode) -> None:
         await self._set_player_prop("Repeat", Variant("s", REPEAT_TO_BLUEZ.get(mode, "off")))

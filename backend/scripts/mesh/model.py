@@ -27,6 +27,10 @@ class PlayerState:
     connected: bool
     group_id: str | None  # the group it currently renders, if any
     url: str | None = None  # the player's own LAN listener URL (how any server reclaims it)
+    # Render level as the PLAYER last reported it (client/state), not as we last commanded it —
+    # the player is the source of truth for its own gain, and it persists it across restarts.
+    volume: int = 100
+    muted: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -35,6 +39,8 @@ class PlayerState:
             "connected": self.connected,
             "group_id": self.group_id,
             "url": self.url,
+            "volume": self.volume,
+            "muted": self.muted,
         }
 
     @classmethod
@@ -45,6 +51,8 @@ class PlayerState:
             connected=bool(d.get("connected", False)),
             group_id=d.get("group_id"),
             url=d.get("url"),
+            volume=int(d.get("volume", 100)),
+            muted=bool(d.get("muted", False)),
         )
 
 
@@ -63,6 +71,14 @@ class SourceState:
     # A sender is actually using this source (audio arrived recently and the writer is still open).
     # Idle sources stay routable but drop out of the GUI's stream list — see SourceFeeder.is_active.
     active: bool = False
+    # The volume ON THE SENDING DEVICE (the phone's AirPlay/Bluetooth slider, the Spotify Connect
+    # device volume) — NOT any endpoint's output level. Sendspin has no concept of it (the protocol's
+    # controller volume is the group's player volume), so it rides our own snapshot instead.
+    # None = this source cannot report/accept one right now; `supports_source_volume` is what the
+    # GUI gates the second slider on, so a source with no live sender hides it rather than lying.
+    source_volume: int | None = None
+    source_muted: bool | None = None
+    supports_source_volume: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -75,10 +91,15 @@ class SourceState:
             # also keeps to_dict/from_dict a stable round trip.
             "name": self.name or self.source_id,
             "active": self.active,
+            "source_volume": self.source_volume,
+            "source_muted": self.source_muted,
+            "supports_source_volume": self.supports_source_volume,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "SourceState":
+        volume = d.get("source_volume")
+        muted = d.get("source_muted")
         return cls(
             source_id=d["source_id"],
             group_id=d["group_id"],
@@ -87,6 +108,9 @@ class SourceState:
             player_ids=list(d.get("player_ids", [])),
             name=d.get("name", "") or d["source_id"],
             active=bool(d.get("active", False)),
+            source_volume=None if volume is None else int(volume),
+            source_muted=None if muted is None else bool(muted),
+            supports_source_volume=bool(d.get("supports_source_volume", False)),
         )
 
 

@@ -16,7 +16,8 @@ Endpoints (parity with the old /api/federation/* surface, so the GUI ports with 
   POST /api/mesh/release           hand it back to whatever server it came from
   POST /api/mesh/route             {player_id, source_id}          route a player onto a source
   POST /api/mesh/unroute           {player_id, source_id}          remove a player from a source
-  POST /api/mesh/volume            {player_id, volume, muted}      per-player volume
+  POST /api/mesh/volume            {player_id, volume, muted}      per-player (endpoint) volume
+  POST /api/mesh/source-volume     {source_id, volume?, muted?}    the SENDING DEVICE's own volume
   POST /api/mesh/source            {source_id, fifo?}              start a local source (a group)
   POST /api/mesh/source/stop       {source_id}                     stop a local source
 
@@ -89,6 +90,7 @@ class MeshApi:
                 web.post("/api/mesh/route", self._route),
                 web.post("/api/mesh/unroute", self._unroute),
                 web.post("/api/mesh/volume", self._volume),
+                web.post("/api/mesh/source-volume", self._source_volume),
                 web.post("/api/mesh/source", self._source_start),
                 web.post("/api/mesh/source/stop", self._source_stop),
                 web.route("OPTIONS", "/api/mesh/{tail:.*}", self._options),
@@ -260,6 +262,25 @@ class MeshApi:
         try:
             await self._router.set_volume(player_id, int(body["volume"]), bool(body.get("muted", False)))
         except (KeyError, RuntimeError) as e:
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response({"ok": True})
+
+    async def _source_volume(self, request: web.Request) -> web.Response:
+        """The volume ON THE SENDING DEVICE — the phone's AirPlay/BT slider, Spotify's device volume.
+
+        Separate from /volume (our own render endpoints) because the two are genuinely different
+        quantities and stack: the sender attenuates what it transmits, each endpoint then applies its
+        own gain. Sendspin models only the latter, so this surface is ours.
+        """
+        body = await self._json(request)
+        source_id = body.get("source_id")
+        if not source_id or ("volume" not in body and "muted" not in body):
+            return web.json_response({"error": "source_id and volume or muted required"}, status=400)
+        volume = None if body.get("volume") is None else int(body["volume"])
+        muted = None if body.get("muted") is None else bool(body["muted"])
+        try:
+            await self._router.set_source_volume(source_id, volume, muted)
+        except (KeyError, RuntimeError, NotImplementedError) as e:
             return web.json_response({"error": str(e)}, status=400)
         return web.json_response({"ok": True})
 

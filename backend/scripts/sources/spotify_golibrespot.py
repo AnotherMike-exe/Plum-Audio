@@ -51,10 +51,18 @@ class SpotifyGoLibrespot:
     # and the GUI hides the repeat/shuffle controls for it. See sendspin_server._supported_commands_for.
     supports_repeat_shuffle = True
 
-    def __init__(self, group, instance_id: str, api_base: str) -> None:
+    # The Spotify Connect DEVICE volume — what the phone's own volume slider shows for this speaker,
+    # and what go-librespot applies to the PCM it writes us. Not an endpoint output level.
+    supports_source_volume = True
+
+    def __init__(self, group, instance_id: str, api_base: str, *, on_source_volume=None) -> None:
         self.group = group
         self.instance_id = instance_id
         self.api_base = api_base.rstrip("/")
+        self._on_source_volume = on_source_volume
+        # go-librespot's volume scale is its own (`volume_steps`, default 65535); the events and
+        # /status carry the current max, so we convert rather than assume.
+        self._volume_max = 65535
         self._session: aiohttp.ClientSession | None = None
         self._task: asyncio.Task | None = None
         self._stop_evt = asyncio.Event()
@@ -159,6 +167,7 @@ class SpotifyGoLibrespot:
                 if resp.status != 200:
                     return
                 status = await resp.json()
+            self._apply_volume(status.get("volume"), status.get("volume_steps"))
             self._playing = not status.get("paused", True) and not status.get("stopped", True)
             self._repeat_context = bool(status.get("repeat_context"))
             self._repeat_track = bool(status.get("repeat_track"))
@@ -190,9 +199,7 @@ class SpotifyGoLibrespot:
                 self._shuffle_state = bool(data.get("value"))
                 self.push_modes()
             elif etype == "volume":
-                value, vmax = data.get("value"), data.get("max") or 0
-                if vmax:
-                    logger.debug("[%s] volume %d/%d", self.instance_id, value, vmax)
+                self._apply_volume(data.get("value"), data.get("max"))
 
     async def _apply_track(self, track: dict) -> None:
         role = self._metadata_role()
@@ -339,3 +346,25 @@ class SpotifyGoLibrespot:
 
     async def set_shuffle(self, shuffle: bool) -> None:
         await self._post("/player/shuffle_context", {"shuffle_context": bool(shuffle)})
+
+    # -- source volume (the Spotify Connect device level) --------------------
+
+    def _apply_volume(self, value, vmax) -> None:
+        """Record go-librespot's volume as a percentage, learning its scale from the report."""
+        try:
+            if vmax:
+                self._volume_max = int(vmax)
+            if value is None or not self._volume_max:
+                return
+            percent = int(round(int(value) * 100 / self._volume_max))
+        except (TypeError, ValueError, ZeroDivisionError):
+            return
+        logger.debug("[%s] source volume %d%% (%s/%s)", self.instance_id, percent, value, self._volume_max)
+        if self._on_source_volume is not None:
+            self._on_source_volume(percent)
+
+    async def set_source_volume(self, percent: int) -> None:
+        """Set the Spotify Connect device volume — this is what moves on the controlling phone."""
+        raw = max(0, min(self._volume_max, round(percent * self._volume_max / 100)))
+        await self._post("/player/volume", {"volume": raw})
+        logger.info("[%s] source volume -> %d%% (%d/%d)", self.instance_id, percent, raw, self._volume_max)

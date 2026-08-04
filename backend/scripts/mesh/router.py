@@ -148,6 +148,12 @@ class Router:
     async def set_volume(self, player_id: str, volume: int, muted: bool) -> None:
         await self._engine.set_player_volume(player_id, volume, muted)
 
+    async def set_source_volume(
+        self, source_id: str, volume: int | None = None, muted: bool | None = None
+    ) -> None:
+        """Drive the SENDER's own volume for a local source (never a peer's — sources stay home)."""
+        await self._engine.set_source_volume(source_id, volume, muted)
+
     def _require_peer(self, unit_id: str) -> Peer:
         peer = self._peer(unit_id)
         if peer is None:
