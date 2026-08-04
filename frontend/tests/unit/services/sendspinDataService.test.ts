@@ -122,6 +122,39 @@ describe('unit identity + source state', () => {
   });
 });
 
+describe('the two volumes', () => {
+  it('reads each endpoint\'s real level from the snapshot', () => {
+    const view: MeshView = structuredClone(VIEW);
+    view.units[0].players[0].volume = 42;
+    view.units[0].players[0].muted = true;
+    const m = mapViewToModel(view, new Map(), new Map());
+    expect(m.clients[0].volume).toBe(42);
+    expect(m.clients[0].muted).toBe(true);
+  });
+
+  it('falls back to full volume for a player whose unit predates the field', () => {
+    const m = mapViewToModel(VIEW, new Map(), new Map());
+    expect(m.clients[0].volume).toBe(100);
+  });
+
+  it('keeps group volume (controller role) and source volume (the sender) separate', () => {
+    const view: MeshView = structuredClone(VIEW);
+    view.units[0].sources[0].source_volume = 30;
+    view.units[0].sources[0].supports_source_volume = true;
+    const npByGroup = new Map([['gA', np({ groupId: 'gA', volume: 75 })]]);
+    const m = mapViewToModel(view, npByGroup, new Map());
+    expect(m.streams[0].volume).toBe(75);        // our endpoints, from the controller role
+    expect(m.streams[0].sourceVolume).toBe(30);  // the phone's own slider, from our snapshot
+    expect(m.streams[0].supportsSourceVolume).toBe(true);
+  });
+
+  it('reports no source volume for a source that cannot do it (slider stays hidden)', () => {
+    const m = mapViewToModel(VIEW, new Map(), new Map());
+    expect(m.streams[0].sourceVolume).toBeUndefined();
+    expect(m.streams[0].supportsSourceVolume).toBe(false);
+  });
+});
+
 describe('currentPositionMs extrapolation', () => {
   const base = np({ playbackState: 'playing', trackProgressMs: 10000, trackDurationMs: 300000, playbackSpeed: 1000, timestampUs: 5_000_000 });
 

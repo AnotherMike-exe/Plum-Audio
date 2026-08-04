@@ -18,6 +18,9 @@ import {ALBUM_ART_PLACEHOLDER} from './albumArtPlaceholder';
 const MESH_API_PORT = 5001;
 const MESH_API_BASE = import.meta.env.VITE_MESH_API_URL || '/api/mesh';
 const POLL_INTERVAL_MS = 3000;
+// How long a just-set volume is held over the polled value (see applyPendingVolumes). Comfortably
+// longer than one poll, short enough that a level which never applied corrects itself visibly.
+const VOLUME_HOLD_MS = 5000;
 // Synthetic stream id for a foreign-server session our player renders (see snapshot()).
 export const FOREIGN_PREFIX = 'foreign::';
 
@@ -28,6 +31,8 @@ interface WirePlayer {
   connected: boolean;
   group_id: string | null;
   url: string | null;
+  volume?: number;    // as the PLAYER reports it (client/state), not as we last commanded it
+  muted?: boolean;
 }
 interface WireSource {
   source_id: string;
@@ -37,6 +42,11 @@ interface WireSource {
   player_ids: string[];
   name?: string;      // endpoint device name ("Kitchen") — what the GUI labels the stream
   active?: boolean;   // a sender is using it right now (see SourceFeeder.is_active)
+  // The volume ON THE SENDING DEVICE (phone's AirPlay/BT slider, Spotify Connect device volume).
+  // Not an endpoint output level, and not part of the Sendspin protocol — see mesh/model.py.
+  source_volume?: number | null;
+  source_muted?: boolean | null;
+  supports_source_volume?: boolean;
 }
 interface WireUnit {
   unit_id: string;
@@ -159,7 +169,13 @@ export function mapViewToModel(
           playback_status: np ? (paused ? 'paused' : np.playbackState) : 'unknown',
           is_stale: !np,
         },
+        // `volume` is the GROUP volume the controller role reports (the average of this source's
+        // endpoints, maintained by the library) — our own output. `sourceVolume` is the sender's.
         volume: np?.volume,
+        muted: np?.muted,
+        sourceVolume: src.source_volume ?? undefined,
+        sourceMuted: src.source_muted ?? undefined,
+        supportsSourceVolume: !!src.supports_source_volume,
         supportedCommands: np?.supportedCommands ?? [],
         repeat: np?.repeat,
         shuffle: np?.shuffle,
@@ -183,7 +199,8 @@ export function mapViewToModel(
         serverName: unit.name,
         name: p.name,
         currentStreamId: (p.group_id && groupToStream.get(p.group_id)) || null,
-        volume: 100, // TODO(backend): per-player volume isn't in the snapshot yet
+        volume: p.volume ?? 100,
+        muted: p.muted ?? false,
         connected: p.connected,
         isLocal,
         url: p.url ?? undefined,
@@ -215,7 +232,7 @@ export function mapViewToModel(
       serverName: unit.name,
       name: lp.name || lp.player_id,
       currentStreamId: null,
-      volume: 100,
+      volume: 100, // unknown: a speaker attached elsewhere reports its level to THAT server, not us
       connected: !!lp.attached,
       isLocal,
       foreignServer,
@@ -298,6 +315,11 @@ export class SendspinDataService {
   private listeners = new Set<Listener>();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
+  // Volume the user just set, held over the polled value until the round trip completes (set →
+  // player applies → player reports → our next /view poll). Without it a drag fights the poll.
+  // Player volume only; group volume needs none — the controller WS echoes it back immediately.
+  private pendingVolume = new Map<string, { volume: number; muted: boolean; at: number }>();
+  private pendingSourceVolume = new Map<string, { volume: number; at: number }>();
 
   start(): void {
     void this.poll();
@@ -388,8 +410,37 @@ export class SendspinDataService {
     return () => this.listeners.delete(cb);
   }
 
+  /**
+   * Overlay a just-set level on the polled model until the real value comes back (or we give up).
+   *
+   * Held for at most VOLUME_HOLD_MS, and dropped the moment the poll agrees — so a level that
+   * failed to apply (offline speaker, source with no absolute volume) snaps back to the truth
+   * rather than lying indefinitely.
+   */
+  private applyPendingVolumes(model: Model): void {
+    const now = Date.now();
+    for (const [playerId, pending] of this.pendingVolume) {
+      const client = model.clients.find((c) => c.id === playerId);
+      if (!client || now - pending.at > VOLUME_HOLD_MS || client.volume === pending.volume) {
+        this.pendingVolume.delete(playerId);
+        continue;
+      }
+      client.volume = pending.volume;
+      client.muted = pending.muted;
+    }
+    for (const [sid, pending] of this.pendingSourceVolume) {
+      const stream = model.streams.find((s) => s.id === sid);
+      if (!stream || now - pending.at > VOLUME_HOLD_MS || stream.sourceVolume === pending.volume) {
+        this.pendingSourceVolume.delete(sid);
+        continue;
+      }
+      stream.sourceVolume = pending.volume;
+    }
+  }
+
   snapshot(): Model {
     const model = mapViewToModel(this.lastView, this.npByGroup, this.offsetByGroup, Date.now(), this.neighbourhood);
+    this.applyPendingVolumes(model);
     // Our player playing a FOREIGN server (MA) is not a stream in the mesh view — synthesize one so
     // now-playing, transport and the visualizer all light up on it. Its metadata rides the player's
     // self-report (foreignServer); controls + spectrum ride the consume relay.
@@ -458,10 +509,26 @@ export class SendspinDataService {
     await this.post(unitId, '/unroute', { player_id: playerId, source_id: sourceId });
   }
 
+  /** Per-endpoint output level (Sendspin player role, via the mesh REST surface). */
   async setVolume(playerId: string, volume: number, muted = false): Promise<void> {
     const unitId = this.playerUnit(playerId);
     if (!unitId) return;
+    // Hold what the user just chose until the poll catches up: the round trip is player → server
+    // → next /view poll, so without this a drag fights the last polled value and the knob jumps.
+    this.pendingVolume.set(playerId, { volume, muted, at: Date.now() });
     await this.post(unitId, '/volume', { player_id: playerId, volume, muted });
+  }
+
+  /**
+   * The volume ON THE SENDING DEVICE for a source — the phone's AirPlay/Bluetooth slider, the
+   * Spotify Connect device volume. Nothing to do with our own output gain: the two stack, and only
+   * this one is visible on the sender's screen. Not part of Sendspin, hence our own endpoint.
+   */
+  async setSourceVolume(federatedStreamId: string, volume: number, muted?: boolean): Promise<void> {
+    if (federatedStreamId.startsWith(FOREIGN_PREFIX)) return; // a foreign server owns its own sender
+    const { unitId, sourceId } = parseStreamId(federatedStreamId);
+    this.pendingSourceVolume.set(federatedStreamId, { volume, at: Date.now() });
+    await this.post(unitId, '/source-volume', { source_id: sourceId, volume, muted });
   }
 
   controlStream(federatedStreamId: string, command: ControllerCommand): void {
@@ -477,12 +544,29 @@ export class SendspinDataService {
     if (command === 'play' || command === 'pause') controller.applyOptimisticTransport(command);
   }
 
+  /**
+   * GROUP volume for a source — every endpoint rendering it, over the protocol.
+   *
+   * The controller `volume` command is not ours to interpret: aiosendspin's controller group role
+   * redistributes it across the group's players preserving their relative levels, then republishes
+   * the average as the group volume. So this is one command, not a per-client fan-out, and it works
+   * identically against a foreign server (Music Assistant) via the consume relay.
+   */
   setStreamVolume(federatedStreamId: string, volume: number): void {
     if (federatedStreamId.startsWith(FOREIGN_PREFIX)) {
       this.sendForeignCommand('volume', { volume });
       return;
     }
     this.controllers.get(federatedStreamId)?.send('volume', { volume });
+  }
+
+  /** Group mute for a source (all its endpoints), same protocol path as setStreamVolume. */
+  setStreamMute(federatedStreamId: string, mute: boolean): void {
+    if (federatedStreamId.startsWith(FOREIGN_PREFIX)) {
+      this.sendForeignCommand('mute', { mute });
+      return;
+    }
+    this.controllers.get(federatedStreamId)?.send('mute', { mute });
   }
 
   getStreamCapabilities(federatedStreamId: string): {

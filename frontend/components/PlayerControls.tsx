@@ -4,9 +4,13 @@ import { Icon, type IconName } from './Icon';
 
 interface PlayerControlsProps {
     stream: Stream;
-    volume: number;                              // Hardware/endpoint volume (Snapcast client)
+    // Group/endpoint volume: the speakers rendering this source. One Sendspin controller command;
+    // the server redistributes it across them, preserving their relative levels.
+    volume: number;
     onVolumeChange: (volume: number) => void;
-    sourceVolume?: number;                       // Source/integration volume (AirPlay, Spotify, etc.)
+    // Source volume: the level on the SENDING device (AirPlay/Bluetooth phone, Spotify Connect).
+    // Both undefined when this source has no such control — the slider is then hidden, not dead.
+    sourceVolume?: number;
     onSourceVolumeChange?: (volume: number) => void;
     onPlayPause: () => void;
     onSkip: (direction: 'next' | 'prev') => void;
@@ -129,7 +133,8 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
             {/* Volume Controls - order-1 on mobile, order-2 on desktop */}
             {/* On desktop: flex-1 to fill remaining space (same as text area above) */}
             <div className="flex flex-col gap-2 w-full max-w-xs order-1 md:order-2 md:flex-1 md:max-w-none">
-                {/* Source Volume (controls integration - AirPlay, Spotify, etc.) */}
+                {/* Source volume — the sending device's own level (AirPlay/Bluetooth phone, Spotify
+                    Connect). Hidden entirely when the source can't report or accept one. */}
                 {hasSourceVolume && (
                     <div className="flex items-center gap-3 w-full">
                         <Icon name="tower-broadcast" className="text-[var(--text-secondary)] w-6 text-center flex-shrink-0" style={{ color: 'inherit' }} aria-hidden />
@@ -147,7 +152,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
                     </div>
                 )}
 
-                {/* Hardware Volume (controls Snapcast endpoint output) */}
+                {/* Group volume — the output level of every endpoint rendering this source */}
                 <div className="flex items-center gap-3 w-full">
                     <Icon name="volume-low" className="text-[var(--text-secondary)] w-6 text-center flex-shrink-0" style={{ color: 'inherit' }} aria-hidden />
                     <input
@@ -158,7 +163,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
                         onChange={(e) => onVolumeChange(Number(e.target.value))}
                         className="w-full h-2 rounded-lg appearance-none cursor-pointer volume-slider"
                         style={sliderStyle}
-                        aria-label="Hardware volume control"
+                        aria-label="Group volume control"
                     />
                     <Icon name="volume-high" className="text-[var(--text-secondary)] w-6 text-center flex-shrink-0" style={{ color: 'inherit' }} aria-hidden />
                 </div>

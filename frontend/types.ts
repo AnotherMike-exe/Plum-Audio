@@ -61,7 +61,18 @@ export interface Stream {
     isPlaying: boolean;
     progress: number;                // in seconds (legacy, frontend-tracked)
     playback?: PlaybackData;         // Server-provided playback position (preferred)
-    volume?: number;                 // Source volume (0-100) from control script
+    // GROUP volume (0-100): the average level of the endpoints rendering this source, maintained by
+    // the Sendspin controller role. Setting it redistributes across them, preserving relative levels.
+    volume?: number;
+    muted?: boolean;                 // group mute (true only when every endpoint is muted)
+    // SOURCE volume (0-100): the level on the SENDING device — the phone's AirPlay/Bluetooth slider,
+    // the Spotify Connect device volume. Stacks with the endpoint levels above and is the only one
+    // visible on the sender's own screen. Outside the Sendspin spec; carried on our mesh snapshot.
+    sourceVolume?: number;
+    sourceMuted?: boolean;
+    // Whether this source can report/accept one right now (no live sender → no source volume). The
+    // second slider is gated on this rather than shown dead, as with repeat/shuffle.
+    supportsSourceVolume?: boolean;
     // A sender is actively using this source. Idle sources stay routable but drop out of the
     // stream list, so the picker shows what is in use rather than every configured endpoint.
     active?: boolean;
@@ -79,7 +90,8 @@ export interface Client {
     serverName?: string;             // "Main Server" (for federation)
     name: string;
     currentStreamId: string | null;
-    volume: number; // 0-100
+    volume: number; // 0-100 — this endpoint's own output level, as the player reports it
+    muted?: boolean;
     connected: boolean;
     isLocal?: boolean;               // this unit's OWN player (the page you are looking at)
     // Set when this speaker has been claimed by a Sendspin server outside our mesh — Music

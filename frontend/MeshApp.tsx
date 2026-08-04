@@ -50,6 +50,7 @@ const MemoPlayerControls = React.memo(
     a.stream.id === b.stream.id &&
     a.stream.isPlaying === b.stream.isPlaying &&
     a.stream.volume === b.stream.volume &&
+    a.stream.sourceVolume === b.stream.sourceVolume &&
     a.volume === b.volume &&
     a.sourceVolume === b.sourceVolume &&
     a.canShuffle === b.canShuffle &&
@@ -111,6 +112,8 @@ export default function MeshApp(): React.ReactElement {
   );
   // Where this unit is playing from right now — the authority for what the left card shows.
   const myStreamId = myPlayers.find((c) => c.currentStreamId)?.currentStreamId ?? null;
+  // This unit's OWN output level — what the main card's slider shows and moves.
+  const myVolume = myPlayers[0]?.volume ?? 100;
 
   // A route takes a moment to land (a cross-server reclaim reconnects the player), so hold the
   // user's choice until the mesh view catches up; then the view wins again.
@@ -180,7 +183,9 @@ export default function MeshApp(): React.ReactElement {
 
   // Identity-stable arrays: keep the same reference across position ticks so the memoized device
   // lists only re-render when a client/stream field they show actually changes.
-  const streamsSig = model.streams.map((s) => `${s.id}|${s.name}|${s.isPlaying}|${s.volume ?? ''}|${s.active}`).join(';');
+  const streamsSig = model.streams
+    .map((s) => `${s.id}|${s.name}|${s.isPlaying}|${s.volume ?? ''}|${s.sourceVolume ?? ''}|${s.active}`)
+    .join(';');
   const clientsSig = viewClients
     .map((c) => `${c.id}|${c.name}|${c.currentStreamId ?? ''}|${c.volume}|${c.connected}`)
     .join(';');
@@ -227,9 +232,21 @@ export default function MeshApp(): React.ReactElement {
       f.repeat == null || f.repeat === 'off' ? 'repeat_all' : f.repeat === 'all' ? 'repeat_one' : 'repeat_off';
     service.controlStream(f.id, next);
   }, []);
+  // Three quantities, three handlers — the main card's slider is THIS unit's speaker, not the
+  // group. Moving it must not touch the other rooms (the whole point of per-endpoint levels); the
+  // group is adjusted deliberately, through the group buttons under Synced Devices.
+  //   this endpoint — per-player, over the mesh REST surface.
+  //   group         — one controller command; the library redistributes across the group's players
+  //                   preserving their relative levels (see onGroupVolumeAdjust / onGroupMute).
+  //   source        — the SENDER's own level (the phone's AirPlay/BT slider, Spotify device
+  //                   volume). Ours to carry: the protocol has no such concept.
+  const onMyVolume = useCallback((v: number) => {
+    const mine = modelRef.current.clients.find((c) => c.isLocal);
+    if (mine) void service.setVolume(mine.id, clampVol(v));
+  }, []);
   const onSourceVolume = useCallback((v: number) => {
     const f = featuredRef.current;
-    if (f) service.setStreamVolume(f.id, v);
+    if (f) void service.setSourceVolume(f.id, clampVol(v));
   }, []);
   const onClientVolume = useCallback((clientId: string, v: number) => service.setVolume(clientId, v), []);
 
@@ -362,7 +379,13 @@ export default function MeshApp(): React.ReactElement {
     const s = modelRef.current.streams.find((x) => x.id === streamId);
     service.setStreamVolume(streamId, clampVol((s?.volume ?? 100) + (dir === 'up' ? 5 : -5)));
   }, []);
-  const muteStream = useCallback((streamId: string) => service.controlStream(streamId, 'mute'), []);
+  // Group mute is a controller command carrying the TARGET state, so it has to be a toggle against
+  // what the group currently reports — a bare 'mute' command with no value is dropped by the server
+  // (`cmd.mute is not None`), which is why this used to do nothing at all.
+  const muteStream = useCallback((streamId: string) => {
+    const s = modelRef.current.streams.find((x) => x.id === streamId);
+    service.setStreamMute(streamId, !s?.muted);
+  }, []);
   const syncedGroupVolumeAdjust = useCallback((dir: 'up' | 'down') => {
     const f = featuredRef.current;
     if (f) adjustStreamVolume(f.id, dir);
@@ -419,10 +442,10 @@ export default function MeshApp(): React.ReactElement {
                 <NowPlaying stream={featured} canSeek={false} onAlbumArtClick={() => setVisualizerOpen(true)} />
                 <MemoPlayerControls
                   stream={featured}
-                  volume={featured.volume ?? 100}
-                  onVolumeChange={onSourceVolume}
-                  sourceVolume={featured.volume}
-                  onSourceVolumeChange={onSourceVolume}
+                  volume={myVolume}
+                  onVolumeChange={onMyVolume}
+                  sourceVolume={featured.supportsSourceVolume ? featured.sourceVolume : undefined}
+                  onSourceVolumeChange={featured.supportsSourceVolume ? onSourceVolume : undefined}
                   onPlayPause={onPlayPause}
                   onSkip={onSkip}
                   canShuffle={canShuffle}
@@ -534,10 +557,10 @@ export default function MeshApp(): React.ReactElement {
         settings={settings}
         getSpectrum={getSpectrum}
         extractedAlbumArtColors={albumArtColors}
-        currentVolume={featured?.volume ?? 100}
+        currentVolume={myVolume}
         onPlayPause={onPlayPause}
         onSkip={(dir) => onSkip(dir === 'next' ? 'next' : 'prev')}
-        onVolumeChange={onSourceVolume}
+        onVolumeChange={onMyVolume}
         onStreamChange={onSelectStream}
         onOpenSettings={() => { setVisualizerOpen(false); setSettingsOpen(true); }}
         onOpenVisualizerSettings={() => { setVisualizerOpen(false); setSettingsOpen(true); }}
