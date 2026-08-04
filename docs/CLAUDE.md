@@ -126,7 +126,7 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
 - **Sendspin WS** (JSON control + binary media) for sync/transport
 - **Flask REST** for settings/integrations/audio; **aiohttp** for the mesh API (in the audio
   event loop). The mesh API keeps parity with the old federation REST surface (`/api/mesh/*`:
-  snapshot/view/route/unroute/volume/source) so the GUI ports with minimal change
+  snapshot/view/route/unroute/volume/source-volume/source) so the GUI ports with minimal change
 - **FIFO** audio transport from source services (single consumer — no tee needed)
 - **Dynamic stream lifecycle**: services run continuously; streams created on activity
 
@@ -194,6 +194,23 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
   or `PLUM_SOURCE_IDLE_TIMEOUT` silence call `group.stop()` (playback_state=**stopped** via
   `group/update`), never `stop_stream()` (which keeps clients logically PLAYING). The spec has no
   distinct idle/unrouted state — `stopped` is it. Groups/anchors persist, so routing survives.
+- **Three volumes, and only two of them are the protocol's.** *Per-player* (one endpoint's output)
+  and *group* (all endpoints on a source) are Sendspin: player-role command / controller-role
+  `volume`+`mute`, and **the library already does the delta-preserving group redistribution** — do
+  not fan out per client. *Source volume* is the level on the SENDING device (the phone's
+  AirPlay/Bluetooth slider, the Spotify Connect device volume); the spec has no such concept, so it
+  rides `POST /api/mesh/source-volume` + `SourceState.source_volume` and is driven per source
+  (shairport's **`SetVolume` method** — its MPRIS `Volume` property is read-only, so a
+  Properties.Set is refused and looks like success / `MediaTransport1.Volume` / go-librespot
+  `/player/volume`). It stacks with the endpoint levels; never conflate the two in the GUI. The main
+  card's slider is **this unit's own endpoint**, not the group — the group is moved deliberately,
+  via the group buttons.
+- **A player MUST echo its level back** (`client/state`) after every volume/mute command, and
+  persist it (`/data/player_state.json`, not `settings.json` — different process owns that file).
+  `PlayerV1Role.set_volume()` only *sends*; the server's own view moves solely on `client/state`,
+  of which the client library sends exactly one, at connect, carrying `initial_volume`. Skip the
+  echo and every level in the mesh reads 100% forever while the audio is demonstrably quieter —
+  the failure looks like a GUI bug and is not one. See `sendspin_player._publish_render_state`.
 - **WiFi/host concerns** (NetworkManager owns `wlan0`) live on the host, not the container (as Plum-Snapcast).
 - **The unit's display name comes from `settings.json` `deviceName`** (`scripts/unit_identity.py`),
   NOT from `PLUM_UNIT_NAME`/`PLUM_PLAYER_NAME` — those are only what an unnamed unit boots with.

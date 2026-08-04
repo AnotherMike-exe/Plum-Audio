@@ -182,8 +182,28 @@ stream + clock domain). The orchestrator's job is to present this coherently:
   `add_client`. Removing = `remove_client` (back to a solo group on its current server).
 - **Contention is defined:** a player can only render one group; routing it elsewhere pulls
   it (that's the `ANOTHER_SERVER` handoff). The GUI shows current group membership per player.
-- **Volume:** per-player volume via player-role command; group volume = delta-preserving
-  redistribution across the group's players (port existing logic).
+- **Volume — three levels, two of them the protocol's** (implemented 2026-08-03):
+  - *Per-player* (one endpoint's output): player-role command, `POST /api/mesh/volume`.
+  - *Group* (every endpoint on a source): the controller-role `volume`/`mute` command. **The
+    library does the delta-preserving redistribution** (`roles/player/group.py`) and republishes
+    the average as `controller.volume` — nothing to port, and it works identically against a
+    foreign server (Music Assistant) through the consume relay.
+  - *Source* (the level ON THE SENDING DEVICE — the phone's AirPlay/Bluetooth slider, the Spotify
+    Connect device volume): **not a Sendspin concept**, so it rides our own
+    `POST /api/mesh/source-volume` + `SourceState.source_volume` and is driven per source (MPRIS /
+    `MediaTransport1.Volume` / go-librespot `/player/volume`). It stacks with the endpoint levels.
+  - **GUI mapping:** the main card's slider is THIS unit's own endpoint (per-player REST) — moving
+    it must never touch another room; the Synced Devices rows are the other endpoints; the group
+    +/-/mute buttons are the protocol group command. The source slider appears only when the source
+    can actually report/accept one.
+  - **AirPlay writes go through `SetVolume`, not the property** — shairport-sync exposes MPRIS
+    `Volume` READ-ONLY plus a custom `SetVolume` method. A Properties.Set is refused, and since the
+    readback is a separate call the failure looks like success in the GUI.
+  - **A server cannot read a player's level, only command it** — `PlayerV1Role.set_volume()` does
+    not move the server's own view; only the player's `client/state` does, and the client library
+    sends one at connect carrying `initial_volume`. So the player MUST echo its level after every
+    command (`sendspin_player._publish_render_state`) or the whole mesh reads 100% forever, and it
+    persists that level (`/data/player_state.json`) so a restart doesn't reset the room.
 
 ---
 

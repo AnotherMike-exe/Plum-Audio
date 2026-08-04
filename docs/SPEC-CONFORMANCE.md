@@ -99,12 +99,23 @@ per-source shape, not a gap.
 | `client/time` sent continuously; clock via a filter | ✅ `TimeFilter`, best-of-window min-delay; NTP formula verbatim from the library; adaptive 0.2→3 s cadence | done 2026-07-23 — see note below |
 | `client/state` with `state` (REQUIRED) | ✅ sends `{state:'synchronized'}` once the clock settles | done 2026-07-23 |
 | Controller `switch` command | ✅ generic `client/command` sends it (all commands MA advertises are sendable) | done |
-| Group volume "preserving relative levels" | ⚠️ naive per-stream volume | REMAINING — quality, not conformance: group volume flattens relative levels |
+| Group volume "preserving relative levels" | ✅ the controller `volume`/`mute` command, redistributed by the library | done 2026-08-03 — see note below |
 | `stream/request-format` | ❌ | REMAINING — cannot renegotiate artwork size at runtime; we hardcode 512×512 |
 
 The two REQUIRED items (client/time, client/state) are done and hardware-verified, so the GUI is
 now spec-safe to point at a third-party server for reading state and issuing whatever commands that
-server advertises. The two remaining items are quality-of-life and do not affect conformance.
+server advertises. The one remaining item is quality-of-life and does not affect conformance.
+
+**Note — group volume was never ours to implement (corrected 2026-08-03).** `ControllerGroupRole`
+advertises `[volume, mute, switch]` unconditionally and redistributes a group volume across the
+group's players preserving their relative levels (`roles/player/group.py`), republishing the average
+as `controller.volume`. The earlier "naive per-stream volume" reading was wrong about the library —
+what we actually lacked was the other half of the loop: **`PlayerV1Role.set_volume()` does not
+update the server's view of a player**; only the player's own `client/state` does, and the client
+library sends exactly one, at connect, carrying `initial_volume`. Our player never re-reported, so
+every level in the mesh (and the redistribution baseline) sat at 100 forever. The player now echoes
+after each command and persists its level. **Any player implementation must do this** — a server
+cannot read a speaker's volume, only command it.
 
 **Note — the GUI clock filter is display-grade.** `TimeFilter` is a minimum-delay NTP filter (the
 offset/delay formulas match the library verbatim), **not** the library's Kalman filter with a drift
