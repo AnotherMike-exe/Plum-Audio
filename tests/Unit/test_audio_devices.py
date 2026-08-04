@@ -19,6 +19,8 @@ Run: `pytest tests/Unit/test_audio_devices.py`.
 """
 
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -285,6 +287,85 @@ def test_no_soundcards_is_an_empty_list_not_a_crash(monkeypatch):
 
 
 # -- the PortAudio bridge --------------------------------------------------------------------------
+
+
+class _RacyPortAudio:
+    """Stands in for sounddevice, and reports if two threads are ever inside it at once.
+
+    The real consequence of overlap is a SIGSEGV, not an exception — Pa_Terminate frees state that
+    the other thread is walking. There is nothing to catch, so the only way to test it is to detect
+    the overlap ourselves.
+    """
+
+    def __init__(self):
+        self.inside = 0
+        self.overlapped = False
+        self.enumerations = 0
+
+    def _terminate(self):
+        self.inside += 1
+        if self.inside > 1:
+            self.overlapped = True
+        time.sleep(0.002)  # widen the window a real Pa_Terminate would occupy
+
+    def _initialize(self):
+        time.sleep(0.002)
+        self.inside -= 1
+        if self.inside < 0:
+            self.overlapped = True
+
+    def query_devices(self):
+        self.enumerations += 1
+        return [{"name": "bcm2835 Headphones: - (hw:0,0)", "max_output_channels": 2}]
+
+
+@pytest.fixture
+def racy_portaudio(monkeypatch):
+    fake = _RacyPortAudio()
+    monkeypatch.setattr(audio_devices, "sd", fake)
+    monkeypatch.setattr(audio_devices, "_portaudio_cache", None)
+    return fake
+
+
+def test_concurrent_enumeration_never_overlaps(racy_portaudio, monkeypatch):
+    """The config API crash-looped on this exact pattern (SIGSEGV, no traceback).
+
+    The GUI fetches the device list and the current output in one Promise.all; Flask serves them on
+    two threads; both re-initialised PortAudio at once. Sequential calls never reproduce it, which is
+    why it survived a round of hardware testing.
+    """
+    monkeypatch.setattr(audio_devices, "PORTAUDIO_CACHE_S", 0)  # force every call to do real work
+
+    barrier = threading.Barrier(8)
+
+    def hammer():
+        barrier.wait()  # all threads enter together
+        audio_devices._portaudio_outputs()
+
+    threads = [threading.Thread(target=hammer) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert racy_portaudio.overlapped is False
+
+
+def test_repeated_calls_are_served_from_the_cache(racy_portaudio):
+    """Two endpoints milliseconds apart should cost one enumeration, not two."""
+    audio_devices._portaudio_outputs()
+    audio_devices._portaudio_outputs()
+    audio_devices._portaudio_outputs()
+
+    assert racy_portaudio.enumerations == 1
+
+
+def test_force_bypasses_the_cache(racy_portaudio):
+    """The player re-reads after closing its stream; a stale map would omit the card it just freed."""
+    audio_devices._portaudio_outputs()
+    audio_devices._portaudio_outputs(force=True)
+
+    assert racy_portaudio.enumerations == 2
 
 
 @pytest.mark.parametrize(

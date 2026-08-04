@@ -50,6 +50,8 @@ import logging
 import os
 import re
 import subprocess
+import threading
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -59,6 +61,11 @@ import unit_identity
 logger = logging.getLogger("plum.audio_devices")
 
 WATCH_INTERVAL_S = 5.0
+
+# Serialises every Pa_Terminate/Pa_Initialize/query in this process — see _portaudio_outputs.
+_PORTAUDIO_LOCK = threading.Lock()
+_portaudio_cache: tuple[float, dict[tuple[int, int], int]] | None = None
+PORTAUDIO_CACHE_S = 2.0
 
 try:  # PortAudio is absent on a dev laptop and in unit tests; discovery must still parse.
     import sounddevice as sd
@@ -233,34 +240,54 @@ def _pcm_in_use(card: int, device: int) -> tuple[bool, int | None]:
 # -- PortAudio bridge --------------------------------------------------------------------------
 
 
-def _portaudio_outputs(*, refresh: bool = True) -> dict[tuple[int, int], int]:
+def _portaudio_outputs(*, force: bool = False) -> dict[tuple[int, int], int]:
     """Map (alsa_card, alsa_device) -> PortAudio index, for every output PortAudio publishes.
 
     PortAudio caches its device list at Pa_Initialize, so a card that appeared (a HAT fitted, a USB
     DAC plugged in) is invisible until it is re-initialised. Refreshing costs a few ms and makes a
     rescan mean what the user thinks it means.
+
+    THE LOCK IS NOT OPTIONAL. Pa_Terminate/Pa_Initialize tear down and rebuild PortAudio's PROCESS-
+    GLOBAL state; running one thread's terminate while another is enumerating segfaults the
+    interpreter outright — no exception, no traceback, just SIGSEGV. That is not hypothetical: the
+    GUI fetches the device list and the current output together (one Promise.all), Flask serves them
+    on two threads, and the config API crash-looped on exactly that. Sequential calls never show it,
+    which is why it survived a round of hardware testing.
+
+    The TTL cache exists for the same request pair: two endpoints a few milliseconds apart do not
+    each need to re-enumerate. `force` bypasses it for the player, which MUST re-read after closing
+    its stream — a cached map taken while the card was still held would be missing that very card.
     """
+    global _portaudio_cache
     if sd is None:
         return {}
-    if refresh:
+
+    with _PORTAUDIO_LOCK:
+        cached = _portaudio_cache
+        if not force and cached is not None and (time.monotonic() - cached[0]) < PORTAUDIO_CACHE_S:
+            return cached[1]
+
         try:
             sd._terminate()
             sd._initialize()
         except Exception:  # noqa: BLE001 - a refresh failure just means a staler list
             logger.debug("PortAudio re-initialise failed; using the cached device list", exc_info=True)
-    found: dict[tuple[int, int], int] = {}
-    try:
-        devices = sd.query_devices()
-    except Exception:  # noqa: BLE001
-        logger.warning("PortAudio device query failed", exc_info=True)
-        return {}
-    for index, dev in enumerate(devices):
-        if dev.get("max_output_channels", 0) < 1:
-            continue
-        match = PORTAUDIO_HW.search(dev.get("name", ""))
-        if match:
-            found[(int(match.group(1)), int(match.group(2)))] = index
-    return found
+
+        found: dict[tuple[int, int], int] = {}
+        try:
+            devices = sd.query_devices()
+        except Exception:  # noqa: BLE001
+            logger.warning("PortAudio device query failed", exc_info=True)
+            return {}
+        for index, dev in enumerate(devices):
+            if dev.get("max_output_channels", 0) < 1:
+                continue
+            match = PORTAUDIO_HW.search(dev.get("name", ""))
+            if match:
+                found[(int(match.group(1)), int(match.group(2)))] = index
+
+        _portaudio_cache = (time.monotonic(), found)
+        return found
 
 
 # -- discovery ---------------------------------------------------------------------------------
@@ -351,7 +378,7 @@ async def watch_output_device(
             logger.warning("applying the new output device failed; will retry on the next change", exc_info=True)
 
 
-def list_output_devices(active_spec: str | None = None) -> list[AudioDevice]:
+def list_output_devices(active_spec: str | None = None, *, force_refresh: bool = False) -> list[AudioDevice]:
     """Every ALSA playback device, annotated with whether it can actually be opened.
 
     `active_spec` is the output this unit is configured to render to (settings.json, or the
@@ -372,7 +399,7 @@ def list_output_devices(active_spec: str | None = None) -> list[AudioDevice]:
         return []
 
     devices = parse_aplay_output(output)
-    exposed = _portaudio_outputs()
+    exposed = _portaudio_outputs(force=force_refresh)
     active = find_device(active_spec, devices) if active_spec else None
 
     for dev in devices:
@@ -435,8 +462,11 @@ def resolve_portaudio_index(spec: str) -> tuple[int | None, AudioDevice | None]:
 
     A None index with a non-None device means the card is present but not openable right now; the
     caller should keep whatever it already has rather than tearing down a working output.
+
+    Forces a fresh enumeration: the player calls this right after closing its stream, and a cached
+    map taken while that card was still held would be missing the very device we are reopening.
     """
-    devices = list_output_devices(active_spec=spec)
+    devices = list_output_devices(active_spec=spec, force_refresh=True)
     dev = find_device(spec, devices)
     if dev is None:
         logger.warning("configured output %r is not present", spec)
