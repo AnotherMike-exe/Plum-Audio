@@ -18,6 +18,28 @@ cd docker && docker compose up -d
 # Local backend dev — see docs/DEV-SETUP.md
 ```
 
+### Audio HAT (host, before first deploy)
+
+Raspberry Pi OS does not auto-detect audio HATs — without the device-tree overlay the card is not
+there at all, and the output picker has nothing to offer. This runs on the **host**, not in the
+container, because the bootloader reads `config.txt` long before Docker exists:
+
+```bash
+sudo scripts/host-setup/configure-audio-hat.sh --list      # supported boards
+sudo scripts/host-setup/configure-audio-hat.sh --detect    # what is fitted right now
+sudo scripts/host-setup/configure-audio-hat.sh --overlay hifiberry-amp100
+sudo reboot
+sudo scripts/host-setup/configure-audio-hat.sh --unity     # pin the HAT's mixer to 0 dB
+```
+
+`--unity` is not cosmetic. A HAT's own mixer is restored at every boot by `alsa-restore` and does
+not default to unity — a HiFiBerry Amp100 comes up at **-22 dB**. Plum-Audio applies volume as
+software gain and never touches that control, so without pinning the unit plays 22 dB quiet with
+every level in the GUI reading correct. On a power amplifier, expect it to get **markedly louder**
+the moment it is applied.
+
+Then choose the output in **Settings → Playback → Audio Output**.
+
 ## Documentation
 
 - [Architecture & Plan](docs/ARCHITECTURE.md) — system design, mesh model, phased roadmap
