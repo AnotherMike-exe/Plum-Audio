@@ -26,6 +26,12 @@ services:
       # host's SYSTEM D-Bus, so its socket is mounted rather than duplicated in here.
       - /var/run/dbus:/var/run/dbus
       - /var/run/avahi-daemon:/var/run/avahi-daemon
+      # Which sound cards are BUSY, for the output picker. Docker masks /proc/asound, and runc
+      # rejects mounting anything back over it ("cannot be mounted because it is inside /proc"), so
+      # the host's copy lands outside /proc and PLUM_PROC_ASOUND points audio_devices.py at it.
+      # Read-only, and purely informational — without it the picker still works, it just cannot tell
+      # a card held by some other process from one that is genuinely unopenable.
+      - /proc/asound:/host/asound:ro
     devices:
       - /dev/snd:/dev/snd         # ALSA out for the local player, in for the Bluetooth capture
     # Audio reliability over container purity: the player's PortAudio thread and shairport-sync both

@@ -28,7 +28,8 @@ ENV PUID=99 \
     TZ=UTC \
     DEBUG=false \
     PIP_NO_CACHE_DIR=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PLUM_PROC_ASOUND=/host/asound
 
 # Runtime, by consumer:
 #   libportaudio2      sendspin_player -> onboard DAC
