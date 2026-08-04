@@ -210,6 +210,58 @@ def test_current_output_says_so_when_the_configured_device_is_gone(client, monke
     assert "not attached to this unit" in body["unavailable_reason"]
 
 
+def test_pending_until_the_player_echoes_the_new_device(client, monkeypatch, settings_file, tmp_path):
+    """Saved is not playing. Between the two, the GUI must not claim the audio has moved."""
+    state = tmp_path / "player_state.json"
+    state.write_text(json.dumps({"volume": 100, "output_device": "Headphones:0"}))
+    monkeypatch.setenv("PLUM_PLAYER_STATE_FILE", str(state))
+    settings_file.write_text(json.dumps({"audio": {"output": {"device": "sndrpihifiberry:0"}}}))
+    _present(monkeypatch, [_device()])
+
+    body = client.get("/api/audio/output/current").get_json()
+    assert body["pending"] is True
+    assert body["playing_on"] == "Headphones:0"  # still the old one
+    assert body["configured"] == "sndrpihifiberry:0"
+
+
+def test_not_pending_once_the_echo_matches(client, monkeypatch, settings_file, tmp_path):
+    state = tmp_path / "player_state.json"
+    state.write_text(json.dumps({"volume": 100, "output_device": "sndrpihifiberry:0"}))
+    monkeypatch.setenv("PLUM_PLAYER_STATE_FILE", str(state))
+    settings_file.write_text(json.dumps({"audio": {"output": {"device": "sndrpihifiberry:0"}}}))
+    _present(monkeypatch, [_device()])
+
+    body = client.get("/api/audio/output/current").get_json()
+    assert body["pending"] is False
+    assert body["playing_on"] == "sndrpihifiberry:0"
+
+
+def test_a_switch_that_never_opened_stays_pending(client, monkeypatch, settings_file, tmp_path):
+    """The renderer restored the old device, so the echo never moves — and `pending` stays true.
+
+    This is the case that must never render as success: settings.json says one thing, the speaker is
+    audibly playing another, and only the echo can tell them apart.
+    """
+    state = tmp_path / "player_state.json"
+    state.write_text(json.dumps({"output_device": "Headphones:0"}))
+    monkeypatch.setenv("PLUM_PLAYER_STATE_FILE", str(state))
+    settings_file.write_text(json.dumps({"audio": {"output": {"device": "vc4hdmi0:0"}}}))
+    _present(monkeypatch, [_device(available=False)])
+
+    body = client.get("/api/audio/output/current").get_json()
+    assert body["pending"] is True
+    assert body["playing_on"] == "Headphones:0"
+
+
+def test_no_echo_yet_is_not_reported_as_pending(client, monkeypatch, settings_file, tmp_path):
+    """A player that has never written its state (first boot) must not look mid-switch forever."""
+    monkeypatch.setenv("PLUM_PLAYER_STATE_FILE", str(tmp_path / "absent.json"))
+    settings_file.write_text(json.dumps({"audio": {"output": {"device": "sndrpihifiberry:0"}}}))
+    _present(monkeypatch, [_device()])
+
+    assert client.get("/api/audio/output/current").get_json()["pending"] is False
+
+
 def test_test_tone_refuses_the_active_device_with_an_explanation(client, monkeypatch):
     monkeypatch.setattr(audio_devices, "test_device", lambda *a, **k: (False, "X is in use — it is already this unit's output."))
     response = client.post("/api/audio/output/test", json={"id": "sndrpihifiberry:0"})

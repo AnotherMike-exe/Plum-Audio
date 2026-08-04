@@ -63,8 +63,15 @@ except Exception:  # noqa: BLE001 - allows --probe-config / import without PortA
     sd = None
 
 from mesh.avahi import CLIENT_SERVICE, AvahiClient
-from player_state import STATE_SAVE_DEBOUNCE_S, load_render_state, save_render_state, state_file_path
+from player_state import (
+    STATE_SAVE_DEBOUNCE_S,
+    load_render_state,
+    save_active_output,
+    save_render_state,
+    state_file_path,
+)
 
+import audio_devices
 import unit_identity
 
 logger = logging.getLogger("plum.sendspin_player")
@@ -128,24 +135,76 @@ class AlsaRenderer:
     def start(self) -> None:
         if sd is None:
             raise RuntimeError("sounddevice/PortAudio unavailable — cannot open the DAC")
+        self._open(self.device)
+
+    def _open(self, spec: str | None) -> None:
+        """Open the PortAudio stream for `spec`, which is a device spec, not an ALSA address.
+
+        Resolution goes through audio_devices so a stored `<card_name>:<device>` survives the card
+        renumbering that a reboot can do. If that lookup finds nothing usable we still hand the raw
+        spec to sounddevice: it substring-matches PortAudio's own names, which is how PLUM_DAC_DEVICE
+        has always worked, and losing that fallback would strand a unit whose `aplay -l` is somehow
+        unavailable. MUST NOT be called with a stream already open — resolution re-initialises
+        PortAudio, which would pull that stream out from under the callback.
+        """
+        device_arg: str | int | None = spec
+        if spec:
+            index, resolved = audio_devices.resolve_portaudio_index(spec)
+            if index is not None:
+                device_arg = index
+                logger.info("output %r -> PortAudio index %d (%s)", spec, index, resolved.hw_id if resolved else "?")
+            else:
+                logger.warning("output %r did not resolve; letting PortAudio match it by name", spec)
+
         self._stream = sd.RawOutputStream(
             samplerate=self.rate,
             channels=self.channels,
             dtype=f"int{self.bits}",
             blocksize=DAC_BLOCK_FRAMES,
-            device=self.device,
+            device=device_arg,
             callback=self._callback,
         )
         self._stream.start()
+        self.device = spec
         logger.info(
             "DAC open: device=%s %d:%d:%d block=%d target=%dms",
-            self.device or "default",
+            spec or "default",
             self.rate,
             self.bits,
             self.channels,
             DAC_BLOCK_FRAMES,
             self._target_bytes * 1000 // (self._bpf * self.rate),
         )
+
+    def reopen(self, spec: str | None) -> bool:
+        """Move playback to a different output. Returns True if `spec` is what is now open.
+
+        Called from a worker thread (never the event loop) because both PortAudio teardown and the
+        `aplay -l` behind resolution block. Buffered audio and the software gain are kept: the user
+        asked to change speakers, not to restart the track, and the jitter buffer refills from the
+        server on its own.
+
+        A failed switch restores the previous device rather than leaving the room silent — the whole
+        point of this slice is that a bad output must be obvious, not inaudible. If even that fails
+        we are genuinely silent, so it is logged at error and the state file records the truth.
+        """
+        if spec == self.device and self._stream is not None:
+            return True
+
+        previous = self.device
+        self.stop()
+        try:
+            self._open(spec)
+            return True
+        except Exception:  # noqa: BLE001 - any PortAudio/ALSA failure means "did not switch"
+            logger.error("could not open output %r — restoring %r", spec, previous, exc_info=True)
+
+        try:
+            self._open(previous)
+        except Exception:  # noqa: BLE001
+            logger.error("restoring output %r ALSO failed — this unit is now silent", previous, exc_info=True)
+            self.device = None
+        return False
 
     def stop(self) -> None:
         if self._stream is not None:
@@ -268,8 +327,9 @@ class SendspinPlayer:
             spectrum=ClientHelloVisualizerSpectrum(n_disp_bins=256, scale="log", f_min=40, f_max=16000),
         )
         art_support = ClientHelloArtworkSupport(
-            channels=[ArtworkChannel(source=ArtworkSource.ALBUM, format=PictureFormat.JPEG,
-                                     media_width=512, media_height=512)],
+            channels=[
+                ArtworkChannel(source=ArtworkSource.ALBUM, format=PictureFormat.JPEG, media_width=512, media_height=512)
+            ],
         )
         self.client = SendspinClient(
             client_id=player_id,
@@ -340,8 +400,15 @@ class SendspinPlayer:
             # described this one. Cleared BEFORE the new group_id lands, so a frame emitted before
             # fresh metadata arrives for the new group reports "no data yet," not stale old data —
             # the GUI already renders a missing np as unknown/idle rather than a wrong timeline.
-            for field in ("title", "artist", "album", "track_progress", "track_duration",
-                          "playback_speed", "progress_ts_us"):
+            for field in (
+                "title",
+                "artist",
+                "album",
+                "track_progress",
+                "track_duration",
+                "playback_speed",
+                "progress_ts_us",
+            ):
                 self._state.pop(field, None)
         state = getattr(payload, "playback_state", None)
         self._state["group_id"] = new_group_id
@@ -376,7 +443,7 @@ class SendspinPlayer:
             "commands": st.get("commands", []),
             "volume": st.get("volume"),
             "muted": st.get("muted"),
-            "repeat": st.get("repeat"),      # "off" | "one" | "all" (foreign source, e.g. MA)
+            "repeat": st.get("repeat"),  # "off" | "one" | "all" (foreign source, e.g. MA)
             "shuffle": st.get("shuffle"),
             # `playing` is the authoritative play/pause boolean (audio actually flowing); `state`/
             # `speed` are relayed for reference but are unreliable from Music Assistant.
@@ -487,8 +554,11 @@ class SendspinPlayer:
             # playing when none is. audio-flow is the reliable truth (MA's playback_state is not).
             playing = self._audio_flowing
             state.update(
-                server_id=info.server_id, server_name=info.name, connection_reason=reason,
-                group_id=self._state.get("group_id"), group_name=self._state.get("group_name"),
+                server_id=info.server_id,
+                server_name=info.name,
+                connection_reason=reason,
+                group_id=self._state.get("group_id"),
+                group_name=self._state.get("group_name"),
                 playback_state=("playing" if playing else "stopped"),
                 playing=playing,
                 title=self._state.get("title") if playing else None,
@@ -583,7 +653,9 @@ class SendspinPlayer:
         async with aiohttp.ClientSession() as session:
             while True:
                 with contextlib.suppress(Exception):
-                    await session.post(self.report_url, json=self._snapshot_state(), timeout=aiohttp.ClientTimeout(total=3))
+                    await session.post(
+                        self.report_url, json=self._snapshot_state(), timeout=aiohttp.ClientTimeout(total=3)
+                    )
                 await asyncio.sleep(3.0)
 
     # -- lifecycle -----------------------------------------------------------
@@ -631,7 +703,9 @@ class SendspinPlayer:
         if advertise:
             self._avahi = AvahiClient()
             await self._avahi.publish(
-                self.player_id, CLIENT_SERVICE, self.port,
+                self.player_id,
+                CLIENT_SERVICE,
+                self.port,
                 {"path": "/sendspin", "name": self.player_name},
             )
 
@@ -643,7 +717,8 @@ class SendspinPlayer:
             if advertise:
                 logger.warning(
                     "ignoring home server %s: we advertise %s, so servers dial us (spec)",
-                    home_server_url, CLIENT_SERVICE,
+                    home_server_url,
+                    CLIENT_SERVICE,
                 )
             else:
                 with contextlib.suppress(Exception):
@@ -757,7 +832,9 @@ async def main() -> None:
     )
     player_name = unit_identity.device_name(env_player_name)
     port = int(os.environ.get("PLUM_PLAYER_PORT", DEFAULT_PORT))
-    device = os.environ.get("PLUM_DAC_DEVICE") or None
+    # settings.json > PLUM_DAC_DEVICE, same precedence as the device name: env is what a unit boots
+    # with before anyone has chosen an output, not an override of a choice they have made.
+    device = audio_devices.configured_output_spec()
     rate = int(os.environ.get("PLUM_PLAYER_RATE", DEFAULT_RATE))
     channels = int(os.environ.get("PLUM_PLAYER_CHANNELS", DEFAULT_CHANNELS))
     bits = int(os.environ.get("PLUM_PLAYER_BITS", DEFAULT_BITS))
@@ -799,9 +876,21 @@ async def main() -> None:
                 player.player_id, CLIENT_SERVICE, player.port, {"path": "/sendspin", "name": new_name}
             )
 
-    rename_watch = asyncio.ensure_future(
-        unit_identity.watch_device_name(_apply_player_name, fallback=env_player_name)
-    )
+    rename_watch = asyncio.ensure_future(unit_identity.watch_device_name(_apply_player_name, fallback=env_player_name))
+
+    # Follow an output change from Settings. The swap runs in a worker thread: PortAudio teardown
+    # and the `aplay -l` behind device resolution both block, and stalling the event loop would
+    # stall the feed from the server as well as the switch.
+    async def _apply_output(spec: str | None) -> None:
+        applied = await asyncio.get_running_loop().run_in_executor(None, renderer.reopen, spec)
+        # Echo what we ACTUALLY have open, not what was asked for — the config API reports this back
+        # to the GUI, which is the only way a switch that failed can be told from one that worked.
+        save_active_output(state_file, renderer.device)
+        if not applied:
+            logger.error("output stayed on %r; %r could not be opened", renderer.device, spec)
+
+    save_active_output(state_file, renderer.device)
+    output_watch = asyncio.ensure_future(audio_devices.watch_output_device(_apply_output))
 
     stop = asyncio.Event()
     try:
@@ -809,9 +898,10 @@ async def main() -> None:
     except asyncio.CancelledError:
         pass
     finally:
-        rename_watch.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await rename_watch
+        for task in (rename_watch, output_watch):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         await player.stop()
 
 

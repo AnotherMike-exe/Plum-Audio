@@ -43,18 +43,22 @@ is exactly the kind of quieter-than-the-GUI-claims failure that model is meant t
 
 from __future__ import annotations
 
+import asyncio
 import glob
 import json
 import logging
 import os
 import re
 import subprocess
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
 
 import unit_identity
 
 logger = logging.getLogger("plum.audio_devices")
+
+WATCH_INTERVAL_S = 5.0
 
 try:  # PortAudio is absent on a dev laptop and in unit tests; discovery must still parse.
     import sounddevice as sd
@@ -319,6 +323,32 @@ def configured_output_spec(fallback: str | None = None) -> str | None:
     except (OSError, ValueError):
         pass
     return (os.environ.get("PLUM_DAC_DEVICE") or "").strip() or fallback
+
+
+async def watch_output_device(
+    on_change: Callable[[str | None], Awaitable[None]],
+    *,
+    interval: float = WATCH_INTERVAL_S,
+) -> None:
+    """Poll settings.json and invoke `on_change(spec)` whenever the chosen output changes.
+
+    Polling for the same reason unit_identity does: settings.json is a cross-process contract
+    written by the config API, and a device switch is a deliberate user action, not something that
+    needs sub-second latency. A failing callback is logged and the loop continues — a device that
+    would not open must not also stop us noticing the user picking a different one.
+    """
+    current = configured_output_spec()
+    while True:
+        await asyncio.sleep(interval)
+        latest = configured_output_spec()
+        if latest == current:
+            continue
+        logger.info("output device changed: %r -> %r", current, latest)
+        current = latest
+        try:
+            await on_change(latest)
+        except Exception:  # noqa: BLE001
+            logger.warning("applying the new output device failed; will retry on the next change", exc_info=True)
 
 
 def list_output_devices(active_spec: str | None = None) -> list[AudioDevice]:

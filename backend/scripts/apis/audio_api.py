@@ -29,6 +29,7 @@ from flask import Blueprint, jsonify, request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/ on path
 import audio_devices  # noqa: E402
+from player_state import load_active_output, state_file_path  # noqa: E402
 
 from settings_api import SettingsManager  # noqa: E402
 
@@ -36,13 +37,29 @@ logger = logging.getLogger(__name__)
 
 
 def _current_output(settings_manager: SettingsManager) -> dict:
-    """The configured output, resolved against what is actually present right now."""
+    """The configured output, resolved against what is actually present right now.
+
+    `pending` compares the CHOICE (settings.json) against the player's ECHO of what it has open
+    (player_state.json). They differ for the second or two before the player's next settings poll,
+    and they stay different when the new device would not open — which is precisely the case the GUI
+    must not render as success. Same reasoning as the volume echo: only the player knows what is
+    actually audible, so the API reports its word, not its own assumption.
+    """
     spec = audio_devices.configured_output_spec()
-    devices = audio_devices.list_output_devices(active_spec=spec)
+    playing_on = load_active_output(state_file_path())
+    devices = audio_devices.list_output_devices(active_spec=playing_on or spec)
     device = audio_devices.find_device(spec, devices) if spec else None
 
+    pending = playing_on is not None and playing_on != spec
+
     if device is not None:
-        return {"configured": spec, "resolved": True, **device.to_dict()}
+        return {
+            "configured": spec,
+            "resolved": True,
+            "playing_on": playing_on,
+            "pending": pending,
+            **device.to_dict(),
+        }
 
     # Configured but missing: a HAT removed, a USB DAC unplugged, or a spec from another unit. Say
     # so rather than substituting a device that happens to work — the user needs to know the box is
@@ -50,6 +67,8 @@ def _current_output(settings_manager: SettingsManager) -> dict:
     return {
         "configured": spec,
         "resolved": False,
+        "playing_on": playing_on,
+        "pending": pending,
         "id": None,
         "friendly_name": f"Not present ({spec})" if spec else "No output selected",
         "is_available": False,
