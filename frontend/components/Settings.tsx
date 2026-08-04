@@ -2,7 +2,6 @@ import React, {useState} from 'react';
 import type {Settings as SettingsType} from '../types';
 import {TabBar, type Tab} from './TabBar';
 import {IntegrationsTab} from './settings/IntegrationsTab';
-import {AudioTab} from './settings/AudioTab';
 import {PlaybackTab} from './settings/PlaybackTab';
 import {ThemeTab} from './settings/ThemeTab';
 import {VisualizerTab} from './settings/VisualizerTab';
@@ -37,8 +36,6 @@ export const Settings: React.FC<SettingsProps> = ({settings, onSettingsChange, o
         switch (activeTab) {
             case 'integrations':
                 return <IntegrationsTab settings={settings} onSettingsChange={onSettingsChange} enabledSources={['airplay', 'spotify', 'bluetooth']} />;
-            case 'audio':
-                return <AudioTab settings={settings} onSettingsChange={onSettingsChange} />;
             case 'playback':
                 return <PlaybackTab settings={settings} onSettingsChange={onSettingsChange} />;
             case 'theme':

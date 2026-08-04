@@ -22,6 +22,9 @@ import type { Settings } from '../../types'
 let mockSettings: Settings = createMockSettings()
 let mockPlaybackData: Record<string, unknown> = {}
 let mockFederationEnabled = false
+// What the PLAYER reports it actually has open. Distinct from the configured device on purpose:
+// the gap between them is what `pending` means. See setMockPlayingOn.
+let mockPlayingOn = 'Headphones:0'
 
 /**
  * Reset mock state between tests
@@ -30,6 +33,15 @@ export function resetMockState(): void {
   mockSettings = createMockSettings()
   mockPlaybackData = {}
   mockFederationEnabled = false
+  mockPlayingOn = 'Headphones:0'
+}
+
+/**
+ * Point the player's echo at a different device than the configured one — i.e. a switch that is
+ * still in flight, or one that failed and left playback where it was.
+ */
+export function setMockPlayingOn(deviceId: string): void {
+  mockPlayingOn = deviceId
 }
 
 /**
@@ -190,61 +202,73 @@ export const handlers = [
   // Audio API
   // -------------------------------------------------------------------------
 
+  // Shapes mirror backend/scripts/apis/audio_api.py. `id` is the stable <card_name>:<device>
+  // identity; `hw_id` is the current ALSA address and moves when cards renumber. The device list is
+  // a bare array, not {success, devices} — that wrapper never existed on this API.
   http.get('/api/audio/devices/output', () => {
-    return HttpResponse.json({
-      success: true,
-      devices: [
-        {
-          hw_id: 'hw:Headphones',
-          hw_name: 'Headphones',
-          friendly_name: 'Headphones',
-          type: 'BUILTIN_HEADPHONES',
-          is_available: true
-        },
-        {
-          hw_id: 'hw:HDMI',
-          hw_name: 'HDMI',
-          friendly_name: 'HDMI Output',
-          type: 'HDMI',
-          is_available: true
-        }
-      ]
-    })
+    return HttpResponse.json([
+      {
+        id: 'Headphones:0',
+        hw_id: 'hw:0,0',
+        friendly_name: 'Built-in Headphones (3.5mm)',
+        type: 'BUILTIN_HEADPHONES',
+        is_available: true,
+        unavailable_reason: null,
+        in_use: true,
+        is_active: true
+      },
+      {
+        id: 'vc4hdmi0:0',
+        hw_id: 'hw:1,0',
+        friendly_name: 'HDMI Output 1',
+        type: 'BUILTIN_HDMI',
+        is_available: false,
+        unavailable_reason:
+          'PortAudio cannot open this device. For an HDMI output this normally means no display is attached.',
+        in_use: false,
+        is_active: false
+      }
+    ])
   }),
 
   http.get('/api/audio/output/current', () => {
     return HttpResponse.json({
-      success: true,
-      device: {
-        hw_id: 'hw:Headphones',
-        device_type: 'BUILTIN_HEADPHONES'
-      }
+      configured: 'Headphones:0',
+      playing_on: mockPlayingOn,
+      pending: mockPlayingOn !== 'Headphones:0',
+      resolved: true,
+      id: 'Headphones:0',
+      friendly_name: 'Built-in Headphones (3.5mm)',
+      is_available: true,
+      is_active: true,
+      unavailable_reason: null
     })
   }),
 
   http.post('/api/audio/output/device', async ({ request }) => {
-    const { hw_id } = await request.json() as { hw_id?: string }
-    if (!hw_id) {
+    const { id } = await request.json() as { id?: string }
+    if (!id) {
+      return HttpResponse.json({ success: false, error: 'id is required' }, { status: 400 })
+    }
+    if (id === 'vc4hdmi0:0') {
+      // The API refuses an unopenable device rather than persisting it.
       return HttpResponse.json(
-        { success: false, message: 'hw_id is required' },
-        { status: 400 }
+        { success: false, error: 'PortAudio cannot open this device.' },
+        { status: 409 }
       )
     }
-    return HttpResponse.json({
-      success: true,
-      message: `Output device set to ${hw_id}`
-    })
+    return HttpResponse.json({ success: true, pending: true, message: `Output set to ${id}` })
   }),
 
-  http.post('/api/audio/output/test', () => {
-    return HttpResponse.json({ success: true })
-  }),
-
-  http.get('/api/audio/devices/input', () => {
-    return HttpResponse.json({
-      success: true,
-      devices: []
-    })
+  http.post('/api/audio/output/test', async ({ request }) => {
+    const { id } = await request.json() as { id?: string }
+    if (id === 'Headphones:0') {
+      return HttpResponse.json(
+        { success: false, message: "Built-in Headphones (3.5mm) is in use — it is already this unit's output." },
+        { status: 409 }
+      )
+    }
+    return HttpResponse.json({ success: true, message: 'Test tone sent' })
   }),
 
   // -------------------------------------------------------------------------

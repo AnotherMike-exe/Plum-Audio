@@ -1,331 +1,153 @@
 /**
- * Audio Service
- * Handles API calls for audio device discovery and configuration
+ * Audio output device discovery and selection.
+ *
+ * Two things about this API shape matter to the UI and are easy to get wrong:
+ *
+ * `id` is the stable identifier (`<card_name>:<device>`, e.g. `sndrpihifiberry:0`) and is what gets
+ * persisted. `hwId` is the CURRENT ALSA address (`hw:2,0`) and is display-only — ALSA card numbers
+ * move across reboots (measured: a HiFiBerry went from card 2 to card 1 across one restart), so
+ * keying anything off it will eventually address the wrong card.
+ *
+ * Saving a device does not mean it is playing. The config API writes settings.json; the player picks
+ * the change up on its own poll a moment later and echoes back what it ACTUALLY opened. Until those
+ * agree, `pending` is true — and it STAYS true if the device turned out not to open, which is the
+ * case the UI must never draw as success. See CurrentOutput.playingOn.
  */
 
-import type { IconName } from '../components/Icon';
+import type {IconName} from '../components/Icon';
 
-const API_BASE = `${window.location.protocol}//${window.location.hostname}:${window.location.port}/api/audio`;
+const API_BASE = '/api/audio';
 
 export enum DeviceType {
   BUILTIN_HEADPHONES = 'BUILTIN_HEADPHONES',
   BUILTIN_HDMI = 'BUILTIN_HDMI',
   USB = 'USB',
   HAT = 'HAT',
-  OTHER = 'OTHER'
+  OTHER = 'OTHER',
 }
 
 export interface AudioDevice {
-  card: number;
-  device: number;
-  hw_id: string;
-  hw_name: string | null;
-  card_name: string;
-  device_name: string;
+  /** Stable identity — persist and compare on this. */
+  id: string;
+  /** Current ALSA address; display only, moves across reboots. */
+  hwId: string;
+  friendlyName: string;
   type: DeviceType;
-  friendly_name: string;
-  is_available: boolean;
+  isAvailable: boolean;
+  /** Why it cannot be selected, when isAvailable is false. */
+  unavailableReason: string | null;
+  /** Something holds the PCM — normally this unit's own player. */
+  inUse: boolean;
+  /** This is the output the unit is configured to render to. */
+  isActive: boolean;
 }
 
-export interface CurrentOutputDevice {
+export interface CurrentOutput {
+  /** What settings.json (or PLUM_DAC_DEVICE) asks for. */
+  configured: string | null;
+  /**
+   * What the player reports it actually has OPEN. Differs from `configured` while a switch is in
+   * flight, and keeps differing if the switch failed and the player fell back.
+   */
+  playingOn: string | null;
+  pending: boolean;
+  /** Whether `configured` names a device present on this unit at all. */
+  resolved: boolean;
+  friendlyName: string;
+  unavailableReason: string | null;
+}
+
+interface RawDevice {
+  id: string;
   hw_id: string;
-  hw_name: string | null;
   friendly_name: string;
   type: DeviceType;
   is_available: boolean;
+  unavailable_reason: string | null;
+  in_use: boolean;
+  is_active: boolean;
 }
 
-export interface SetOutputDeviceResult {
-  success: boolean;
-  message?: string;
-  error?: string;
-  device?: {
-    hw_id: string;
-    friendly_name: string;
-  };
-  fallback_device?: string;
-  details?: string;
+const toDevice = (d: RawDevice): AudioDevice => ({
+  id: d.id,
+  hwId: d.hw_id,
+  friendlyName: d.friendly_name,
+  type: d.type,
+  isAvailable: d.is_available,
+  unavailableReason: d.unavailable_reason,
+  inUse: d.in_use,
+  isActive: d.is_active,
+});
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`, init);
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(body.error || body.message || `HTTP ${response.status}`);
+  }
+  return body as T;
 }
 
-export interface TestDeviceResult {
-  success: boolean;
-  message: string;
-  device?: {
-    hw_id: string;
-    friendly_name: string;
-  };
-}
-
-export interface ConfiguredInputDevice {
-  hw_id: string;
-  custom_name: string;
-  enabled: boolean;
-  is_available: boolean;
-  device_info: AudioDevice | null;
-}
-
-export interface InputDeviceConfigResult {
-  success: boolean;
-  message?: string;
-  error?: string;
-  device?: {
-    hw_id: string;
-    custom_name: string;
-    enabled: boolean;
-  };
-}
-
-export interface ToggleInputDeviceResult {
-  success: boolean;
-  message?: string;
-  error?: string;
-  enabled?: boolean;
-}
-
-/**
- * Audio Configuration Service
- */
 export const audioService = {
-  /**
-   * Get all available output devices
-   */
   async getOutputDevices(): Promise<AudioDevice[]> {
-    try {
-      const response = await fetch(`${API_BASE}/devices/output`);
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      return await response.json();
-    } catch (error) {
-      console.error('Failed to get output devices:', error);
-      throw error;
-    }
+    const raw = await request<RawDevice[]>('/devices/output');
+    return raw.map(toDevice);
   },
 
-  /**
-   * Get all available input devices
-   */
-  async getInputDevices(): Promise<AudioDevice[]> {
-    try {
-      const response = await fetch(`${API_BASE}/devices/input`);
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      return await response.json();
-    } catch (error) {
-      console.error('Failed to get input devices:', error);
-      throw error;
-    }
+  async getCurrentOutput(): Promise<CurrentOutput> {
+    const raw = await request<{
+      configured: string | null;
+      playing_on: string | null;
+      pending: boolean;
+      resolved: boolean;
+      friendly_name: string;
+      unavailable_reason: string | null;
+    }>('/output/current');
+    return {
+      configured: raw.configured,
+      playingOn: raw.playing_on,
+      pending: raw.pending,
+      resolved: raw.resolved,
+      friendlyName: raw.friendly_name,
+      unavailableReason: raw.unavailable_reason,
+    };
   },
 
-  /**
-   * Get currently configured output device
-   */
-  async getCurrentOutputDevice(): Promise<CurrentOutputDevice> {
-    try {
-      const response = await fetch(`${API_BASE}/output/current`);
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      return await response.json();
-    } catch (error) {
-      console.error('Failed to get current output device:', error);
-      throw error;
-    }
+  /** Persist a device. Resolves once SAVED — the switch itself lands a moment later. */
+  async setOutputDevice(id: string): Promise<{message: string}> {
+    return request<{message: string}>('/output/device', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id}),
+    });
   },
 
-  /**
-   * Set output device
-   */
-  async setOutputDevice(hwId: string): Promise<SetOutputDeviceResult> {
-    try {
-      const response = await fetch(`${API_BASE}/output/device`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ hw_id: hwId }),
-      });
-
-      const result = await response.json();
-
-      if (!response.ok) {
-        throw new Error(result.error || `HTTP ${response.status}`);
-      }
-
-      return result;
-    } catch (error) {
-      console.error('Failed to set output device:', error);
-      throw error;
-    }
+  /** Play a test tone. Refused for the device already in use — see the backend's test_device. */
+  async testOutputDevice(id: string): Promise<{message: string}> {
+    return request<{message: string}>('/output/test', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id}),
+    });
   },
 
-  /**
-   * Test an output device (plays brief test sound)
-   */
-  async testOutputDevice(hwId: string): Promise<TestDeviceResult> {
-    try {
-      const response = await fetch(`${API_BASE}/output/test`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ hw_id: hwId }),
-      });
-
-      const result = await response.json();
-
-      if (!response.ok) {
-        throw new Error(result.message || `HTTP ${response.status}`);
-      }
-
-      return result;
-    } catch (error) {
-      console.error('Failed to test output device:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Get friendly device type label
-   */
   getDeviceTypeLabel(type: DeviceType): string {
     switch (type) {
-      case DeviceType.BUILTIN_HEADPHONES:
-        return 'Built-in';
-      case DeviceType.BUILTIN_HDMI:
-        return 'HDMI';
-      case DeviceType.USB:
-        return 'USB';
-      case DeviceType.HAT:
-        return 'HAT';
-      case DeviceType.OTHER:
-        return 'Other';
-      default:
-        return 'Unknown';
+      case DeviceType.BUILTIN_HEADPHONES: return 'Built-in';
+      case DeviceType.BUILTIN_HDMI: return 'HDMI';
+      case DeviceType.USB: return 'USB';
+      case DeviceType.HAT: return 'HAT';
+      default: return 'Other';
     }
   },
 
-  /**
-   * Get device type icon name
-   */
   getDeviceTypeIcon(type: DeviceType): IconName {
     switch (type) {
-      case DeviceType.BUILTIN_HEADPHONES:
-        return 'headphones';
-      case DeviceType.BUILTIN_HDMI:
-        return 'desktop';
-      case DeviceType.USB:
-        return 'volume-high';
-      case DeviceType.HAT:
-        return 'waveform';
-      case DeviceType.OTHER:
-      default:
-        return 'volume-high';
+      case DeviceType.BUILTIN_HEADPHONES: return 'headphones';
+      case DeviceType.BUILTIN_HDMI: return 'desktop';
+      case DeviceType.USB: return 'volume-high';
+      case DeviceType.HAT: return 'waveform';
+      default: return 'volume-high';
     }
   },
-
-  /**
-   * Get configured input devices
-   */
-  async getConfiguredInputDevices(): Promise<ConfiguredInputDevice[]> {
-    try {
-      const response = await fetch(`${API_BASE}/input/devices`);
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      return await response.json();
-    } catch (error) {
-      console.error('Failed to get configured input devices:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Add or update input device configuration
-   */
-  async addOrUpdateInputDevice(
-    hwId: string,
-    customName?: string,
-    enabled?: boolean
-  ): Promise<InputDeviceConfigResult> {
-    try {
-      const body: any = { hw_id: hwId };
-      if (customName !== undefined) body.custom_name = customName;
-      if (enabled !== undefined) body.enabled = enabled;
-
-      const response = await fetch(`${API_BASE}/input/device`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
-      });
-
-      const result = await response.json();
-
-      if (!response.ok) {
-        throw new Error(result.error || `HTTP ${response.status}`);
-      }
-
-      return result;
-    } catch (error) {
-      console.error('Failed to add/update input device:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Remove input device configuration
-   */
-  async removeInputDevice(hwId: string): Promise<InputDeviceConfigResult> {
-    try {
-      const encodedHwId = encodeURIComponent(hwId);
-      const response = await fetch(`${API_BASE}/input/device/${encodedHwId}`, {
-        method: 'DELETE',
-      });
-
-      const result = await response.json();
-
-      if (!response.ok) {
-        throw new Error(result.error || `HTTP ${response.status}`);
-      }
-
-      return result;
-    } catch (error) {
-      console.error('Failed to remove input device:', error);
-      throw error;
-    }
-  },
-
-  /**
-   * Toggle input device enabled state
-   */
-  async toggleInputDevice(hwId: string): Promise<ToggleInputDeviceResult> {
-    try {
-      const encodedHwId = encodeURIComponent(hwId);
-      const response = await fetch(`${API_BASE}/input/device/${encodedHwId}/toggle`, {
-        method: 'POST',
-      });
-
-      const result = await response.json();
-
-      if (!response.ok) {
-        throw new Error(result.error || `HTTP ${response.status}`);
-      }
-
-      return result;
-    } catch (error) {
-      console.error('Failed to toggle input device:', error);
-      throw error;
-    }
-  }
 };
