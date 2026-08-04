@@ -48,7 +48,14 @@ from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFo
 from aiosendspin.models.artwork import ArtworkChannel, ClientHelloArtworkSupport
 from aiosendspin.models.types import ArtworkSource, PictureFormat
 from aiosendspin.models.visualizer import ClientHelloVisualizerSpectrum, ClientHelloVisualizerSupport
-from aiosendspin.models.types import AudioCodec, GoodbyeReason, MediaCommand, PlayerCommand, Roles
+from aiosendspin.models.types import (
+    AudioCodec,
+    GoodbyeReason,
+    MediaCommand,
+    PlayerCommand,
+    PlayerStateType,
+    Roles,
+)
 
 try:
     import sounddevice as sd
@@ -56,6 +63,7 @@ except Exception:  # noqa: BLE001 - allows --probe-config / import without PortA
     sd = None
 
 from mesh.avahi import CLIENT_SERVICE, AvahiClient
+from player_state import STATE_SAVE_DEBOUNCE_S, load_render_state, save_render_state, state_file_path
 
 import unit_identity
 
@@ -233,11 +241,18 @@ class SendspinPlayer:
         bits: int,
         static_delay_ms: float,
         initial_volume: int,
+        initial_muted: bool = False,
+        state_file: str | None = None,
     ) -> None:
         self.player_id = player_id
         self.player_name = player_name  # friendly name; also the mDNS TXT `name`
         self.port = port
         self.renderer = renderer
+        # Our own render level. The server cannot tell us what it is — see _publish_render_state.
+        self._volume = max(0, min(100, initial_volume))
+        self._muted = initial_muted
+        self._state_file = state_file or state_file_path()
+        self._save_task: asyncio.Task | None = None
 
         support = ClientHelloPlayerSupport(
             supported_formats=[
@@ -272,9 +287,10 @@ class SendspinPlayer:
             visualizer_support=viz_support,
             artwork_support=art_support,
             static_delay_ms=static_delay_ms,
-            initial_volume=initial_volume,
+            initial_volume=self._volume,
+            initial_muted=self._muted,
         )
-        renderer.set_volume(volume=initial_volume)
+        renderer.set_volume(volume=self._volume, muted=self._muted)
 
         self.client.add_audio_chunk_listener(self._on_audio)
         self.client.add_stream_start_listener(self._on_stream_start)
@@ -679,14 +695,52 @@ class SendspinPlayer:
 
     def _on_server_command(self, payload) -> None:  # noqa: ANN001
         # Volume/mute arrive nested: ServerCommandPayload.player -> PlayerCommandPayload(volume, mute).
+        # A command carries ONE of them (a group volume change lands as vol=N mute=None immediately
+        # followed by vol=None mute=False), so merge into our tracked state rather than replacing it.
         cmd = getattr(payload, "player", None)
         if cmd is None:
             return
         volume = getattr(cmd, "volume", None)
         muted = getattr(cmd, "mute", None)
-        if volume is not None or muted is not None:
-            self.renderer.set_volume(volume=volume, muted=muted)
-            logger.info("server volume/mute applied: vol=%s mute=%s", volume, muted)
+        if volume is None and muted is None:
+            return
+        if volume is not None:
+            self._volume = max(0, min(100, int(volume)))
+        if muted is not None:
+            self._muted = bool(muted)
+        self.renderer.set_volume(volume=volume, muted=muted)
+        logger.info("server volume/mute applied: vol=%s mute=%s", volume, muted)
+        self._publish_render_state()
+
+    def _publish_render_state(self) -> None:
+        """Echo our level back to the server, and persist it (debounced).
+
+        The echo is load-bearing, not cosmetic. `PlayerV1Role.set_volume()` only SENDS the command —
+        it does not update the server's own view of this player. That view moves solely on
+        `client/state`, and the client library sends exactly one of those, at connect, carrying
+        `initial_volume`. Without this echo every level in the mesh view stays pinned at the
+        connect-time value, the group average (`controller.volume`) reads 100 forever, and the
+        library's group-volume redistribution computes its delta from a baseline that is not real.
+        """
+        if self.client.connected:
+            asyncio.ensure_future(self._send_render_state())
+        # Also keep the values the client reports on its NEXT connect in step: after a roam the
+        # library re-sends its constructor-time initial_volume, which would otherwise hand the new
+        # server a stale level.
+        self.client._initial_volume = self._volume  # noqa: SLF001
+        self.client._initial_muted = self._muted  # noqa: SLF001
+        if self._save_task is None or self._save_task.done():
+            self._save_task = asyncio.ensure_future(self._save_render_state())
+
+    async def _send_render_state(self) -> None:
+        with contextlib.suppress(Exception):  # a state report must never break the render path
+            await self.client.send_player_state(
+                state=PlayerStateType.SYNCHRONIZED, volume=self._volume, muted=self._muted
+            )
+
+    async def _save_render_state(self) -> None:
+        await asyncio.sleep(STATE_SAVE_DEBOUNCE_S)
+        save_render_state(self._state_file, self._volume, self._muted)
 
 
 async def main() -> None:
@@ -709,8 +763,13 @@ async def main() -> None:
     bits = int(os.environ.get("PLUM_PLAYER_BITS", DEFAULT_BITS))
     static_delay_ms = float(os.environ.get("PLUM_STATIC_DELAY_MS", "0"))
     target_buffer_ms = int(os.environ.get("PLUM_TARGET_BUFFER_MS", DEFAULT_TARGET_BUFFER_MS))
-    initial_volume = int(os.environ.get("PLUM_INITIAL_VOLUME", "100"))
     home_server = os.environ.get("PLUM_HOME_SERVER") or None
+    # Env is only what an un-adjusted speaker boots with; once its level has been set, the persisted
+    # value wins — a restart (or a container rebuild) must not silently return the room to 100%.
+    state_file = state_file_path()
+    initial_volume, initial_muted = load_render_state(
+        state_file, default_volume=int(os.environ.get("PLUM_INITIAL_VOLUME", "100"))
+    )
 
     renderer = AlsaRenderer(rate, channels, bits, device=device, target_buffer_ms=target_buffer_ms)
     player = SendspinPlayer(
@@ -723,7 +782,10 @@ async def main() -> None:
         bits=bits,
         static_delay_ms=static_delay_ms,
         initial_volume=initial_volume,
+        initial_muted=initial_muted,
+        state_file=state_file,
     )
+    logger.info("render state: volume=%d muted=%s (%s)", initial_volume, initial_muted, state_file)
     await player.start(home_server_url=home_server)
 
     # Follow a rename from Settings: update the friendly name we report in player state and
