@@ -632,10 +632,18 @@ class PlumSendspinServer:
         deadline = loop.time() + timeout_s
         while loop.time() < deadline:
             for client in self.server.clients:
-                known = player_id and client.client_id == player_id
-                if (known or client.client_id not in before) and client.is_connected:
-                    if not has_role_family("player", client.negotiated_roles):
-                        continue  # not a render endpoint (a controller connecting for its own reasons)
+                if not client.is_connected:
+                    continue
+                if not has_role_family("player", client.negotiated_roles):
+                    continue  # not a render endpoint (a controller connecting for its own reasons)
+                # Identify the speaker we just dialled. The URL is the reliable test and has to come
+                # first: a speaker adopted ONCE stays in self.server.clients, so on every later
+                # adopt it is already in `before`, and its handshake id (a MAC, for a Home Assistant
+                # Voice PE) is not the mDNS name the GUI passes as player_id — so the other two
+                # tests both miss and the adopt fails with "never connected" while the speaker is
+                # sitting there connected. Measured on .7.204: adopted twice, then never again.
+                registered = self.server.get_client_url(client.client_id)
+                if registered == url or client.client_id == player_id or client.client_id not in before:
                     self.server.register_client_url(client.client_id, url)
                     await self.attach_player(source_id, client.client_id)
                     logger.info("[%s] adopted foreign speaker %s (%s)", source_id, client.client_id, url)
