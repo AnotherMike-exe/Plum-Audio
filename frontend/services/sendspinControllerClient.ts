@@ -142,6 +142,7 @@ export class SendspinControllerClient {
   private serverClockOffsetUs = 0;
   private timeTimer: ReturnType<typeof setTimeout> | null = null;
   private stateSent = false; // client/state{synchronized} is sent once per connection
+  private helloSeen = false; // gate: nothing but client/hello goes on the wire before server/hello
   private closed = false;
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -201,6 +202,17 @@ export class SendspinControllerClient {
     this.revokeArtwork();
     if (this.ws) {
       this.ws.onclose = null;
+      // Say goodbye before dropping the socket. Servers must tolerate an abrupt close anyway, but
+      // an explicit client/goodbye lets one release our slot immediately instead of holding a
+      // reconnect grace — and the browser player already does this, so the pattern was understood,
+      // just not applied here.
+      if (this.ws.readyState === WebSocket.OPEN) {
+        try {
+          this.ws.send(JSON.stringify({ type: 'client/goodbye', payload: { reason: 'user_request' } }));
+        } catch {
+          // A send on a socket closing underneath us is not worth reporting — we are leaving.
+        }
+      }
       this.ws.close();
       this.ws = null;
     }
@@ -222,6 +234,24 @@ export class SendspinControllerClient {
   }
 
   /** server/time reply → NTP offset/delay → filter (formulas verbatim from the library). */
+  /**
+   * The handshake is complete. Only now may anything else go on the wire.
+   *
+   * The spec requires client/state "immediately after receiving server/hello", so it is sent here
+   * unconditionally. It used to be sent only from onServerTime, and only once the clock had
+   * settled (>=3 samples) — which meant a server that never answered client/time, or answered
+   * twice, got NO client/state at all, a required message simply skipped. The gating instinct was
+   * right and is preserved in the VALUE: we open as 'synchronized' by declaration and correct
+   * ourselves if the clock never settles, rather than withholding the message.
+   */
+  private onServerHello(): void {
+    if (this.helloSeen) return;
+    this.helloSeen = true;
+    this.sendState('synchronized');
+    this.stateSent = true;
+    this.sendTime(); // continuous clock sync starts now, not before
+  }
+
   private onServerTime(p: { client_transmitted: number; server_received: number; server_transmitted: number }): void {
     const now = this.nowUs();
     const offset = ((p.server_received - p.client_transmitted) + (p.server_transmitted - now)) / 2;
@@ -229,10 +259,6 @@ export class SendspinControllerClient {
     this.clock.update(Math.round(offset), Math.round(delay));
     if (this.clock.synchronized) {
       this.serverClockOffsetUs = this.clock.offsetUs; // authoritative once we have real samples
-      if (!this.stateSent) {
-        this.sendState('synchronized');
-        this.stateSent = true;
-      }
     }
   }
 
@@ -285,6 +311,7 @@ export class SendspinControllerClient {
       this.reconnectAttempts = 0;
       this.clock = new TimeFilter(); // a new socket is a new clock relationship
       this.stateSent = false;
+      this.helloSeen = false;
       ws.send(
         JSON.stringify({
           type: 'client/hello',
@@ -318,8 +345,11 @@ export class SendspinControllerClient {
           },
         }),
       );
-      // Begin continuous clock sync immediately (spec: clients send client/time continuously).
-      this.sendTime();
+      // NOTHING else goes on the wire until server/hello lands. The spec is explicit: "The first
+      // message must always be a client/hello... Before this handshake is complete, no other
+      // messages should be sent." We used to call sendTime() synchronously right here, pushing
+      // client/time ahead of server/hello. aiosendspin servers tolerate it, which is why it never
+      // showed up on the rig; a stricter server may drop the connection. See onServerHello.
       // Flush any commands queued during the reconnect, once the server has had time to re-group us
       // into the source group (a command sent while still in our solo group would go nowhere).
       if (this.pendingCommands.length > 0) setTimeout(() => this.flushPending(), 600);
@@ -387,6 +417,9 @@ export class SendspinControllerClient {
     switch (msg.type) {
       case 'server/time':
         this.onServerTime(msg.payload);
+        break;
+      case 'server/hello':
+        this.onServerHello();
         break;
       case 'server/state':
         this.onServerState(msg.payload);

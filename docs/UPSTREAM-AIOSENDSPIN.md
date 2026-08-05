@@ -10,6 +10,44 @@
 
 ---
 
+## 0. `client/state` never carries the spec's REQUIRED top-level `state` — **a library bug**
+
+**Conformance impact: HIGH. This is a defect in `aiosendspin` itself, not a missing seam, and it
+affects every client the library ships — including its own.**
+
+The spec makes `state` a REQUIRED field of the `client/state` payload, at the top level, one of
+`synchronized` / `error` / `external_source`. `SendspinClient.send_player_state()`
+(`client/client.py`) sets it only inside the nested `player` object — the field the library's own
+`models/player.py` annotates:
+
+```python
+# DEPRECATED(before-spec-pr-50): Remove once all clients send state at client level.
+```
+
+and leaves `ClientStatePayload.state` at its `None` default, which `omit_none = True`
+(`models/core.py`) then strips from the JSON entirely. So the emitted message is:
+
+```json
+{"type":"client/state","payload":{"player":{"state":"synchronized","volume":42, ...}}}
+```
+
+Meanwhile the library's own **server** reads `payload.state` at the top level
+(`server/connection.py`) — so it reads `None`, skips the transition, and leaves the client at its
+default. **aiosendspin's client and server disagree with each other**, and it is invisible only
+because both ends default to `SYNCHRONIZED`. A spec-strict third-party server sees a required field
+missing on every state message, including the mandatory one at connect.
+
+**Current workaround** — `sendspin_player.build_client_state_message()` constructs the message
+directly and sets **both** fields (top-level for the spec, nested for peers mid-migration), then
+sends it via `client._send_message()`. Guarded by `tests/Unit/test_client_state_conformance.py`,
+whose last test asserts the upstream bug is still present: **when that test starts failing, the fix
+has landed — delete the local builder and go back to `send_player_state()`.**
+
+**Ask:** set `ClientStatePayload.state` in `send_player_state()`. One line, and it makes every
+aiosendspin client conformant at once.
+
+---
+
 ## 1. Let a client inspect `connection_reason` **before** committing to a dialing server
 
 **Conformance impact: HIGH — this is the one open conformance gap in `docs/SPEC-CONFORMANCE.md`.**

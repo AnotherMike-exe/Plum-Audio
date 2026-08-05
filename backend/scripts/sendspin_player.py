@@ -43,17 +43,17 @@ import numpy as np
 
 from aiosendspin.client.client import SendspinClient
 from aiosendspin.client.listener import ClientListener
-from aiosendspin.models.core import DeviceInfo
-from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
+from aiosendspin.models.core import ClientStateMessage, ClientStatePayload, DeviceInfo
+from aiosendspin.models.player import ClientHelloPlayerSupport, PlayerStatePayload, SupportedAudioFormat
 from aiosendspin.models.artwork import ArtworkChannel, ClientHelloArtworkSupport
 from aiosendspin.models.types import ArtworkSource, PictureFormat
 from aiosendspin.models.visualizer import ClientHelloVisualizerSpectrum, ClientHelloVisualizerSupport
 from aiosendspin.models.types import (
     AudioCodec,
+    ClientStateType,
     GoodbyeReason,
     MediaCommand,
     PlayerCommand,
-    PlayerStateType,
     Roles,
 )
 
@@ -65,8 +65,10 @@ except Exception:  # noqa: BLE001 - allows --probe-config / import without PortA
 from mesh.avahi import CLIENT_SERVICE, AvahiClient
 from player_state import (
     STATE_SAVE_DEBOUNCE_S,
+    load_last_playing_server,
     load_render_state,
     save_active_output,
+    save_last_playing_server,
     save_render_state,
     state_file_path,
 )
@@ -89,6 +91,55 @@ DEFAULT_TARGET_BUFFER_MS = 300  # jitter buffer depth we aim to hold ahead of th
 MAX_BUFFER_MS = 2000  # hard cap; drop oldest beyond this if the DAC falls behind
 XRUN_LOG_EVERY = 50  # throttle xrun warnings
 OVERRUN_LOG_EVERY = 50  # ditto for buffer overruns — enqueue() runs once per ~20ms chunk
+# Padded frames since the last state report that mean "we are not keeping up", i.e. report
+# client/state error. ~50ms at 44.1k: comfortably past a single scheduling hiccup, well under
+# anything a listener would call continuous. The spec's example of a client that cannot maintain
+# sync is exactly buffer underrun, and reporting it is how a server learns to send more lead time.
+ERROR_PAD_FRAMES = DEFAULT_RATE // 20
+HEALTH_POLL_S = 3.0  # how often we re-evaluate whether to report client/state error
+
+
+def build_client_state_message(
+    state: ClientStateType,
+    *,
+    volume: int,
+    muted: bool,
+    static_delay_ms: int,
+    required_lead_time_ms: int,
+    min_buffer_ms: int,
+    supported_commands: list | None = None,
+) -> ClientStateMessage:
+    """A spec-conformant client/state, with `state` at the TOP level.
+
+    aiosendspin 6.0.5's send_player_state() sets state only inside the `player` object — the field
+    its own models mark "DEPRECATED(before-spec-pr-50): Remove once all clients send state at client
+    level" — and leaves ClientStatePayload.state at None, which omit_none then drops from the wire
+    entirely. Its own server reads payload.state at the top level, so it always reads None and never
+    transitions the client. Plum-to-Plum that is benign purely by luck, because both ends default to
+    SYNCHRONIZED; a spec-strict third-party server sees a REQUIRED field missing on every state
+    message we send, including the mandatory one at connect.
+
+    Both fields are set: the top-level one because the spec requires it, the nested one because a
+    peer mid-migration may still read it and extra fields are tolerated.
+
+    Free-standing (rather than a method) so the wire format can be asserted without standing up a
+    player. Delete it and go back to send_player_state() once the pin bumps past the upstream fix —
+    see docs/UPSTREAM-AIOSENDSPIN.md.
+    """
+    return ClientStateMessage(
+        payload=ClientStatePayload(
+            state=state,
+            player=PlayerStatePayload(
+                state=state,
+                volume=volume,
+                muted=muted,
+                static_delay_ms=static_delay_ms,
+                required_lead_time_ms=required_lead_time_ms,
+                min_buffer_ms=min_buffer_ms,
+                supported_commands=supported_commands,
+            ),
+        )
+    )
 
 
 class AlsaRenderer:
@@ -329,6 +380,13 @@ class SendspinPlayer:
         self._muted = initial_muted
         self._state_file = state_file or state_file_path()
         self._save_task: asyncio.Task | None = None
+        # Health reporting: pad_frames at the last client/state, so _health measures the delta
+        # rather than a lifetime total that would pin us at error forever after one dropout.
+        self._last_pad_frames = 0
+        self._last_reported_state = ClientStateType.SYNCHRONIZED
+        # Spec: persist the server that most recently had us playing. Loaded so a restart does not
+        # re-write the same value, and so the id survives for the arbitration that will use it.
+        self._last_playing_server = load_last_playing_server(self._state_file)
 
         support = ClientHelloPlayerSupport(
             supported_formats=[
@@ -384,6 +442,7 @@ class SendspinPlayer:
         # the standard), so the GUI has to learn about it from the speaker itself.
         self._state: dict = {"attached": False}
         self._report_task: asyncio.Task | None = None
+        self._health_task: asyncio.Task | None = None
         self.report_url = os.environ.get("PLUM_PLAYER_STATE_URL", "http://127.0.0.1:5001/api/mesh/player-state")
         # Consume relay: forward the group's controller state + visualizer frames (which we receive
         # as a MEMBER of whatever server serves us, foreign ones included) to our GUI, and take
@@ -663,6 +722,47 @@ class SendspinPlayer:
             await self.client.send_group_command(cmd, **kwargs)
             logger.info("consume relay: sent %s to server", cmd.value)
 
+    async def _health_loop(self) -> None:
+        """Report client/state whenever our health changes, not only when the volume moves.
+
+        The spec wants `state: 'error'` while a client cannot maintain sync; that is a condition
+        with a duration, so it needs its own cadence. Only sends on a TRANSITION — a healthy player
+        keeps sending its one connect-time state and nothing more, which is what the spec asks for
+        ("whenever any state changes thereafter").
+        """
+        while True:
+            await asyncio.sleep(HEALTH_POLL_S)
+            self._remember_playing_server()
+            if not self.client.connected:
+                continue
+            state = self._health()
+            if state is not self._last_reported_state:
+                with contextlib.suppress(Exception):  # never break the render path over a report
+                    await self._send_client_state(state)
+
+    def _remember_playing_server(self) -> None:
+        """Persist the server_id of whoever most recently had us actually playing.
+
+        The spec makes this storage a MUST, as the input to multi-server arbitration: a client is
+        meant to accept a second server's handshake, compare it against the server it last played
+        for, and then decide which to keep. We cannot do the deciding half yet — aiosendspin's
+        attach_websocket blocks on server_hello inside the attach, so connection_reason is not
+        readable until we have already committed (docs/UPSTREAM-AIOSENDSPIN.md). Storing it is
+        implementable now, costs one key, and makes the rest a small delta later.
+
+        Keyed on audio actually flowing rather than on the reported playback_state: a foreign server
+        holds us as a group member while idle, and Music Assistant's playback_state is not reliable
+        for this — the same reason _snapshot_state prefers _audio_flowing.
+        """
+        info = self.client.server_info
+        if not (self.client.connected and info is not None and self._audio_flowing):
+            return
+        server_id = getattr(info, "server_id", None)
+        if server_id and server_id != self._last_playing_server:
+            self._last_playing_server = server_id
+            save_last_playing_server(self._state_file, server_id)
+            logger.info("now playing for server %s (persisted)", server_id)
+
     async def _report_loop(self) -> None:
         """Push our state to this unit's mesh API. Best-effort: the audio path never waits on it."""
         import aiohttp
@@ -707,6 +807,7 @@ class SendspinPlayer:
         )
         await self._listener.start()
         logger.info("player listening on :%d (id=%s)", self.port, self.player_id)
+        self._health_task = asyncio.ensure_future(self._health_loop())
         if self.report_url:
             self._report_task = asyncio.ensure_future(self._report_loop())
         if self.relay_url:
@@ -743,7 +844,7 @@ class SendspinPlayer:
                     logger.info("dialed home server %s", home_server_url)
 
     async def stop(self) -> None:
-        for task_attr in ("_report_task", "_relay_task"):
+        for task_attr in ("_report_task", "_relay_task", "_health_task"):
             task = getattr(self, task_attr)
             if task is not None:
                 task.cancel()
@@ -824,11 +925,45 @@ class SendspinPlayer:
         if self._save_task is None or self._save_task.done():
             self._save_task = asyncio.ensure_future(self._save_render_state())
 
+    def _health(self) -> ClientStateType:
+        """SYNCHRONIZED, or ERROR while we are demonstrably failing to keep up.
+
+        The spec asks a client that cannot maintain sync — buffer underrun is its own example — to
+        report `state: 'error'`, which is how a server learns to give this player more lead time.
+        AlsaRenderer has counted xruns, starvations and pad_frames since Phase 1 and none of it had
+        ever left the process: _send_render_state hardcoded SYNCHRONIZED, so a speaker that was
+        audibly dropping out reported itself perfectly healthy to Plum's server and to any foreign
+        one. Measured on the padding actually emitted, which is the honest signal (see pad_frames).
+        """
+        padded = self.renderer.pad_frames
+        delta = padded - self._last_pad_frames
+        self._last_pad_frames = padded
+        return ClientStateType.ERROR if delta >= ERROR_PAD_FRAMES else ClientStateType.SYNCHRONIZED
+
     async def _send_render_state(self) -> None:
         with contextlib.suppress(Exception):  # a state report must never break the render path
-            await self.client.send_player_state(
-                state=PlayerStateType.SYNCHRONIZED, volume=self._volume, muted=self._muted
-            )
+            await self._send_client_state(self._health())
+
+    async def _send_client_state(self, state: ClientStateType) -> None:
+        """Send client/state, bypassing the library's non-conformant builder.
+
+        The player payload mirrors what send_player_state() would have built, which is why it
+        reaches for the same private attributes. See build_client_state_message for the why.
+        """
+        client = self.client
+        message = build_client_state_message(
+            state,
+            volume=self._volume,
+            muted=self._muted,
+            static_delay_ms=round(client._static_delay_us / 1_000),  # noqa: SLF001
+            required_lead_time_ms=round(client._required_lead_time_us / 1_000),  # noqa: SLF001
+            min_buffer_ms=round(client._min_buffer_us / 1_000),  # noqa: SLF001
+            supported_commands=client._state_supported_commands or None,  # noqa: SLF001
+        )
+        await client._send_message(message.to_json())  # noqa: SLF001
+        if state is not self._last_reported_state:
+            logger.warning("reporting client state=%s %s", state.value, self.renderer.stats())
+            self._last_reported_state = state
 
     async def _save_render_state(self) -> None:
         await asyncio.sleep(STATE_SAVE_DEBOUNCE_S)

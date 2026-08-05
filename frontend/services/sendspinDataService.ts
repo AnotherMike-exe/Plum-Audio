@@ -26,6 +26,7 @@ export const FOREIGN_PREFIX = 'foreign::';
 // Where the learned speaker names live (see rememberPlayerNames). Survives a reload so a speaker
 // that is idle when the page opens still reads the way it does when it is playing.
 const NAME_MEMO_KEY = 'plum.speakerNames';
+const CLIENT_NONCE_PREFIX = 'plum.ctrlNonce.';
 
 // ---- Mesh REST wire shapes (backend/scripts/mesh/model.py) ----
 interface WirePlayer {
@@ -313,6 +314,26 @@ function saveNameMemo(memo: Map<string, string>): void {
     window.localStorage?.setItem(NAME_MEMO_KEY, JSON.stringify([...memo]));
   } catch {
     // non-fatal: the memo still works for this page's lifetime
+  }
+}
+
+// The spec asks that a client_id "remain persistent across reconnections so servers can associate
+// clients with previous sessions". A performance.now() nonce survives a WS reconnect (it is fixed at
+// construction) but not a page reload, so every refresh minted a fresh identity — and against a
+// foreign server such as Music Assistant that accretes a dead client record per reload. Persisted
+// per source, the same way and for the same reason as the speaker-name memo above.
+function stableClientNonce(sourceId: string): string {
+  const key = `${CLIENT_NONCE_PREFIX}${sourceId}`;
+  try {
+    const existing = window.localStorage?.getItem(key);
+    if (existing) return existing;
+    const minted = Math.floor(Math.random() * 1e9).toString(36);
+    window.localStorage?.setItem(key, minted);
+    return minted;
+  } catch {
+    // Private mode or quota: fall back to a per-load value. Worse for the server's bookkeeping,
+    // but never a reason to fail to connect.
+    return Math.floor(performance.now()).toString(36);
   }
 }
 
@@ -714,7 +735,7 @@ export class SendspinDataService {
         if (this.controllers.has(key)) continue;
         // The "ctrl:<source_id>:" client id tells the unit which source group to join us to.
         const c = new SendspinControllerClient(unit.unit_id, unit.host, (_uid, np) => this.onNowPlaying(key, np), {
-          clientId: `ctrl:${src.source_id}:${Math.floor(performance.now())}`,
+          clientId: `ctrl:${src.source_id}:${stableClientNonce(src.source_id)}`,
           // Negotiate the native visualizer role on every source controller. The server only sends
           // spectrum/loudness while that source is actually streaming, so an idle source costs
           // nothing — and whichever source the user opens the visualizer on already has its frames.

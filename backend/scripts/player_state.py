@@ -97,6 +97,31 @@ def load_active_output(path: str) -> str | None:
     return str(output) if output else None
 
 
+def load_last_playing_server(path: str) -> str | None:
+    """The server_id of the server that most recently had us playing, or None."""
+    server_id = _read(path).get("last_playing_server_id")
+    return str(server_id) if server_id else None
+
+
+def save_last_playing_server(path: str, server_id: str | None) -> None:
+    """Persist which server most recently had this player in playback.
+
+    The spec is prescriptive here: a client "must persistently store the server_id of the server
+    that most recently had playback_state: 'playing'", and use it to arbitrate when a second server
+    connects — accept the incoming handshake first, then decide which server to keep.
+
+    Plum implements none of that arbitration yet, and cannot fully: aiosendspin's attach_websocket
+    blocks on server_hello inside the attach, so connection_reason is not available until after the
+    client has already committed to the new server (see docs/UPSTREAM-AIOSENDSPIN.md). What IS
+    implementable locally is the storage half, which is what this is — it makes the eventual
+    arbitration a small delta rather than a design task, and it costs one key.
+
+    Until then this is observability: it records which server won a contested speaker, which is the
+    thing that was impossible to see during the Music Assistant tug-of-war.
+    """
+    _merge_write(path, {"last_playing_server_id": server_id})
+
+
 def save_active_output(path: str, spec: str | None) -> None:
     """Record which output the player actually has open.
 
