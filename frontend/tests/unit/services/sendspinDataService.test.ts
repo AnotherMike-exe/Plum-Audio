@@ -271,3 +271,76 @@ describe('speaker names survive going idle', () => {
     expect(reloaded.snapshot().clients.find((c) => c.url === URL)!.name).toBe('Kitchen');
   });
 });
+
+describe('a live unit rename reaches its PEERS', () => {
+  // Reported from the rig 2026-08-05: renaming unit-133 updated its own GUI but not unit-113's,
+  // and a page refresh did not help.
+  //
+  // Two names again, but a different pair. `players[].name` is what the speaker declared at the
+  // Sendspin HANDSHAKE, and that is fixed at connect — a unit renamed while attached keeps
+  // announcing the old name to its server until the audio process restarts, which is deliberate
+  // (restarting it to apply a rename would drop playback). `local_player` is the unit's own
+  // self-report, driven from settings.json, and it reflects a rename within a poll.
+  //
+  // The memo learned only from the handshake name, and it is PERSISTED — so a peer's GUI pinned
+  // the pre-rename name and a refresh restored it from localStorage rather than fixing it.
+  const URL = 'ws://192.0.2.10:8928/sendspin';
+
+  const view = (handshakeName: string, selfReportName: string): MeshView => ({
+    local_unit_id: 'unit-113',
+    units: [
+      {
+        unit_id: 'unit-113',
+        name: '113 Sendspin',
+        host: '192.0.2.11',
+        sources: [{ source_id: 'airplay-1', group_id: 'gA', group_name: 'AirPlay', streaming: true, player_ids: ['player-133'] }],
+        // The PEER's server holds unit-133's speaker, carrying its handshake name.
+        players: [{ player_id: 'player-133', name: handshakeName, connected: true, group_id: 'gA', url: URL }],
+      },
+      {
+        unit_id: 'unit-133',
+        name: selfReportName,
+        host: '192.0.2.10',
+        sources: [],
+        players: [],
+        local_player: { player_id: 'player-133', name: selfReportName, url: URL, attached: true },
+      },
+    ],
+  });
+
+  beforeEach(() => window.localStorage.clear());
+
+  const nameOf = (svc: SendspinDataService) => svc.snapshot().clients.find((c) => c.url === URL)!.name;
+
+  it('prefers the self-report over a stale handshake name', () => {
+    const svc = new SendspinDataService();
+    // @ts-expect-error — private hand-off; no network in a unit test.
+    svc.applyView(view('Pi4-02', 'Pi4-02'));
+    expect(nameOf(svc)).toBe('Pi4-02');
+
+    // The rename: settings.json moved, so the self-report has it. The handshake name has NOT
+    // changed and will not until unit-133's audio process restarts.
+    // @ts-expect-error — private hand-off.
+    svc.applyView(view('Pi4-02', 'Pi4-02-Renamed'));
+    expect(nameOf(svc)).toBe('Pi4-02-Renamed');
+  });
+
+  it('does not let the stale handshake name win back on the next poll', () => {
+    const svc = new SendspinDataService();
+    // @ts-expect-error — private hand-off.
+    svc.applyView(view('Pi4-02', 'Pi4-02-Renamed'));
+    // @ts-expect-error — poll again with the same (still stale) handshake name.
+    svc.applyView(view('Pi4-02', 'Pi4-02-Renamed'));
+    expect(nameOf(svc)).toBe('Pi4-02-Renamed');
+  });
+
+  it('persists the new name, so a refresh does not restore the old one', () => {
+    // @ts-expect-error — private hand-off.
+    new SendspinDataService().applyView(view('Pi4-02', 'Pi4-02-Renamed'));
+
+    const reloaded = new SendspinDataService();   // reads the persisted memo, as a refresh would
+    // @ts-expect-error — private hand-off.
+    reloaded.applyView(view('Pi4-02', 'Pi4-02-Renamed'));
+    expect(nameOf(reloaded)).toBe('Pi4-02-Renamed');
+  });
+});

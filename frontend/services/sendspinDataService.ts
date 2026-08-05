@@ -496,18 +496,31 @@ export class SendspinDataService {
     }
   }
 
-  /** Learn each attached speaker's protocol name, keyed by its listener URL. */
+  /** Learn each speaker's name, keyed by its listener URL. */
   private rememberPlayerNames(view: MeshView): void {
     let changed = false;
-    for (const unit of view.units) {
-      for (const p of unit.players) {
-        // A rename is authoritative: whatever the speaker declares now replaces what we knew.
-        if (p.url && p.name && this.nameByUrl.get(p.url) !== p.name) {
-          this.nameByUrl.set(p.url, p.name);
-          changed = true;
-        }
+    const learn = (url: string | null | undefined, name: string | null | undefined) => {
+      if (url && name && this.nameByUrl.get(url) !== name) {
+        this.nameByUrl.set(url, name);
+        changed = true;
       }
+    };
+
+    // `players` carries the name the speaker declared at the Sendspin HANDSHAKE, which is fixed at
+    // connect: a unit renamed while attached keeps announcing its old name to its server until the
+    // audio process restarts, deliberately (restarting it to apply a rename would drop playback).
+    for (const unit of view.units) {
+      for (const p of unit.players) learn(p.url, p.name);
     }
+
+    // ...so the unit's OWN self-report wins, and is applied second. It is driven from settings.json
+    // via unit_identity and therefore reflects a rename within a poll. Without this the memo pinned
+    // the pre-rename name — and because the memo is persisted, a peer's GUI kept showing the old
+    // name across a page refresh, which is exactly how this was reported from the rig 2026-08-05.
+    for (const unit of view.units) {
+      learn(unit.local_player?.url, unit.local_player?.name);
+    }
+
     if (changed) saveNameMemo(this.nameByUrl);
   }
 

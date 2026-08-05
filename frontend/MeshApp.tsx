@@ -208,7 +208,11 @@ export default function MeshApp(): React.ReactElement {
   // Identity-stable arrays: keep the same reference across position ticks so the memoized device
   // lists only re-render when a client/stream field they show actually changes.
   const streamsSig = model.streams
-    .map((s) => `${s.id}|${s.name}|${s.isPlaying}|${s.volume ?? ''}|${s.sourceVolume ?? ''}|${s.active}`)
+    // serverName is in here because StreamSelector renders it as the group header — renaming a unit
+    // changes nothing else about its streams, so without it a peer's GUI kept the old heading until
+    // some unrelated field moved. Same class of bug as the PlayerControls memo above.
+    .map((s) =>
+      `${s.id}|${s.name}|${s.serverName ?? ''}|${s.isPlaying}|${s.volume ?? ''}|${s.sourceVolume ?? ''}|${s.active}`)
     .join(';');
   const clientsSig = viewClients
     .map((c) => `${c.id}|${c.name}|${c.currentStreamId ?? ''}|${c.volume}|${c.connected}`)

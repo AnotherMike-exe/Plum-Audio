@@ -979,7 +979,13 @@ class SendspinPlayer:
             min_buffer_ms=round(client._min_buffer_us / 1_000),  # noqa: SLF001
             supported_commands=client._state_supported_commands or None,  # noqa: SLF001
         )
-        await client._send_message(message.to_json())  # noqa: SLF001
+        payload = message.to_json()
+        # The exact bytes, at DEBUG. This message is the one place we bypass the library's own
+        # builder (it drops the spec's REQUIRED top-level `state` — UPSTREAM §0), so being able to
+        # read what actually went on the wire without a packet capture is worth one log line. The
+        # units have no tcpdump, and aiosendspin's DEBUG does not dump frames.
+        logger.debug("client/state -> %s", payload)
+        await client._send_message(payload)  # noqa: SLF001
         if state is not self._last_reported_state:
             logger.warning("reporting client state=%s %s", state.value, self.renderer.stats())
             self._last_reported_state = state
