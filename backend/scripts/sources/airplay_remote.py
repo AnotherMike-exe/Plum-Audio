@@ -32,6 +32,10 @@ MPRIS_NAME = "org.mpris.MediaPlayer2.ShairportSync"
 MPRIS_PATH = "/org/mpris/MediaPlayer2"
 PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
 PROPS_IFACE = "org.freedesktop.DBus.Properties"
+# Consecutive "Stopped" observations before we call the sender gone. At the 5s watch interval that
+# is ~10s of quiet, comfortably longer than the status flurry a pause produces and short enough that
+# a genuinely departed phone stops being offered as controllable.
+SESSION_LOSS_STRIKES = 2
 
 
 class AirplayRemote:
@@ -52,6 +56,10 @@ class AirplayRemote:
         # PlaybackStatus=Stopped and Volume=0.0 — a truthful read of nothing, which as a source
         # volume would show the user a 0% slider for an endpoint no phone is even using.
         self._has_session = False
+        # Consecutive "Stopped" observations. Presence is declared lost only after
+        # SESSION_LOSS_STRIKES of them, because a pausing sender produces a brief flurry of status
+        # changes and a single Stopped in the middle of it is not a departed phone — see _note_status.
+        self._stopped_strikes = 0
 
     async def connect(self) -> None:
         """Connect to the bus (idempotent). Binding to shairport happens lazily per command."""
@@ -167,13 +175,37 @@ class AirplayRemote:
             return
         self._watch_task = asyncio.ensure_future(self._volume_watch(interval))
 
+    def _note_status(self, status) -> None:
+        """Fold one PlaybackStatus observation into session presence, with hysteresis on loss.
+
+        Presence used to be a bare `status != "Stopped"` written from three places on two different
+        schedules — this poll, the PlaybackStatus signal, and (unconditionally, as True) the Volume
+        signal. A pausing sender produces a flurry of those, so the flag flapped on roughly the poll
+        interval and the GUI's source slider locked and unlocked at random. Reported from the rig
+        2026-08-05.
+
+        Gaining a session is immediate; losing one takes SESSION_LOSS_STRIKES consecutive Stopped
+        observations, so a transient Stopped mid-pause does not read as a departed phone.
+        """
+        present = str(getattr(status, "value", status)) != "Stopped"
+        if present:
+            self._stopped_strikes = 0
+            if not self._has_session:
+                logger.info("airplay remote: sender present")
+            self._has_session = True
+            return
+
+        self._stopped_strikes += 1
+        if self._has_session and self._stopped_strikes >= SESSION_LOSS_STRIKES:
+            logger.info("airplay remote: sender gone (%d consecutive Stopped)", self._stopped_strikes)
+            self._has_session = False
+
     async def _volume_watch(self, interval: float) -> None:
         while True:
             player = await self._player_iface()  # binds (and subscribes) as soon as shairport is up
             if player is not None:
                 with contextlib.suppress(Exception):
-                    status = await player.get_playback_status()
-                    self._has_session = str(getattr(status, "value", status)) != "Stopped"
+                    self._note_status(await player.get_playback_status())
                     if self._has_session:
                         vol = await player.get_volume()
                         self._report_volume(getattr(vol, "value", vol))
@@ -183,13 +215,15 @@ class AirplayRemote:
         if iface != PLAYER_IFACE:
             return
         if "PlaybackStatus" in changed:
-            status = changed["PlaybackStatus"]
-            self._has_session = str(getattr(status, "value", status)) != "Stopped"
+            self._note_status(changed["PlaybackStatus"])
         if "Volume" in changed:
-            val = changed["Volume"]
-            # A volume signal is itself proof of a sender: shairport only relays one from a session.
-            self._has_session = True
-            self._report_volume(val.value if isinstance(val, Variant) else val)
+            # Only while we believe a sender is there. This signal used to force _has_session True
+            # and cache the level unconditionally — but shairport emits Volume=0.0 as a session tears
+            # down, so the teardown value was being latched as the "last known" level AND briefly
+            # unlocking the slider on the way past. Presence is PlaybackStatus's job alone now.
+            if self._has_session:
+                val = changed["Volume"]
+                self._report_volume(val.value if isinstance(val, Variant) else val)
 
     def _report_volume(self, mpris_volume) -> None:
         if self._on_source_volume is None:
