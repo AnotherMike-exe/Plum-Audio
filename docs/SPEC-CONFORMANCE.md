@@ -49,7 +49,8 @@ instead — same wire result, one responder per host.
 **The gap:** the spec has the client accept the new handshake, then choose by `connection_reason`
 (`playback` beats `discovery`), tie-breaking on the persisted `server_id` of the last server with
 `playback_state: playing`. Our player implements only the first branch — it always yields to the
-newest dialer — and persists nothing. Plum-to-Plum this is indistinguishable from conformant, since
+newest dialer — but it now persists the `server_id` of the server that most recently had it
+playing, which is the storage the third branch needs. Plum-to-Plum this is indistinguishable from conformant, since
 we only ever dial `playback`. Against a foreign server running a discovery sweep it is wrong: we
 would hand over a playing speaker.
 

@@ -3,7 +3,7 @@
  *
  * The GUI's live now-playing + transport channel. Connects to a unit's Sendspin server
  * (ws://<host>:8927) as a controller/metadata/artwork receiver — NOT a player, so it never pulls
- * the audio stream. See docs/FRONTEND-PORT.md for the audited protocol.
+ * the audio stream. See docs/SENDSPIN-CONTROLLER-PROTOCOL.md for the audited wire format.
  *
  * Per connection the server exposes ONE group's state; with one source-group per unit that group
  * is the unit's active source. Metadata/controller state ride `server/state` (as diffs), transport

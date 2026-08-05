@@ -66,7 +66,8 @@ already had to accept or reject it blind.
 
 **Current workaround** (`backend/scripts/sendspin_player.py`, `on_connection`): on a second dial we
 *always* release the old connection (`goodbye: another_server`) and attach the new one — i.e. we
-yield to the newest dialer unconditionally, and persist nothing. Plum-to-Plum this is
+yield to the newest dialer unconditionally. The `server_id` of the last server that had us playing
+IS now persisted (`player_state.json`), so only the deciding half is missing. Plum-to-Plum this is
 indistinguishable from conformant because our servers **only ever dial `playback`**. Against a
 foreign server running a `discovery` sweep it is wrong: we hand over a *playing* speaker. Observed
 live — our unit's boot-time dial took a speaker back off Music Assistant ~1 min after MA claimed it.

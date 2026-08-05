@@ -5,7 +5,10 @@
  * this pulls (and plays) the actual audio via the official @sendspin/sendspin-js player. It dials IN
  * to ws://<host>:8927/sendspin, so the tab shows up in that unit's mesh snapshot as a routable
  * endpoint ("Browser Audio") — routing/volume/removal all ride the existing /api/mesh/* path, no
- * special backend handling (see docs/LISTEN-IN-BROWSER-PLAN.md).
+ * special backend handling (see docs/ARCHITECTURE.md §11).
+ *
+ * Dialing IN is the inverse of the native player, which servers dial. A tab has no listener socket,
+ * so cross-server roam does not apply to it.
  *
  * Codec: PCM FIRST, and that ordering is a sync decision, not a bandwidth one. The server caches
  * outgoing audio per TRANSFORM KEY (codec + rate + depth + channels + frame size), and a client

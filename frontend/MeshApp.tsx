@@ -14,7 +14,7 @@
  * there — and with it every player currently sharing its group, so a synced room moves together.
  * Only sources a sender is actually using are listed (plus whatever we're on); idle ones stay
  * routable and reappear the moment audio flows. Browser-audio, federation server-CRUD, and the
- * reactive visualizer are dropped for v1 (see docs/FRONTEND-PORT.md).
+ * reactive visualizer are dropped for v1.
  *
  * All interactive sub-trees are memoized with identity-stable array/handler props so the 500ms
  * position tick (which re-renders to advance the progress bar) can't reconcile their DOM mid-click.

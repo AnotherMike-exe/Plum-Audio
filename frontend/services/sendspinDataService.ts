@@ -2,7 +2,7 @@
  * Sendspin data service — the engine seam for the Plum-Audio mesh GUI.
  *
  * Replaces Plum-Snapcast's snapcastService + snapcastDataService + federationService +
- * playbackService. Two data planes (see docs/FRONTEND-PORT.md):
+ * playbackService, all four now deleted. Two data planes (see docs/ARCHITECTURE.md §11):
  *   - Topology (which units/sources/players/groups exist) — REST poll of GET /api/mesh/view.
  *   - Now-playing (title/artist/album/art/position/transport) — ONE controller WS per SOURCE
  *     (a client sits in exactly one group, so it sees exactly one source). Merged client-side.

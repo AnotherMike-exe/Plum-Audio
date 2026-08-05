@@ -1,465 +1,253 @@
-# CLAUDE.md - Plum-Audio
+# CLAUDE.md — Plum-Audio
 
-> **Purpose**: Project memory for Claude Code. Defines rules, workflows, and preferences.
-> **Status**: **Phase 2 complete + merged to `main` (2026-07-14)** — single-unit AirPlay and the
-> full mesh (discovery/aggregation/roam/multi-group/per-player volume) are hardware-validated on
-> two Pis, incl. live AirPlay + metadata/artwork + multi-room. **Phase 3 in progress**
-> (`feature/phase3-sources-gui`): settings core + the **Spotify slice are DONE and fully
-> hardware-validated** (audio, metadata/artwork, transport, timeline, live endpoint CRUD, roam).
-> **Multi-endpoint AirPlay** (private D-Bus session per endpoint for MPRIS), the **per-unit nginx
-> GUI**, and **third-party interop** (Sendspin mDNS via Avahi; adopt/release of foreign speakers —
-> proven against Music Assistant + a Home Assistant Voice PE) are in and hardware-verified.
-> **The container build is DONE (2026-07-31)** — all three R&D Pis run the unit as a container
-> (`docker/build.sh` → `docker/deploy.sh`), with the `~/plum-test` dev stack stopped but left on
-> disk. **Audio output selection is DONE (2026-08-04)** — discovery, `/api/audio/*`, live apply
-> without a restart, and the picker in **Settings → Audio**, plus
-> `scripts/host-setup/configure-audio-hat.sh` for HAT provisioning. Validated on a **fourth unit,
-> `.7.204` (HiFiBerry Amp100)**, recommissioned from Plum-Snapcast. **GUI polish pass done
-> (2026-08-05)** — themed scrollbars, the Audio tab, active-only device pickers, a stream picker on
-> idle devices, and stable speaker names; **all four units now run the same image (`6a64b88`)**.
-> Remaining: DLNA/Plexamp and the conformance gaps in docs/SPEC-CONFORMANCE.md.
+> **Purpose**: project memory for Claude Code — the rules that stop an agent breaking things.
+> **Status**: Phase 3, on `feature/phase3-sources-gui`. Phase 2 (mesh) is merged to `main`.
+> AirPlay/Spotify/Bluetooth, the mesh, interop, the container and output selection are all
+> hardware-validated on four units. Remaining: DLNA + Plexamp (no backend yet) and the gaps in
+> `docs/SPEC-CONFORMANCE.md`. What landed when → `docs/PHASE-HISTORY.md`.
 >
-> **Not ours, do not re-investigate:** a Home Assistant Voice PE joins a group, acknowledges our
-> `stream/start` codec header, reports PLAYING — and plays nothing. It does not play from **Music
-> Assistant** either, under FLAC or PCM. Device-side. Chased at length on 2026-08-04.
+> **Not ours, do not re-investigate:** a Home Assistant Voice PE joins a group, ACKs our
+> `stream/start` codec header, reports PLAYING — and renders nothing. It does the same from **Music
+> Assistant**, under FLAC and PCM. Device-side. Play from MA first before blaming us.
 
-## Project Overview
+## What this is
 
-**Plum-Audio** is a multi-room audio streaming system and the successor to **Plum-Snapcast**.
-It replaces the Snapcast server + custom federation backbone **entirely** with **Sendspin**
-(Open Home Foundation sync protocol; WebSocket transport; `aiosendspin` server library) as the
-**sole** sync engine. Source integrations (AirPlay/Spotify/DLNA/Bluetooth/Plexamp) and the
-React/TS GUI are **ported** from Plum-Snapcast, not rewritten.
+Multi-room audio streaming, successor to **Plum-Snapcast**. Replaces the Snapcast server + custom
+federation backbone **entirely** with **Sendspin** (Open Home Foundation sync protocol, WebSocket
+transport, `aiosendspin` server library) as the **sole** sync engine. Source integrations and the
+React/TS GUI were **ported** from Plum-Snapcast, not rewritten.
 
-### Key Features
-- **Mesh multi-room**: every unit runs both a Sendspin server (local ingest) and a roamable
-  player. Cross-route any source to any set of endpoints; multiple concurrent groups.
-- **Out-of-band metadata/artwork/visualizer** (Sendspin roles) — structurally eliminates the
+- **Mesh multi-room**: every unit runs a Sendspin server (local ingest) *and* a roamable player.
+  Cross-route any source to any set of endpoints; multiple concurrent groups.
+- **Metadata/artwork/visualizer out-of-band** via Sendspin roles — this structurally eliminates the
   Snapcast `onResync()` storm that Plum-Snapcast fought with five control-script guards.
-- Multi-instance AirPlay/Spotify/DLNA sources, per-client volume, real-time metadata + album art.
-- React web UI, full-screen visualizer, album-art theming (ported).
+- Multi-instance sources, per-client volume, React GUI with visualizer and album-art theming.
 
-### Project Context
-- **Stage**: Phase 2 (mesh) merged to `main`; Phase 3 (remaining sources + GUI) starting
-- **Team**: Solo developer + AI assistance
-- **Priority**: Correct mesh + audio reliability first; port UI second
+Solo developer + AI assistance. Priority: correct mesh + audio reliability first.
 
----
+## Working preferences
 
-## Claude Code Preferences
-- **Model**: Sonnet (daily) / Opus (architecture)
-- **Planning**: Complex multi-step tasks only
-- **Communication**: Concise — explain major changes, skip obvious details
-- **Testing**: Manual integration testing on Raspberry Pi hardware; headless protocol/xrun probes where possible
+- **Model**: Sonnet (daily) / Opus (architecture). **Planning**: complex multi-step tasks only.
+- **Communication**: concise — explain major changes, skip obvious details.
+- **Testing**: manual integration testing on the Pi rig; headless protocol/xrun probes where possible.
 
----
+## Stack and ports
 
-## Technology Stack
+**Backend** — Python 3.13 · `aiosendspin` **pinned 6.0.5** · PyAV · numpy · Flask (:5002) + aiohttp
+(:5001) · supervisord · Avahi + D-Bus + host networking.
+Base image **`python:3.13-slim-trixie`** — glibc, not Alpine (deliberate: trivial PyAV/PortAudio/
+numpy wheels). **Trixie specifically** to match the units' Debian 13: bluez-alsa still names its
+daemon `bluealsa`, and shairport-sync is the MPRIS build. The Dockerfile asserts the build-time
+dependencies because each failure is invisible at runtime. Built arm64 only; amd64 never built.
 
-### Backend
-- **Base image**: **`python:3.13-slim-trixie`** (glibc) — NOT Alpine/musl. Deliberate: glibc makes
-  PyAV / PortAudio / numpy wheels trivial and removes the Alpine packaging pain Plum-Snapcast had.
-  **Do not "optimize" this back to Alpine.** Multi-arch amd64 + arm64.
-  **Trixie specifically, matching the units' Debian 13**: bluez-alsa 4.3.1-3 still names its daemon
-  `bluealsa` (renamed `bluealsad` upstream in 4.0) and shairport-sync **4.3.7** is the MPRIS build
-  multi-endpoint AirPlay was verified against. The Dockerfile asserts both at BUILD time — each
-  failure is invisible at runtime (dead transport controls, a Bluetooth source that never appears).
-- **Language**: Python 3.13
-- **Sync engine**: `aiosendspin` (**pinned 6.0.5**; fast-moving — pin + smoke-test on bump), PyAV, numpy
-- **APIs**: Flask REST on **:5002** (settings, integrations, audio); **mesh API is aiohttp on :5001**
-  — it must call the async router/aggregator inside the audio event loop, so WSGI Flask (2nd
-  process) doesn't fit
-- **Audio sources**: shairport-sync (AirPlay), go-librespot (Spotify), gmrender-resurrect (DLNA),
-  BlueZ+bluez-alsa (Bluetooth), Plexamp (Debian sidecar)
-- **Infra**: supervisord, Avahi (mDNS), D-Bus, host networking
+**Frontend** — React 19, TypeScript 5, Vite 6. Sendspin controller-role WS client + engine-agnostic
+data service. ColorThief, react-colorful. Tailwind compiled in, no CDN.
 
-### Frontend
-- React 19, TypeScript 5, Vite 6 (ported)
-- Sendspin **controller-role** WS client + engine-agnostic data service
-- ColorThief (album-art color), react-colorful
+| Port | What |
+|---|---|
+| 80 | nginx per unit — serves the built app, proxies both APIs same-origin |
+| 8927 / 8928 | Sendspin server / player — all audio, sync, metadata, transport |
+| 8929 | mesh discovery beacon (UDP broadcast) |
+| 5001 | mesh API (aiohttp, **in the audio event loop** — topology, route, volume) |
+| 5002 | config API (Flask — settings, integrations, audio) |
+| 5050+ | AirPlay RAOP (UDP blocks from 6001, stride 10) · Spotify zeroconf 5354+, control 3678+ |
+| 5353 | mDNS — the **host's** Avahi, not ours |
 
----
+**DLNA/Plexamp have no backend.** Only a settings stub and a GUI card exist; no ports are in use.
+**Requirements**: layer-2 network for mDNS, host networking mode.
 
-## Project Structure
+## Repo map
 
 ```
-├── _resources/           # Dev references (NOT in git); spike/ holds mesh probes
-├── docs/
-│   ├── ARCHITECTURE.md    # Canonical design + phased plan (READ FIRST)
-│   ├── SPEC-CONFORMANCE.md # Where we stand against the Sendspin spec (interop is the point)
-│   ├── TESTING.md         # Test tiers 1-6 + what is not yet reproducible
-│   ├── CLAUDE.md          # This file (symlinked to root)
-│   ├── DEV-SETUP.md
-│   └── QUICK-REFERENCE.md
-├── backend/
-│   ├── Dockerfile         # multi-stage, debian-slim
-│   ├── requirements.txt   # aiosendspin==6.0.5 pinned
-│   ├── config/            # sendspin/shairport/etc configs
-│   ├── scripts/
-│   │   ├── sendspin_server.py   # in-process SendspinServer + PushStream feeders
-│   │   ├── sync_engine/         # engine seam (base + sendspin impl)
-│   │   ├── mesh/                # orchestrator: discovery, aggregator, router
-│   │   ├── sources/             # per-integration control scripts (metadata→roles)
-│   │   └── apis/                # settings/integrations/audio Flask APIs (mesh API lives in mesh/api.py, aiohttp)
-│   └── supervisord/       # process .ini configs
-├── frontend/src/{components,services,hooks,assets}/
-├── docker/                # compose + build.sh/deploy.sh + units.conf (the rig's unit table)
-└── tests/{Unit,Integration}/
+_resources/            # dev references, NEVER in git; spike/ holds mesh probes
+docs/                  # everything except README.md — see the table in README
+backend/
+  Dockerfile           # multi-stage, python:3.13-slim-trixie, build-time dep assertions
+  entrypoint.sh        # derives the unit identity
+  nginx/               # the per-unit GUI server config
+  config/              # daemon config templates + bluez/ patches + D-Bus policies
+  scripts/
+    sendspin_server.py # in-process SendspinServer + PushStream feeders
+    sendspin_player.py # the roamable render endpoint
+    lifecycle.py       # SIGTERM handling for both audio processes
+    audio_devices.py · player_state.py · unit_identity.py
+    sync_engine/       # engine seam (base + sendspin impl)
+    mesh/              # orchestrator, discovery, aggregator, router, follow, neighbourhood, avahi, api
+    sources/           # per-integration config/manager/metadata + shared config_render, artwork
+    apis/              # settings/integrations/audio Flask blueprints (mesh API is mesh/api.py)
+  supervisord/         # four programs: sendspin_server, sendspin_player, config-api, nginx
+scripts/host-setup/    # configure-audio-hat.sh — runs on the HOST
+docker/                # compose + build.sh/deploy.sh + units.conf (the rig's unit table)
+tests/{Unit,Integration}/
 ```
 
-**Special**: `_resources/` NEVER in git. All docs in `docs/` except README.
+## Core architecture (detail: `docs/ARCHITECTURE.md`)
 
----
-
-## Core Architecture (summary — full detail in docs/ARCHITECTURE.md)
-
-### Mesh model — "servers stay, players roam"
-Every unit runs a Sendspin **server** (owns local audio ingest via in-process `PushStream`)
-**and** a **player** (roamable render endpoint). Cross-routing moves *players*, never bridges
-audio between servers (avoids the unmerged `Roles.SOURCE` path). Two tiers:
-1. **Intra-server** re-route → live `group.add_client` / `remove_client` (no reconnect), **plus
+**Mesh model — "servers stay, players roam."** Cross-routing moves *players*, never bridges audio
+between servers (that would need the unmerged `Roles.SOURCE`). Two tiers:
+1. **Intra-server** re-route → live `group.add_client`/`remove_client`, **plus
    `feeder.refresh_stream()`** — see the stream-membership rule below.
 2. **Cross-server** roam → `reclaim_client_for_playback` + `GoodbyeReason.ANOTHER_SERVER`.
-Cross-server roam is inaudible: the player never flushes on a roam, so its ~300 ms jitter buffer
-drains through the ~25-55 ms reconnect. **There is no DISCOVERY pre-connect** — a client holds one
-websocket, so a playing player can't be warmed on a 2nd server (and a DISCOVERY dial would steal it).
-Do not reintroduce it; see ARCHITECTURE §2.
 
-### Audio pipeline
+A roam is inaudible: the player never flushes, so its ~300 ms jitter buffer drains through the
+~25-55 ms reconnect. **There is no DISCOVERY pre-connect** — a client holds one websocket, so a
+playing player cannot be warmed on a second server, and a DISCOVERY dial would steal it. Refuted on
+hardware; do not reintroduce it.
+
 ```
-Source (AirPlay/BT/Spotify/DLNA/Plexamp) → service → /tmp/<source>-fifo
+Source (AirPlay/BT/Spotify) → daemon → /tmp/<source>-<id>-fifo
   → PushStream feeder → in-process SendspinServer (group/stream)
   → Sendspin players (local hw:<card> + roamed remote players)
 Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio stream)
 ```
 
-### Key design patterns
-- **Sendspin WS** (JSON control + binary media) for sync/transport
-- **Flask REST** for settings/integrations/audio; **aiohttp** for the mesh API (in the audio
-  event loop). The mesh API keeps parity with the old federation REST surface (`/api/mesh/*`:
-  snapshot/view/route/unroute/volume/source-volume/source) so the GUI ports with minimal change
-- **FIFO** audio transport from source services (single consumer — no tee needed)
-- **Dynamic stream lifecycle**: services run continuously; streams created on activity
+## Conventions
 
----
-
-## Development Workflow
-
-### Git
-- Main: `main` (protected). Branches: `feature/*`, `bugfix/*`, `docs/*`, `refactor/*`.
-- Conventional Commits. `git pull --rebase`. Atomic commits. Never force-push main.
-
-### Code Quality
-- Python: `ruff` + `black` (4-space indent, snake_case modules/files). TS: ESLint + Prettier
-  (2-space, PascalCase components, camelCase services). Constants/env: `UPPER_SNAKE_CASE`.
-- Max 120 cols.
-
-### Naming (per-ecosystem)
-- **Backend Python**: `snake_case.py` modules/functions, `PascalCase` classes (PEP 8 — overrides
-  the house PascalCase-files rule; Python demands it).
-- **Frontend**: `PascalCase.tsx` components, `camelCase.ts` services, `camelCase` vars/functions.
-- **Constants / env vars**: `UPPER_SNAKE_CASE`.
-
----
-
-## Key Ports (planned)
-- Web GUI: **80** (nginx, per unit — serves the built app + proxies the APIs)
-- Sendspin server: 8927 (per unit) · player: 8928 — **all audio, sync, metadata and transport**
-- Mesh API 5001 (aiohttp) · config API 5002 (Flask) — our own surfaces for what the spec does not
-  cover (cross-unit topology/routing, settings/integrations). NOT the old Snapcast/federation
-  layer: nothing of Snapcast's 1780/1704 or `federation/*` remains, only the port numbering.
-- Per-endpoint daemon control APIs on loopback: go-librespot 3678+ (`3678 + id - 1`)
-- AirPlay 5050-5059 (+ UDP blocks from 6001, stride 10), Spotify 5354-5363, DLNA 49494-49503,
-  mDNS 5353/udp
-- **Requirements**: Layer-2 network for mDNS/Avahi, host networking mode
-
----
-
-## Docker (Binhex conventions)
-- Volumes: `/config` (config+logs+db), `/data` (app data), `/media` (media)
-- Env: `PUID`, `PGID`, `UMASK` (prefer `002`), `TZ`
-- Logs: supervisord → `/config/supervisord.log` (first place to check)
-- Build: debian-slim base, multi-stage, deps-before-code, `.dockerignore`
-
----
-
-## Coding Conventions
+- **Git**: `main` protected. Branches `feature/*`, `bugfix/*`, `docs/*`, `refactor/*`. Conventional
+  Commits, atomic, `git pull --rebase`. Never force-push main.
+- **Python**: `ruff` + `black`, 4-space, `snake_case.py` modules/functions, `PascalCase` classes
+  (PEP 8 overrides the house PascalCase-files rule). **TS**: ESLint + Prettier, 2-space,
+  `PascalCase.tsx` components, `camelCase.ts` services. Constants/env `UPPER_SNAKE_CASE`. 120 cols.
+- **Docker**: Binhex conventions (see the global CLAUDE.md). Project deltas: host networking, and
+  `/proc/asound` bind-mounted from the host at `/host/asound` because it is masked in the container.
+  `/media` is mounted and declared but nothing reads it yet — it is there for Plexamp.
 
 ### Principles
-1. Keep it simple. 2. Audio reliability first — never compromise the pipeline.
-3. Document the *why*. 4. Fail gracefully (supervisord auto-restart). 5. Test on hardware.
+1. Keep it simple. 2. **Audio reliability first — never compromise the pipeline.** 3. Document the
+*why*. 4. Fail gracefully. 5. Test on hardware.
 
-### Project-specific rules
-- **Pin `aiosendspin`** (6.0.5). On any bump, run `_resources/spike/mesh_smoke.py` first.
-- **`SendspinServer` always binds mDNS (UDP 5353)** → collides with our Avahi. Start with
-  `start_server(advertise_addresses=[], discover_clients=False)`; drive connections by URL.
-- **Sendspin mDNS goes through the system Avahi** (`mesh/avahi.py`, D-Bus), never our own responder:
-  players advertise `_sendspin._tcp`, servers `_sendspin-server._tcp`. This is what makes us
-  discoverable by Music Assistant and other third-party Sendspin servers — do not disable it.
-  A client picks ONE direction: while advertising, we are server-dialed and must not dial out.
+## Project-specific rules — the ones that break things
+
+The *reasoning* behind these, and the failures that produced them, is in
+**`docs/HARD-WON-LESSONS.md`**. Do not re-litigate them from first principles.
+
+- **Pin `aiosendspin`** (6.0.5). On any bump run `_resources/spike/mesh_smoke.py` first, and re-check
+  `docs/UPSTREAM-AIOSENDSPIN.md` — several shipped workarounds should be deleted when it moves.
+- **`SendspinServer` always binds mDNS (5353)** → collides with the host Avahi. Start with
+  `start_server(advertise_addresses=[], discover_clients=False)` and drive connections by URL.
+- **Sendspin mDNS goes through the system Avahi** (`mesh/avahi.py`, D-Bus), never our own responder.
+  This is what makes us discoverable by Music Assistant — do not disable it. A client picks ONE
+  direction: while advertising we are server-dialed and must not dial out.
 - **Ingest via in-process `PushStream`** (`prepare_audio` + `commit_audio` + `set_live_source`),
   never the unmerged `Roles.SOURCE`.
-- **Metadata off the audio path** — emit to Sendspin metadata/artwork roles, not the stream.
-  The five Snapcast resync guards are obsolete here; do not port them.
-- **Adding a player to a live stream does NOT put it in that stream.** A stream's membership is
-  fixed at `start_stream()`. A client that CONNECTS while one is live gets it at handshake; one
-  already connected and then added to the group does not — it sits in the group, in the GUI, at the
-  right volume, and silent, with nothing in any log. `attach_player` therefore calls
-  `SourceFeeder.refresh_stream()` after `add_client`. The cost is a brief discontinuity for
-  everyone already listening, which is the deliberate trade. Roaming hides this (a reconnect gets
-  the stream free), so only the intra-server path was ever affected — do not "optimise" the
-  refresh away because a roam test passes.
-- **Re-dial before adopting a foreign speaker.** `connect_to_client(url)` is a NO-OP when the
-  server already holds a dial registration for that URL, so a second `adopt` of a speaker that
-  went away (rebooted, reclaimed by its own server) silently does nothing and times out reporting
-  "never connected" about a device whose port is plainly open. `adopt_foreign_client` cancels the
-  existing dial first. Identify the speaker by its **registered URL**, not by "a client id that
-  was not in the set before" — that only holds the first time, and the GUI passes an mDNS name
-  while the handshake id is a MAC.
-- **Codec choice belongs to the CLIENT.** The spec says `supported_formats` is in priority order,
-  first preferred, and the server takes the first match it implements — aiosendspin does exactly
-  that, and a player that cannot sustain its own choice is meant to renegotiate with
-  `stream/request-format`. Do not add a server-side override without a live, proven case: one was
-  written and reverted (`f19a428`) after the device it was for turned out not to play from Music
-  Assistant either. Per-client encoding means a heterogeneous group is normal, not a problem.
-- **Announce idle, don't imply it** — a stream exists only while a sender feeds the source. On EOF
-  or `PLUM_SOURCE_IDLE_TIMEOUT` silence call `group.stop()` (playback_state=**stopped** via
-  `group/update`), never `stop_stream()` (which keeps clients logically PLAYING). The spec has no
-  distinct idle/unrouted state — `stopped` is it. Groups/anchors persist, so routing survives.
-- **Three volumes, and only two of them are the protocol's.** *Per-player* (one endpoint's output)
-  and *group* (all endpoints on a source) are Sendspin: player-role command / controller-role
-  `volume`+`mute`, and **the library already does the delta-preserving group redistribution** — do
-  not fan out per client. *Source volume* is the level on the SENDING device (the phone's
-  AirPlay/Bluetooth slider, the Spotify Connect device volume); the spec has no such concept, so it
-  rides `POST /api/mesh/source-volume` + `SourceState.source_volume` and is driven per source
-  (shairport's **`SetVolume` method** — its MPRIS `Volume` property is read-only, so a
-  Properties.Set is refused and looks like success / `MediaTransport1.Volume` / go-librespot
-  `/player/volume`). It stacks with the endpoint levels; never conflate the two in the GUI. The main
-  card's slider is **this unit's own endpoint**, not the group — the group is moved deliberately,
-  via the group buttons.
-- **A player MUST echo its level back** (`client/state`) after every volume/mute command, and
-  persist it (`/data/player_state.json`, not `settings.json` — different process owns that file).
-  `PlayerV1Role.set_volume()` only *sends*; the server's own view moves solely on `client/state`,
-  of which the client library sends exactly one, at connect, carrying `initial_volume`. Skip the
-  echo and every level in the mesh reads 100% forever while the audio is demonstrably quieter —
-  the failure looks like a GUI bug and is not one. See `sendspin_player._publish_render_state`.
-- **The output device's identity is the ALSA CARD NAME, never `hw:C,D`.** Card numbers move: the
+- **Metadata off the audio path** — emit to metadata/artwork roles. The five Snapcast resync guards
+  are obsolete here; do not port them.
+- **Adding a player to a live stream does NOT put it in that stream.** Membership is fixed at
+  `start_stream()`. A client that connects while one is live gets it at handshake; one already
+  connected and then added to the group does not — it sits in the group, in the GUI, at the right
+  volume, and silent, with nothing in any log. `attach_player` therefore calls
+  `SourceFeeder.refresh_stream()` after `add_client`. The cost is a brief discontinuity for everyone
+  already listening; that is the deliberate trade. **Roaming hides this** (a reconnect gets the
+  stream free), so do not "optimise" the refresh away because a roam test passes.
+- **Re-dial before adopting a foreign speaker.** `connect_to_client(url)` is a NO-OP when a dial
+  registration for that URL already exists, so a second `adopt` silently does nothing and then times
+  out reporting "never connected" about a device whose port is plainly open. Identify a speaker by
+  its **registered URL**, never by "a client id that was not in the set before".
+- **Codec choice belongs to the CLIENT.** `supported_formats` is in priority order and the server
+  takes the first match it implements. A player that cannot sustain its own choice renegotiates with
+  `stream/request-format`. Do not add a server-side override without a live, proven case — one was
+  written and reverted (`f19a428`). A heterogeneous group is normal, not a problem.
+- **Announce idle, don't imply it.** On EOF or `PLUM_SOURCE_IDLE_TIMEOUT` silence call
+  `group.stop()` (playback_state=**stopped**), never `stop_stream()` (which keeps clients logically
+  PLAYING). The spec has no distinct idle state — `stopped` is it. Groups/anchors persist, so
+  routing survives.
+- **Three volumes, and only two are the protocol's.** *Per-player* and *group* are Sendspin, and the
+  library already does the delta-preserving group redistribution — do not fan out per client.
+  *Source volume* is the level on the **sending** device (the phone's slider, Spotify Connect); the
+  spec has no such concept, so it rides `POST /api/mesh/source-volume` and is driven per source. It
+  stacks with the endpoint levels; never conflate them in the GUI. The main card's slider is **this
+  unit's own endpoint**, not the group.
+- **A player MUST echo back both its level and the output it actually opened** into
+  `/data/player_state.json` — not `settings.json`, which a different process owns. `set_volume()`
+  only *sends*; the server's view moves solely on `client/state`, of which the library sends exactly
+  one, at connect. Skip the echo and every level in the mesh reads 100% forever while the audio is
+  demonstrably quieter — it looks like a GUI bug and is not one. The output echo is what lets the
+  API report `pending` rather than claiming a switch that never opened.
+- **`client/state` must carry `state` at the TOP level**, via
+  `sendspin_player.build_client_state_message`. The library's own `send_player_state()` puts it only
+  in the deprecated nested `player` object and drops the required field — see UPSTREAM §0. There is
+  a canary test; when it fails, delete the workaround.
+- **The output device's identity is the ALSA CARD NAME, never `hw:C,D`.** Card numbers move — the
   HiFiBerry on `.7.204` was card 2, then 1, then 2, then 0 across four reboots with config
-  unchanged. `settings.json` stores `<card_name>:<device>` (`sndrpihifiberry:0`) and `hw:C,D` is
-  re-derived every scan for display and `speaker-test` only. Snapcast persisted the number and got
-  away with it because `get-settings.py` translated to `default:CARD=<name>` at launch — but from
-  the STALE number, so a reboot that renumbered would have resolved to the wrong card.
-- **PortAudio is not ALSA, and availability cannot be probed by opening.** `sounddevice`'s
-  `device=` matches a substring of PortAudio's OWN name list, so an arbitrary ALSA PCM string is
-  rejected; the `(hw:C,D)` suffix PortAudio embeds is the join between the two. And PortAudio
-  ENUMERATES BY OPENING, so a card held exclusively vanishes from `query_devices()` — with our
-  player holding the Amp100's single-subdevice pcm512x the output list came back EMPTY.
-  Availability therefore rests on three signals that fail in different places: `is_active` (what
-  we are configured to render to — survives everywhere), `in_use` (`/proc/asound/.../sub*/status`),
-  and PortAudio exposure. Never reduce it to the probe.
+  unchanged. `settings.json` stores `<card_name>:<device>`; `hw:C,D` is re-derived every scan.
 - **Serialise every PortAudio re-init.** `sd._terminate()`/`sd._initialize()` rebuild PROCESS-GLOBAL
-  state; two threads doing it at once SIGSEGVs the interpreter — no exception, no traceback. The
-  GUI fetches the device list and current output in one `Promise.all`, Flask is `threaded=True`,
-  and the config API crash-looped on exactly that. `_portaudio_outputs` holds a module lock and a
-  2 s TTL cache; the player passes `force=True` because it re-reads right after closing its stream.
-  Sequential curl cannot reproduce this — test concurrently.
-- **`/proc/asound` is masked in the container** and runc refuses to bind anything back into `/proc`,
-  so compose mounts the host copy at `/host/asound` (`PLUM_PROC_ASOUND`). Read from in-container,
-  `owner_pid` is 0 (different PID namespace) — only `closed` vs a state block is trustworthy — and
-  every subdevice must be checked, not `sub0` (bcm2835 has eight).
-- **A player echoes the output it ACTUALLY opened** into `/data/player_state.json` (`output_device`),
-  the same contract as the volume echo. The config API compares it against the choice in
-  `settings.json` to report `pending`; without it the GUI marks a switch applied the moment it is
-  saved, including switches that never opened. A failed switch RESTORES the previous device rather
-  than leaving silence (measured: 42 ms, still playing).
-- **A HAT's hardware mixer is not at unity** and `alsa-restore` reinstates it every boot — an Amp100
-  comes up at `Digital` 163/207, i.e. **-22 dB**, which nothing in Plum-Audio can see because volume
-  is software gain in the PortAudio callback. `scripts/host-setup/configure-audio-hat.sh --unity`
-  pins and persists it. Snapcast never hit this: snapclient owned the control via
-  `--mixer hardware:`. Also: the overlay block must go BEFORE the first existing `dtoverlay=` —
-  appending it after `vc4-kms-v3d` costs an HDMI audio output (measured over 5 boots).
-- **A speaker has TWO names, and which one you see depends on where it is.** Attached, it is in its
-  server's `players` carrying the name it declared at the Sendspin handshake ("Home Assistant Voice
-  PE - 01"). Idle, no server holds it, so the only trace is its mDNS advertisement — and a
-  third-party device usually publishes no `name` TXT key, leaving the bare instance name
-  ("home-assistant-voice-a1b2c3"). One device therefore read as two, renaming itself on every
-  join/leave. `sendspinDataService` memoises the protocol name against the speaker's **listener
-  URL** — the only identifier both views share, because the client id is NOT (mDNS names by
-  instance, the handshake by MAC; the same reason `adopt` matches by URL). Persisted to
-  localStorage: "idle at page load" is the common case, so an in-memory memo would still flip on
-  the first reload.
-- **A per-device stream picker lists only ACTIVE sources.** A source exists for every configured
-  endpoint whether or not a sender is feeding it, so the unfiltered list shows Bluetooth/Spotify/
-  AirPlay long after the phone disconnected — "ghost sources". Routing to an idle source is legal
-  and silent, which is exactly why it reads as a ghost rather than an error. `MeshApp` passes
-  `stableRoutable` (active, non-`foreign::`) to the device lists; the top picker keeps the featured
-  stream as well so a source going idle can't yank the selection out from under the user. Do not
-  "restore" the full set for the sake of a peer parked on a quiet source — `viewClients` already
-  reports that peer as idle.
-- **Idle devices are routable, and the router always supported it.** `route_player` reclaims a
-  player that is in no unit's group via the listener URL from its own unit's self-report, and
-  delegates when the source lives on a peer. The GUI was the only thing missing, which meant an
-  idle unit's page could route *nothing* (Join Stream needs a stream that page is on). Every device
-  row gets `StreamPickerButton`; Join Stream stays as the one-click case.
-- **Scrollbars need `color-scheme`, not just `::-webkit-scrollbar`.** Two independent mechanisms:
-  the pseudo-elements style a *persistent* scrollbar, but an **overlay** scrollbar (macOS's default
-  unless "show scroll bars: always" is set) cannot be reached by CSS at all — only `color-scheme`
-  makes the browser draw its own chrome dark. That is why the page looked fine while the Settings
-  overlay showed a white bar. And the standard `scrollbar-width`/`scrollbar-color` pair is fenced
-  behind a Firefox-only `@supports` **on purpose**: Chromium IGNORES every `::-webkit-scrollbar`
-  rule for any element whose `scrollbar-color` is not `auto`, so setting both unconditionally
-  silently discards the styling.
-- **WiFi/host concerns** (NetworkManager owns `wlan0`) live on the host, not the container (as Plum-Snapcast).
-- **The unit's display name comes from `settings.json` `deviceName`** (`scripts/unit_identity.py`),
-  NOT from `PLUM_UNIT_NAME`/`PLUM_PLAYER_NAME` — those are only what an unnamed unit boots with.
-  A rename applies live (mesh view + mDNS TXT, via `Neighbourhood.rename`/`AvahiClient.republish`);
-  the Sendspin-level `server_name`/client name are fixed at connect and catch up on the next
-  restart, deliberately — restarting the audio process to apply a rename would drop playback.
-- **mDNS hostname changes go through Avahi's D-Bus `SetHostName`** on the HOST bus, never by
-  writing `/etc/avahi` or restarting a service (there is no `avahi` program in our supervisord —
-  Avahi is the host's). Two verified behaviours the code must handle: setting the name it already
-  has raises *"invalid because redundant"* (a no-op, not an error), and a real change makes Avahi
-  reset and **drop the D-Bus connection mid-call**, so a successful set surfaces as "recipient
-  disconnected" — always reconnect and read the name back rather than trusting the set. It is
-  runtime state: a host reboot reverts it, and we do NOT re-apply on boot (every unit ships with
-  the same default hostname, so replaying it would collide all units onto one name).
-- **Bluetooth needs a PATCHED host `bluetoothd`** — `backend/config/bluez/` (two DEP-3 patches +
-  `install_patched_bluez.sh`, which rebuilds the distro package at `<version>+plumN` and holds it).
-  Stock BlueZ registers AVRCP position-changed with a 49.7-day interval and never polls
-  `GetPlayStatus`, so a scrub on the phone cannot reach us at all. This is **host provisioning, not
-  a container concern** — the host owns the radio and the AVCTP channel, exactly like the rfkill
-  unblock and the D-Bus policy. Also `systemctl --user mask obex.service`: a phone serves ONE AVRCP
-  cover-art session, and the distro's obexd steals it from ours. Nothing in our Python depends on
-  the patches; an unpatched unit just loses scrub reporting. See ARCHITECTURE §8 Phase 3.
-- **`backend/config/bluealsa-plum-dbus.conf` must be installed on the host** at
-  `/etc/dbus-1/system.d/`, or `bluealsa` cannot acquire `org.bluealsa`, exits `rc=1` ~3 s after
-  every start, and the source manager respawns it forever — on `.7.204` that was 178 restarts, a new
-  dbus-daemon every 9.5 s, and enough log spam to bury unrelated diagnosis. It is in the repo but
-  nothing installs it automatically; a new unit needs it copied by hand alongside the bluez patches.
+  state; two threads doing it at once SIGSEGVs the interpreter with no exception and no traceback.
+  Sequential curl cannot reproduce it — **test concurrently**.
+- **PortAudio is not ALSA, and availability cannot be probed by opening** — it enumerates *by*
+  opening, so a card we hold exclusively vanishes from `query_devices()`. Availability rests on
+  three signals that fail in different places; never reduce it to the probe.
+- **`settings.json` access must go through `SettingsManager`**, which holds a lock across the whole
+  read-modify-write. Flask is `threaded=True`, and the read path answers a damaged file with
+  defaults — building a *write* on that reply resets the unit's entire configuration.
+- **A device name is not free text.** It is interpolated into shairport's libconfig and
+  go-librespot's YAML, then a daemon is respooled — and shairport's `sessioncontrol` runs shell
+  commands. Validated at the CRUD boundary, sanitized in `SettingsManager`, escaped at render.
+- **A speaker has TWO names**, and which you see depends on where it is: the handshake name while
+  attached, the bare mDNS instance name while idle. The **listener URL** is the only identifier both
+  views share — the client id is not (mDNS names by instance, the handshake by MAC).
+- **Device pickers list ACTIVE sources only.** A source exists for every configured endpoint whether
+  or not a sender is feeding it, so the unfiltered list shows ghosts long after the phone
+  disconnected. Idle devices are still routable — every device row gets `StreamPickerButton`.
+- **The unit's display name comes from `settings.json` `deviceName`**, not `PLUM_UNIT_NAME` — those
+  are only what an unnamed unit boots with. A rename applies live to the mesh view and mDNS TXT; the
+  Sendspin-level names are fixed at connect and catch up on the next restart, deliberately, because
+  restarting the audio process to apply a rename would drop playback.
+- **mDNS hostname changes go through Avahi's D-Bus `SetHostName`** on the HOST bus — never by writing
+  `/etc/avahi` or restarting a service. Setting the name it already has raises "invalid because
+  redundant" (a no-op), and a real change drops the D-Bus connection mid-call, so success surfaces as
+  failure. Always reconnect and read the name back.
+- **Host provisioning is not optional.** The bluez patches, `bluealsa-plum-dbus.conf` and the HAT
+  mixer must be installed on the host by hand — nothing does it automatically, and each absence
+  fails silently or catastrophically. See `docs/HOST-PROVISIONING.md`.
+- **WiFi/host concerns** (NetworkManager owns `wlan0`) live on the host, not the container.
 
----
-
-## Common Tasks
+## Common tasks
 
 ### Adding an audio source
 Multi-instance sources follow the **source-manager** pattern (`sources/spotify_manager.py` is the
-reference; see ARCHITECTURE §8 Phase 3). Do NOT bring back render-config-then-`supervisorctl` from
-the API — that process can't reach the audio loop, and the dev rig has no supervisord.
-1. Daemon writes PCM → `/tmp/<source>-<id>-fifo` (one daemon per endpoint).
-2. `<source>_config.py`: render the daemon config per endpoint; resolve endpoints → instances.
+reference). Do NOT bring back render-config-then-`supervisorctl` from the API — that process cannot
+reach the audio loop, and the dev rig has no supervisord.
+1. Daemon writes PCM → `/tmp/<source>-<id>-fifo`, one daemon per endpoint.
+2. `<source>_config.py`: render the daemon config per endpoint; resolve endpoints → instances. Use
+   `sources/config_render.py` for escaping and atomic writes.
 3. `<source>_manager.py`: poll `settings.json` in the audio loop; reconcile sources + daemon
-   processes (source FIRST so the feeder creates the FIFO, then the daemon). Start it in `main()`.
-4. `<source>_<proto>.py`: daemon events → metadata/artwork roles; register it as the source's
-   transport remote.
-5. Integrations API endpoint (persistence only); surface the card via `enabledSources` in
-   `Settings.tsx`.
-6. Test: deploy to the RPi rig → verify live add/rename/disable/remove → then build the image.
+   processes (**source first**, so the feeder creates the FIFO, then the daemon). Start it in `main()`.
+4. `<source>_<proto>.py`: daemon events → metadata/artwork roles; register as the source's transport
+   remote. Decode artwork via `sources/artwork.py` — never on the loop.
+5. Integrations API endpoint (persistence only); surface the card via `enabledSources`.
+6. Deploy to the rig → verify live add/rename/disable/remove → then build the image.
 
-### Building + deploying to the rig
-```bash
-docker/build.sh                    # arm64 image (native on Apple Silicon) -> dist/*.tar.gz
-docker/deploy.sh all               # every unit in docker/units.conf
-docker/deploy.sh 192.0.2.10   # one unit
-```
-`deploy.sh` is re-runnable and stops the pre-container `~/plum-test` stack itself. It imports that
-unit's existing `settings.json` + go-librespot auth on FIRST deploy only, then never touches
-`/opt/plum-audio/{config,data}` again — so a rebuild is not a re-authorisation. Reverting a unit to
-the dev stack is `docker compose down` in `/opt/plum-audio` plus `~/plum-test/run_*.sh`, which is
-still on disk.
+### Build, deploy, debug
+`docker/build.sh` then `docker/deploy.sh all`. Full loop, the deceptive failure modes, and the
+debugging cookbook are in **`docs/OPERATIONS.md`**.
 
-Two conflicts it clears, both of which fail deceptively — see ARCHITECTURE §8 Phase 3: the **host's
-nginx** (it answers :80 while the container's nginx crash-loops, serving a stale GUI that looks
-fine), and a **SIGTERM-deaf shairport** that survives `pkill` still holding RAOP 5050.
+## Open
 
-### Debugging
-```bash
-docker logs plum-audio                                    # entrypoint: the derived unit identity
-docker exec plum-audio supervisorctl -c /app/supervisord/supervisord.conf status
-docker exec plum-audio tail -f /config/logs/sendspin_server.log   # + sendspin_player/config_api/nginx
-docker exec plum-audio tail -f /data/shairport/1/shairport-sync.log   # per-endpoint daemon logs
-docker exec plum-audio aplay -l
-```
-Source daemons are NOT supervisord programs — the managers own them, so `ps` inside the container
-is how you confirm shairport/go-librespot/bluealsa are up. A source missing there but enabled in
-settings.json is a manager problem, not a supervisord one.
-
-**Protocol-level debugging.** `PLUM_LOG_LEVEL=DEBUG` in `/opt/plum-audio/plum-audio.env` +
-`docker compose up -d --force-recreate` turns on the aiosendspin handshake trace — `client/hello`
-with the client's `supported_formats`, the `stream/start` we answer with, and periodic
-`Send summary role=player ... buf_ms(...)`. That is the only way to see what a third-party device
-actually negotiated. **Revert it afterwards**: it is verbose, and the force-recreate drops every
-connection — doing that mid-test once produced a "bug" that was purely the restart.
-
-**Watch what you conclude from a `tail`.** A crash-looping source (see the bluealsa D-Bus policy
-above) writes fast enough to push the lines you need thousands back, and a filtered tail then reads
-as "this never happened". Two wrong diagnoses on 2026-08-04 came from exactly that.
-
-**Checking output devices from outside the container:**
-```bash
-docker exec plum-audio python3 /app/scripts/audio_devices.py    # id / hw_id / availability / active
-cat /proc/asound/cards                                          # on the HOST — card numbers move
-amixer -c <n> sget Digital                                      # a HAT at -22 dB is the default
-```
-
----
-
-## Porting map (from Plum-Snapcast)
-| Plum-Snapcast | Plum-Audio |
-|---|---|
-| `snapserver` / `snapclient` | in-process `SendspinServer` + Sendspin player |
-| `federation/*` | `backend/scripts/mesh/*` (same concepts, Sendspin protocol) |
-| `auto-switch-service.py` | `reclaim` (no pre-connect needed — roam is inaudible) |
-| `*-stream-lifecycle-manager.py` | PushStream feeders via `sync_engine/` |
-| AirPlay resync guards | dropped (metadata is out-of-band) |
-| `snapcastService.ts` / `snapcastDataService.ts` | Sendspin controller WS client + engine-agnostic data service |
-| Browser audio wire protocol | `sendspin-js` (Phase 3, if kept) |
-
-Reused ~as-is: source services, endpoint APIs, control-script metadata extraction, settings/
-integrations/audio Flask layer, most GUI components.
-
-**Changed in the port (don't copy the old shape):** spotifyd → **go-librespot** (0.4.x dropped MPRIS);
-per-source supervisord programs + API-driven respool → the **source manager** reconciling from
-`settings.json`; one controller WS per unit → **one per source** (`ctrl:<source_id>:` client id);
-separate frontend container → **nginx inside the unit container**; Tailwind CDN → compiled in.
-
----
-
-## Open — carried into the next session (as of 2026-08-05)
-
-Ordered by what bites first. Delete an entry when it is genuinely done, not when it is started.
-
-1. **`configure-audio-hat.sh --keep-onboard` and the no-`dtoverlay` fallback have never run on real
-   hardware.** Both are unit-tested against config.txt fixtures
-   (`tests/Unit/test_configure_audio_hat.py`) and the main path is verified across four reboots on
-   `.7.204`, but a unit with no HAT has never been through the script. Exercise before relying on it.
-3. **`.7.204` has no 3.5 mm jack** because the HAT block sets `dtparam=audio=off`. That is correct
-   and deliberate; re-run with `--keep-onboard` if the jack should be listed alongside the HAT.
-4. **`PLUM_SOURCE_IDLE_TIMEOUT` is 300 s**, so a paused AirPlay session keeps its stream for five
-   minutes before announcing `stopped`. Reported as "the stream did not die"; it is the configured
-   default, not a hang. Lower it if that is the wrong feel.
-5. **Most of the GUI still has no visual review.** Confirmed in a browser on a real unit: the
-   output picker, the Settings tab bar (order + Audio tab + which tab opens), the scrollbars, and
-   the idle-device stream picker. Integrations, Visualizer, About and the whole now-playing card
-   have only ever been exercised through the API and the bundle. Nothing below has been seen with a
-   source actually streaming, so the picker contents under load are still unverified.
-6. **`.7.204` uses Docker's containerd image store; the other three use the classic one**
-   (`docker info` → `driver=overlayfs` + `io.containerd.snapshotter.v1` vs `overlay2`). Harmless
-   today, but it makes `docker inspect <container> --format '{{.Image}}'` report the **manifest**
-   digest there and the **config** digest everywhere else — so the same image compares as different
-   ids across units, which reads as a failed deploy. Compare a unit's ids against *its own*
-   `docker image inspect plum-audio:<tag>`, or just diff the served bundle
-   (`curl -s http://<unit>/ | grep -o 'assets/index-[^"]*\.js'`). Worth normalising next time host
-   provisioning is touched.
-
----
+1. **DLNA and Plexamp have no backend at all.** Worse than unimplemented: the Integrations tab
+   renders a **live DLNA card** that calls `/api/integrations/dlna/*`, and
+   `create_integrations_blueprint` registers only airplay/spotify/bluetooth — so every control on
+   that card 404s. Either build the slice or hide the card; do not leave it inert.
+2. **Four frontend test suites assert nothing about production code** (`NowPlaying`,
+   `PlayerControls`, `integrationsService`, `settingsService` — 77 of 112 tests). See TESTING.md.
+3. **`sendspin_server.py` has no unit coverage**, including `refresh_stream` — the regression guard
+   for the highest-profile bug in the repo does not exist.
+4. **`configure-audio-hat.sh --keep-onboard` and the no-`dtoverlay` fallback have never run on real
+   hardware** — unit-tested against fixtures only.
+5. **Most of the GUI has no visual review under a live stream.** The output picker, Settings tab bar,
+   scrollbars and idle-device picker were confirmed in a browser; Integrations, Visualizer, About and
+   the now-playing card have only been exercised through the API and the bundle.
+6. **Multi-server arbitration** is a spec MUST we only half-implement — we persist the last playing
+   `server_id` but cannot yet decide, pending UPSTREAM §1.
+7. **amd64 has never been built.**
 
 ## Resources
-- Sendspin spec: https://www.sendspin-audio.com/spec/ · Org: https://github.com/Sendspin
-- `aiosendspin`: https://github.com/Sendspin/aiosendspin
-- Predecessor: Plum-Snapcast (`docs/PLUM-AUDIO-ARCHITECTURE.md` = the design this repo implements)
+- Sendspin spec: <https://www.sendspin-audio.com/spec/> · Org: <https://github.com/Sendspin>
+- `aiosendspin`: <https://github.com/Sendspin/aiosendspin>
+- Predecessor: the **Plum-Snapcast** repo — this repo implements the design its architecture doc set out.
 
----
-
-## Maintaining This File
-Update on: major architecture changes, new sources, new env vars, new workflows. Keep
-`docs/ARCHITECTURE.md` in sync. Document *why*, not just *what*. Temporary notes → `_resources/`.
+## Maintaining this file
+Update on: architecture changes, new sources, new env vars, new workflows. **Keep it under ~250
+lines** — it loads into every session, and it reached 465 by absorbing things that belong elsewhere.
+War stories → `docs/HARD-WON-LESSONS.md`. Dated narrative → `docs/PHASE-HISTORY.md`. Procedures →
+`docs/OPERATIONS.md`. A rule earns its place here only if an agent would break something without it.
+Document *why*, not just *what*.

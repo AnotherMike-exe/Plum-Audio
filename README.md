@@ -2,62 +2,62 @@
 
 > Mesh multi-room audio streaming, built on Sendspin. Successor to Plum-Snapcast.
 
-Plum-Audio streams synchronized audio to any number of rooms. Each unit ingests local
-sources (AirPlay, Spotify, Bluetooth, DLNA, Plexamp) and can cross-route them across a mesh
-of units, with metadata, album art, and a visualizer delivered out-of-band. It replaces the
-Snapcast + custom federation backbone of Plum-Snapcast with **Sendspin** as the sole sync engine.
+Plum-Audio streams synchronized audio to any number of rooms. Each unit ingests local sources
+(AirPlay, Spotify, Bluetooth) and can cross-route them across a mesh of units, with metadata, album
+art and a visualizer delivered out-of-band. It replaces the Snapcast + custom federation backbone of
+Plum-Snapcast with **Sendspin** as the sole sync engine.
+
+A unit is **one container per Raspberry Pi**: the Sendspin server and player, the mesh orchestrator,
+the source managers, the config API, and the nginx that serves the GUI all run inside it.
 
 ---
 
-## Quick Start
+## Quick start
 
 ```bash
-# Containerized (Binhex standards)
-cd docker && docker compose up -d
-
-# Local backend dev — see docs/DEV-SETUP.md
+docker/build.sh                    # arm64 image -> dist/*.tar.gz
+docker/deploy.sh all               # every unit in docker/units.conf
+docker/deploy.sh 192.0.2.10   # or just one
 ```
 
-### Audio HAT (host, before first deploy)
-
-Raspberry Pi OS does not auto-detect audio HATs — without the device-tree overlay the card is not
-there at all, and the output picker has nothing to offer. This runs on the **host**, not in the
-container, because the bootloader reads `config.txt` long before Docker exists:
-
-```bash
-sudo scripts/host-setup/configure-audio-hat.sh --list      # supported boards
-sudo scripts/host-setup/configure-audio-hat.sh --detect    # what is fitted right now
-sudo scripts/host-setup/configure-audio-hat.sh --overlay hifiberry-amp100
-sudo reboot
-sudo scripts/host-setup/configure-audio-hat.sh --unity     # pin the HAT's mixer to 0 dB
-```
-
-`--unity` is not cosmetic. A HAT's own mixer is restored at every boot by `alsa-restore` and does
-not default to unity — a HiFiBerry Amp100 comes up at **-22 dB**. Plum-Audio applies volume as
-software gain and never touches that control, so without pinning the unit plays 22 dB quiet with
-every level in the GUI reading correct. On a power amplifier, expect it to get **markedly louder**
-the moment it is applied.
-
-Then choose the output in **Settings → Playback → Audio Output**.
+A new Pi needs host provisioning first — the audio HAT overlay and mixer, the patched `bluetoothd`,
+and a D-Bus policy that nothing installs automatically. Do that before the first deploy; after
+that, `docs/OPERATIONS.md` is the daily loop.
 
 ## Documentation
 
-- [Architecture & Plan](docs/ARCHITECTURE.md) — system design, mesh model, phased roadmap
-- [Development Guide](docs/DEV-SETUP.md) — environment setup and workflows
-- [Quick Reference](docs/QUICK-REFERENCE.md) — standards cheat sheet
-- [CLAUDE.md](CLAUDE.md) — Claude Code project memory
+| Doc | What it is for |
+|---|---|
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | What the system is — mesh model, process model, subsystem design |
+| [OPERATIONS.md](docs/OPERATIONS.md) | Build, deploy, debug |
+| [HOST-PROVISIONING.md](docs/HOST-PROVISIONING.md) | Commissioning a new Pi — the once-per-unit checklist |
+| [SPEC-CONFORMANCE.md](docs/SPEC-CONFORMANCE.md) | Where we stand against the Sendspin spec |
+| [UPSTREAM-AIOSENDSPIN.md](docs/UPSTREAM-AIOSENDSPIN.md) | Workarounds to delete when the pin bumps |
+| [HARD-WON-LESSONS.md](docs/HARD-WON-LESSONS.md) | Why the code is shaped this way. Read before "simplifying" |
+| [PHASE-HISTORY.md](docs/PHASE-HISTORY.md) | What shipped when, and what hardware proved it |
+| [TESTING.md](docs/TESTING.md) | Test tiers, and what is not yet reproducible |
+| [CLAUDE.md](CLAUDE.md) | Claude Code project memory |
 
-## Tech Stack
+## Tech stack
 
-- **Backend**: Python 3.13, `aiosendspin` (pinned 6.0.5), PyAV, Flask, supervisord
-- **Frontend**: React 19, TypeScript 5, Vite 6
-- **Infra**: Docker (multi-arch amd64/arm64), **Debian-slim base**, host networking
-- **Target**: Raspberry Pi 4, RPi OS / Debian
+- **Backend**: Python 3.13, `aiosendspin` (pinned 6.0.5), PyAV, numpy, Flask + aiohttp, supervisord
+- **Frontend**: React 19, TypeScript 5, Vite 6 — served by nginx inside the unit container
+- **Base image**: `python:3.13-slim-trixie`. glibc, and **trixie specifically**, to match the units'
+  Debian 13 for bluez-alsa and shairport-sync parity. Not Alpine — see ARCHITECTURE
+- **Infra**: host networking (mDNS needs L2), host Avahi and D-Bus
+- **Target**: Raspberry Pi 4 / Debian 13, arm64. amd64 has never been built
 
 ## Status
 
-Greenfield rework, Phase 0 (scaffold) complete. Mesh feasibility verified against
-`aiosendspin` 6.0.5 on hardware (see `docs/ARCHITECTURE.md` §7).
+**Phase 3**, on `feature/phase3-sources-gui`. Phase 2 (the mesh) is merged to `main`.
+
+AirPlay, Spotify and Bluetooth are hardware-validated across four units, as are the mesh (discovery,
+aggregation, roam, multi-group, per-player volume), third-party interop against Music Assistant, the
+container build, and audio output selection. Output is chosen in **Settings → Audio**.
+
+Remaining: DLNA and Plexamp — neither has a backend yet — and the gaps in
+[SPEC-CONFORMANCE.md](docs/SPEC-CONFORMANCE.md). See [PHASE-HISTORY.md](docs/PHASE-HISTORY.md) for
+what landed when and what measured it.
 
 ---
 

@@ -387,7 +387,7 @@ main() {
     echo "                                               # make an amplifier markedly louder)"
     echo "    docker restart plum-audio                  # so the picker re-enumerates"
     echo
-    echo "  Then pick it in the GUI under Settings -> Playback -> Audio Output."
+    echo "  Then pick it in the GUI under Settings -> Audio."
 }
 
 main "$@"

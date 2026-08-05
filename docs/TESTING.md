@@ -20,16 +20,31 @@ weights integration and interop over breadth of unit coverage.
 
 | Suite | Runs | Covers |
 |---|---|---|
-| `frontend/tests/unit/**` (vitest) | `npx vitest run` | view→model mapping, local-player-by-host, progress extrapolation, `TimeFilter` clock sync, settings service (17 in the data-service suite) |
-| `tests/Unit/**` (pytest, 25) | `PYTHONPATH=backend/scripts pytest tests/Unit` | router path selection · loopback URL rewrite · snapshot wire round trip · **source_config** (port/UDP allocation, filtering, template substitution) · **source_manager** reconcile (start order, rename-respools-keeps-source, dead/empty respawn, render-on-change, one-bad-endpoint isolation) |
+| `tests/Unit/**` (pytest, **217**) | `PYTHONPATH=backend/scripts pytest tests/Unit` | see the breakdown below |
+| `frontend/tests/unit/**` (vitest, **112**) | `cd frontend && npx vitest run` | view→model mapping, local-player-by-host, progress extrapolation, `TimeFilter` clock sync, audio + settings + integrations services |
 
-**Done 2026-07-23:** `test_source_config.py` (9) and `test_source_manager.py` (8) replace the
-scratch smoke script. `SourceFeeder` idle transitions can't be unit-tested (they need a real FIFO +
-group, and sendspin_server imports aiosendspin) — they are covered by `t2_source_lifecycle.sh`
-instead. `integrations_api` CRUD is covered live by `t2_endpoint_crud.sh`.
+Backend, by file: `audio_devices` 31 · `bluetooth_avrcp` 27 · `audio_api` 21 · `follow_reconciler`
+21 · `configure_audio_hat` 17 · `audio_output_apply` 14 · `settings_store` 14 · `volume` 12 ·
+`bluetooth_config` 11 · `mesh_routing` 11 · `mesh_discovery` 10 · `source_manager` 10 ·
+`client_state_conformance` 9 · `source_config` 9.
 
-**Still open (tier 1):** a pytest for `settings_api` atomic write + version bump + deep-merge, and
-for the `integrations_api` EndpointsManager port allocation with a temp settings file (both pure).
+`SourceFeeder` idle transitions can't be unit-tested (they need a real FIFO + group, and
+`sendspin_server` imports aiosendspin) — `t2_source_lifecycle.sh` covers them. `integrations_api`
+CRUD is covered live by `t2_endpoint_crud.sh`.
+
+> **Read the frontend number with suspicion.** Of the six vitest files, only `audioService` (12) and
+> `sendspinDataService` (23) import a production module at all. The other four — `NowPlaying` (13),
+> `PlayerControls` (18), `integrationsService` (27), `settingsService` (19) — assert against MSW
+> handlers or against mock components declared inside the test file, so **77 of the 112 would stay
+> green if the code they name were deleted**. That is not hypothetical: four more files of the same
+> shape were removed with the dead Snapcast tree, and two of them (`federationService`,
+> `playbackService`) never imported the service in their own filename. Treat the frontend suite as
+> covering two modules, not six, until those are rewritten against real imports.
+
+**Still open (tier 1):** the four hollow frontend suites above · `sendspin_server.py` has no unit
+coverage at all, including `SourceFeeder.refresh_stream` (the fix for the silent-speaker bug) ·
+`AlsaRenderer._callback` and `_publish_render_state` are untested · `source_manager`'s real
+`_spawn_daemons`/`_kill_daemons` are stubbed out by the suite that appears to cover them.
 
 ## Tier 2 — single unit on hardware
 
