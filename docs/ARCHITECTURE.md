@@ -535,6 +535,34 @@ never ourselves. The source picker is a CONTROL: choosing a source routes this u
 along with everyone sharing its group, so a synced room moves together. Only sources with a sender
 on them are listed; idle ones drop out and their devices read as idle, while staying routable.
 
+**GUI POLISH PASS (2026-08-05, `8dfaca2`..`6a64b88`).** Four defects found in the first real visual
+review, three of which are worth recording because the reasoning is not recoverable from the code:
+
+- *Ghost sources.* The per-device pickers were handed the full stream set on the theory that a peer
+  parked on an idle source must stay reachable. That theory was wrong about its own code —
+  `viewClients` already reports such a peer as idle — and the cost was every configured endpoint
+  appearing in every device's picker forever, minutes after the sender left. Device lists now take
+  the same active-only truth the top picker uses. Routing to an idle source is legal and silent,
+  which is exactly why the stale entries read as ghosts rather than as errors.
+- *Idle devices could not be routed from the GUI at all.* They had only "Join Stream", which
+  requires a stream the current page is on — so an idle unit's page controlled nothing. The router
+  had supported this the whole time (`route_player` reclaims a groupless player via the listener URL
+  in its own unit's self-report, and delegates when the source is a peer's); only the UI was
+  missing. Every device row now carries the same picker.
+- *A speaker renamed itself on every join and leave.* Attached it is named by the Sendspin
+  handshake; idle it is named by mDNS, and a third-party device usually publishes no `name` TXT key,
+  so the same Voice PE read as "Home Assistant Voice PE - 01" or "home-assistant-voice-a1b2c3"
+  depending on whether it was playing. The two views share exactly one identifier — the listener
+  URL, not the client id (mDNS names by instance, the handshake by MAC; the same asymmetry that
+  makes `adopt` match by URL). The protocol name is memoised against that URL and persisted, since
+  "idle at page load" is the common case.
+
+Also: the output picker moved to its own **Audio** tab (Playback is where audio comes *from*; Audio
+is where it comes *out* — the Plum-Snapcast split, restored), Settings opens on `tabs[0]` rather
+than a hardcoded default that had drifted, and scrollbars are themed. See CLAUDE.md for why themed
+scrollbars need `color-scheme` *and* `::-webkit-scrollbar`, and why the two must not be combined
+with `scrollbar-color`.
+
 **BLUETOOTH: THE POSITION/SEEK CEILING IS IN `bluetoothd`, AND WE PATCH IT (2026-07-29).**
 
 The A2DP slice relays BlueZ's `org.bluez.MediaPlayer1` into the metadata/artwork roles

@@ -12,10 +12,12 @@
 > **The container build is DONE (2026-07-31)** — all three R&D Pis run the unit as a container
 > (`docker/build.sh` → `docker/deploy.sh`), with the `~/plum-test` dev stack stopped but left on
 > disk. **Audio output selection is DONE (2026-08-04)** — discovery, `/api/audio/*`, live apply
-> without a restart, and the picker in Settings → Playback, plus
+> without a restart, and the picker in **Settings → Audio**, plus
 > `scripts/host-setup/configure-audio-hat.sh` for HAT provisioning. Validated on a **fourth unit,
-> `.7.204` (HiFiBerry Amp100)**, recommissioned from Plum-Snapcast. Remaining: DLNA/Plexamp and the
-> conformance gaps in docs/SPEC-CONFORMANCE.md.
+> `.7.204` (HiFiBerry Amp100)**, recommissioned from Plum-Snapcast. **GUI polish pass done
+> (2026-08-05)** — themed scrollbars, the Audio tab, active-only device pickers, a stream picker on
+> idle devices, and stable speaker names; **all four units now run the same image (`6a64b88`)**.
+> Remaining: DLNA/Plexamp and the conformance gaps in docs/SPEC-CONFORMANCE.md.
 >
 > **Not ours, do not re-investigate:** a Home Assistant Voice PE joins a group, acknowledges our
 > `stream/start` codec header, reports PLAYING — and plays nothing. It does not play from **Music
@@ -276,6 +278,37 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
   pins and persists it. Snapcast never hit this: snapclient owned the control via
   `--mixer hardware:`. Also: the overlay block must go BEFORE the first existing `dtoverlay=` —
   appending it after `vc4-kms-v3d` costs an HDMI audio output (measured over 5 boots).
+- **A speaker has TWO names, and which one you see depends on where it is.** Attached, it is in its
+  server's `players` carrying the name it declared at the Sendspin handshake ("Home Assistant Voice
+  PE - 01"). Idle, no server holds it, so the only trace is its mDNS advertisement — and a
+  third-party device usually publishes no `name` TXT key, leaving the bare instance name
+  ("home-assistant-voice-a1b2c3"). One device therefore read as two, renaming itself on every
+  join/leave. `sendspinDataService` memoises the protocol name against the speaker's **listener
+  URL** — the only identifier both views share, because the client id is NOT (mDNS names by
+  instance, the handshake by MAC; the same reason `adopt` matches by URL). Persisted to
+  localStorage: "idle at page load" is the common case, so an in-memory memo would still flip on
+  the first reload.
+- **A per-device stream picker lists only ACTIVE sources.** A source exists for every configured
+  endpoint whether or not a sender is feeding it, so the unfiltered list shows Bluetooth/Spotify/
+  AirPlay long after the phone disconnected — "ghost sources". Routing to an idle source is legal
+  and silent, which is exactly why it reads as a ghost rather than an error. `MeshApp` passes
+  `stableRoutable` (active, non-`foreign::`) to the device lists; the top picker keeps the featured
+  stream as well so a source going idle can't yank the selection out from under the user. Do not
+  "restore" the full set for the sake of a peer parked on a quiet source — `viewClients` already
+  reports that peer as idle.
+- **Idle devices are routable, and the router always supported it.** `route_player` reclaims a
+  player that is in no unit's group via the listener URL from its own unit's self-report, and
+  delegates when the source lives on a peer. The GUI was the only thing missing, which meant an
+  idle unit's page could route *nothing* (Join Stream needs a stream that page is on). Every device
+  row gets `StreamPickerButton`; Join Stream stays as the one-click case.
+- **Scrollbars need `color-scheme`, not just `::-webkit-scrollbar`.** Two independent mechanisms:
+  the pseudo-elements style a *persistent* scrollbar, but an **overlay** scrollbar (macOS's default
+  unless "show scroll bars: always" is set) cannot be reached by CSS at all — only `color-scheme`
+  makes the browser draw its own chrome dark. That is why the page looked fine while the Settings
+  overlay showed a white bar. And the standard `scrollbar-width`/`scrollbar-color` pair is fenced
+  behind a Firefox-only `@supports` **on purpose**: Chromium IGNORES every `::-webkit-scrollbar`
+  rule for any element whose `scrollbar-color` is not `auto`, so setting both unconditionally
+  silently discards the styling.
 - **WiFi/host concerns** (NetworkManager owns `wlan0`) live on the host, not the container (as Plum-Snapcast).
 - **The unit's display name comes from `settings.json` `deviceName`** (`scripts/unit_identity.py`),
   NOT from `PLUM_UNIT_NAME`/`PLUM_PLAYER_NAME` — those are only what an unnamed unit boots with.
@@ -391,19 +424,11 @@ separate frontend container → **nginx inside the unit container**; Tailwind CD
 
 ---
 
-## Open — carried into the next session (as of 2026-08-04)
+## Open — carried into the next session (as of 2026-08-05)
 
 Ordered by what bites first. Delete an entry when it is genuinely done, not when it is started.
 
-1. **`.201.133` and `.113` are running a build WITHOUT the silent-join fix.** They will put a player
-   in a group and play nothing whenever the source is already streaming — the bug that cost most of
-   2026-08-04. Only the two VLAN-7 units (`.7.204`, `.7.122`) are current. Fix: rebuild from HEAD
-   (do NOT reuse `dist/plum-audio-266e5fe-*` — that tag names a commit since reverted, and while its
-   code is equivalent apart from an inert override, the tag lies) and
-   `docker/deploy.sh 192.0.2.10 && docker/deploy.sh 192.0.2.11`. **Needs a machine that
-   can route to 192.0.2.0/24** — it was unreachable from the dev laptop's network position on
-   2026-08-04, which is why it was not done then.
-2. **`configure-audio-hat.sh --keep-onboard` and the no-`dtoverlay` fallback have never run on real
+1. **`configure-audio-hat.sh --keep-onboard` and the no-`dtoverlay` fallback have never run on real
    hardware.** Both are unit-tested against config.txt fixtures
    (`tests/Unit/test_configure_audio_hat.py`) and the main path is verified across four reboots on
    `.7.204`, but a unit with no HAT has never been through the script. Exercise before relying on it.
@@ -412,9 +437,19 @@ Ordered by what bites first. Delete an entry when it is genuinely done, not when
 4. **`PLUM_SOURCE_IDLE_TIMEOUT` is 300 s**, so a paused AirPlay session keeps its stream for five
    minutes before announcing `stopped`. Reported as "the stream did not die"; it is the configured
    default, not a hang. Lower it if that is the wrong feel.
-5. **The GUI has never been visually reviewed beyond the output picker.** The Playback tab was
-   confirmed in a browser on 2026-08-04; the rest of Settings has only ever been exercised through
-   the API and the bundle.
+5. **Most of the GUI still has no visual review.** Confirmed in a browser on a real unit: the
+   output picker, the Settings tab bar (order + Audio tab + which tab opens), the scrollbars, and
+   the idle-device stream picker. Integrations, Visualizer, About and the whole now-playing card
+   have only ever been exercised through the API and the bundle. Nothing below has been seen with a
+   source actually streaming, so the picker contents under load are still unverified.
+6. **`.7.204` uses Docker's containerd image store; the other three use the classic one**
+   (`docker info` → `driver=overlayfs` + `io.containerd.snapshotter.v1` vs `overlay2`). Harmless
+   today, but it makes `docker inspect <container> --format '{{.Image}}'` report the **manifest**
+   digest there and the **config** digest everywhere else — so the same image compares as different
+   ids across units, which reads as a failed deploy. Compare a unit's ids against *its own*
+   `docker image inspect plum-audio:<tag>`, or just diff the served bundle
+   (`curl -s http://<unit>/ | grep -o 'assets/index-[^"]*\.js'`). Worth normalising next time host
+   provisioning is touched.
 
 ---
 
