@@ -17,11 +17,20 @@ import json
 import logging
 import os
 import re
+import tempfile
+import threading
 from typing import Dict, Any
 
 from flask import Blueprint, jsonify, request
 
 logger = logging.getLogger(__name__)
+
+# Serialises the whole read-modify-write cycle, not just the write. Flask runs threaded=True
+# (apis/server.py), so two concurrent endpoint edits both read version N, both write N+1, and the
+# second silently drops the first's change — with a matching version, so the GUI's poller never
+# reconciles it. Module-level rather than per-instance because settings_api's __main__ block builds
+# a second SettingsManager over the same path.
+_SETTINGS_LOCK = threading.RLock()
 
 # Default settings structure. `integrations` matches frontend/types.ts `Settings` (endpoints-array
 # shape); `version` increments on every update so the GUI's poller detects changes.
@@ -109,6 +118,50 @@ SETTINGS_FILE = os.environ.get("PLUM_SETTINGS_FILE", "/data/settings.json")
 # SettingsManager._migrate_audio_output.
 LEGACY_OUTPUT_PLACEHOLDERS = {"hw:Headphones", "hw:headphones", ""}
 
+# A device name is not free text: it is interpolated into shairport-sync's libconfig
+# (`name = "<here>";`) and go-librespot's YAML (`device_name: "<here>"`), then a daemon is respooled
+# to read it. Quotes, braces, semicolons and newlines all terminate the surrounding scalar, and
+# shairport's sessioncontrol block can run shell commands — so an unfiltered name is remote code
+# execution as root, reachable from any LAN page via the blanket-CORS POST /api/settings.
+#
+# This is the OUTER of two layers. The renderers escape as well (sources/*_config.py); neither is
+# trusted alone. Permissive enough for real names ("Mike's Room", "Kitchen (Main)").
+DEVICE_NAME_ALLOWED = re.compile(r"^[A-Za-z0-9 ._\-'()&+]{1,50}$")
+_DEVICE_NAME_STRIP = re.compile(r"[^A-Za-z0-9 ._\-'()&+]")
+
+
+def sanitize_device_name(name: Any) -> str | None:
+    """Reduce a name to the safe charset, or None if nothing usable survives."""
+    if not isinstance(name, str):
+        return None
+    cleaned = _DEVICE_NAME_STRIP.sub("", name).strip()[:50]
+    return cleaned or None
+
+
+def _sanitize_device_names(settings: Dict[str, Any]) -> None:
+    """Scrub every device name in place, whatever route wrote it.
+
+    POST /api/settings takes arbitrary JSON and never went through the endpoint CRUD's validation,
+    so this is the only chokepoint both paths share.
+    """
+    top = sanitize_device_name(settings.get("deviceName"))
+    if top:
+        settings["deviceName"] = top
+
+    integrations = settings.get("integrations")
+    if not isinstance(integrations, dict):
+        return
+    for section in integrations.values():
+        if not isinstance(section, dict):
+            continue
+        for endpoint in section.get("endpoints", []) or []:
+            if not isinstance(endpoint, dict) or "deviceName" not in endpoint:
+                continue
+            safe = sanitize_device_name(endpoint.get("deviceName"))
+            if safe != endpoint.get("deviceName"):
+                logger.warning("sanitized endpoint deviceName %r -> %r", endpoint.get("deviceName"), safe)
+            endpoint["deviceName"] = safe or "Plum Audio"
+
 
 class SettingsManager:
     """Manages server-side settings persistence."""
@@ -137,10 +190,17 @@ class SettingsManager:
         Write-to-temp + os.replace, because this file is a cross-process contract: the audio
         process's Spotify reconciler and the GUI both read it on a poll, and a truncated
         in-place rewrite would hand them a torn/empty JSON mid-save.
+
+        The temp name must be UNIQUE, not `<file>.tmp`: os.replace is atomic, but two threads
+        sharing one temp path are not: B truncates A's half-written buffer, then both rename, and
+        the survivor is a splice of two JSON documents. mkstemp in the same directory keeps the
+        rename atomic (same filesystem) while giving each writer its own file.
         """
+        fd, tmp_path = tempfile.mkstemp(
+            dir=os.path.dirname(self.settings_file) or ".", prefix=".settings-", suffix=".tmp"
+        )
         try:
-            tmp_path = f"{self.settings_file}.tmp"
-            with open(tmp_path, "w") as f:
+            with os.fdopen(fd, "w") as f:
                 json.dump(settings, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
@@ -160,6 +220,14 @@ class SettingsManager:
         except Exception as e:
             logger.error(f"Failed to save settings: {e}")
             raise
+        finally:
+            # A failure before the rename leaves the temp behind; mkstemp names are unique, so
+            # without this every failed save leaks a file into /data.
+            if os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     @staticmethod
     def _migrate_bluetooth(integrations: Dict[str, Any]) -> bool:
@@ -211,7 +279,12 @@ class SettingsManager:
         if not isinstance(output, dict):
             return False
         changed = False
-        if (output.get("device") or "").strip() in LEGACY_OUTPUT_PLACEHOLDERS:
+        # `isinstance(device, str)` is load-bearing: the shipped default is device=None, and
+        # `(None or "").strip()` is "", which is IN the placeholder set. Without the type guard this
+        # migration reports "changed" on every call for every unit that has not picked an output —
+        # so get_settings() persisted the file on every read, and the GUI polls it every 10s per tab.
+        device = output.get("device")
+        if isinstance(device, str) and device.strip() in LEGACY_OUTPUT_PLACEHOLDERS:
             output["device"] = None
             output["device_type"] = None
             changed = True
@@ -222,12 +295,22 @@ class SettingsManager:
             logger.info("cleared the pre-picker audio output placeholder")
         return changed
 
-    def get_settings(self) -> Dict[str, Any]:
-        """Load settings from the JSON file, merged over defaults so new keys always exist."""
+    def _load_merged(self) -> Dict[str, Any]:
+        """Load + merge + migrate, RAISING if the file exists but cannot be read.
+
+        Split out from get_settings() precisely so a write path can tell "no file yet" (defaults
+        are correct) from "the file is damaged or unreadable" (defaults are catastrophic). See
+        update_settings for what the difference costs.
+        """
         try:
             with open(self.settings_file, "r") as f:
                 settings = json.load(f)
+        except FileNotFoundError:
+            # Genuinely absent is not damage: _ensure_settings_file creates it from these defaults.
+            logger.warning("Settings file not found, using defaults")
+            return copy.deepcopy(DEFAULT_SETTINGS)
 
+        try:
             merged = copy.deepcopy(DEFAULT_SETTINGS)
             for key in merged:
                 if key in settings:
@@ -256,30 +339,49 @@ class SettingsManager:
                 self._save_settings(merged)
 
             return merged
-        except FileNotFoundError:
-            logger.warning("Settings file not found, using defaults")
-            return copy.deepcopy(DEFAULT_SETTINGS)
         except Exception as e:
             logger.error(f"Failed to load settings: {e}")
-            return copy.deepcopy(DEFAULT_SETTINGS)
+            raise
+
+    def get_settings(self) -> Dict[str, Any]:
+        """Load settings, merged over defaults so new keys always exist. Never raises.
+
+        A damaged file reads as defaults so the GUI still renders something. Do NOT call this from
+        a write path — use _load_merged, which raises. See update_settings.
+        """
+        with _SETTINGS_LOCK:
+            try:
+                return self._load_merged()
+            except Exception:
+                return copy.deepcopy(DEFAULT_SETTINGS)
 
     def update_settings(self, new_settings: Dict[str, Any]) -> Dict[str, Any]:
-        """Update settings (partial or full), deep-merging one level and bumping the version."""
-        current = self.get_settings()
+        """Update settings (partial or full), deep-merging one level and bumping the version.
 
-        for key in new_settings:
-            if key == "version":
-                continue  # version is server-owned
-            if key in current and isinstance(current[key], dict) and isinstance(new_settings[key], dict):
-                current[key].update(new_settings[key])
-            else:
-                current[key] = new_settings[key]
+        Reads through _load_merged, NOT get_settings: get_settings answers a damaged file with
+        DEFAULT_SETTINGS, and building a write on that reply replaces the unit's entire
+        configuration — every AirPlay/Spotify/Bluetooth endpoint, the device name, the chosen
+        output — with defaults plus the caller's patch, then persists it with a bumped version so
+        the GUI's poller sees nothing to reconcile. Failing the request is the only safe answer.
+        """
+        with _SETTINGS_LOCK:
+            current = self._load_merged()
 
-        current["version"] = current.get("version", 0) + 1
-        logger.info(f"Settings updated to version {current['version']}")
+            for key in new_settings:
+                if key == "version":
+                    continue  # version is server-owned
+                if key in current and isinstance(current[key], dict) and isinstance(new_settings[key], dict):
+                    current[key].update(new_settings[key])
+                else:
+                    current[key] = new_settings[key]
 
-        self._save_settings(current)
-        return current
+            _sanitize_device_names(current)
+
+            current["version"] = current.get("version", 0) + 1
+            logger.info(f"Settings updated to version {current['version']}")
+
+            self._save_settings(current)
+            return current
 
     @staticmethod
     def validate_hostname(hostname: str) -> tuple[bool, str]:

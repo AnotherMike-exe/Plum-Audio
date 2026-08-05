@@ -1,0 +1,174 @@
+"""Unit tests for the settings store's write-path integrity.
+
+Every test here guards a failure that is silent by construction — the file ends up wrong, the API
+returns 200, and the GUI's version poller sees a bumped version and stops looking.
+
+`test_update_on_a_damaged_file_refuses_rather_than_resetting` is the important one. get_settings()
+answers an unreadable file with DEFAULT_SETTINGS so the GUI still renders. update_settings() used to
+build on that same reply, so ONE torn read inside a write replaced the whole unit configuration —
+every AirPlay/Spotify/Bluetooth endpoint, the device name, the chosen output — with defaults plus
+whatever the caller happened to be patching, and persisted it with a bumped version.
+
+`test_migration_does_not_rewrite_on_every_read` guards a loop, not a corruption: the placeholder set
+contains "", and `(None or "").strip()` is "", so the shipped default (device=None) matched on every
+call and get_settings() wrote the file on every read — with the GUI polling it every 10s per tab.
+
+`test_concurrent_updates_do_not_lose_each_other` is why the lock exists; it fails reliably without
+one, because Flask serves this API with threaded=True.
+
+Run: `pytest tests/Unit/test_settings_store.py`.
+"""
+
+import json
+import sys
+import threading
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "backend" / "scripts"))
+sys.path.insert(0, str(REPO / "backend" / "scripts" / "apis"))
+
+from settings_api import SettingsManager, sanitize_device_name  # noqa: E402
+
+
+@pytest.fixture()
+def manager(tmp_path):
+    return SettingsManager(str(tmp_path / "settings.json"))
+
+
+# -- the write path must not invent data ------------------------------------------------------
+
+
+def test_update_on_a_damaged_file_refuses_rather_than_resetting(manager):
+    manager.update_settings({"deviceName": "Kitchen"})
+    manager.update_settings({"integrations": {"airplay": {"endpoints": [{"id": "7", "enabled": True}]}}})
+
+    Path(manager.settings_file).write_text("{ this is not json")
+
+    with pytest.raises(Exception):
+        manager.update_settings({"deviceName": "Hallway"})
+
+    # The damaged file is left exactly as found — not silently replaced with defaults+patch.
+    assert Path(manager.settings_file).read_text() == "{ this is not json"
+
+
+def test_read_on_a_damaged_file_still_answers_defaults(manager):
+    """The read path keeps its never-raise contract, so the GUI renders something."""
+    Path(manager.settings_file).write_text("{ this is not json")
+    settings = manager.get_settings()
+    assert settings["deviceName"] == "Plum Sendspin"
+
+
+def test_a_missing_file_is_not_damage(manager):
+    """No file at all legitimately means defaults — that is how a fresh unit boots."""
+    Path(manager.settings_file).unlink()
+    assert manager.update_settings({"deviceName": "Fresh"})["deviceName"] == "Fresh"
+
+
+# -- the migration must converge --------------------------------------------------------------
+
+
+def test_migration_does_not_rewrite_on_every_read(manager):
+    """A unit that has never chosen an output must not rewrite settings.json on every read."""
+    manager.get_settings()
+    before = Path(manager.settings_file).stat().st_mtime_ns
+
+    for _ in range(5):
+        manager.get_settings()
+
+    assert Path(manager.settings_file).stat().st_mtime_ns == before
+
+
+def test_legacy_placeholder_is_still_cleared_once(manager):
+    """The migration must keep firing for the case it was written for."""
+    settings = manager.get_settings()
+    settings["audio"]["output"]["device"] = "hw:Headphones"
+    Path(manager.settings_file).write_text(json.dumps(settings))
+
+    assert manager.get_settings()["audio"]["output"]["device"] is None
+
+    # ...and then stop.
+    after = Path(manager.settings_file).stat().st_mtime_ns
+    manager.get_settings()
+    assert Path(manager.settings_file).stat().st_mtime_ns == after
+
+
+# -- concurrency -------------------------------------------------------------------------------
+
+
+def test_concurrent_updates_do_not_lose_each_other(manager):
+    """Flask is threaded=True; two endpoint edits must not both read N and both write N+1.
+
+    The version counter is the probe: update_settings reads it and writes it back incremented, so a
+    lost update is exactly a version that did not advance. Asserting on the endpoint list instead
+    would not detect it — the one-level merge means the last writer legitimately wins on content.
+    """
+    start = manager.get_settings()["version"]
+    threads_count, per_thread = 4, 20
+
+    def bump(name):
+        for _ in range(per_thread):
+            manager.update_settings({"deviceName": name})
+
+    threads = [threading.Thread(target=bump, args=(f"unit-{i}",)) for i in range(threads_count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert manager.get_settings()["version"] == start + threads_count * per_thread
+
+
+def test_concurrent_writes_never_leave_a_torn_file(manager):
+    """A shared temp path let one writer truncate another's buffer mid-write."""
+    errors = []
+
+    def churn(name):
+        for _ in range(25):
+            try:
+                manager.update_settings({"deviceName": name})
+                json.loads(Path(manager.settings_file).read_text())
+            except Exception as exc:  # noqa: BLE001 - the assertion is that nothing raises
+                errors.append(exc)
+
+    threads = [threading.Thread(target=churn, args=(f"unit-{i}",)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+
+
+# -- device names reach a daemon config template, not just a label -----------------------------
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        'X"; }; sessioncontrol = { run_this_before_play_begins = "/bin/sh -c id";',
+        "Kitchen\nname = \"pwned\";",
+        "back\\slash",
+        "semi;colon",
+        "{braces}",
+    ],
+)
+def test_injection_payloads_are_stripped_on_persist(manager, raw):
+    manager.update_settings({"integrations": {"airplay": {"endpoints": [{"id": "1", "deviceName": raw}]}}})
+    stored = manager.get_settings()["integrations"]["airplay"]["endpoints"][0]["deviceName"]
+    for forbidden in ('"', "\\", "\n", ";", "{", "}"):
+        assert forbidden not in stored
+
+
+def test_ordinary_names_survive_intact():
+    """Sanitizing must not mangle names people actually use."""
+    for name in ["Mike's Room", "Kitchen (Main)", "Bed & Breakfast", "Study-2", "Loft 3.1"]:
+        assert sanitize_device_name(name) == name
+
+
+def test_a_name_with_nothing_usable_falls_back(manager):
+    manager.update_settings({"integrations": {"airplay": {"endpoints": [{"id": "1", "deviceName": '"""'}]}}})
+    stored = manager.get_settings()["integrations"]["airplay"]["endpoints"][0]["deviceName"]
+    assert stored == "Plum Audio"

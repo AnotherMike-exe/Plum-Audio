@@ -19,6 +19,8 @@ import logging
 import os
 from dataclasses import dataclass
 
+from .config_render import escape_libconfig, write_atomic
+
 logger = logging.getLogger("plum.airplay_config")
 
 # Defaults are container paths (Binhex /app layout); every path is overridable — by argument or the
@@ -128,14 +130,15 @@ def render_configs(
         inst = _instance(endpoint, config_root)
         os.makedirs(inst.config_dir, exist_ok=True)
 
+        # escape_libconfig, not the raw name: this lands inside `name = "...";`, and shairport's
+        # sessioncontrol block runs shell commands, so an unescaped quote is RCE as root.
         rendered = (
-            template.replace("PLUM_AP_NAME", inst.device_name)
+            template.replace("PLUM_AP_NAME", escape_libconfig(inst.device_name))
             .replace("PLUM_AP_PORT", str(inst.port))
             .replace("PLUM_AP_UDP_BASE", str(inst.udp_port_base))
             .replace("PLUM_AP_ID", inst.instance_id)
         )
-        with open(inst.config_path, "w", encoding="utf-8") as f:
-            f.write(rendered)
+        write_atomic(inst.config_path, rendered)
 
         instances.append(inst)
         logger.info(

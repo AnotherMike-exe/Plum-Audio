@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) 
 from sources import airplay_config, bluetooth_config  # noqa: E402
 
 import bluetooth_bonds  # noqa: E402
-from settings_api import SettingsManager  # noqa: E402
+from settings_api import DEVICE_NAME_ALLOWED, SettingsManager  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,10 @@ class EndpointsManager:
     """
 
     source_key = ""
+    # Per-source, because the renderers cap independently and a mismatch is silent: Bluetooth
+    # renders at most bluetooth_config.MAX_ENDPOINTS, so a flat cap here let the API accept an
+    # endpoint that enabled_endpoints then truncated away — added in the GUI, never started, no error.
+    max_endpoints = MAX_ENDPOINTS
 
     def __init__(self, settings_manager: SettingsManager | None = None) -> None:
         self.settings_manager = settings_manager or SettingsManager()
@@ -76,7 +80,13 @@ class EndpointsManager:
 
     @staticmethod
     def _valid_name(device_name: str | None) -> bool:
-        return bool(device_name) and len(device_name) <= MAX_NAME_LEN
+        """Length AND charset — the name reaches a daemon config template, not just a label.
+
+        Rejecting here is what gives the GUI a usable error message; SettingsManager sanitizes the
+        same field silently for callers that bypass this CRUD (POST /api/settings takes raw JSON),
+        and the renderers escape on top of that.
+        """
+        return bool(device_name) and bool(DEVICE_NAME_ALLOWED.match(device_name))
 
     # -- CRUD ----------------------------------------------------------------
 
@@ -86,11 +96,17 @@ class EndpointsManager:
 
     def add_endpoint(self, device_name: str, enabled: bool = True) -> dict:
         if not self._valid_name(device_name):
-            return {"success": False, "message": f"Invalid device name (must be 1-{MAX_NAME_LEN} characters)"}
+            return {"success": False, "message": (
+                    f"Invalid device name (1-{MAX_NAME_LEN} characters; letters, digits, "
+                    "space and . _ - ' ( ) & + only)"
+                )}
         section = self._section()
         endpoints = section.get("endpoints", []) or []
-        if len(endpoints) >= MAX_ENDPOINTS:
-            return {"success": False, "message": f"Maximum of {MAX_ENDPOINTS} {self.source_key} endpoints allowed"}
+        if len(endpoints) >= self.max_endpoints:
+            return {
+                "success": False,
+                "message": f"Maximum of {self.max_endpoints} {self.source_key} endpoints allowed",
+            }
         instance_id = self._next_id(endpoints)
         endpoint = {
             "id": instance_id,
@@ -111,7 +127,10 @@ class EndpointsManager:
             return {"success": False, "message": f"Endpoint '{endpoint_id}' not found"}
         if device_name is not None:
             if not self._valid_name(device_name):
-                return {"success": False, "message": f"Invalid device name (must be 1-{MAX_NAME_LEN} characters)"}
+                return {"success": False, "message": (
+                    f"Invalid device name (1-{MAX_NAME_LEN} characters; letters, digits, "
+                    "space and . _ - ' ( ) & + only)"
+                )}
             endpoint["deviceName"] = device_name
         if enabled is not None:
             endpoint["enabled"] = enabled
@@ -181,6 +200,8 @@ class BluetoothEndpointsManager(EndpointsManager):
     how one radio behaves, and bluetooth_config carries them onto every instance because the
     adapter is what applies them.
     """
+
+    max_endpoints = bluetooth_config.MAX_ENDPOINTS
 
     source_key = "bluetooth"
 

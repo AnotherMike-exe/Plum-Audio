@@ -26,6 +26,8 @@ import logging
 import os
 from dataclasses import dataclass
 
+from .config_render import escape_yaml_double_quoted, write_atomic
+
 logger = logging.getLogger("plum.spotify_config")
 
 # Defaults are container paths (Binhex /app layout); every path is overridable — by argument or the
@@ -71,7 +73,9 @@ def api_port_for(instance_id: str) -> int:
 
 def enabled_endpoints(settings: dict) -> list[dict]:
     """Enabled Spotify endpoints from a settings dict (endpoints-array shape), capped at MAX_ENDPOINTS."""
-    spotify = settings.get("integrations", {}).get("spotify", {})
+    # `or {}` matches airplay_config/bluetooth_config: a section present but null (which a raw
+    # POST /api/settings can write) makes .get return None, and the next .get raises AttributeError.
+    spotify = settings.get("integrations", {}).get("spotify", {}) or {}
     endpoints = spotify.get("endpoints", []) or []
     return [e for e in endpoints[:MAX_ENDPOINTS] if e.get("enabled")]
 
@@ -114,15 +118,16 @@ def render_configs(
         inst = _instance(endpoint, config_root)
         os.makedirs(inst.config_dir, exist_ok=True)
 
+        # Escaped: this lands inside a double-quoted YAML scalar, where a raw quote or newline
+        # lets the name become configuration (e.g. redirecting audio_output_pipe).
         rendered = (
-            template.replace("SPOTIFY_NAME", inst.device_name)
+            template.replace("SPOTIFY_NAME", escape_yaml_double_quoted(inst.device_name))
             .replace("SPOTIFY_ZEROCONF_PORT", str(inst.zeroconf_port))
             .replace("SPOTIFY_API_PORT", str(inst.api_port))
             .replace("SPOTIFY_BITRATE", str(bitrate))
             .replace("INSTANCE_ID", inst.instance_id)
         )
-        with open(os.path.join(inst.config_dir, "config.yml"), "w", encoding="utf-8") as f:
-            f.write(rendered)
+        write_atomic(os.path.join(inst.config_dir, "config.yml"), rendered)
 
         instances.append(inst)
         logger.info(
