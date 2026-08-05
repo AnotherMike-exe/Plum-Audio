@@ -18,10 +18,12 @@ Events consumed (go-librespot /events, {"type", "data"}):
   playing / paused / not_playing / stopped  → playback_speed (1000 / 0)
   seek {position, duration}                  → re-anchor progress
   volume {value, max}                        → source volume (logged; role wiring later)
-Position/duration are milliseconds (Sendspin roles use ms); the metadata role stamps a timestamp so
-clients extrapolate position between events. We re-anchor on metadata/seek AND on every play/pause
-(asking the daemon where it actually is) — a bare speed flip would re-stamp the track's start anchor
-and snap the client's timeline back to 0:00.
+Position/duration are milliseconds (Sendspin roles use ms) and every progress emit must carry an
+EXPLICIT fresh timestamp (`timestamp_us=None` through `set_metadata`, never `role.update()`, which
+inherits the previous stamp) so clients extrapolate from now rather than from an ever-older anchor —
+see `_anchor_progress`. We re-anchor on metadata/seek AND on every play/pause (asking the daemon
+where it actually is), because a bare speed flip would re-stamp the track's start anchor and snap the
+client's timeline back to 0:00.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from dataclasses import replace
 
 import aiohttp
 from PIL import Image
@@ -232,12 +235,32 @@ class SpotifyGoLibrespot:
 
     def _anchor_progress(self, position, duration) -> None:
         role = self._metadata_role()
-        if role is None or position is None or duration is None:
+        if role is None or position is None or duration is None or role.metadata is None:
             return
         speed = 1000 if self._playing else 0
-        # All three progress fields together or the role emits none; the role stamps a timestamp so
-        # clients extrapolate from here (speed 0 freezes at this anchor).
-        role.update(track_progress=max(0, int(position)), track_duration=max(0, int(duration)), playback_speed=speed)
+        # All three progress fields together or the role emits none.
+        #
+        # Force a FRESH server timestamp — do NOT use role.update() here. The old comment claimed
+        # "the role stamps a timestamp"; it does not. update() does replace(current, **kwargs),
+        # which COPIES the existing timestamp_us, and set_metadata only stamps anew when it is None.
+        # So every anchor paired a CURRENT position with an ANCIENT timestamp, and the client added
+        # all the elapsed time since that stale stamp on top of an already-current position.
+        #
+        # It hid while playing (speed 1000 and a near-current stamp are close enough) and while
+        # paused (speed 0 freezes the client at track_progress, which is why pause looked right).
+        # It surfaced on RESUME: the stamp inherited from before the pause, so the position jumped
+        # forward by the length of the pause — several seconds, or straight to 100% on a long one.
+        # airplay_metadata._emit_progress and bluetooth_avrcp both hit this and pass timestamp_us=None;
+        # Spotify was the one handler that did not. See docs/UPSTREAM-AIOSENDSPIN.md §2.
+        role.set_metadata(
+            replace(
+                role.metadata,
+                track_progress=max(0, int(position)),
+                track_duration=max(0, int(duration)),
+                playback_speed=speed,
+                timestamp_us=None,
+            )
+        )
 
     async def _apply_speed(self, playing: bool, data: dict | None = None) -> None:
         """Flip playback speed AND re-anchor progress to the daemon's true position.
