@@ -35,12 +35,6 @@ Design notes (the *why*, learned from the lifecycle audit + handoff probe):
     playback_state=stopped and pushes a group/update to every client — then loop back to wait
     for the next writer. A stream exists ONLY while a sender is feeding us; the group and its
     anchor persist regardless, so routing survives across source sessions.
-
-TODO(Phase 1+):
-  - Drive start_source/stop_source from the integration lifecycle (control scripts signalling
-    activity); for now main() brings up a single AirPlay source from env.
-  - Metadata/artwork/visualizer role emission from the control scripts (out-of-band).
-  - supervisord integration (this module is the `sendspin_server` program).
 """
 
 from __future__ import annotations

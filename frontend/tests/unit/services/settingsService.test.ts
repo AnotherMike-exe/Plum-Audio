@@ -219,8 +219,8 @@ describe('settingsService', () => {
     })
 
     it('should detect version changes for polling', () => {
-      const oldVersion = 1
-      const newVersion = 2
+      const oldVersion: number = 1
+      const newVersion: number = 2
 
       const hasChanged = newVersion !== oldVersion
       expect(hasChanged).toBe(true)

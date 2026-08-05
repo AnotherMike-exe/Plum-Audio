@@ -196,8 +196,13 @@ export function createMockSettings(overrides: Partial<Settings> = {}): Settings 
     }
   }
 
-  // Deep merge overrides
-  return deepMerge(defaultSettings, overrides) as Settings
+  // Deep merge overrides. `Settings` has no index signature, so it does not satisfy deepMerge's
+  // Record constraint directly — go through unknown rather than widening the helper, which would
+  // lose the type check at every other call site.
+  return deepMerge(
+    defaultSettings as unknown as Record<string, unknown>,
+    overrides as Record<string, unknown>,
+  ) as unknown as Settings
 }
 
 /**

@@ -113,9 +113,6 @@ class AirplayRemote:
     async def pause(self) -> None:
         await self._invoke("call_pause")
 
-    async def play_pause(self) -> None:
-        await self._invoke("call_play_pause")
-
     async def next_track(self) -> None:
         await self._invoke("call_next")
 

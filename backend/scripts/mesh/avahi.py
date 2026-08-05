@@ -50,7 +50,6 @@ BROWSER_IFACE = "org.freedesktop.Avahi.ServiceBrowser"
 
 IF_UNSPEC = -1  # AVAHI_IF_UNSPEC — all interfaces
 PROTO_UNSPEC = -1  # AVAHI_PROTO_UNSPEC — v4 and v6
-PROTO_INET = 0  # AVAHI_PROTO_INET — v4 only
 
 # The two Sendspin service types (spec §Discovery).
 CLIENT_SERVICE = "_sendspin._tcp"

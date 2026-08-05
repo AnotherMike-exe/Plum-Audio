@@ -24,8 +24,6 @@ import paletteIcon from '../src/assets/icons/palette.svg?raw';
 import headphonesIcon from '../src/assets/icons/headphones.svg?raw';
 import plusIcon from '../src/assets/icons/plus.svg?raw';
 import trashIcon from '../src/assets/icons/trash.svg?raw';
-import penToSquareIcon from '../src/assets/icons/pen-to-square.svg?raw';
-import eyeIcon from '../src/assets/icons/eye.svg?raw';
 import circleInfoIcon from '../src/assets/icons/circle-info.svg?raw';
 import puzzlePieceIcon from '../src/assets/icons/puzzle-piece.svg?raw';
 import bookIcon from '../src/assets/icons/book.svg?raw';
@@ -33,17 +31,10 @@ import githubIcon from '../src/assets/icons/github.svg?raw';
 import spotifyIcon from '../src/assets/icons/spotify.svg?raw';
 import appleIcon from '../src/assets/icons/apple.svg?raw';
 import bluetoothIcon from '../src/assets/icons/bluetooth.svg?raw';
-import wifiIcon from '../src/assets/icons/wifi.svg?raw';
 import waveformIcon from '../src/assets/icons/waveform.svg?raw';
-import snapcastIcon from '../src/assets/icons/snapcast.svg?raw';
-import snapcastColorIcon from '../src/assets/icons/snapcast-color.svg?raw';
 import plexampIcon from '../src/assets/icons/plexamp.svg?raw';
-import gaugeIcon from '../src/assets/icons/gauge.svg?raw';
-import slidersIcon from '../src/assets/icons/sliders.svg?raw';
 import stopIcon from '../src/assets/icons/stop.svg?raw';
-import circleCheckIcon from '../src/assets/icons/circle-check.svg?raw';
 import circleExclamationIcon from '../src/assets/icons/circle-exclamation.svg?raw';
-import microphoneIcon from '../src/assets/icons/microphone.svg?raw';
 import shuffleIcon from '../src/assets/icons/shuffle.svg?raw';
 import repeatIcon from '../src/assets/icons/repeat.svg?raw';
 
@@ -71,8 +62,6 @@ export type IconName =
   | 'headphones'
   | 'plus'
   | 'trash'
-  | 'pen-to-square'
-  | 'eye'
   | 'circle-info'
   | 'puzzle-piece'
   | 'book'
@@ -80,17 +69,10 @@ export type IconName =
   | 'spotify'
   | 'apple'
   | 'bluetooth'
-  | 'wifi'
   | 'waveform'
-  | 'snapcast'
-  | 'snapcast-color'
   | 'plexamp'
-  | 'gauge'
-  | 'sliders'
   | 'stop'
-  | 'circle-check'
   | 'circle-exclamation'
-  | 'microphone'
   | 'shuffle'
   | 'repeat';
 
@@ -118,8 +100,6 @@ const iconMap: Record<IconName, string> = {
   'headphones': headphonesIcon,
   'plus': plusIcon,
   'trash': trashIcon,
-  'pen-to-square': penToSquareIcon,
-  'eye': eyeIcon,
   'circle-info': circleInfoIcon,
   'puzzle-piece': puzzlePieceIcon,
   'book': bookIcon,
@@ -127,17 +107,10 @@ const iconMap: Record<IconName, string> = {
   'spotify': spotifyIcon,
   'apple': appleIcon,
   'bluetooth': bluetoothIcon,
-  'wifi': wifiIcon,
   'waveform': waveformIcon,
-  'snapcast': snapcastIcon,
-  'snapcast-color': snapcastColorIcon,
   'plexamp': plexampIcon,
-  'gauge': gaugeIcon,
-  'sliders': slidersIcon,
   'stop': stopIcon,
-  'circle-check': circleCheckIcon,
   'circle-exclamation': circleExclamationIcon,
-  'microphone': microphoneIcon,
   'shuffle': shuffleIcon,
   'repeat': repeatIcon,
 };

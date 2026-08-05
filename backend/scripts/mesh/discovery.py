@@ -56,14 +56,6 @@ class Peer:
     player_port: int
     last_seen: float
 
-    @property
-    def server_url(self) -> str:
-        return f"ws://{self.host}:{self.server_port}/sendspin"
-
-    @property
-    def player_url(self) -> str:
-        return f"ws://{self.host}:{self.player_port}/sendspin"
-
 
 class _BeaconProtocol(asyncio.DatagramProtocol):
     def __init__(self, on_datagram) -> None:

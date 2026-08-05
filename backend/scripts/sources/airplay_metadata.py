@@ -384,12 +384,6 @@ class AirplayMetadataReader:
             with contextlib.suppress(Exception):
                 await role.set_album_artwork(img)
 
-    def _clear(self) -> None:
-        role = self._metadata_role()
-        if role is not None:
-            role.clear()
-        self._pending = {}
-
 
 def _hex_to_ascii(hex_text: str) -> str:
     try:
