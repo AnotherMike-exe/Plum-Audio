@@ -800,6 +800,21 @@ class SendspinPlayer:
             disc = asyncio.Event()
             self.client.add_disconnect_listener(disc.set)
             logger.info("attached to a server %s", self.renderer.stats())
+            # Re-send client/state immediately, conformantly.
+            #
+            # attach_websocket's handshake already sent one — through the library's own
+            # send_player_state(), which omits the spec's REQUIRED top-level `state` (UPSTREAM §0).
+            # That is the message the spec singles out ("must be sent immediately after receiving
+            # server/hello"), so overriding only the states WE initiate left the mandatory one
+            # non-conformant. Confirmed on the wire 2026-08-05: our own frames carry the field, the
+            # library's connect-time frame does not.
+            #
+            # A duplicate client/state is harmless — it is a full state report, not a delta — so
+            # following the library's with a correct one is the cheapest way to be conformant
+            # without patching it. Delete when the pin bumps past the fix.
+            self._last_starved_frames = self.renderer.starved_frames  # don't charge pre-attach idle
+            with contextlib.suppress(Exception):
+                await self._send_client_state(ClientStateType.SYNCHRONIZED)
             await disc.wait()
             logger.info("detached from server %s", self.renderer.stats())
 
