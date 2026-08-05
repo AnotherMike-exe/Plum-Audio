@@ -6,6 +6,12 @@
     <title>Sync Audio Controller</title>
     <style id="base-styles">
         :root {
+            /* Tells the browser to draw its OWN chrome — scrollbars, form controls — dark. The
+               ::-webkit-scrollbar rules below cannot reach an overlay scrollbar (macOS's default
+               unless "show scroll bars: always" is set), so without this the Settings overlay
+               scrolls with a white bar on a dark panel. */
+            color-scheme: dark;
+
             --bg-primary: #14141d;
             --bg-secondary: #1f1f2b;
             --bg-secondary-hover: #2c2c3a;
@@ -25,6 +31,7 @@
         }
 
         [data-theme='light'] {
+            color-scheme: light;
             --bg-primary: #f0f2f5;
             --bg-secondary: #ffffff;
             --bg-secondary-hover: #f9f9f9; /* Lighter hover for white mode */
@@ -85,6 +92,7 @@
         }
 
         [data-theme='white'] {
+            color-scheme: light;
             --bg-primary: #ffffff;
             --bg-secondary: #f5f5f5;
             --bg-secondary-hover: #fafafa; /* Much lighter hover */
@@ -115,6 +123,40 @@
         /* Don't transition transforms and other properties that should be instant */
         .transition-none {
             transition: none !important;
+        }
+
+        /* Scrollbars, themed. Every scroll container in the app (the Settings overlay body, the
+           stream dropdowns, the visualizer panels) otherwise renders the browser's default grey —
+           which reads as a bug against a black or album-art-tinted page.
+
+           Two mechanisms, deliberately not both at once: Chromium IGNORES ::-webkit-scrollbar-*
+           for any element whose `scrollbar-color` is not `auto`, so that property is fenced behind
+           a Firefox-only @supports. Chromium/WebKit take the pseudo-elements (thin, rounded,
+           transparent track); Firefox takes the standard properties. */
+        ::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+        ::-webkit-scrollbar-track,
+        ::-webkit-scrollbar-corner {
+            background: transparent;
+        }
+        ::-webkit-scrollbar-thumb {
+            background-color: var(--border-color);
+            border-radius: 9999px;
+            /* Inset the thumb without shrinking the hit target. */
+            border: 2px solid transparent;
+            background-clip: padding-box;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background-color: var(--text-muted);
+        }
+
+        @supports (-moz-appearance: none) {
+            html {
+                scrollbar-width: thin;
+                scrollbar-color: var(--border-color) transparent; /* inherited by every scroller */
+            }
         }
 
         .volume-slider {
