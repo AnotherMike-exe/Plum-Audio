@@ -23,6 +23,9 @@ const POLL_INTERVAL_MS = 3000;
 const VOLUME_HOLD_MS = 5000;
 // Synthetic stream id for a foreign-server session our player renders (see snapshot()).
 export const FOREIGN_PREFIX = 'foreign::';
+// Where the learned speaker names live (see rememberPlayerNames). Survives a reload so a speaker
+// that is idle when the page opens still reads the way it does when it is playing.
+const NAME_MEMO_KEY = 'plum.speakerNames';
 
 // ---- Mesh REST wire shapes (backend/scripts/mesh/model.py) ----
 interface WirePlayer {
@@ -281,6 +284,38 @@ export function mapViewToModel(
   return { servers, streams, clients, localUnitId: view.local_unit_id, localPlayerIds };
 }
 
+// -- learned speaker names ---------------------------------------------------------------------
+//
+// A speaker has TWO names and the GUI sees a different one depending on whether it is playing.
+// Attached, it is in its server's `players` and carries the name it declared at the Sendspin
+// handshake ("Home Assistant Voice PE - 01"). Idle, no server holds it, so the only trace of it is
+// its mDNS advertisement — and a third-party device typically publishes no `name` TXT key, leaving
+// the bare instance name ("home-assistant-voice-a1b2c3"). The row therefore renamed itself every
+// time it joined or left a group, which reads as two devices rather than one.
+//
+// So: remember the protocol name against the speaker's listener URL — the one identifier both
+// views share (the client id does NOT: mDNS names it by instance, the handshake by MAC) — and use
+// it wherever that URL turns up. Persisted, because "idle at page load" is the common case and a
+// memo that only fills in after the speaker has played once would still flip on the first reload.
+
+function loadNameMemo(): [string, string][] {
+  try {
+    const raw = window.localStorage?.getItem(NAME_MEMO_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return Array.isArray(parsed) ? parsed.filter((e) => Array.isArray(e) && e.length === 2) : [];
+  } catch {
+    return []; // private mode, quota, corrupt entry — names just fall back to mDNS
+  }
+}
+
+function saveNameMemo(memo: Map<string, string>): void {
+  try {
+    window.localStorage?.setItem(NAME_MEMO_KEY, JSON.stringify([...memo]));
+  } catch {
+    // non-fatal: the memo still works for this page's lifetime
+  }
+}
+
 type Listener = (model: Model) => void;
 
 export class SendspinDataService {
@@ -320,6 +355,8 @@ export class SendspinDataService {
   // Player volume only; group volume needs none — the controller WS echoes it back immediately.
   private pendingVolume = new Map<string, { volume: number; muted: boolean; at: number }>();
   private pendingSourceVolume = new Map<string, { volume: number; at: number }>();
+  // listener URL -> the name the speaker gave over the PROTOCOL (see rememberPlayerNames).
+  private nameByUrl = new Map<string, string>(loadNameMemo());
 
   start(): void {
     void this.poll();
@@ -438,8 +475,32 @@ export class SendspinDataService {
     }
   }
 
+  /** Learn each attached speaker's protocol name, keyed by its listener URL. */
+  private rememberPlayerNames(view: MeshView): void {
+    let changed = false;
+    for (const unit of view.units) {
+      for (const p of unit.players) {
+        // A rename is authoritative: whatever the speaker declares now replaces what we knew.
+        if (p.url && p.name && this.nameByUrl.get(p.url) !== p.name) {
+          this.nameByUrl.set(p.url, p.name);
+          changed = true;
+        }
+      }
+    }
+    if (changed) saveNameMemo(this.nameByUrl);
+  }
+
+  /** Give every speaker we have ever seen attached its protocol name, whatever state it is in. */
+  private applyStableNames(model: Model): void {
+    for (const c of model.clients) {
+      const known = c.url ? this.nameByUrl.get(c.url) : undefined;
+      if (known) c.name = known;
+    }
+  }
+
   snapshot(): Model {
     const model = mapViewToModel(this.lastView, this.npByGroup, this.offsetByGroup, Date.now(), this.neighbourhood);
+    this.applyStableNames(model);
     this.applyPendingVolumes(model);
     // Our player playing a FOREIGN server (MA) is not a stream in the mesh view — synthesize one so
     // now-playing, transport and the visualizer all light up on it. Its metadata rides the player's
@@ -642,6 +703,7 @@ export class SendspinDataService {
 
   private applyView(view: MeshView): void {
     this.lastView = view;
+    this.rememberPlayerNames(view);
     const seen = new Set<string>();
     for (const unit of view.units) {
       if (unit.host) this.unitHosts.set(unit.unit_id, unit.host);

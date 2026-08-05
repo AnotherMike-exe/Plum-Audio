@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { mapViewToModel, streamId, parseStreamId, MeshView } from '../../../services/sendspinDataService';
+import { describe, it, expect, beforeEach } from 'vitest';
+import { mapViewToModel, streamId, parseStreamId, MeshView, SendspinDataService } from '../../../services/sendspinDataService';
 import { NowPlaying, currentPositionMs, SendspinControllerClient, TimeFilter } from '../../../services/sendspinControllerClient';
 
 function np(partial: Partial<NowPlaying>): NowPlaying {
@@ -207,5 +207,67 @@ describe('TimeFilter (clock sync)', () => {
     const delay = ((now - ct) - (st - sr)) / 2;
     expect(offset).toBe(4500);
     expect(delay).toBe(500);
+  });
+});
+
+describe('speaker names survive going idle', () => {
+  // A speaker names itself twice: over the protocol while it is attached ("Home Assistant Voice
+  // PE - 01"), and over mDNS while it is not (the bare instance name, because a third-party device
+  // usually publishes no `name` TXT key). The row used to rename itself on every join/leave.
+  const URL = 'ws://198.51.100.30:8927/sendspin';
+  const ATTACHED: MeshView = {
+    local_unit_id: 'unit-7204',
+    units: [
+      {
+        unit_id: 'unit-7204',
+        name: 'Plum Amp100',
+        host: '198.51.100.21',
+        sources: [{ source_id: 'airplay', group_id: 'gA', group_name: 'AirPlay', streaming: true, player_ids: ['aa:bb:cc'] }],
+        players: [{ player_id: 'aa:bb:cc', name: 'Home Assistant Voice PE - 01', connected: true, group_id: 'gA', url: URL }],
+      },
+    ],
+  };
+  const IDLE: MeshView = {
+    local_unit_id: 'unit-7204',
+    units: [{ ...ATTACHED.units[0], players: [] }],
+  };
+  const NEIGHBOURHOOD = {
+    players: [{ name: 'home-assistant-voice-a1b2c3', friendly_name: 'home-assistant-voice-a1b2c3', url: URL, host: '198.51.100.30', port: 8927, is_own: false }],
+    servers: [],
+  };
+
+  beforeEach(() => window.localStorage.clear());
+
+  it('keeps the protocol name once the speaker leaves the group', () => {
+    const svc = new SendspinDataService();
+    // @ts-expect-error — driving the poll's private hand-off directly; no network in a unit test.
+    svc.applyView(ATTACHED);
+    // @ts-expect-error — same: the neighbourhood is normally filled by the second poll fetch.
+    svc.neighbourhood = NEIGHBOURHOOD;
+    expect(svc.snapshot().clients.find((c) => c.url === URL)!.name).toBe('Home Assistant Voice PE - 01');
+
+    // @ts-expect-error — the speaker goes idle: no unit lists it, only mDNS still sees it.
+    svc.applyView(IDLE);
+    const idle = svc.snapshot().clients.find((c) => c.url === URL)!;
+    expect(idle.currentStreamId).toBeNull();
+    expect(idle.name).toBe('Home Assistant Voice PE - 01'); // not "home-assistant-voice-a1b2c3"
+  });
+
+  it('learns the name across a reload, and lets a rename win', () => {
+    // @ts-expect-error — private hand-off, as above.
+    new SendspinDataService().applyView(ATTACHED);
+
+    const reloaded = new SendspinDataService();      // fresh instance reads the persisted memo
+    // @ts-expect-error — private field.
+    reloaded.neighbourhood = NEIGHBOURHOOD;
+    // @ts-expect-error — private hand-off.
+    reloaded.applyView(IDLE);
+    expect(reloaded.snapshot().clients.find((c) => c.url === URL)!.name).toBe('Home Assistant Voice PE - 01');
+
+    const renamed: MeshView = structuredClone(ATTACHED);
+    renamed.units[0].players[0].name = 'Kitchen';
+    // @ts-expect-error — private hand-off.
+    reloaded.applyView(renamed);
+    expect(reloaded.snapshot().clients.find((c) => c.url === URL)!.name).toBe('Kitchen');
   });
 });
