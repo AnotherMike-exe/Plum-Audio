@@ -170,6 +170,31 @@ class SourceFeeder:
         self.ps.set_live_source(True)
         return self.ps
 
+    def refresh_stream(self) -> None:
+        """Re-acquire the stream so a player just added to the group is actually IN it.
+
+        A stream's membership is fixed when start_stream() is called. A client that CONNECTS while
+        a stream is live is handed it during the handshake, but a client that was already connected
+        and is later added to the group is not — it sits in the group, in the GUI, at the right
+        volume, and completely silent until the source's next session.
+
+        Measured on .7.204 on 2026-08-04: with airplay-1 streaming, unrouting and re-routing the
+        already-connected local player produced no second "Stream started" on the client and a
+        renderer whose buffer never left 0 ms. It looked exactly like a dead speaker. The reason
+        roaming never showed this is that a cross-server roam RECONNECTS (goodbye another_server),
+        and a reconnect gets the stream for free; only the intra-server "live re-route, no
+        reconnect" path — the one ARCHITECTURE calls tier 1 — was affected.
+
+        Cost: start_stream() replaces the stream for the whole group, so members already playing get
+        a brief discontinuity. That is the same cost the manual unjoin/rejoin workaround already
+        paid, it only happens on a deliberate routing change, and it is strictly better than one
+        endpoint being silently mute.
+        """
+        if self.ps is None or self.ps.is_stopped:
+            return  # nothing playing: the next chunk starts a stream that includes everyone
+        self._acquire_stream()
+        logger.info("[%s] stream re-acquired to include a new group member", self.source_id)
+
     def _ensure_fifo(self) -> None:
         """Create the FIFO if the source service hasn't yet, so we can open the read end and
         wait for the writer rather than racing it."""
@@ -415,6 +440,10 @@ class PlumSendspinServer:
         if player.group is not None:
             await player.group.remove_client(player)
         await handle.group.add_client(player)
+        # add_client alone does not put an already-connected player into a stream that is already
+        # running — see SourceFeeder.refresh_stream. Without this the player joins the group and
+        # stays silent.
+        handle.feeder.refresh_stream()
         logger.info("[%s] attached player %s", source_id, player_id)
 
     async def detach_player(self, source_id: str, player_id: str) -> None:
@@ -477,7 +506,7 @@ class PlumSendspinServer:
         """The source a controller client asked to observe, from a "ctrl:<source_id>:<nonce>" id."""
         if not client_id.startswith(CONTROLLER_PREFIX):
             return None
-        requested = client_id[len(CONTROLLER_PREFIX):].split(":", 1)[0]
+        requested = client_id[len(CONTROLLER_PREFIX) :].split(":", 1)[0]
         return requested if requested in self.sources else None
 
     def set_player_volume(self, player_id: str, volume: int, muted: bool) -> None:
@@ -522,9 +551,7 @@ class PlumSendspinServer:
             state["muted"] = bool(muted)
         logger.debug("[srcvol] %s reports %s", source_id, state)
 
-    async def set_source_volume(
-        self, source_id: str, volume: int | None = None, muted: bool | None = None
-    ) -> None:
+    async def set_source_volume(self, source_id: str, volume: int | None = None, muted: bool | None = None) -> None:
         """Drive the sending device's own volume/mute through this source's remote.
 
         Optimistically caches the requested value so the GUI holds it: the sender confirms with its
@@ -583,8 +610,9 @@ class PlumSendspinServer:
         logger.info("[%s] reclaimed remote player %s from %s", source_id, player_id, player_url)
         return True
 
-    async def adopt_foreign_client(self, source_id: str, url: str, player_id: str | None = None,
-                                   timeout_s: float = 15.0) -> bool:
+    async def adopt_foreign_client(
+        self, source_id: str, url: str, player_id: str | None = None, timeout_s: float = 15.0
+    ) -> bool:
         """Dial a Sendspin speaker we did not create and put it on one of our sources.
 
         A speaker found by mDNS is just a player whose URL came from the neighbourhood instead of a
@@ -599,8 +627,7 @@ class PlumSendspinServer:
         before = {c.client_id for c in self.server.clients}
         if player_id:
             self.server.register_client_url(player_id, url)
-        self.server.connect_to_client(url, connection_reason=ConnectionReason.PLAYBACK,
-                                      retry_initial_connection=True)
+        self.server.connect_to_client(url, connection_reason=ConnectionReason.PLAYBACK, retry_initial_connection=True)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
         while loop.time() < deadline:
@@ -770,9 +797,7 @@ class PlumSendspinServer:
         self.start_source(instance.source_id, instance.fifo_path, name=instance.device_name)
         self.start_airplay_metadata(instance.source_id, instance.metadata_fifo)
         await self.start_airplay_control(instance.source_id, bus_address=instance.bus_address)
-        logger.info(
-            "[%s] airplay source up (name=%r port=%d)", instance.source_id, instance.device_name, instance.port
-        )
+        logger.info("[%s] airplay source up (name=%r port=%d)", instance.source_id, instance.device_name, instance.port)
 
     async def stop_airplay_source(self, source_id: str) -> None:
         """Tear down an AirPlay source: metadata reader, MPRIS remote, then the source itself."""
@@ -798,14 +823,18 @@ class PlumSendspinServer:
         self.start_source(instance.source_id, instance.fifo_path, name=instance.device_name)
         handle = self.sources[instance.source_id]
         monitor = SpotifyGoLibrespot(
-            handle.group, instance.instance_id, instance.api_base,
+            handle.group,
+            instance.instance_id,
+            instance.api_base,
             on_source_volume=functools.partial(self.note_source_volume, instance.source_id),
         )
         await monitor.connect()
         monitor.start()
         self._spotify_monitors[instance.source_id] = monitor
         self._wire_transport_control(instance.source_id, monitor)
-        logger.info("[%s] spotify source up (name=%r api=%s)", instance.source_id, instance.device_name, instance.api_base)
+        logger.info(
+            "[%s] spotify source up (name=%r api=%s)", instance.source_id, instance.device_name, instance.api_base
+        )
 
     async def stop_spotify_source(self, source_id: str) -> None:
         """Tear down a Spotify source: stop its go-librespot monitor, drop its remote, stop the source."""
@@ -835,7 +864,9 @@ class PlumSendspinServer:
         # transport never depend on it.
         cover_art = BluetoothCoverArt(handle.group, instance.instance_id, instance.obex_bus_address)
         avrcp = BluetoothAvrcp(
-            handle.group, instance.instance_id, adapter,
+            handle.group,
+            instance.instance_id,
+            adapter,
             cover_art=cover_art,
             # Repeat/shuffle support is discovered per connected player, not known up front, so the
             # advertised command set has to be republished when it changes (see bluetooth_avrcp).
@@ -850,7 +881,9 @@ class PlumSendspinServer:
         self._wire_transport_control(instance.source_id, avrcp)
         logger.info(
             "[%s] bluetooth source up (name=%r adapter=%s)",
-            instance.source_id, instance.device_name, instance.adapter,
+            instance.source_id,
+            instance.device_name,
+            instance.adapter,
         )
 
     async def stop_bluetooth_source(self, source_id: str) -> None:
@@ -926,8 +959,11 @@ class PlumSendspinServer:
         commands = [MediaCommand.PLAY, MediaCommand.PAUSE, MediaCommand.NEXT, MediaCommand.PREVIOUS]
         if remote is not None and getattr(remote, "supports_repeat_shuffle", False):
             commands += [
-                MediaCommand.REPEAT_OFF, MediaCommand.REPEAT_ONE, MediaCommand.REPEAT_ALL,
-                MediaCommand.SHUFFLE, MediaCommand.UNSHUFFLE,
+                MediaCommand.REPEAT_OFF,
+                MediaCommand.REPEAT_ONE,
+                MediaCommand.REPEAT_ALL,
+                MediaCommand.SHUFFLE,
+                MediaCommand.UNSHUFFLE,
             ]
         return commands
 
@@ -1141,9 +1177,12 @@ async def main() -> None:
         from mesh.follow import FollowReconciler  # local import: avoids an import cycle
 
         follow = FollowReconciler(
-            mesh.aggregator, mesh.router,
-            local_unit_id=unit_id, local_player_id=local_player_id,
-            peer_provider=mesh.discovery.get_peer, delegate=mesh.client.delegate_route,
+            mesh.aggregator,
+            mesh.router,
+            local_unit_id=unit_id,
+            local_player_id=local_player_id,
+            peer_provider=mesh.discovery.get_peer,
+            delegate=mesh.client.delegate_route,
             unroute_delegate=mesh.client.delegate_unroute,
         )
         follow.start()
@@ -1157,9 +1196,7 @@ async def main() -> None:
         if mesh is not None:
             await mesh.neighbourhood.rename(new_name)
 
-    rename_watch = asyncio.ensure_future(
-        unit_identity.watch_device_name(_apply_unit_name, fallback=env_unit_name)
-    )
+    rename_watch = asyncio.ensure_future(unit_identity.watch_device_name(_apply_unit_name, fallback=env_unit_name))
 
     stop = asyncio.Event()
     try:
