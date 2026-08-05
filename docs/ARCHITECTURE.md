@@ -43,7 +43,7 @@ the installed package:
 
 | Primitive (in `aiosendspin.server`) | What it proves |
 |---|---|
-| `SendspinGroup.add_client()` / `remove_client()` + `_send_group_update_to_clients()` | **Intra-server routing is live control-plane.** Move a player between groups/streams over its existing WS — no reconnect. |
+| `SendspinGroup.add_client()` / `remove_client()` + `_send_group_update_to_clients()` | **Intra-server routing is live control-plane.** Move a player between groups/streams over its existing WS — no reconnect. But `add_client` does NOT put an already-connected player into a stream that is already running; the feeder must re-acquire it. See "Stream membership". |
 | `SendspinServer.connect_to_client(url, connection_reason=…)` | **Servers dial players.** A player is addressable (`ws://player:8928/sendspin`); a server initiates the connection to it. |
 | `reclaim_client_for_playback(client_id, timeout_s)` — docstring: *"reclaim clients that disconnected with 'another_server'"* | **Cross-server roaming is first-class.** Contention between servers is a *designed* handoff, not a hack. |
 | `ConnectionReason.{DISCOVERY, PLAYBACK}` | ~~**Two-tier presence.** Hold a player in a lightweight idle (DISCOVERY) connection; upgrade to PLAYBACK when audio routes to it.~~ **❌ REFUTED ON HARDWARE (2026-07-14) — this was a source-reading error.** A `SendspinClient` holds exactly ONE websocket (`attach_websocket` raises if already connected), so a player **cannot** be held on a 2nd server while playing on the 1st. Worse, `connection_reason` is only reported in `server/hello`, which the client sees *after* it attaches — so a player cannot even decline a DISCOVERY dial while busy; it would surrender its current server. Pre-connect is removed. **It is also unnecessary:** the roam is already inaudible (next row). |
@@ -96,6 +96,14 @@ achieved by **servers dialing/reclaiming players**, not by bridging audio betwee
 1. **Intra-server** (players already on the ingesting unit's server): route = live
    `group.remove_client` / `add_client`. No reconnect, no ALSA reinit (given a stable
    format). This is the cheap, common case for units already grouped together.
+   **`add_client` alone is not enough when the source is already streaming** — a stream's
+   membership is fixed when `start_stream()` is called, so a player that was ALREADY connected
+   and is then added to the group never receives it: it sits in the group, in the GUI, at the
+   right volume, and silent. `attach_player` therefore calls `SourceFeeder.refresh_stream()`
+   after `add_client`, which re-acquires the stream so the new member is in it. The cost is that
+   the whole group's stream restarts, so existing listeners get a brief discontinuity on a
+   routing change. See §"Stream membership" below — this was live for months and looked like a
+   dead speaker.
 2. **Cross-server** (pull a player from another unit): the target server calls
    `connect_to_client(player_url)` → player leaves its current server with
    `ANOTHER_SERVER` → joins target → `add_client` to the group. No DISCOVERY pre-connect (a
@@ -227,6 +235,24 @@ stream + clock domain). The orchestrator's job is to present this coherently:
   `old_group.stop()`, which would kill the source the player is *leaving* for every other
   listener. Each source group therefore keeps a stable player member (or the feeder self-heals),
   and `SourceFeeder` re-acquires its `PushStream` on `StreamStoppedError` rather than dying.
+
+  **Stream membership — the second half of that rule (found on hardware 2026-08-04).** The probe
+  above measured re-route against an idle-then-started source, which is why it reported a clean
+  live re-route and missed this: a stream's client set is fixed at `start_stream()`. A client that
+  CONNECTS while a stream is live is handed it during the handshake, but one already connected and
+  later added to the group is NOT. Measured on `.7.204`: with `airplay-1` streaming, unrouting and
+  re-routing the attached local player produced no second `Stream started` on the client and a
+  renderer buffer that never left 0 ms. Nothing in the logs said anything was wrong.
+
+  Roaming never exposed it because a cross-server roam RECONNECTS (`ANOTHER_SERVER`) and a
+  reconnect gets the stream for free — only tier 1, the path advertised as seamless, was affected.
+  It is also why every manual workaround was "unjoin it and rejoin it": that forces the reconnect.
+
+  `SourceFeeder.refresh_stream()` re-acquires the stream after `add_client` when one is live (a
+  no-op when idle — the next chunk starts a stream that includes everyone). Trade-off, stated
+  plainly: the group's stream restarts, so anyone already listening hears a brief discontinuity
+  when someone else is routed in. That is the same cost the manual workaround already paid, it
+  only happens on a deliberate routing change, and it beats one endpoint being silently mute.
 - **Audible tier — NEXT hardware step (needs user + speakers on two units).** Two-node test:
   `.133` ingests a source into Group A, `.113`'s player joins; then reclaim `.113` to a
   second server / move between groups and **listen** for gap/continuity. Mirrors the

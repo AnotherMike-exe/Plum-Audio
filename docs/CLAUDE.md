@@ -11,7 +11,15 @@
 > proven against Music Assistant + a Home Assistant Voice PE) are in and hardware-verified.
 > **The container build is DONE (2026-07-31)** — all three R&D Pis run the unit as a container
 > (`docker/build.sh` → `docker/deploy.sh`), with the `~/plum-test` dev stack stopped but left on
-> disk. Remaining: DLNA/Plexamp and the conformance gaps in docs/SPEC-CONFORMANCE.md.
+> disk. **Audio output selection is DONE (2026-08-04)** — discovery, `/api/audio/*`, live apply
+> without a restart, and the picker in Settings → Playback, plus
+> `scripts/host-setup/configure-audio-hat.sh` for HAT provisioning. Validated on a **fourth unit,
+> `.7.204` (HiFiBerry Amp100)**, recommissioned from Plum-Snapcast. Remaining: DLNA/Plexamp and the
+> conformance gaps in docs/SPEC-CONFORMANCE.md.
+>
+> **Not ours, do not re-investigate:** a Home Assistant Voice PE joins a group, acknowledges our
+> `stream/start` codec header, reports PLAYING — and plays nothing. It does not play from **Music
+> Assistant** either, under FLAC or PCM. Device-side. Chased at length on 2026-08-04.
 
 ## Project Overview
 
@@ -107,7 +115,8 @@ React/TS GUI are **ported** from Plum-Snapcast, not rewritten.
 Every unit runs a Sendspin **server** (owns local audio ingest via in-process `PushStream`)
 **and** a **player** (roamable render endpoint). Cross-routing moves *players*, never bridges
 audio between servers (avoids the unmerged `Roles.SOURCE` path). Two tiers:
-1. **Intra-server** re-route → live `group.add_client` / `remove_client` (no reconnect).
+1. **Intra-server** re-route → live `group.add_client` / `remove_client` (no reconnect), **plus
+   `feeder.refresh_stream()`** — see the stream-membership rule below.
 2. **Cross-server** roam → `reclaim_client_for_playback` + `GoodbyeReason.ANOTHER_SERVER`.
 Cross-server roam is inaudible: the player never flushes on a roam, so its ~300 ms jitter buffer
 drains through the ~25-55 ms reconnect. **There is no DISCOVERY pre-connect** — a client holds one
@@ -190,6 +199,27 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
   never the unmerged `Roles.SOURCE`.
 - **Metadata off the audio path** — emit to Sendspin metadata/artwork roles, not the stream.
   The five Snapcast resync guards are obsolete here; do not port them.
+- **Adding a player to a live stream does NOT put it in that stream.** A stream's membership is
+  fixed at `start_stream()`. A client that CONNECTS while one is live gets it at handshake; one
+  already connected and then added to the group does not — it sits in the group, in the GUI, at the
+  right volume, and silent, with nothing in any log. `attach_player` therefore calls
+  `SourceFeeder.refresh_stream()` after `add_client`. The cost is a brief discontinuity for
+  everyone already listening, which is the deliberate trade. Roaming hides this (a reconnect gets
+  the stream free), so only the intra-server path was ever affected — do not "optimise" the
+  refresh away because a roam test passes.
+- **Re-dial before adopting a foreign speaker.** `connect_to_client(url)` is a NO-OP when the
+  server already holds a dial registration for that URL, so a second `adopt` of a speaker that
+  went away (rebooted, reclaimed by its own server) silently does nothing and times out reporting
+  "never connected" about a device whose port is plainly open. `adopt_foreign_client` cancels the
+  existing dial first. Identify the speaker by its **registered URL**, not by "a client id that
+  was not in the set before" — that only holds the first time, and the GUI passes an mDNS name
+  while the handshake id is a MAC.
+- **Codec choice belongs to the CLIENT.** The spec says `supported_formats` is in priority order,
+  first preferred, and the server takes the first match it implements — aiosendspin does exactly
+  that, and a player that cannot sustain its own choice is meant to renegotiate with
+  `stream/request-format`. Do not add a server-side override without a live, proven case: one was
+  written and reverted (`f19a428`) after the device it was for turned out not to play from Music
+  Assistant either. Per-client encoding means a heterogeneous group is normal, not a problem.
 - **Announce idle, don't imply it** — a stream exists only while a sender feeds the source. On EOF
   or `PLUM_SOURCE_IDLE_TIMEOUT` silence call `group.stop()` (playback_state=**stopped** via
   `group/update`), never `stop_stream()` (which keeps clients logically PLAYING). The spec has no
@@ -211,6 +241,41 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
   of which the client library sends exactly one, at connect, carrying `initial_volume`. Skip the
   echo and every level in the mesh reads 100% forever while the audio is demonstrably quieter —
   the failure looks like a GUI bug and is not one. See `sendspin_player._publish_render_state`.
+- **The output device's identity is the ALSA CARD NAME, never `hw:C,D`.** Card numbers move: the
+  HiFiBerry on `.7.204` was card 2, then 1, then 2, then 0 across four reboots with config
+  unchanged. `settings.json` stores `<card_name>:<device>` (`sndrpihifiberry:0`) and `hw:C,D` is
+  re-derived every scan for display and `speaker-test` only. Snapcast persisted the number and got
+  away with it because `get-settings.py` translated to `default:CARD=<name>` at launch — but from
+  the STALE number, so a reboot that renumbered would have resolved to the wrong card.
+- **PortAudio is not ALSA, and availability cannot be probed by opening.** `sounddevice`'s
+  `device=` matches a substring of PortAudio's OWN name list, so an arbitrary ALSA PCM string is
+  rejected; the `(hw:C,D)` suffix PortAudio embeds is the join between the two. And PortAudio
+  ENUMERATES BY OPENING, so a card held exclusively vanishes from `query_devices()` — with our
+  player holding the Amp100's single-subdevice pcm512x the output list came back EMPTY.
+  Availability therefore rests on three signals that fail in different places: `is_active` (what
+  we are configured to render to — survives everywhere), `in_use` (`/proc/asound/.../sub*/status`),
+  and PortAudio exposure. Never reduce it to the probe.
+- **Serialise every PortAudio re-init.** `sd._terminate()`/`sd._initialize()` rebuild PROCESS-GLOBAL
+  state; two threads doing it at once SIGSEGVs the interpreter — no exception, no traceback. The
+  GUI fetches the device list and current output in one `Promise.all`, Flask is `threaded=True`,
+  and the config API crash-looped on exactly that. `_portaudio_outputs` holds a module lock and a
+  2 s TTL cache; the player passes `force=True` because it re-reads right after closing its stream.
+  Sequential curl cannot reproduce this — test concurrently.
+- **`/proc/asound` is masked in the container** and runc refuses to bind anything back into `/proc`,
+  so compose mounts the host copy at `/host/asound` (`PLUM_PROC_ASOUND`). Read from in-container,
+  `owner_pid` is 0 (different PID namespace) — only `closed` vs a state block is trustworthy — and
+  every subdevice must be checked, not `sub0` (bcm2835 has eight).
+- **A player echoes the output it ACTUALLY opened** into `/data/player_state.json` (`output_device`),
+  the same contract as the volume echo. The config API compares it against the choice in
+  `settings.json` to report `pending`; without it the GUI marks a switch applied the moment it is
+  saved, including switches that never opened. A failed switch RESTORES the previous device rather
+  than leaving silence (measured: 42 ms, still playing).
+- **A HAT's hardware mixer is not at unity** and `alsa-restore` reinstates it every boot — an Amp100
+  comes up at `Digital` 163/207, i.e. **-22 dB**, which nothing in Plum-Audio can see because volume
+  is software gain in the PortAudio callback. `scripts/host-setup/configure-audio-hat.sh --unity`
+  pins and persists it. Snapcast never hit this: snapclient owned the control via
+  `--mixer hardware:`. Also: the overlay block must go BEFORE the first existing `dtoverlay=` —
+  appending it after `vc4-kms-v3d` costs an HDMI audio output (measured over 5 boots).
 - **WiFi/host concerns** (NetworkManager owns `wlan0`) live on the host, not the container (as Plum-Snapcast).
 - **The unit's display name comes from `settings.json` `deviceName`** (`scripts/unit_identity.py`),
   NOT from `PLUM_UNIT_NAME`/`PLUM_PLAYER_NAME` — those are only what an unnamed unit boots with.
@@ -233,6 +298,11 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
   unblock and the D-Bus policy. Also `systemctl --user mask obex.service`: a phone serves ONE AVRCP
   cover-art session, and the distro's obexd steals it from ours. Nothing in our Python depends on
   the patches; an unpatched unit just loses scrub reporting. See ARCHITECTURE §8 Phase 3.
+- **`backend/config/bluealsa-plum-dbus.conf` must be installed on the host** at
+  `/etc/dbus-1/system.d/`, or `bluealsa` cannot acquire `org.bluealsa`, exits `rc=1` ~3 s after
+  every start, and the source manager respawns it forever — on `.7.204` that was 178 restarts, a new
+  dbus-daemon every 9.5 s, and enough log spam to bury unrelated diagnosis. It is in the repo but
+  nothing installs it automatically; a new unit needs it copied by hand alongside the bluez patches.
 
 ---
 
@@ -279,6 +349,24 @@ docker exec plum-audio aplay -l
 Source daemons are NOT supervisord programs — the managers own them, so `ps` inside the container
 is how you confirm shairport/go-librespot/bluealsa are up. A source missing there but enabled in
 settings.json is a manager problem, not a supervisord one.
+
+**Protocol-level debugging.** `PLUM_LOG_LEVEL=DEBUG` in `/opt/plum-audio/plum-audio.env` +
+`docker compose up -d --force-recreate` turns on the aiosendspin handshake trace — `client/hello`
+with the client's `supported_formats`, the `stream/start` we answer with, and periodic
+`Send summary role=player ... buf_ms(...)`. That is the only way to see what a third-party device
+actually negotiated. **Revert it afterwards**: it is verbose, and the force-recreate drops every
+connection — doing that mid-test once produced a "bug" that was purely the restart.
+
+**Watch what you conclude from a `tail`.** A crash-looping source (see the bluealsa D-Bus policy
+above) writes fast enough to push the lines you need thousands back, and a filtered tail then reads
+as "this never happened". Two wrong diagnoses on 2026-08-04 came from exactly that.
+
+**Checking output devices from outside the container:**
+```bash
+docker exec plum-audio python3 /app/scripts/audio_devices.py    # id / hw_id / availability / active
+cat /proc/asound/cards                                          # on the HOST — card numbers move
+amixer -c <n> sget Digital                                      # a HAT at -22 dB is the default
+```
 
 ---
 

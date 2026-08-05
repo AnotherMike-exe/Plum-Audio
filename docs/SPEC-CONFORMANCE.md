@@ -83,6 +83,22 @@ Before this we held a stream from boot and announced `playing` forever, on every
 | visualizer@v1 | ✅ computed by the aiosendspin viz role when a viz client is present (library DSP, not ours) | ✅ consumes — incl. from a foreign server it is a group member of (MA) | ✅ decodes spectrum(19)/loudness(16), renders |
 | color@v1 | ❌ not implemented | ❌ | ❌ |
 
+**Codec negotiation (confirmed against the spec 2026-08-04).** A client's `supported_formats` is in
+**priority order — first is preferred** — and the server activates the first match it implements.
+`aiosendspin` does exactly that, and we do not override it: encoding is per-client, so a group can
+legitimately carry FLAC to one endpoint and PCM to another. Servers must support `opus`, `flac` and
+`pcm`; the spec gives **no** guidance preferring one for constrained players. A player that cannot
+sustain its own first choice is expected to renegotiate CLIENT-side via `stream/request-format`
+(the spec's stated purpose: adapt to "changing network conditions or CPU constraints"), which the
+server answers with a fresh `stream/start` carrying a new `codec_header`.
+
+Sample-rate conversion is the library's job and it does it: our sources are 44.1 kHz (AirPlay
+native) and a 48 kHz-only client is served resampled 48 kHz FLAC with no work from us. A
+server-side codec override was written and **reverted** (`f19a428`) — the device that motivated it
+turned out not to play from Music Assistant either, so it bought nothing and left us deviating from
+the client-preference rule for no reason. Do not re-add one without a case that survives a
+cross-server check.
+
 **Repeat/shuffle (added 2026-07-25).** Fully wired for **Spotify** (go-librespot exposes it natively):
 the source advertises the repeat/shuffle commands on the controller role, honours them
 (`/player/repeat_context|repeat_track|shuffle_context`), and publishes state back (`set_repeat`/

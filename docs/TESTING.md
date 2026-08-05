@@ -44,11 +44,29 @@ Everything that needs a real FIFO, a real daemon, or a real DAC. Target: one Pi,
   is polled every ~2 s while the phone is playing and `Position` reaches D-Bus clients on that beat,
   so a scrub lands within ~2 s. Needs a phone connected and playing; `t2_bt_avrcp_position.sh`.
 - Config API + GUI served by nginx; settings persist across a restart.
+- Output selection: `/api/audio/devices/output` lists every card `aplay -l` sees; the ACTIVE one is
+  selectable even though our own player holds it (PortAudio cannot enumerate a busy exclusive card
+  — assert the active device is never greyed out); an unopenable card (HDMI with no display) is
+  refused with a 409 rather than persisted; switching writes `settings.json` and the player applies
+  it within its poll, with `pending` true until the echo in `player_state.json` agrees.
+- **Concurrently**, not sequentially: fetch `/devices/output` and `/output/current` in parallel, in
+  a loop. Sequential calls cannot reproduce the PortAudio re-init SIGSEGV that crash-looped the
+  config API, and three rounds of sequential hardware testing missed it.
+- A failed switch keeps playing: write an unopenable device straight into `settings.json` (bypassing
+  the API's validation) and assert the renderer restores the previous device and `pending` stays
+  true, rather than the unit going silent with a correct-looking settings file.
+- On a HAT unit: the card is addressed by NAME across a reboot (`sndrpihifiberry:0` survives; the
+  `hw:C,D` behind it may not), and the hardware mixer is at 0 dB after `alsa-restore`.
 
 ## Tier 3 — two-unit mesh (the 192.0.2.0/24 rig)
 
 - Discovery: each unit sees the other; `host` comes from the beacon.
 - Routing: intra-server re-group; cross-server reclaim; delegate-to-owning-unit.
+- **Re-route onto an ALREADY-STREAMING source, and assert audio actually arrives** — not just that
+  the player appears in the group. This is the gap that let the silent-join bug live: every earlier
+  test routed first and started the source after, which works. Route a connected player into a live
+  stream and assert a fresh `Stream started` on the client plus a renderer buffer that leaves 0 ms.
+  Membership in the group is not evidence of audio.
 - **Roam is inaudible**: `pad_ms` (emitted silence) unchanged across a handoff — the Phase-2
   measurement, worth re-running whenever the audio path changes.
 - Per-player volume; multiple concurrent groups; 0 xruns under concurrent load.
@@ -64,12 +82,20 @@ the third parties are on.**
 | MA discovers our player | MA → us | appears in MA within seconds of advertising |
 | MA plays to our speaker | MA → us | audio renders; our GUI shows "→ Music Assistant" + track |
 | We adopt a foreign speaker | us → HA Voice PE | joins our source group; audio renders |
+| **Adopt the SAME speaker repeatedly, without releasing** | us → HA Voice PE | every attempt succeeds. A second `adopt` used to be a silent no-op (the dial was still registered) reporting "never connected" about a device whose port was open |
 | We release it | us → HA Voice PE | leaves the group **and the socket closes** (all four steps) |
 | We reclaim our own speaker from MA | us → us | source picker pulls it back (adopt by URL) |
 | Controller into MA | us → MA | group/metadata/controller state arrives; note `supported_commands` |
 | **MA discovery sweep during our playback** | MA → us | ⚠️ known to fail — the arbitration gap. Track until fixed. |
 
 **Re-probe with MA actually playing** to settle whether `supported_commands` gains transport.
+
+**Before blaming ourselves for a third-party speaker, play to it from MA.** The HA Voice PE
+negotiates cleanly with us (handshake, group, `stream/start`, it acknowledges the codec header,
+reports PLAYING, tracks volume) and renders nothing — and it does the same from **Music Assistant**,
+under both FLAC and PCM. That one comparison is the cheapest way to split "our bug" from "their
+device", and running it earlier would have saved a long chase down sample-rate and codec theories
+that were both wrong. Treat it as the first step of any foreign-speaker investigation, not the last.
 
 ## Tier 5 — soak and failure modes
 
