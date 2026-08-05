@@ -44,15 +44,25 @@ const clampVol = (v: number) => Math.max(0, Math.min(100, v));
 // x2 under StrictMode. Reconciling a control's DOM mid-click silently drops the click, so give each
 // a stable DOM by memoizing on the fields it actually shows (paired with identity-stable array +
 // useCallback handler props below).
-const MemoPlayerControls = React.memo(
-  PlayerControls,
-  (a, b) =>
+// Exported for tests: a memo comparator that silently omits a prop produces a control that renders
+// stale, with no error anywhere. That has happened once already (see sourceVolumeUnavailable below),
+// so the predicate is asserted directly rather than only through a rendered component.
+export const playerControlsPropsEqual = (
+  a: React.ComponentProps<typeof PlayerControls>,
+  b: React.ComponentProps<typeof PlayerControls>,
+) =>
     a.stream.id === b.stream.id &&
     a.stream.isPlaying === b.stream.isPlaying &&
     a.stream.volume === b.stream.volume &&
     a.stream.sourceVolume === b.stream.sourceVolume &&
+    a.stream.supportsSourceVolume === b.stream.supportsSourceVolume &&
     a.volume === b.volume &&
     a.sourceVolume === b.sourceVolume &&
+    // Every prop the controls RENDER has to be here, and this one is easy to forget because it
+    // changes the control's enabled state rather than its value. Omitted at first: the source
+    // slider's value tracked the sender correctly while its disabled state stayed frozen, so it
+    // came back from a pause showing the right number and refusing to move.
+    a.sourceVolumeUnavailable === b.sourceVolumeUnavailable &&
     a.canShuffle === b.canShuffle &&
     a.canRepeat === b.canRepeat &&
     a.shuffle === b.shuffle &&
@@ -62,8 +72,9 @@ const MemoPlayerControls = React.memo(
     a.onToggleShuffle === b.onToggleShuffle &&
     a.onCycleRepeat === b.onCycleRepeat &&
     a.onVolumeChange === b.onVolumeChange &&
-    a.onSourceVolumeChange === b.onSourceVolumeChange,
-);
+    a.onSourceVolumeChange === b.onSourceVolumeChange;
+
+const MemoPlayerControls = React.memo(PlayerControls, playerControlsPropsEqual);
 const MemoStreamSelector = React.memo(StreamSelector);
 const MemoSyncedDevices = React.memo(SyncedDevices);
 const MemoClientManager = React.memo(ClientManager);
