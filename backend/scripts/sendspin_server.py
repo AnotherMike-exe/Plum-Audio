@@ -627,6 +627,16 @@ class PlumSendspinServer:
         before = {c.client_id for c in self.server.clients}
         if player_id:
             self.server.register_client_url(player_id, url)
+        # Drop any dial we are already holding for this URL before opening a new one. Without this a
+        # second adopt is a NO-OP: connect_to_client sees a live registration for the URL and does
+        # nothing, so if the speaker went away in the meantime (unplugged, rebooted, or taken back by
+        # its own server) nothing ever re-dials and we time out blaming it — "never connected" about
+        # a speaker whose port is plainly open. Only release_foreign_client cancelled the dial, which
+        # is why releasing first was the accidental workaround.
+        # Measured on .7.204 against a Home Assistant Voice PE, seconds apart on the same URL:
+        # adopt alone -> ok:false; release (whose only extra step is this) then adopt -> ok:true.
+        with contextlib.suppress(Exception):
+            self.server.disconnect_from_client(url)
         self.server.connect_to_client(url, connection_reason=ConnectionReason.PLAYBACK, retry_initial_connection=True)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
