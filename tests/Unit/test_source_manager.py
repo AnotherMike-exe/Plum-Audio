@@ -40,11 +40,18 @@ class FakeProc:
         self.returncode = returncode
 
 
+class FakeServer:
+    """Stand-in for PlumSendspinServer — the reconcile reads `sources` to spot a vanished source."""
+
+    def __init__(self):
+        self.sources = {}
+
+
 class FakeManager(SourceManagerBase):
     """A SourceManagerBase whose sources and daemons are just recorded events."""
 
     def __init__(self, endpoints):
-        super().__init__(server=None, name="fake", settings_file="/does/not/exist")
+        super().__init__(server=FakeServer(), name="fake", settings_file="/does/not/exist")
         self._endpoints = endpoints  # list of {id, name, enabled}
         self.events = []  # ordered log of everything that happened
         self.render_count = 0
@@ -72,9 +79,11 @@ class FakeManager(SourceManagerBase):
 
     async def start_source(self, instance):
         self.events.append(("source_up", instance.instance_id))
+        self.server.sources[instance.source_id] = object()
 
     async def stop_source(self, instance):
         self.events.append(("source_down", instance.instance_id))
+        self.server.sources.pop(instance.source_id, None)
 
     async def update_source(self, instance):
         self.events.append(("source_rename", instance.instance_id, instance.device_name))
@@ -189,3 +198,51 @@ def test_one_broken_endpoint_does_not_stall_the_others():
     assert ("source_up", "1") in mgr.events
     assert ("daemon_spawn", "1") in mgr.events
     assert "1" in mgr._running
+
+
+def test_an_endpoint_whose_source_failed_to_start_is_retried():
+    """A start_source that raises must not leave the endpoint permanently half-up.
+
+    Registering in _running BEFORE awaiting start_source meant a failure left an entry with
+    procs == [], which every later cycle routed to _reap_and_respawn — and that retries DAEMONS,
+    never the source. The endpoint sat with a daemon feeding a FIFO nothing read, logged at DEBUG.
+    """
+    mgr = FakeManager([{"id": "1", "name": "K", "enabled": True}])
+    orig_start = mgr.start_source
+    fail = {"now": True}
+
+    async def start_source(instance):
+        if fail["now"]:
+            raise RuntimeError("boom")
+        await orig_start(instance)
+
+    mgr.start_source = start_source
+
+    reconcile(mgr)
+    assert "1" not in mgr._running, "a failed start must not be recorded as running"
+
+    fail["now"] = False
+    reconcile(mgr)  # the next cycle must genuinely retry the source, not just the daemons
+    assert ("source_up", "1") in mgr.events
+    assert ("daemon_spawn", "1") in mgr.events
+    assert "1" in mgr._running
+
+
+def test_a_vanished_sendspin_source_is_rebuilt():
+    """POST /api/mesh/source/stop pops the source handle without telling the manager.
+
+    The daemons stay healthy, so a reconcile that only inspects running.procs sees nothing wrong —
+    and the endpoint is dead until the container restarts, with no error anywhere.
+    """
+    mgr = FakeManager([{"id": "1", "name": "K", "enabled": True}])
+    reconcile(mgr)
+    mgr.events.clear()
+
+    mgr.server.sources.pop("fake-1")  # what /api/mesh/source/stop does
+    assert mgr._running["1"].procs, "precondition: the daemons are still healthy"
+
+    reconcile(mgr)
+    assert ("source_up", "1") in mgr.events, "the Sendspin source must be rebuilt"
+    # ...and the daemons re-pointed at the fresh FIFO, not left writing into the old one.
+    assert ("daemon_kill", "1") in mgr.events
+    assert ("daemon_spawn", "1") in mgr.events

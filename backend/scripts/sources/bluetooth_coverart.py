@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import io
 import logging
 import os
 import tempfile
@@ -39,7 +38,16 @@ from dbus_next import Variant
 from dbus_next.aio import MessageBus
 from PIL import Image
 
+from .artwork import decode_image
+
 logger = logging.getLogger("plum.bluetooth_coverart")
+
+
+def _read_bytes(path: str) -> bytes:
+    """Read a settled transfer off the loop — obexd writes these to /tmp and they can be large."""
+    with open(path, "rb") as f:
+        return f.read()
+
 
 OBEX_BUS = "org.bluez.obex"
 OBEX_ROOT = "/org/bluez/obex"
@@ -425,11 +433,9 @@ class BluetoothCoverArt:
             return None
 
         try:
-            with open(path, "rb") as f:
-                data = f.read()
-            img = Image.open(io.BytesIO(data))
-            img.load()
-            return img
+            data = await asyncio.to_thread(_read_bytes, path)
         except Exception:  # noqa: BLE001 - partial or corrupt transfer
             logger.debug("[bluetooth-%s] could not read cover art %s", self.instance_id, path, exc_info=True)
             return None
+        # Read and decoded off the loop — this runs in the audio event loop. See sources/artwork.py.
+        return await decode_image(data, what=f"[bluetooth-{self.instance_id}] cover art")

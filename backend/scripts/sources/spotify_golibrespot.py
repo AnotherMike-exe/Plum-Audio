@@ -28,13 +28,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import io
 import logging
 
 import aiohttp
 from PIL import Image
 
 from aiosendspin.models.types import RepeatMode
+
+from .artwork import decode_image
 
 logger = logging.getLogger("plum.spotify_golibrespot")
 
@@ -299,12 +300,11 @@ class SpotifyGoLibrespot:
                 if resp.status != 200:
                     return None
                 data = await resp.read()
-            img = Image.open(io.BytesIO(data))
-            img.load()
-            return img
-        except Exception:  # noqa: BLE001 - malformed/unreachable art shouldn't break the source
+        except Exception:  # noqa: BLE001 - unreachable art shouldn't break the source
             logger.debug("[%s] failed to download artwork %s", self.instance_id, url, exc_info=True)
             return None
+        # Decoded off the loop — this runs in the audio event loop. See sources/artwork.py.
+        return await decode_image(data, what=f"[{self.instance_id}] artwork")
 
     # -- transport control (controller → go-librespot) -----------------------
 

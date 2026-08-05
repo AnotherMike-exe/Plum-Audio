@@ -73,6 +73,7 @@ from player_state import (
 
 import audio_devices
 import unit_identity
+from lifecycle import install_shutdown_handlers
 
 logger = logging.getLogger("plum.sendspin_player")
 
@@ -87,6 +88,7 @@ DAC_BLOCK_FRAMES = 480  # PortAudio callback block (~10 ms @ 48k); small → tig
 DEFAULT_TARGET_BUFFER_MS = 300  # jitter buffer depth we aim to hold ahead of the DAC
 MAX_BUFFER_MS = 2000  # hard cap; drop oldest beyond this if the DAC falls behind
 XRUN_LOG_EVERY = 50  # throttle xrun warnings
+OVERRUN_LOG_EVERY = 50  # ditto for buffer overruns — enqueue() runs once per ~20ms chunk
 
 
 class AlsaRenderer:
@@ -125,6 +127,9 @@ class AlsaRenderer:
         self.starved_frames = 0
         self._playing = False  # gates idle silence from being logged as starvation
         self._xrun_since_log = 0
+        self.overruns = 0  # buffer pinned at MAX_BUFFER_MS — the DAC is behind, we dropped oldest
+        self._overrun_since_log = 0
+        self.dropped_bytes = 0
         # Unconditional silence accounting: every frame we had to pad, whether or not we thought
         # we were "playing". starved_frames alone hides a gap where stream_end/clear flipped us
         # idle (e.g. a cross-server roam) — this is the honest measure of audible dropout.
@@ -222,7 +227,19 @@ class AlsaRenderer:
             if len(self._buf) > self._max_bytes:  # DAC behind → drop oldest to bound latency
                 drop = len(self._buf) - self._max_bytes
                 del self._buf[:drop]
-                logger.warning("jitter buffer over %dms — dropped %d bytes", MAX_BUFFER_MS, drop)
+                self.overruns += 1
+                self.dropped_bytes += drop
+                # Throttled like the xrun path above, and for the same reason: enqueue runs once
+                # per received chunk (~20ms), so a buffer that stays pinned logged ~50 lines/second
+                # at WARNING — which no log level suppresses, and which rotated the lines that
+                # explain the underlying stall out of the file within minutes.
+                self._overrun_since_log += 1
+                if self._overrun_since_log >= OVERRUN_LOG_EVERY:
+                    logger.warning(
+                        "jitter buffer over %dms — %d overruns, %d bytes dropped total",
+                        MAX_BUFFER_MS, self.overruns, self.dropped_bytes,
+                    )
+                    self._overrun_since_log = 0
 
     def flush(self) -> None:
         """Drop buffered audio (server sent stream_clear — discard pending)."""
@@ -892,9 +909,9 @@ async def main() -> None:
     save_active_output(state_file, renderer.device)
     output_watch = asyncio.ensure_future(audio_devices.watch_output_device(_apply_output))
 
-    stop = asyncio.Event()
+    stop = install_shutdown_handlers()
     try:
-        await stop.wait()  # run forever; supervisord manages the process lifecycle
+        await stop.wait()  # run until SIGTERM; supervisord manages the process lifecycle
     except asyncio.CancelledError:
         pass
     finally:

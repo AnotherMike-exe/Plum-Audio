@@ -188,6 +188,18 @@ class SourceManagerBase:
             await self.update_source(instance)
             await self._kill_daemons(running)
             await self._spawn_daemons(running)
+        elif instance.source_id not in self.server.sources:
+            # The DAEMONS are healthy but the Sendspin source is gone — POST /api/mesh/source/stop
+            # pops the handle and stops the feeder without telling us. The old reconcile only ever
+            # looked at running.procs, so it saw a healthy set and did nothing: the daemon kept
+            # writing into a FIFO with no reader and the endpoint was dead until the container
+            # restarted, silently. Rebuild the source and re-point the daemons at the fresh FIFO.
+            logger.warning("[%s] Sendspin source vanished; rebuilding", instance.source_id)
+            await self.start_source(instance)
+            for path in self.fifos(instance):
+                self._ensure_fifo(path)
+            await self._kill_daemons(running)
+            await self._spawn_daemons(running)
         elif not running.procs or any(p.returncode is not None for p in running.procs):
             # No procs at all counts as needing a respawn: a failed launch (binary not
             # installed yet, config not written yet) leaves the set empty, and without this the
@@ -197,8 +209,13 @@ class SourceManagerBase:
     async def _start_instance(self, instance, signature: tuple) -> None:
         """Bring up the Sendspin source, then the daemons that feed it (order matters: FIFO first)."""
         running = _Running(instance, signature)
-        self._running[instance.instance_id] = running
         await self.start_source(instance)
+        # Registered only AFTER start_source returns. Registering first meant a start_source that
+        # raised — caught by _reconcile — left the endpoint in _running with procs == [], which
+        # every later cycle then routed to _reap_and_respawn. That retries DAEMONS, never the
+        # Sendspin source, so the endpoint stayed permanently half-up: a daemon feeding a FIFO
+        # nothing reads, logged at DEBUG. Leaving it unregistered lets the next cycle retry properly.
+        self._running[instance.instance_id] = running
         for path in self.fifos(instance):
             self._ensure_fifo(path)
         await self._spawn_daemons(running)

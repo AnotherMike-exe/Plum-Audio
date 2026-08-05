@@ -50,6 +50,7 @@ import contextlib
 import functools
 import logging
 import os
+import signal
 import time
 
 from aiosendspin.models.types import GoodbyeReason, MediaCommand, has_role_family
@@ -80,6 +81,7 @@ from sources.spotify_golibrespot import SpotifyGoLibrespot
 from sources.spotify_manager import SpotifyManager
 
 import unit_identity
+from lifecycle import install_shutdown_handlers
 
 logger = logging.getLogger("plum.sendspin_server")
 
@@ -1216,9 +1218,9 @@ async def main() -> None:
 
     rename_watch = asyncio.ensure_future(unit_identity.watch_device_name(_apply_unit_name, fallback=env_unit_name))
 
-    stop = asyncio.Event()
+    stop = install_shutdown_handlers()
     try:
-        await stop.wait()  # run forever; supervisord manages the process lifecycle
+        await stop.wait()  # run until SIGTERM; supervisord manages the process lifecycle
     except asyncio.CancelledError:
         pass
     finally:

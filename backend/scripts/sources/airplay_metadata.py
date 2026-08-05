@@ -27,7 +27,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
-import io
 import logging
 import os
 import time
@@ -35,6 +34,8 @@ import xml.etree.ElementTree as ET
 from dataclasses import replace
 
 from PIL import Image
+
+from .artwork import decode_image
 
 logger = logging.getLogger("plum.airplay_metadata")
 
@@ -365,10 +366,14 @@ class AirplayMetadataReader:
             await self._set_artwork(None)  # empty PICT = no art
             return
         try:
-            img = Image.open(io.BytesIO(base64.b64decode(raw_b64)))
-            img.load()
+            raw = base64.b64decode(raw_b64)
         except Exception:  # noqa: BLE001 - malformed art shouldn't break the stream
-            logger.debug("failed to decode PICT artwork", exc_info=True)
+            logger.debug("failed to base64-decode PICT artwork", exc_info=True)
+            return
+        # Decoded on a worker thread: this coroutine shares its loop with SourceFeeder._pump, and
+        # iOS sends 1400x1400 PICTs. See sources/artwork.py.
+        img = await decode_image(raw, what="PICT artwork")
+        if img is None:
             return
         await self._set_artwork(img)
         logger.info("artwork: %dx%d %s", img.width, img.height, img.format or "?")
