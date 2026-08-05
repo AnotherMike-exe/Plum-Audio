@@ -52,6 +52,14 @@ class FakePlayer:
     def __init__(self):
         self.renderer = FakeRenderer()
         self._last_starved_frames = 0
+        self._state: dict = {}
+
+    def pause(self):
+        """What an AirPlay pause looks like from in here: speed 0, no stream_end."""
+        self._state["playback_speed"] = 0
+
+    def resume(self):
+        self._state["playback_speed"] = 1000
 
     health = sendspin_player.SendspinPlayer._health
 
@@ -98,3 +106,40 @@ def test_starvation_is_measured_per_window_not_cumulatively():
     for _ in range(5):
         p.renderer.starved_frames += ERROR_STARVED_FRAMES // 4  # slow drip, under threshold
         assert p.health() is ClientStateType.SYNCHRONIZED
+
+
+def test_a_paused_source_is_not_an_error():
+    """A pause starves the renderer and does NOT look idle from in here.
+
+    An AirPlay pause drops metadata playback_speed to 0 while the group's playback_state stays
+    'playing' and no stream_end fires — so AlsaRenderer._playing stays True and every padded block
+    counts as starvation. Two units reported ~12s of "starvation" on the rig that was a user
+    pressing pause.
+    """
+    p = player()
+    p.pause()
+    p.renderer.starved_frames += ERROR_STARVED_FRAMES * 10
+    assert p.health() is ClientStateType.SYNCHRONIZED
+
+
+def test_a_pause_is_not_charged_to_the_resume():
+    """The baseline must advance THROUGH the pause, or the first check after resume sees it all."""
+    p = player()
+    p.pause()
+    p.renderer.starved_frames += ERROR_STARVED_FRAMES * 10
+    assert p.health() is ClientStateType.SYNCHRONIZED
+
+    p.resume()
+    assert p.health() is ClientStateType.SYNCHRONIZED, "the pause's padding must not resurface"
+
+
+def test_starvation_after_a_resume_still_reports():
+    """Gating on pause must not make a genuinely struggling player silent once it resumes."""
+    p = player()
+    p.pause()
+    p.renderer.starved_frames += ERROR_STARVED_FRAMES * 10
+    p.health()
+
+    p.resume()
+    p.renderer.starved_frames += ERROR_STARVED_FRAMES
+    assert p.health() is ClientStateType.ERROR

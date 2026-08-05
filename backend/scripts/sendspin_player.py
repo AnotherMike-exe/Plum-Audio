@@ -947,6 +947,16 @@ class SendspinPlayer:
         starved = self.renderer.starved_frames
         delta = starved - self._last_starved_frames
         self._last_starved_frames = starved
+
+        # A PAUSED source starves the renderer without anything being broken, and it does not look
+        # idle from in here: an AirPlay pause drops the metadata playback_speed to 0 while the
+        # group's playback_state stays 'playing' and no stream_end fires, so AlsaRenderer._playing
+        # stays True and every padded block counts as starvation. Measured on the rig 2026-08-05 —
+        # ~12s of "starvation" on two units at once that was just the user pressing pause.
+        # The baseline is still advanced above, so the pause's padding is not charged to the resume.
+        if self._state.get("playback_speed") == 0:
+            return ClientStateType.SYNCHRONIZED
+
         return ClientStateType.ERROR if delta >= ERROR_STARVED_FRAMES else ClientStateType.SYNCHRONIZED
 
     async def _send_render_state(self) -> None:
