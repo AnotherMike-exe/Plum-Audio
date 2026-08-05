@@ -52,7 +52,7 @@ import logging
 import os
 import time
 
-from aiosendspin.models.types import AudioCodec, GoodbyeReason, MediaCommand, has_role_family
+from aiosendspin.models.types import GoodbyeReason, MediaCommand, has_role_family
 from aiosendspin.server.audio import AudioFormat
 from aiosendspin.server.group import SendspinGroup
 from aiosendspin.server.push_stream import PushStream, StreamStoppedError
@@ -98,26 +98,6 @@ ANCHOR_PREFIX = "src:"  # server-side group anchor client id namespace
 SOURCE_IDLE_TIMEOUT_S = float(os.environ.get("PLUM_SOURCE_IDLE_TIMEOUT", "300"))
 CONTROLLER_PREFIX = "ctrl:"  # GUI controller client id namespace: "ctrl:<source_id>:<nonce>"
 REACQUIRE_BACKOFF_S = 0.1  # pause before re-acquiring a stopped stream (avoid hot-looping)
-
-# Optional per-unit codec override for PLAYER clients. UNSET IS THE DEFAULT AND IS THE SPEC
-# BEHAVIOUR — leave it unset unless a specific speaker needs rescuing.
-#
-# The spec says a client's `supported_formats` is in priority order, first is preferred, and the
-# server should take "the first match it implements". aiosendspin does exactly that, so by default
-# we honour whatever the device asked for and this override does nothing.
-#
-# It exists because a device can ask for something it cannot actually sustain. A Home Assistant
-# Voice PE lists FLAC first, and on 2026-08-04 it accepted our stream (`Processed new codec header:
-# flac, 48000 Hz, 2 ch, 16-bit`) and then logged "Failed to send audio chunk" on every chunk — an
-# ESP32-S3 decoding FLAC while running four wake-word models with ~73 KB of free heap. The spec's
-# own remedy for that is client-side (`stream/request-format`, which it says exists to "adapt to
-# changing network conditions or CPU constraints"), and this device does not use it.
-#
-# So this is a DELIBERATE DEVIATION: we override a device's stated preference on its behalf. It is
-# scoped, opt-in and per-unit rather than global, and it can only select a codec the client itself
-# advertised — set_preferred_format() validates against the client's own list and refuses anything
-# it did not offer. Prefer fixing the device, or getting it to request a format, over setting this.
-PLAYER_CODEC_OVERRIDE = (os.environ.get("PLUM_PLAYER_CODEC") or "").strip().lower() or None
 
 
 def _bytes_per_frame(fmt: AudioFormat) -> int:
@@ -443,43 +423,6 @@ class PlumSendspinServer:
             handle.group.stop_stream()
         logger.info("[%s] source stopped", source_id)
 
-    def _apply_codec_override(self, player_id: str) -> None:
-        """Apply PLUM_PLAYER_CODEC to a player, if one is configured. No-op by default.
-
-        Uses the library's public set_preferred_format(codec=...), which resolves the first format
-        for that codec IN THE CLIENT'S OWN PRIORITY ORDER and refuses a codec the client never
-        advertised — so we can only ever pick something the device said it supports. The change is
-        applied mid-stream (on_role_format_changed + a deferred stream/start with a fresh
-        codec_header), so it does not need a reconnect.
-        """
-        if PLAYER_CODEC_OVERRIDE is None or self.server is None:
-            return
-        try:
-            codec = AudioCodec(PLAYER_CODEC_OVERRIDE)
-        except ValueError:
-            logger.warning(
-                "PLUM_PLAYER_CODEC=%r is not a codec (%s) — ignoring, honouring the client's order",
-                PLAYER_CODEC_OVERRIDE,
-                ", ".join(c.value for c in AudioCodec),
-            )
-            return
-
-        client = self.server.get_client(player_id)
-        if client is None or not client.is_connected:
-            return
-        for role in client.roles_by_family("player"):
-            if not isinstance(role, PlayerV1Role):
-                continue
-            if role.set_preferred_format(None, codec):
-                logger.info("[codec] %s -> %s (override)", player_id, codec.value)
-            else:
-                # The device never offered it, or we cannot encode it. Leave it on its own choice.
-                logger.warning(
-                    "[codec] %s does not support %s — leaving it on its advertised preference",
-                    player_id,
-                    codec.value,
-                )
-
     async def attach_player(self, source_id: str, player_id: str) -> None:
         """Route a connected player into a source's group.
 
@@ -497,8 +440,6 @@ class PlumSendspinServer:
         if player.group is not None:
             await player.group.remove_client(player)
         await handle.group.add_client(player)
-        # Before the stream is (re)acquired, so the new stream is built with the right encoder.
-        self._apply_codec_override(player_id)
         # add_client alone does not put an already-connected player into a stream that is already
         # running — see SourceFeeder.refresh_stream. Without this the player joins the group and
         # stays silent.
