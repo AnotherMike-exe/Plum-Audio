@@ -29,6 +29,20 @@ BEACON_VERSION = 1
 DEFAULT_INTERVAL_S = 2.0
 DEFAULT_TTL_S = 8.0  # a peer unheard for this long is dropped (≈4 missed beacons)
 BROADCAST_ADDR = "255.255.255.255"
+# A ceiling on the peer table. Far above any real rig (four units today), but the beacon is
+# unauthenticated broadcast — without it, anything on the segment can grow this without limit and
+# each entry costs a concurrent HTTP fetch per aggregator tick, inside the audio event loop.
+MAX_PEERS = 64
+
+
+def _valid_port(value, fallback: int) -> int:
+    """A port from the wire, or the fallback when absent. Raises on anything non-numeric."""
+    if value is None:
+        return fallback
+    port = int(value)
+    if not 1 <= port <= 65535:
+        raise ValueError(f"port out of range: {port}")
+    return port
 
 
 @dataclass
@@ -118,7 +132,8 @@ class MeshDiscovery:
     def peers(self) -> list[Peer]:
         """Live peers (excludes self and expired entries)."""
         now = time.monotonic()
-        return [p for p in self._peers.values() if now - p.last_seen <= self.ttl_s]
+        self._prune(now)
+        return list(self._peers.values())
 
     def get_peer(self, unit_id: str) -> Peer | None:
         peer = self._peers.get(unit_id)
@@ -139,6 +154,17 @@ class MeshDiscovery:
             }
         ).encode("utf-8")
 
+    def _prune(self, now: float) -> None:
+        """Drop expired entries. peers() only FILTERED by TTL, so the table itself never shrank.
+
+        On a normal LAN that is bounded by the number of real units. It is not bounded at all
+        against the wire: the beacon is unauthenticated UDP broadcast, so anything on the segment
+        can mint peers faster than they expire, and each one becomes a concurrent HTTP fetch from
+        the aggregator — which runs in the audio event loop.
+        """
+        for unit_id in [u for u, p in self._peers.items() if now - p.last_seen > self.ttl_s]:
+            del self._peers[unit_id]
+
     def _on_datagram(self, data: bytes, addr) -> None:  # noqa: ANN001
         try:
             msg = json.loads(data.decode("utf-8"))
@@ -147,19 +173,38 @@ class MeshDiscovery:
         if msg.get("v") != BEACON_VERSION:
             return
         unit_id = msg.get("unit_id")
-        if not unit_id or unit_id == self.unit_id:
+        if not isinstance(unit_id, str) or not unit_id or unit_id == self.unit_id:
             return  # ignore malformed and our own beacon
+        try:
+            # int() on a non-numeric value raises ValueError/TypeError, which escaped into
+            # datagram_received and reached the loop exception handler — one traceback per packet.
+            server_port = _valid_port(msg.get("server_port"), self.server_port)
+            player_port = _valid_port(msg.get("player_port"), self.player_port)
+        except (TypeError, ValueError):
+            logger.debug("ignoring beacon with bad ports from %s", addr[0])
+            return
+
+        now = time.monotonic()
         prev = self._peers.get(unit_id)
+        if prev is None:
+            self._prune(now)
+            if len(self._peers) >= MAX_PEERS:
+                logger.warning(
+                    "peer table full (%d); ignoring new unit %s from %s", MAX_PEERS, unit_id, addr[0]
+                )
+                return
+
+        name = msg.get("name")
         self._peers[unit_id] = Peer(
             unit_id=unit_id,
-            name=msg.get("name", unit_id),
+            name=name if isinstance(name, str) and name else unit_id,
             host=addr[0],
-            server_port=int(msg.get("server_port", self.server_port)),
-            player_port=int(msg.get("player_port", self.player_port)),
-            last_seen=time.monotonic(),
+            server_port=server_port,
+            player_port=player_port,
+            last_seen=now,
         )
         if prev is None:
-            logger.info("discovered peer %s (%s) at %s", unit_id, msg.get("name"), addr[0])
+            logger.info("discovered peer %s (%s) at %s", unit_id, name, addr[0])
 
     async def _broadcast_loop(self) -> None:
         while not self._stop.is_set():

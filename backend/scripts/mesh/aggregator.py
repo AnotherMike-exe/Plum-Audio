@@ -49,6 +49,8 @@ def _detect_local_host() -> str | None:
 FetchSnapshot = Callable[[Peer], Awaitable["dict | None"]]
 
 DEFAULT_INTERVAL_S = 2.0
+# Comfortably above any real rig, so normal operation is still one round trip for everyone at once.
+MAX_CONCURRENT_FETCHES = 16
 
 
 class DataAggregator:
@@ -106,7 +108,17 @@ class DataAggregator:
         """Rebuild the view now: local snapshot + every reachable peer's snapshot."""
         units: list[UnitSnapshot] = [self.local_snapshot()]
         peers = self._discovery.peers()
-        results = await asyncio.gather(*(self._fetch_peer(p) for p in peers))
+        # Bounded fan-out. This runs in the AUDIO event loop every interval_s, so the number of
+        # sockets it opens at once has to be a property of our code, not of how many beacons
+        # happen to have arrived — the beacon is unauthenticated broadcast. Discovery caps the
+        # table; this caps the concurrency, and the two together bound the work per tick.
+        sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
+
+        async def fetch(peer: Peer) -> UnitSnapshot | None:
+            async with sem:
+                return await self._fetch_peer(peer)
+
+        results = await asyncio.gather(*(fetch(p) for p in peers))
         units.extend(u for u in results if u is not None)
         self._view = MeshView(units=units)
         return self._view
