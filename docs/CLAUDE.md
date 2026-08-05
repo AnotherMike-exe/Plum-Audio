@@ -391,6 +391,33 @@ separate frontend container → **nginx inside the unit container**; Tailwind CD
 
 ---
 
+## Open — carried into the next session (as of 2026-08-04)
+
+Ordered by what bites first. Delete an entry when it is genuinely done, not when it is started.
+
+1. **`.201.133` and `.113` are running a build WITHOUT the silent-join fix.** They will put a player
+   in a group and play nothing whenever the source is already streaming — the bug that cost most of
+   2026-08-04. Only the two VLAN-7 units (`.7.204`, `.7.122`) are current. Fix: rebuild from HEAD
+   (do NOT reuse `dist/plum-audio-266e5fe-*` — that tag names a commit since reverted, and while its
+   code is equivalent apart from an inert override, the tag lies) and
+   `docker/deploy.sh 192.0.2.10 && docker/deploy.sh 192.0.2.11`. **Needs a machine that
+   can route to 192.0.2.0/24** — it was unreachable from the dev laptop's network position on
+   2026-08-04, which is why it was not done then.
+2. **`configure-audio-hat.sh --keep-onboard` and the no-`dtoverlay` fallback have never run on real
+   hardware.** Both are unit-tested against config.txt fixtures
+   (`tests/Unit/test_configure_audio_hat.py`) and the main path is verified across four reboots on
+   `.7.204`, but a unit with no HAT has never been through the script. Exercise before relying on it.
+3. **`.7.204` has no 3.5 mm jack** because the HAT block sets `dtparam=audio=off`. That is correct
+   and deliberate; re-run with `--keep-onboard` if the jack should be listed alongside the HAT.
+4. **`PLUM_SOURCE_IDLE_TIMEOUT` is 300 s**, so a paused AirPlay session keeps its stream for five
+   minutes before announcing `stopped`. Reported as "the stream did not die"; it is the configured
+   default, not a hang. Lower it if that is the wrong feel.
+5. **The GUI has never been visually reviewed beyond the output picker.** The Playback tab was
+   confirmed in a browser on 2026-08-04; the rest of Settings has only ever been exercised through
+   the API and the bundle.
+
+---
+
 ## Resources
 - Sendspin spec: https://www.sendspin-audio.com/spec/ · Org: https://github.com/Sendspin
 - `aiosendspin`: https://github.com/Sendspin/aiosendspin
