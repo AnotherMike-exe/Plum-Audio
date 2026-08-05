@@ -1,6 +1,7 @@
-import React, {useEffect, useRef, useState} from 'react';
+import React from 'react';
 import type {Client, Stream} from '../types';
 import {GroupVolumeControl} from './GroupVolumeControl';
+import {StreamPickerButton} from './StreamPickerButton';
 import { Icon } from './Icon';
 
 interface ClientManagerProps {
@@ -24,66 +25,10 @@ const ClientDevice: React.FC<{
     onStreamChange: (clientId: string, streamId: string | null) => void;
     federationEnabled?: boolean;
 }> = ({client, streams, onVolumeChange, onStreamChange, federationEnabled = false}) => {
-    const [isSelectorOpen, setIsSelectorOpen] = useState(false);
-    const wrapperRef = useRef<HTMLDivElement>(null);
-
-    useEffect(() => {
-        const handleClickOutside = (event: MouseEvent) => {
-            if (wrapperRef.current && !wrapperRef.current.contains(event.target as Node)) {
-                setIsSelectorOpen(false);
-            }
-        };
-        document.addEventListener('mousedown', handleClickOutside);
-        return () => {
-            document.removeEventListener('mousedown', handleClickOutside);
-        };
-    }, [wrapperRef]);
-
-    const handleSelectStream = (streamId: string | null) => {
-        onStreamChange(client.id, streamId);
-        setIsSelectorOpen(false);
-    };
-
-    // Find the none stream for this client's server
-    const getNoneStreamForClient = (): string | null => {
-        if (!client.serverId) return null;
-        const noneStream = streams.find(s =>
-            s.serverId === client.serverId && s.id.includes('none-')
-        );
-        return noneStream?.id || null;
-    };
-
-    const handleSelectNone = () => {
-        const noneStreamId = getNoneStreamForClient();
-        onStreamChange(client.id, noneStreamId);
-        setIsSelectorOpen(false);
-    };
-
     const volumePercentage = client.volume;
     const sliderStyle = {
         background: `linear-gradient(to right, var(--accent-color) ${volumePercentage}%, var(--border-color) ${volumePercentage}%)`
     };
-
-    // Filter out "none" streams from dropdown options (they're used internally but shown via "None" button)
-    const selectableStreams = React.useMemo(() => {
-        return streams.filter(s => !s.id.includes('none-'));
-    }, [streams]);
-
-    const groupedStreams = React.useMemo(() => {
-        if (!federationEnabled) {
-            return { ungrouped: selectableStreams };
-        }
-
-        const groups: { [serverName: string]: Stream[] } = {};
-        selectableStreams.forEach(stream => {
-            const serverName = stream.serverName || 'Unknown Server';
-            if (!groups[serverName]) {
-                groups[serverName] = [];
-            }
-            groups[serverName].push(stream);
-        });
-        return groups;
-    }, [selectableStreams, federationEnabled]);
 
     return (
         <div className="flex items-center gap-3">
@@ -100,60 +45,13 @@ const ClientDevice: React.FC<{
                     style={sliderStyle}
                 />
             </div>
-            <div ref={wrapperRef} className="relative">
-                <button
-                    onClick={() => setIsSelectorOpen(!isSelectorOpen)}
-                    className="w-8 h-8 flex items-center justify-center rounded-full text-[var(--text-secondary)] bg-[var(--border-color)] hover:bg-[var(--bg-secondary-hover)] transition-colors"
-                    title="Change Stream"
-                >
-                    <Icon name="tower-broadcast" style={{ color: 'inherit' }} />
-                </button>
-                {isSelectorOpen && (
-                    <div
-                        className="absolute z-10 bottom-full right-0 mb-2 w-48 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-lg shadow-xl">
-                        <ul className="py-1 text-sm text-[var(--text-primary)] max-h-40 overflow-auto">
-                            <li role="option">
-                                <button
-                                    onClick={handleSelectNone}
-                                    className="block w-full text-left px-3 py-2 text-[var(--text-secondary)] hover:bg-[var(--bg-secondary-hover)]"
-                                >
-                                    None
-                                </button>
-                            </li>
-                            {federationEnabled ? (
-                                Object.entries(groupedStreams).map(([serverName, serverStreams]) => (
-                                    <React.Fragment key={serverName}>
-                                        <li className="px-3 py-1 text-xs font-semibold text-[var(--text-secondary)] uppercase tracking-wider border-t border-[var(--border-color)] mt-1 first:mt-0 first:border-0">
-                                            {serverName}
-                                        </li>
-                                        {serverStreams.map(s => (
-                                            <li key={s.id} role="option" aria-selected={client.currentStreamId === s.id}>
-                                                <button
-                                                    onClick={() => handleSelectStream(s.id)}
-                                                    className={`block w-full text-left px-3 py-2 hover:bg-[var(--bg-secondary-hover)] transition-colors truncate ${client.currentStreamId === s.id ? 'font-semibold text-[var(--accent-color)]' : ''}`}
-                                                >
-                                                    {s.name}
-                                                </button>
-                                            </li>
-                                        ))}
-                                    </React.Fragment>
-                                ))
-                            ) : (
-                                selectableStreams.map(s => (
-                                    <li key={s.id} role="option" aria-selected={client.currentStreamId === s.id}>
-                                        <button
-                                            onClick={() => handleSelectStream(s.id)}
-                                            className={`block w-full text-left px-3 py-2 hover:bg-[var(--bg-secondary-hover)] transition-colors truncate ${client.currentStreamId === s.id ? 'font-semibold text-[var(--accent-color)]' : ''}`}
-                                        >
-                                            {s.name}
-                                        </button>
-                                    </li>
-                                ))
-                            )}
-                        </ul>
-                    </div>
-                )}
-            </div>
+            <StreamPickerButton
+                streams={streams}
+                currentStreamId={client.currentStreamId}
+                onSelect={(streamId) => onStreamChange(client.id, streamId)}
+                federationEnabled={federationEnabled}
+                title={`Change ${client.name}'s stream`}
+            />
         </div>
     );
 };
@@ -274,15 +172,31 @@ export const ClientManager: React.FC<ClientManagerProps> = ({
                                         </span>
                                     )}
                                 </span>
-                                <button
-                                    onClick={() => onStreamChange(client.id, myClientStreamId)}
-                                    disabled={!myClientStreamId}
-                                    className="text-sm bg-[var(--accent-color)] accent-button-text font-bold py-1 px-3 rounded-full hover:bg-[var(--accent-color-hover)] transition-colors disabled:bg-gray-500 disabled:cursor-not-allowed flex-shrink-0"
-                                    title={myClientStreamId ? 'Join your current stream' : 'Select a stream first'}
-                                >
-                                    <Icon name="plus" className="mr-1" />
-                                    Join Stream
-                                </button>
+                                <div className="flex items-center gap-2 flex-shrink-0">
+                                    <button
+                                        onClick={() => onStreamChange(client.id, myClientStreamId)}
+                                        disabled={!myClientStreamId}
+                                        className="text-sm bg-[var(--accent-color)] accent-button-text font-bold py-1 px-3 rounded-full hover:bg-[var(--accent-color-hover)] transition-colors disabled:bg-gray-500 disabled:cursor-not-allowed"
+                                        title={myClientStreamId ? 'Join your current stream' : 'Select a stream first'}
+                                    >
+                                        <Icon name="plus" className="mr-1" />
+                                        Join Stream
+                                    </button>
+                                    {/* Join Stream is the one-click case: bring it to what THIS page is
+                                        playing. The picker is the general one — send an idle speaker to
+                                        any source anyone is feeding, including one this unit isn't on.
+                                        The mesh router already supports it: an idle player is in no
+                                        unit's group, so it is reclaimed by the listener URL from its own
+                                        unit's self-report (mesh/router.py route_player). Without this,
+                                        an idle unit's GUI could route nothing at all. */}
+                                    <StreamPickerButton
+                                        streams={streams}
+                                        currentStreamId={null}
+                                        onSelect={(streamId) => onStreamChange(client.id, streamId)}
+                                        federationEnabled={federationEnabled}
+                                        title={`Send ${client.name} to a stream`}
+                                    />
+                                </div>
                             </div>
                         ))}
                     </div>

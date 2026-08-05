@@ -147,11 +147,24 @@ export default function MeshApp(): React.ReactElement {
   const albumArtColors = useThemeSettings(settings, featured?.currentTrack.albumArtUrl ?? null);
 
   // The PICKER lists only sources a sender is actually using (plus whatever we're on, so a stream
-  // going idle can't yank itself out from under the selection). Device lists still get the full
-  // set — a peer parked on an idle source must stay visible and reachable.
+  // going idle can't yank itself out from under the selection).
   const listedStreams = useMemo(
     () => model.streams.filter((s) => s.active || s.id === featuredId),
     [model.streams, featuredId],
+  );
+
+  // What a per-DEVICE picker may offer: strictly the sources someone is streaming to right now.
+  // A source exists for every configured endpoint whether or not anything is playing to it, so the
+  // unfiltered list showed a device's dropdown full of Bluetooth/Spotify/AirPlay entries minutes
+  // after the phone disconnected — sources the top picker had already (correctly) dropped. Routing
+  // to an idle source is legal and silent, which is exactly why it reads as a ghost. The featured
+  // stream is NOT force-included here (unlike the top picker): a device picker's selection is that
+  // device's own membership, and viewClients already reports a device on a quiet source as idle.
+  // Foreign sessions are excluded — a stream we merely observe on someone else's server has no
+  // route we could perform (moveClient bails on FOREIGN_PREFIX).
+  const routableStreams = useMemo(
+    () => model.streams.filter((s) => s.active && !s.id.startsWith(FOREIGN_PREFIX)),
+    [model.streams],
   );
 
   // What each device READS AS. A player parked on a source nobody is streaming to isn't "on
@@ -193,6 +206,8 @@ export default function MeshApp(): React.ReactElement {
   const stableStreams = useMemo(() => model.streams, [streamsSig]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const stablePickable = useMemo(() => listedStreams, [listedStreams.map((s) => `${s.id}|${s.name}`).join(';')]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const stableRoutable = useMemo(() => routableStreams, [routableStreams.map((s) => `${s.id}|${s.name}`).join(';')]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const stableClients = useMemo(() => viewClients, [clientsSig]);
 
@@ -458,7 +473,7 @@ export default function MeshApp(): React.ReactElement {
               </div>
               <MemoSyncedDevices
                 clients={syncedClients}
-                streams={stableStreams}
+                streams={stableRoutable}
                 onVolumeChange={onClientVolume}
                 onStreamChange={onClientStreamChange}
                 onGroupVolumeAdjust={syncedGroupVolumeAdjust}
@@ -504,7 +519,7 @@ export default function MeshApp(): React.ReactElement {
             </h2>
             <MemoClientManager
               clients={otherClients}
-              streams={stableStreams}
+              streams={stableRoutable}
               myClientStreamId={featuredId}
               onVolumeChange={onClientVolume}
               onStreamChange={onClientStreamChange}
