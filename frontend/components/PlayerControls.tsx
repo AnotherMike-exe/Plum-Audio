@@ -9,9 +9,13 @@ interface PlayerControlsProps {
     volume: number;
     onVolumeChange: (volume: number) => void;
     // Source volume: the level on the SENDING device (AirPlay/Bluetooth phone, Spotify Connect).
-    // Both undefined when this source has no such control — the slider is then hidden, not dead.
+    // Undefined when this source has never reported one — only then is the row hidden.
     sourceVolume?: number;
     onSourceVolumeChange?: (volume: number) => void;
+    // The sender is not currently reachable, so the level is a last-known value and cannot be
+    // driven. The row STAYS, disabled: a control that vanishes mid-session reads as a bug, and an
+    // AirPlay pause long enough for iOS to drop the RAOP session does exactly that. See MeshApp.
+    sourceVolumeUnavailable?: boolean;
     onPlayPause: () => void;
     onSkip: (direction: 'next' | 'prev') => void;
     // Repeat/shuffle are shown ONLY when the source advertises them (canShuffle/canRepeat, derived
@@ -79,6 +83,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
                                                                   onVolumeChange,
                                                                   sourceVolume,
                                                                   onSourceVolumeChange,
+                                                                  sourceVolumeUnavailable,
                                                                   onPlayPause,
                                                                   onSkip,
                                                                   canShuffle,
@@ -93,11 +98,14 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
         background: `linear-gradient(to right, var(--accent-color) ${volumePercentage}%, var(--border-color) ${volumePercentage}%)`
     };
 
-    // Source volume slider style (uses a different color to distinguish)
+    // Source volume slider style (uses a different color to distinguish). The row is shown whenever
+    // a level is KNOWN — `sourceVolumeUnavailable` only greys it out, so a sender that goes away
+    // mid-session leaves the control in place instead of collapsing the layout under the user.
     const hasSourceVolume = sourceVolume !== undefined && onSourceVolumeChange !== undefined;
     const sourceVolumePercentage = sourceVolume ?? 100;
+    const sourceTrackColor = sourceVolumeUnavailable ? 'var(--border-color)' : 'var(--text-secondary)';
     const sourceSliderStyle = {
-        background: `linear-gradient(to right, var(--text-secondary) ${sourceVolumePercentage}%, var(--border-color) ${sourceVolumePercentage}%)`
+        background: `linear-gradient(to right, ${sourceTrackColor} ${sourceVolumePercentage}%, var(--border-color) ${sourceVolumePercentage}%)`
     };
 
     return (
@@ -134,19 +142,31 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
             {/* On desktop: flex-1 to fill remaining space (same as text area above) */}
             <div className="flex flex-col gap-2 w-full max-w-xs order-1 md:order-2 md:flex-1 md:max-w-none">
                 {/* Source volume — the sending device's own level (AirPlay/Bluetooth phone, Spotify
-                    Connect). Hidden entirely when the source can't report or accept one. */}
+                    Connect). Hidden only when this source has NEVER reported one; once a level is
+                    known the row stays put and merely greys out while the sender is away. */}
                 {hasSourceVolume && (
-                    <div className="flex items-center gap-3 w-full">
+                    <div
+                        className={`flex items-center gap-3 w-full transition-opacity ${sourceVolumeUnavailable ? 'opacity-40' : ''}`}
+                        title={sourceVolumeUnavailable ? 'The sending device is not connected — last known level' : undefined}
+                    >
                         <Icon name="tower-broadcast" className="text-[var(--text-secondary)] w-6 text-center flex-shrink-0" style={{ color: 'inherit' }} aria-hidden />
                         <input
                             type="range"
                             min="0"
                             max="100"
                             value={sourceVolume}
-                            onChange={(e) => onSourceVolumeChange(Number(e.target.value))}
-                            className="w-full h-2 rounded-lg appearance-none cursor-pointer volume-slider"
+                            disabled={sourceVolumeUnavailable}
+                            // Guarded as well as disabled: `disabled` stops a user dragging it, but
+                            // it does not stop a change event reaching the handler, and driving a
+                            // level at a sender that is not there would be silently discarded.
+                            onChange={(e) => {
+                                if (sourceVolumeUnavailable) return;
+                                onSourceVolumeChange(Number(e.target.value));
+                            }}
+                            className={`w-full h-2 rounded-lg appearance-none volume-slider ${sourceVolumeUnavailable ? 'cursor-not-allowed' : 'cursor-pointer'}`}
                             style={sourceSliderStyle}
                             aria-label="Source volume control"
+                            aria-disabled={sourceVolumeUnavailable}
                         />
                         <span className="text-xs text-[var(--text-secondary)] w-8 text-right flex-shrink-0">{sourceVolume}%</span>
                     </div>

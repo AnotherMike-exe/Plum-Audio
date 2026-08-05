@@ -455,12 +455,19 @@ export default function MeshApp(): React.ReactElement {
             <div className="flex-grow flex flex-col">
               <div className="space-y-6">
                 <NowPlaying stream={featured} canSeek={false} onAlbumArtClick={() => setVisualizerOpen(true)} />
+                {/* Source volume: the VALUE is passed whenever one is known, and
+                    `supportsSourceVolume` only decides whether it can be DRIVEN. Gating the value
+                    itself hid the whole row the moment a sender went away — and iOS drops the RAOP
+                    session on a long enough AirPlay pause, so pausing made the slider disappear on
+                    every unit's GUI at once and reappear on resume. The backend caches the last
+                    level, so the row now greys out in place instead of collapsing the layout. */}
                 <MemoPlayerControls
                   stream={featured}
                   volume={myVolume}
                   onVolumeChange={onMyVolume}
-                  sourceVolume={featured.supportsSourceVolume ? featured.sourceVolume : undefined}
-                  onSourceVolumeChange={featured.supportsSourceVolume ? onSourceVolume : undefined}
+                  sourceVolume={featured.sourceVolume}
+                  onSourceVolumeChange={onSourceVolume}
+                  sourceVolumeUnavailable={!featured.supportsSourceVolume}
                   onPlayPause={onPlayPause}
                   onSkip={onSkip}
                   canShuffle={canShuffle}
