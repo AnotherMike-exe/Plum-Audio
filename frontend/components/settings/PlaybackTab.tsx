@@ -1,7 +1,6 @@
 import React, {useState, useEffect} from 'react';
 import type {Settings as SettingsType} from '../../types';
 import {Switch} from '../Switch';
-import {OutputDeviceSection} from './OutputDeviceSection';
 
 interface PlaybackTabProps {
     settings: SettingsType;
@@ -77,10 +76,8 @@ export const PlaybackTab: React.FC<PlaybackTabProps> = ({settings, onSettingsCha
 
     return (
         <div className="space-y-6">
-            {/* Where the audio comes OUT, before the rules about where it comes FROM. */}
-            <OutputDeviceSection />
-
-            <div className="pt-4 border-t border-[var(--border-color)]">
+            {/* Where audio comes FROM. Where it comes OUT is the Audio tab. */}
+            <div>
                 <h3 className="text-base font-semibold text-[var(--text-primary)] mb-1">
                     Playback Routing
                 </h3>

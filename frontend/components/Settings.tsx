@@ -2,6 +2,7 @@ import React, {useState} from 'react';
 import type {Settings as SettingsType} from '../types';
 import {TabBar, type Tab} from './TabBar';
 import {IntegrationsTab} from './settings/IntegrationsTab';
+import {AudioTab} from './settings/AudioTab';
 import {PlaybackTab} from './settings/PlaybackTab';
 import {ThemeTab} from './settings/ThemeTab';
 import {VisualizerTab} from './settings/VisualizerTab';
@@ -18,11 +19,15 @@ interface SettingsProps {
 // Phase 3: Integrations is surfaced with only the sources whose backend exists (AirPlay, Spotify
 // and Bluetooth today — see the enabledSources prop below). A source whose backend lands but which
 // is NOT added to that array is invisible in Settings with no other symptom, so add it here as part
-// of the slice, not afterwards. Audio returns when its service lands; its render
-// case stays wired so re-enabling is just re-adding the array entry. Playback (auto-route-on-connect
-// + auto-follow, mesh/follow.py) landed — re-added here.
+// of the slice, not afterwards. Playback (auto-route-on-connect + auto-follow, mesh/follow.py)
+// landed — re-added here.
+//
+// Tab ORDER is the layout, and the overlay opens on the leftmost tab: Integrations first (what this
+// unit can receive), then Audio (what it plays through), then Playback (the rules about which
+// source it picks up), then presentation.
 const tabs: Tab[] = [
     {id: 'integrations', label: 'Integrations', icon: 'puzzle-piece'},
+    {id: 'audio', label: 'Audio', icon: 'volume-high'},
     {id: 'playback', label: 'Playback', icon: 'network-wired'},
     {id: 'theme', label: 'Theme', icon: 'palette'},
     {id: 'visualizer', label: 'Visualizer', icon: 'waveform'},
@@ -30,12 +35,14 @@ const tabs: Tab[] = [
 ];
 
 export const Settings: React.FC<SettingsProps> = ({settings, onSettingsChange, onClose, initialTab}) => {
-    const [activeTab, setActiveTab] = useState(initialTab || 'theme');
+    const [activeTab, setActiveTab] = useState(initialTab || tabs[0].id);
 
     const renderTabContent = () => {
         switch (activeTab) {
             case 'integrations':
                 return <IntegrationsTab settings={settings} onSettingsChange={onSettingsChange} enabledSources={['airplay', 'spotify', 'bluetooth']} />;
+            case 'audio':
+                return <AudioTab settings={settings} onSettingsChange={onSettingsChange} />;
             case 'playback':
                 return <PlaybackTab settings={settings} onSettingsChange={onSettingsChange} />;
             case 'theme':
