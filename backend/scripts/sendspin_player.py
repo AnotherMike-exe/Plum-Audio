@@ -91,11 +91,12 @@ DEFAULT_TARGET_BUFFER_MS = 300  # jitter buffer depth we aim to hold ahead of th
 MAX_BUFFER_MS = 2000  # hard cap; drop oldest beyond this if the DAC falls behind
 XRUN_LOG_EVERY = 50  # throttle xrun warnings
 OVERRUN_LOG_EVERY = 50  # ditto for buffer overruns — enqueue() runs once per ~20ms chunk
-# Padded frames since the last state report that mean "we are not keeping up", i.e. report
-# client/state error. ~50ms at 44.1k: comfortably past a single scheduling hiccup, well under
-# anything a listener would call continuous. The spec's example of a client that cannot maintain
-# sync is exactly buffer underrun, and reporting it is how a server learns to send more lead time.
-ERROR_PAD_FRAMES = DEFAULT_RATE // 20
+# Frames STARVED (padded while the renderer believed it was playing) since the last state report
+# that mean "we are not keeping up", i.e. report client/state error. ~50ms at 44.1k: comfortably
+# past a single scheduling hiccup, well under anything a listener would call continuous. The spec's
+# example of a client that cannot maintain sync is exactly buffer underrun, and reporting it is how
+# a server learns to send more lead time. See _health for why this is not pad_frames.
+ERROR_STARVED_FRAMES = DEFAULT_RATE // 20
 HEALTH_POLL_S = 3.0  # how often we re-evaluate whether to report client/state error
 
 
@@ -382,7 +383,7 @@ class SendspinPlayer:
         self._save_task: asyncio.Task | None = None
         # Health reporting: pad_frames at the last client/state, so _health measures the delta
         # rather than a lifetime total that would pin us at error forever after one dropout.
-        self._last_pad_frames = 0
+        self._last_starved_frames = 0
         self._last_reported_state = ClientStateType.SYNCHRONIZED
         # Spec: persist the server that most recently had us playing. Loaded so a restart does not
         # re-write the same value, and so the id survives for the arbitration that will use it.
@@ -933,12 +934,20 @@ class SendspinPlayer:
         AlsaRenderer has counted xruns, starvations and pad_frames since Phase 1 and none of it had
         ever left the process: _send_render_state hardcoded SYNCHRONIZED, so a speaker that was
         audibly dropping out reported itself perfectly healthy to Plum's server and to any foreign
-        one. Measured on the padding actually emitted, which is the honest signal (see pad_frames).
+        one.
+
+        Measured on `starved_frames`, NOT `pad_frames`. Both count padded silence, but only
+        starved_frames is gated on the renderer actually believing it is playing — pad_frames is
+        deliberately unconditional, so an ATTACHED BUT IDLE player (no stream flowing, callback
+        padding every block) accumulates a full second of it per second and trips any threshold
+        instantly. Using pad_frames here reported `error` for every idle speaker in the mesh, which
+        is both wrong and exactly the kind of false signal that teaches you to ignore the real one.
+        Caught on hardware 2026-08-05: `state=error` with `starv=0`.
         """
-        padded = self.renderer.pad_frames
-        delta = padded - self._last_pad_frames
-        self._last_pad_frames = padded
-        return ClientStateType.ERROR if delta >= ERROR_PAD_FRAMES else ClientStateType.SYNCHRONIZED
+        starved = self.renderer.starved_frames
+        delta = starved - self._last_starved_frames
+        self._last_starved_frames = starved
+        return ClientStateType.ERROR if delta >= ERROR_STARVED_FRAMES else ClientStateType.SYNCHRONIZED
 
     async def _send_render_state(self) -> None:
         with contextlib.suppress(Exception):  # a state report must never break the render path
