@@ -26,6 +26,7 @@ from flask import Blueprint, jsonify, request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/ on path
 import audio_devices  # noqa: E402  — the sentinel's spelling has exactly one owner
+import unit_identity  # noqa: E402  — owns the per-unit token behind the default names
 
 logger = logging.getLogger(__name__)
 
@@ -77,9 +78,16 @@ def sanitize_device_name(name: Any) -> str | None:
 # attacker-controlled, but the layering is deliberate and this is the cheap place to hold it.
 #
 # A rename in the GUI still wins, and still only has to be written once.
+# And when PLUM_UNIT_NAME is unset too — a hand-run `docker compose up`, or any path that is not
+# docker/deploy.sh — the bare literals would again be identical on every unit. unit_identity derives a
+# short stable per-unit token (the Pi's SoC serial, else its lowest physical MAC) so the floor is
+# "Plum Sendspin EE12" rather than a name several units share. Empty token = bare literal: unknown
+# beats invented.
 _UNIT_NAME_ENV = sanitize_device_name(os.environ.get("PLUM_UNIT_NAME"))
-DEFAULT_DEVICE_NAME = _UNIT_NAME_ENV or "Plum Sendspin"
-DEFAULT_ENDPOINT_NAME = _UNIT_NAME_ENV or "Plum Audio"
+DEFAULT_DEVICE_NAME = _UNIT_NAME_ENV or sanitize_device_name(unit_identity.default_device_name()) or "Plum Sendspin"
+DEFAULT_ENDPOINT_NAME = (
+    _UNIT_NAME_ENV or sanitize_device_name(unit_identity.default_device_name("Plum Audio")) or "Plum Audio"
+)
 
 # Default settings structure. `integrations` matches frontend/types.ts `Settings` (endpoints-array
 # shape); `version` increments on every update so the GUI's poller detects changes.

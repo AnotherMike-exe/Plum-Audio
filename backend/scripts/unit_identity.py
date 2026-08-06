@@ -29,8 +29,72 @@ from typing import Awaitable, Callable
 
 logger = logging.getLogger("plum.unit_identity")
 
-DEFAULT_DEVICE_NAME = "Plum Sendspin"
 WATCH_INTERVAL_S = 5.0
+
+# Where the per-unit token comes from, in order. The Pi's SoC serial first because it survives a NIC
+# swap, a reflash and every reboot — a MAC chosen by default route does not, and a token that moves
+# would RENAME the unit, which is the whole thing this exists to prevent. Both are visible inside the
+# container: /proc/cpuinfo comes from the host kernel and host networking exposes the host's
+# interfaces. Overridable so a test can pin it.
+_CPUINFO = "/proc/cpuinfo"
+_NET_DIR = "/sys/class/net"
+_TOKEN_LEN = 4
+
+
+def host_token(length: int = _TOKEN_LEN) -> str:
+    """A short, stable, per-unit hex token. Empty string when nothing identifying can be read.
+
+    Never raises and never guesses: an unreadable host gets "", and callers fall back to the bare
+    name rather than inventing an identity that would change on the next boot.
+    """
+    raw = ""
+    try:
+        with open(_CPUINFO, encoding="utf-8") as f:
+            for line in f:
+                if line.lower().startswith("serial"):
+                    raw = line.split(":", 1)[1].strip()
+    except (OSError, IndexError):
+        pass
+
+    if not raw:
+        # Lowest PHYSICAL interface MAC — sorted, so enumeration order cannot change the answer.
+        macs = []
+        try:
+            for iface in os.listdir(_NET_DIR):
+                if iface == "lo" or iface.startswith(("docker", "veth", "br-", "dummy")):
+                    continue
+                if not os.path.exists(os.path.join(_NET_DIR, iface, "device")):
+                    continue  # virtual
+                try:
+                    with open(os.path.join(_NET_DIR, iface, "address"), encoding="utf-8") as f:
+                        macs.append(f.read().strip().replace(":", ""))
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        macs = sorted(m for m in macs if m and m != "000000000000")
+        raw = macs[0] if macs else ""
+
+    hexed = "".join(c for c in raw if c in "0123456789abcdefABCDEF")
+    return hexed[-length:].upper() if hexed else ""
+
+
+def default_device_name(base: str = "Plum Sendspin") -> str:
+    """`base`, made unique to this unit when a token can be derived.
+
+    An unnamed unit used to boot as the bare `base` on EVERY unit at once, so a rig brought up without
+    PLUM_UNIT_NAME — a hand-run `docker compose up`, or any deploy path that is not docker/deploy.sh —
+    presented several identical units to the mesh view, the GUI cards, mDNS and to an AirPlay sender.
+    deploy.sh disambiguates what units.conf duplicates, but it cannot help a unit it never touched;
+    this is the floor under that.
+    """
+    token = host_token()
+    return f"{base} {token}" if token else base
+
+
+# Kept as a module constant because sendspin_server/sendspin_player read it directly. Evaluated once
+# at import, which is correct: neither the SoC serial nor a physical MAC changes while we run.
+DEFAULT_DEVICE_NAME = default_device_name()
 
 
 def settings_path() -> str:

@@ -66,6 +66,19 @@ def test_read_on_a_damaged_file_still_answers_defaults(manager):
     assert settings["deviceName"] == settings_api.DEFAULT_SETTINGS["deviceName"]
 
 
+@pytest.fixture()
+def no_host_token(monkeypatch, tmp_path):
+    """Pin `unit_identity.host_token()` to empty, so default-name tests are host-independent.
+
+    Without this the suite passes on macOS (no /proc/cpuinfo, no /sys/class/net -> no token) and fails
+    on Linux, which is what the image actually runs. Patched on unit_identity rather than on
+    settings_api because settings_api reads it at import and is reloaded by these tests.
+    """
+    monkeypatch.setattr(settings_api.unit_identity, "_CPUINFO", str(tmp_path / "absent-cpuinfo"))
+    monkeypatch.setattr(settings_api.unit_identity, "_NET_DIR", str(tmp_path / "absent-net"))
+    assert settings_api.unit_identity.host_token() == ""
+
+
 def _endpoint_names(mod):
     """Every source endpoint's default name, from the defaults as the module currently holds them."""
     return {
@@ -75,7 +88,7 @@ def _endpoint_names(mod):
     }
 
 
-def test_an_unnamed_unit_and_its_endpoints_boot_under_PLUM_UNIT_NAME(monkeypatch):
+def test_an_unnamed_unit_and_its_endpoints_boot_under_PLUM_UNIT_NAME(monkeypatch, no_host_token):
     """The env tier of unit_identity's documented precedence has to actually be reachable.
 
     DEFAULT_SETTINGS is WRITTEN to settings.json on the first read, so a hardcoded literal outranks
@@ -106,7 +119,7 @@ def test_an_unnamed_unit_and_its_endpoints_boot_under_PLUM_UNIT_NAME(monkeypatch
         importlib.reload(settings_api)
 
 
-def test_a_hostile_PLUM_UNIT_NAME_is_scrubbed_before_it_reaches_the_defaults(monkeypatch):
+def test_a_hostile_PLUM_UNIT_NAME_is_scrubbed_before_it_reaches_the_defaults(monkeypatch, no_host_token):
     """`_sanitize_device_names` runs on the WRITE path only, so a default reaches disk unscrubbed.
 
     A device name is interpolated into shairport's libconfig and go-librespot's YAML and a daemon is
@@ -130,6 +143,62 @@ def test_a_hostile_PLUM_UNIT_NAME_is_scrubbed_before_it_reaches_the_defaults(mon
     finally:
         monkeypatch.delenv("PLUM_UNIT_NAME", raising=False)
         importlib.reload(settings_api)
+
+
+def test_the_host_token_prefers_the_SoC_serial_and_is_stable(monkeypatch, tmp_path):
+    """The token must not move, or it renames the unit — the thing it exists to prevent.
+
+    So the SoC serial wins over any MAC: it survives a NIC swap, a reflash and every reboot, while a
+    default-route MAC changes the moment a unit is put on wlan0 instead of eth0.
+    """
+    ui = settings_api.unit_identity
+    cpuinfo = tmp_path / "cpuinfo"
+    cpuinfo.write_text("processor\t: 0\nmodel name\t: ARMv8\nSerial\t\t: 10000000c0ffee12\n")
+    monkeypatch.setattr(ui, "_CPUINFO", str(cpuinfo))
+
+    # A MAC is present too, and must be ignored while the serial is readable.
+    net = tmp_path / "net"
+    (net / "eth0").mkdir(parents=True)
+    (net / "eth0" / "device").write_text("")
+    (net / "eth0" / "address").write_text("aa:bb:cc:11:22:33\n")
+    monkeypatch.setattr(ui, "_NET_DIR", str(net))
+
+    assert ui.host_token() == "EE12"
+    assert ui.host_token() == "EE12", "must be stable across calls"
+    assert ui.default_device_name() == "Plum Sendspin EE12"
+    assert ui.default_device_name("Plum Audio") == "Plum Audio EE12"
+
+
+def test_the_host_token_falls_back_to_the_lowest_physical_mac(monkeypatch, tmp_path):
+    """No serial (a non-Pi host): lowest PHYSICAL MAC, sorted so enumeration order cannot decide it."""
+    ui = settings_api.unit_identity
+    monkeypatch.setattr(ui, "_CPUINFO", str(tmp_path / "absent"))
+
+    net = tmp_path / "net"
+    for iface, mac, physical in (
+        ("eth0", "aa:bb:cc:11:22:33", True),
+        ("wlan0", "aa:bb:cc:11:22:34", True),
+        ("docker0", "02:42:aa:bb:cc:dd", True),   # skipped by name
+        ("veth9f2", "02:42:11:22:33:44", True),   # skipped by name
+        ("bond0", "00:00:00:00:00:01", False),    # skipped: no device/ -> virtual
+    ):
+        (net / iface).mkdir(parents=True)
+        (net / iface / "address").write_text(mac + "\n")
+        if physical:
+            (net / iface / "device").write_text("")
+    monkeypatch.setattr(ui, "_NET_DIR", str(net))
+
+    assert ui.host_token() == "2233"  # eth0 sorts below wlan0; both bridges/veths ignored
+
+
+def test_an_unreadable_host_yields_no_token_rather_than_a_guess(monkeypatch, tmp_path):
+    """Unknown beats invented: a token that cannot be derived must not become a made-up identity."""
+    ui = settings_api.unit_identity
+    monkeypatch.setattr(ui, "_CPUINFO", str(tmp_path / "absent"))
+    monkeypatch.setattr(ui, "_NET_DIR", str(tmp_path / "also-absent"))
+
+    assert ui.host_token() == ""
+    assert ui.default_device_name() == "Plum Sendspin"  # bare, not "Plum Sendspin "
 
 
 def test_a_missing_file_is_not_damage(manager):

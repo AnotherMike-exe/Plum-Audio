@@ -100,32 +100,83 @@ unit_field() {  # unit_field <host> <1-based field>
 # The unit-name column becomes PLUM_UNIT_NAME, which a unit with no settings.json yet adopts as its
 # own display name AND as the name of every source endpoint it offers — so two rows sharing a name
 # produce two units that are indistinguishable in the mesh view, in the GUI's unit cards, and to an
-# AirPlay sender picking a speaker. That is exactly the confusion the greenfield alpha hit on
-# 2026-08-06, and there is no auto-uniquifying to fall back on: a duplicate here IS a duplicate on
-# the network. The ids are worse than cosmetic — the mesh keys routing, group membership and
-# per-player volume off them, so two units claiming one unit_id corrupt each other's routing.
+# AirPlay sender picking a speaker. That is the confusion the greenfield alpha hit on 2026-08-06. The
+# ids are worse than cosmetic: the mesh keys routing, group membership and per-player volume off them,
+# so two units claiming one unit_id corrupt each other's routing rather than merely looking alike.
 #
-# Checked once, up front, for the WHOLE file rather than per selected host: a clash is a property of
-# the table, and finding out on the second unit means the first is already misconfigured.
-check_units_unique() {
-    local bad=0 col name dupes
-    for col in 1:host 2:unit_id 3:unit_name 4:player_id 5:player_name; do
-        name="${col#*:}"
-        dupes="$(grep -vE '^\s*(#|$)' "$UNITS_FILE" \
-            | awk -F'|' -v f="${col%%:*}" '{v=$f; gsub(/^[ \t]+|[ \t]+$/,"",v); if (v!="") print v}' \
-            | sort | uniq -d)"
-        if [[ -n "$dupes" ]]; then
-            echo "    !! ${UNITS_FILE##*/}: duplicate ${name}:" >&2
-            echo "$dupes" | sed 's/^/       /' >&2
-            bad=1
-        fi
-    done
-    if [[ $bad -ne 0 ]]; then
-        echo "    !! every unit must be unique in all five columns — fix units.conf and re-run" >&2
-        exit 1
-    fi
+# A clash DISAMBIGUATES, it does not stop the deploy. Refusing was the first attempt and it was the
+# wrong trade: it turns a cosmetic naming slip into a rig that will not deploy at all, and the failure
+# lands after someone has already re-flashed a card. So a duplicated field gets `-<token>` appended and
+# a loud warning, which is recoverable in the GUI at any time. Rename in Settings to take control.
+#
+# Computed once for the WHOLE table rather than per selected host: a clash is a property of the file,
+# and `deploy.sh <one-host>` must suffix identically to `deploy.sh all` or the two disagree.
+dup_in_column() {  # dup_in_column <1-based field>
+    grep -vE '^\s*(#|$)' "$UNITS_FILE" \
+        | awk -F'|' -v f="$1" '{v=$f; gsub(/^[ \t]+|[ \t]+$/,"",v); if (v!="") print v}' \
+        | sort | uniq -d
 }
-check_units_unique
+DUP_HOST="$(dup_in_column 1)"
+DUP_UNIT_ID="$(dup_in_column 2)"
+DUP_UNIT_NAME="$(dup_in_column 3)"
+DUP_PLAYER_ID="$(dup_in_column 4)"
+DUP_PLAYER_NAME="$(dup_in_column 5)"
+
+if [[ -n "$DUP_HOST$DUP_UNIT_ID$DUP_UNIT_NAME$DUP_PLAYER_ID$DUP_PLAYER_NAME" ]]; then
+    printf '\033[33m!! %s has duplicate values; they will be suffixed per unit:\033[0m\n' "${UNITS_FILE##*/}"
+    for pair in "host:$DUP_HOST" "unit_id:$DUP_UNIT_ID" "unit_name:$DUP_UNIT_NAME" \
+                "player_id:$DUP_PLAYER_ID" "player_name:$DUP_PLAYER_NAME"; do
+        [[ -n "${pair#*:}" ]] && printf '     %-12s %s\n' "${pair%%:*}" "$(echo "${pair#*:}" | tr '\n' ' ')"
+    done
+    # A duplicated HOST is the one case a suffix cannot help — it is the same box twice, so the second
+    # pass simply overwrites the first. Say so; the run is still harmless.
+    [[ -n "$DUP_HOST" ]] && printf '\033[33m     (a repeated host just deploys twice to the same box)\033[0m\n'
+fi
+
+# A short, stable, per-unit token used only to break a units.conf clash.
+#
+# The Pi's SoC serial, not a MAC: it survives a NIC swap, a reflash and every reboot, whereas a
+# default-route MAC moves the moment a unit is put on wlan0 instead of eth0 — which would silently
+# RENAME the unit on its next deploy, the exact problem this is here to prevent. MACs are the fallback
+# for non-Pi hosts, lowest-first so enumeration order cannot change the answer.
+unit_token() {  # unit_token <host>
+    ssh_ "$1" "bash -s" <<'EOS'
+set -uo pipefail
+t="$(sed -n 's/^Serial[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo 2>/dev/null | tail -1 | tr -d ' ')"
+if [[ -z "$t" ]]; then
+    macs=""
+    for n in /sys/class/net/*; do
+        i="${n##*/}"
+        case "$i" in lo|docker*|veth*|br-*|dummy*) continue ;; esac
+        [[ -e "$n/device" ]] || continue          # physical only
+        macs="${macs}$(cat "$n/address" 2>/dev/null | tr -d ':')
+"
+    done
+    t="$(printf '%s' "$macs" | grep -v '^$' | sort | head -1)"
+fi
+# Last four hex, uppercased. Short enough to read out over the phone, long enough that a rig would
+# need ~65k units before a collision is likely.
+printf '%s' "$t" | tr -cd '0-9A-Fa-f' | tail -c 4 | tr '[:lower:]' '[:upper:]'
+EOS
+}
+
+# Echo $1, suffixed with the unit's token when $2 (a newline-separated duplicate list) contains it.
+# Warnings go to STDERR: this runs inside a command substitution, so anything on stdout becomes part
+# of the value and would end up in plum-audio.env.
+disambiguate() {  # disambiguate <value> <dup-list> <label> <host>
+    local v="$1" dups="$2" label="$3" host="$4"
+    if [[ -n "$dups" ]] && printf '%s\n' "$dups" | grep -qxF -- "$v"; then
+        [[ -n "${TOKEN:-}" ]] || TOKEN="$(unit_token "$host")"
+        if [[ -n "$TOKEN" ]]; then
+            printf '\033[33m    !! %s %s is duplicated in units.conf -> using %s-%s\033[0m\n' \
+                "$label" "$v" "$v" "$TOKEN" >&2
+            printf '%s-%s' "$v" "$TOKEN"
+            return
+        fi
+        printf '\033[33m    !! %s %s is duplicated and no token could be derived\033[0m\n' "$label" "$v" >&2
+    fi
+    printf '%s' "$v"
+}
 
 if [[ " ${HOSTS[*]} " == *" all "* ]]; then
     # Plain read loop, not `mapfile`: this is normally run from macOS, whose /bin/bash is 3.2 and
@@ -147,6 +198,14 @@ deploy_one() {
     player_name="$(unit_field "$host" 5)"
     dac="$(unit_field "$host" 6)"
     [[ -n "$unit_id" ]] || { warn "$host is not in units.conf — skipping"; return 1; }
+
+    # Break any units.conf clash before the values reach plum-audio.env. TOKEN is fetched at most once
+    # per unit, and only when there is actually a clash — an unambiguous table costs no extra ssh.
+    local TOKEN=""
+    unit_id="$(disambiguate "$unit_id" "$DUP_UNIT_ID" unit_id "$host")"
+    unit_name="$(disambiguate "$unit_name" "$DUP_UNIT_NAME" unit_name "$host")"
+    player_id="$(disambiguate "$player_id" "$DUP_PLAYER_ID" player_id "$host")"
+    player_name="$(disambiguate "$player_name" "$DUP_PLAYER_NAME" player_name "$host")"
 
     # A DAC column of `none` means this host has no audio output: no player process, no /dev/snd, and
     # the headless compose profile (the audio one cannot even be CREATED without /dev/snd).

@@ -52,32 +52,69 @@ A re-imaged Pi has no dev stack, so the import is skipped and the container writ
   name twice in the mesh view, the unit cards, mDNS and to a sender. On an older image, rename each
   unit in Settings → General and each endpoint in Settings → Integrations.
 
-### Naming across multiple units — nothing auto-uniquifies
+### Naming across multiple units — how a clash resolves itself
 
-`units.conf` is the **only** thing that keeps units distinguishable, and its unit-name column reaches
-further than it looks: `deploy.sh` writes it as `PLUM_UNIT_NAME`, and a unit with no `settings.json`
-yet adopts it as its own display name **and** as the name of every source endpoint it offers. There is
-no de-duplication downstream — a duplicate in this file is a duplicate on the network, in the mesh
-view, on the unit cards, and in an AirPlay sender's speaker list.
+`units.conf`'s unit-name column reaches further than it looks: `deploy.sh` writes it as
+`PLUM_UNIT_NAME`, and a unit with no `settings.json` yet adopts it as its own display name **and** as
+the name of every source endpoint it offers. So a duplicate there is a duplicate in the mesh view, on
+the unit cards, in mDNS, and in an AirPlay sender's speaker list.
 
-So `deploy.sh` refuses to run at all when any of the five columns repeats a value, rather than
-deploying part of a rig and leaving you to notice:
+Nothing refuses. **A clash gets a stable per-unit token appended**, at two layers:
 
-```
-    !! units.conf: duplicate unit_name:
-       Pi4-02
-    !! every unit must be unique in all five columns — fix units.conf and re-run
-```
+1. **`deploy.sh`, for anything `units.conf` repeats.** Duplicates are computed for the whole table up
+   front — so `deploy.sh <one-host>` suffixes identically to `deploy.sh all` — and only a clashing
+   field costs the extra ssh that reads the token:
 
-The ids matter more than the names: the mesh keys routing, group membership and per-player volume off
-`unit_id`/`player_id`, so two units claiming one id corrupt each other's routing rather than merely
-looking alike.
+   ```
+   !! units.conf has duplicate values; they will be suffixed per unit:
+        unit_name    Pi4-02
+       !! unit_name Pi4-02 is duplicated in units.conf -> using Pi4-02-EE12
+   ```
+
+2. **The container itself, when `PLUM_UNIT_NAME` is unset entirely** — a hand-run `docker compose up`,
+   or any path that is not `deploy.sh`. `unit_identity.default_device_name()` makes the floor
+   `Plum Sendspin EE12` / `Plum Audio EE12` rather than a name every unit shares. This is the layer
+   `deploy.sh` cannot provide, because it never saw the unit.
+
+**The token is the Pi's SoC serial** (last four hex, uppercased), falling back to the lowest *physical*
+interface MAC on a non-Pi host. Deliberately not a default-route MAC: that changes the moment a unit
+moves from `eth0` to `wlan0`, which would silently **rename** the unit — the exact failure the token
+exists to prevent. Where nothing identifying can be read the token is empty and the bare name is used;
+unknown beats invented.
+
+Ids clash more consequentially than names — the mesh keys routing, group membership and per-player
+volume off `unit_id`/`player_id`, so two units claiming one id corrupt each other's routing rather than
+merely looking alike. They are suffixed by the same mechanism, and because the token is derived from
+immutable hardware it is stable across every later deploy.
 
 **A rename in the GUI wins permanently** on that unit — `PLUM_UNIT_NAME` only decides what an
 *unnamed* unit boots as, and is not re-applied on later deploys (`settings.json` is never overwritten
 after the first). So changing the column and redeploying does **not** rename a unit that has already
 come up once; rename it in Settings → General, or clear `/opt/plum-audio/data/settings.json` and
 restart to re-derive everything from the env.
+
+### What a greenfield unit actually offers
+
+Measured on both `.201` units, 2026-08-06. **AirPlay only**, and it is the sole source daemon running:
+
+| Section | Enabled | Name | Ports |
+|---|---|---|---|
+| airplay | **yes** | the unit name | RAOP 5050, UDP block 6001 |
+| spotify | no | the unit name | zeroconf 5354 (unused while disabled) |
+| bluetooth | no | the unit name | `hci0`, no TCP port |
+| dlna | — | — | no endpoints, and no backend |
+| plexamp | no | — | `available: false` (`PLEXAMP_ENABLED=0`) |
+
+`visualizer: false` and `autoSwitch` both off. One endpoint per source, id `1`, all named after the
+unit — so nothing is ambiguous on the network, but Spotify and Bluetooth need enabling in
+Settings → Integrations before `go-librespot` or `bluealsa` is spawned at all. Confirm with:
+
+```bash
+docker exec plum-audio ps -ef | grep -E 'shairport|go-librespot|bluealsa|obexd'
+```
+
+A greenfield unit shows **only** `shairport-sync` (plus its private `dbus-daemon`). That is correct,
+not a failed deploy.
 
 Everything else about a greenfield deploy is identical, and `deploy.sh`'s own verify pass is
 sufficient: four RUNNING programs, three APIs answering, 8927 and 8928 listening.
