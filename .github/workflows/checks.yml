@@ -6,6 +6,7 @@ name: Checks
 on:
   pull_request:
   workflow_call:
+  workflow_dispatch:
 
 concurrency:
   group: checks-${{ github.workflow }}-${{ github.ref }}
