@@ -204,6 +204,13 @@ class AlsaRenderer:
         unavailable. MUST NOT be called with a stream already open — resolution re-initialises
         PortAudio, which would pull that stream out from under the callback.
         """
+        if audio_devices.is_no_output(spec):
+            # Unreachable under the gate — a playerless unit has no player process — but reachable by
+            # hand on the dev rig, which has no supervisord. Raising here rather than falling through
+            # matters: `device="none"` would go to PortAudio's name matcher, which raises anyway but
+            # only after the caller has already torn a working stream down.
+            raise ValueError("this unit is configured for no output; there is no device to open")
+
         device_arg: str | int | None = spec
         if spec:
             index, resolved = audio_devices.resolve_portaudio_index(spec)
@@ -245,6 +252,15 @@ class AlsaRenderer:
         point of this slice is that a bad output must be obvious, not inaudible. If even that fails
         we are genuinely silent, so it is logged at error and the state file records the truth.
         """
+        if audio_devices.is_no_output(spec):
+            # Refuse BEFORE the teardown below. Switching to "No output" takes effect at the next
+            # container start (output_gate.py decides the player's existence, not its device), so
+            # tearing this stream down now would go silent early for no benefit and then fail anyway.
+            # Keeping the stream also keeps the echo where it is, which is what makes the API report
+            # restart_required rather than claiming the switch already happened.
+            logger.info("output 'none' selected — keeping %r open until this unit restarts", self.device)
+            return False
+
         if spec == self.device and self._stream is not None:
             return True
 
@@ -1010,7 +1026,7 @@ class SendspinPlayer:
         save_render_state(self._state_file, self._volume, self._muted)
 
 
-async def main() -> None:
+async def main() -> int | None:
     logging.basicConfig(
         level=os.environ.get("PLUM_LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
@@ -1027,6 +1043,15 @@ async def main() -> None:
     # settings.json > PLUM_DAC_DEVICE, same precedence as the device name: env is what a unit boots
     # with before anyone has chosen an output, not an override of a choice they have made.
     device = audio_devices.configured_output_spec()
+    if audio_devices.is_no_output(device):
+        # This unit is configured for no output, so it should have no player process: output_gate.py
+        # removes sendspin_player.ini from supervisord's runtime set before any of this starts. Being
+        # here means the gate was bypassed — a hand-run on the dev rig, or a stale program set. Exit
+        # rather than construct a renderer that cannot open anything; under supervisord this reaches
+        # FATAL after three tries, which is bounded and visible, unlike the crash-loop that a device
+        # named "none" would produce.
+        logger.error("this unit is configured for no output — the player should not have been started")
+        return 2
     rate = int(os.environ.get("PLUM_PLAYER_RATE", DEFAULT_RATE))
     channels = int(os.environ.get("PLUM_PLAYER_CHANNELS", DEFAULT_CHANNELS))
     bits = int(os.environ.get("PLUM_PLAYER_BITS", DEFAULT_BITS))
@@ -1074,6 +1099,15 @@ async def main() -> None:
     # and the `aplay -l` behind device resolution both block, and stalling the event loop would
     # stall the feed from the server as well as the switch.
     async def _apply_output(spec: str | None) -> None:
+        if audio_devices.is_no_output(spec):
+            # Return without touching the renderer OR the echo. "No output" is applied by the gate at
+            # the next container start, not here — this unit has a player precisely because it did
+            # not have that setting when it booted. Leaving the echo on the real device is what makes
+            # the API report restart_required instead of claiming the change already took effect, and
+            # it keeps the room playing in the meantime, which is what the GUI banner promises.
+            logger.info("output 'none' selected — applies at the next restart; still on %r", renderer.device)
+            return
+
         applied = await asyncio.get_running_loop().run_in_executor(None, renderer.reopen, spec)
         # Echo what we ACTUALLY have open, not what was asked for — the config API reports this back
         # to the GUI, which is the only way a switch that failed can be told from one that worked.
@@ -1098,4 +1132,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # SystemExit, not a bare asyncio.run: main() returns a non-zero code when it must not run at all
+    # (this unit is configured for no output), and a discarded return value would exit 0 and leave
+    # supervisord restarting it forever.
+    raise SystemExit(asyncio.run(main()))

@@ -262,3 +262,54 @@ def test_a_failing_callback_does_not_kill_the_watcher(tmp_path, monkeypatch):
 
     asyncio.run(drive())
     assert seen == ["b", "c"]
+
+
+# -- "No output" must never reach the renderer ------------------------------------------------------
+
+
+def test_switching_to_no_output_keeps_the_current_stream(renderer_cls, monkeypatch):
+    """Refused BEFORE the teardown. "No output" applies at the next container start, not now.
+
+    Tearing the stream down here would go silent early, then fail to open anything anyway, and would
+    move the echo — which is precisely what tells the API to report restart_required rather than
+    claiming the change already took effect.
+    """
+    fake = FakeSoundDevice()
+    renderer = _renderer(renderer_cls, fake, "sndrpihifiberry:0", monkeypatch)
+    renderer.start()
+    opened_before = list(fake.opened)
+
+    assert renderer.reopen("none") is False
+    assert renderer.device == "sndrpihifiberry:0"  # the echo source is unmoved
+    assert fake.opened == opened_before  # nothing was torn down and nothing reopened
+    assert renderer._stream is not None
+
+
+def test_opening_the_sentinel_raises_rather_than_reaching_portaudio(renderer_cls, monkeypatch):
+    fake = FakeSoundDevice()
+    renderer = _renderer(renderer_cls, fake, "none", monkeypatch)
+
+    with pytest.raises(ValueError, match="no output"):
+        renderer.start()
+    assert fake.opened == []
+
+
+def test_the_no_output_watcher_leaves_the_echo_alone(renderer_cls, monkeypatch, tmp_path):
+    """The API's restart_required is 'choice vs echo'; moving the echo here would erase the signal."""
+    state = tmp_path / "player_state.json"
+    player_state.save_active_output(str(state), "sndrpihifiberry:0")
+
+    fake = FakeSoundDevice()
+    renderer = _renderer(renderer_cls, fake, "sndrpihifiberry:0", monkeypatch)
+    renderer.start()
+
+    # The watcher body, as sendspin_player.main defines it: the sentinel returns before reopen().
+    async def apply(spec):
+        if audio_devices.is_no_output(spec):
+            return
+        await asyncio.get_running_loop().run_in_executor(None, renderer.reopen, spec)
+        player_state.save_active_output(str(state), renderer.device)
+
+    asyncio.run(apply("none"))
+    assert player_state.load_active_output(str(state)) == "sndrpihifiberry:0"
+    assert renderer.device == "sndrpihifiberry:0"
