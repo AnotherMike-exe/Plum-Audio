@@ -43,6 +43,48 @@ image compares as different across units.
 
 ## Phase 3 — remaining sources, GUI, container (`feature/phase3-sources-gui`, in progress)
 
+### Alpha deployment onto bare Raspberry Pi OS Lite — 2026-08-06 (`8e255a9`)
+
+**The first deploy onto units carrying nothing but a stock image.** `.201.133` and `.201.113` were
+re-flashed to Raspberry Pi OS Lite 64-bit (Debian 13 trixie, kernel 6.18.34, arm64), then taken to a
+working two-node mesh by the documented path alone. This is the run that proved the *documentation* is
+executable, not just the code — and it found four places where it was not.
+
+Greenfield state, measured before touching anything (identical on both units): Avahi active, bluez
+**5.82-1.1+rpt1** unpatched, Bluetooth **soft-blocked**, `Experimental = false`, no bluealsa D-Bus
+policy, no `/etc/dbus-1/system.d` at all, no Docker, no nginx, no `~/plum-test`, `dtparam=audio=on`
+already present, `bcm2835 Headphones` as card 0 with its `PCM` control already at **0.00 dB**.
+
+What the documented path could not do, and now can:
+
+- **A re-imaged unit's new SSH host key aborted the deploy on its first connection.**
+  `StrictHostKeyChecking=no` does not override a *conflicting* `known_hosts` entry — ssh disables
+  password auth in that state. Both scripts now pass `UserKnownHostsFile=/dev/null`.
+- **Nothing got the host-setup payload onto a fresh Pi.** Every command in HOST-PROVISIONING.md runs
+  on the unit against files in this repo, and a fresh Pi has neither the repo nor a remote to fetch
+  it from. Closed by `scripts/host-setup/provision.sh`.
+- **`deploy.sh --tarball dist/...`, exactly as OPERATIONS.md documented it, always failed** — the
+  script `cd`s to its own directory first, so it looked under `docker/dist/`.
+- **Both units came up named "Plum Sendspin"** (`1cd8701`). `DEFAULT_SETTINGS` is written to
+  settings.json on first read, so its literal outranked `PLUM_UNIT_NAME` permanently — making the env
+  tier that `unit_identity.py` documents unreachable. One name for two units in the mesh view, the
+  unit cards and mDNS reads exactly like a discovery bug.
+
+Verified after: 4/4 supervisord programs RUNNING on both, all three APIs answering, 8927/8928
+listening, `bcm2835` → PortAudio index 0 → `hw:0,0` with `Headphones:0` echoed back to
+`player_state.json`, **0 ERROR lines in either `sendspin_server.log`**, and a symmetric two-node mesh
+— each unit lists both, under distinct names, `has_player=True`, both players attached. Sendspin
+server and player mDNS records published under the corrected names.
+
+**Not verified from the workstation**: that the AirPlay receivers actually appear to a sender. mDNS is
+link-local and the workstation is on a routed segment (`192.168.197.x`), and Pi OS Lite ships no
+`avahi-utils`. shairport-sync is running and errorless on both; confirming the receiver needs a device
+on VLAN 201.
+
+Sections 1 (audio HAT) and 4 (mask the user obexd) of the checklist were correctly **no-ops** here —
+no HAT fitted, and Pi OS Lite does not ship `obex.service`. Both are now documented as such, because
+"not-found" and "no HAT card found" read like failures otherwise.
+
 ### GUI polish pass — 2026-08-05 (`8dfaca2`..`6a64b88`)
 
 The first real visual review in a browser on a live unit. Four defects, all in the GUI, none of them
