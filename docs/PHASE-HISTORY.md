@@ -65,10 +65,15 @@ What the documented path could not do, and now can:
   it from. Closed by `scripts/host-setup/provision.sh`.
 - **`deploy.sh --tarball dist/...`, exactly as OPERATIONS.md documented it, always failed** — the
   script `cd`s to its own directory first, so it looked under `docker/dist/`.
-- **Both units came up named "Plum Sendspin"** (`1cd8701`). `DEFAULT_SETTINGS` is written to
-  settings.json on first read, so its literal outranked `PLUM_UNIT_NAME` permanently — making the env
+- **Both units came up named "Plum Sendspin", and both advertised an AirPlay receiver called "Plum
+  Audio"** (`1cd8701`, then the endpoint half on Michael's call). `DEFAULT_SETTINGS` is written to
+  settings.json on first read, so its literals outranked `PLUM_UNIT_NAME` permanently — making the env
   tier that `unit_identity.py` documents unreachable. One name for two units in the mesh view, the
-  unit cards and mDNS reads exactly like a discovery bug.
+  unit cards and mDNS reads exactly like a discovery bug; one AirPlay name for two receivers is
+  indistinguishable to a sender. All three source endpoints share the fallback, so Spotify and
+  Bluetooth were collision-bound identically once enabled. Both env-derived defaults are sanitized at
+  import — `_sanitize_device_names` runs on the write path only, so a default otherwise reaches disk
+  and the config renderers unscrubbed.
 
 Verified after: 4/4 supervisord programs RUNNING on both, all three APIs answering, 8927/8928
 listening, `bcm2835` → PortAudio index 0 → `hw:0,0` with `Headphones:0` echoed back to

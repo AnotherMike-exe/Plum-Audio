@@ -36,19 +36,56 @@ logger = logging.getLogger(__name__)
 # a second SettingsManager over the same path.
 _SETTINGS_LOCK = threading.RLock()
 
+# A device name is not free text: it is interpolated into shairport-sync's libconfig
+# (`name = "<here>";`) and go-librespot's YAML (`device_name: "<here>"`), then a daemon is respooled
+# to read it. Quotes, braces, semicolons and newlines all terminate the surrounding scalar, and
+# shairport's sessioncontrol block can run shell commands — so an unfiltered name is remote code
+# execution as root, reachable from any LAN page via the blanket-CORS POST /api/settings.
+#
+# This is the OUTER of two layers. The renderers escape as well (sources/*_config.py); neither is
+# trusted alone. Permissive enough for real names ("Mike's Room", "Kitchen (Main)").
+#
+# Defined ABOVE DEFAULT_SETTINGS so the env-derived defaults below can be scrubbed at import.
+DEVICE_NAME_ALLOWED = re.compile(r"^[A-Za-z0-9 ._\-'()&+]{1,50}$")
+_DEVICE_NAME_STRIP = re.compile(r"[^A-Za-z0-9 ._\-'()&+]")
+
+
+def sanitize_device_name(name: Any) -> str | None:
+    """Reduce a name to the safe charset, or None if nothing usable survives."""
+    if not isinstance(name, str):
+        return None
+    cleaned = _DEVICE_NAME_STRIP.sub("", name).strip()[:50]
+    return cleaned or None
+
+
+# What a unit and its source endpoints are called before anyone has named them.
+#
+# PLUM_UNIT_NAME first, for the same reason `audio.output` below is left empty so PLUM_DAC_DEVICE
+# applies: these defaults are WRITTEN to settings.json on the first read, so a concrete literal here
+# outranks the env permanently and on every unit at once. unit_identity.py documents the precedence as
+# `settings.json deviceName > the PLUM_* env var > DEFAULT_DEVICE_NAME`, and with literals here the
+# env tier was unreachable.
+#
+# The cost was two kinds of collision on the freshly imaged .201 units (2026-08-06): both came up as
+# the unit "Plum Sendspin" — one name for two units in the mesh view, the GUI cards and mDNS — and
+# both offered an AirPlay receiver called "Plum Audio", indistinguishable to a sender on the LAN.
+# Every source endpoint shares the fallback, so Spotify and Bluetooth collide the same way once
+# enabled; all three derive from the unit name now.
+#
+# Sanitized here rather than trusted: `_sanitize_device_names` runs on the WRITE path only, so a
+# default reaches disk — and the config renderers — unscrubbed. units.conf is operator-controlled, not
+# attacker-controlled, but the layering is deliberate and this is the cheap place to hold it.
+#
+# A rename in the GUI still wins, and still only has to be written once.
+_UNIT_NAME_ENV = sanitize_device_name(os.environ.get("PLUM_UNIT_NAME"))
+DEFAULT_DEVICE_NAME = _UNIT_NAME_ENV or "Plum Sendspin"
+DEFAULT_ENDPOINT_NAME = _UNIT_NAME_ENV or "Plum Audio"
+
 # Default settings structure. `integrations` matches frontend/types.ts `Settings` (endpoints-array
 # shape); `version` increments on every update so the GUI's poller detects changes.
 DEFAULT_SETTINGS = {
     "version": 1,
-    # PLUM_UNIT_NAME first, for the same reason `audio.output` below is empty: this default is WRITTEN
-    # to settings.json on the first read, so a concrete literal here outranks the env on every unit at
-    # once and permanently. unit_identity.py documents the precedence as
-    # `settings.json deviceName > PLUM_* env > DEFAULT_DEVICE_NAME`, and with a literal here the env
-    # tier was unreachable — a freshly imaged unit came up as "Plum Sendspin" no matter what
-    # units.conf said. Two greenfield units then appear under ONE name in the mesh view, the GUI and
-    # mDNS, which is indistinguishable from a discovery bug. Found deploying the alpha to the .201
-    # units, 2026-08-06. A GUI rename still wins, and still only needs writing once.
-    "deviceName": os.environ.get("PLUM_UNIT_NAME", "").strip() or "Plum Sendspin",
+    "deviceName": DEFAULT_DEVICE_NAME,
     "hostname": "plum-audio",
     "integrations": {
         "airplay": {
@@ -56,7 +93,7 @@ DEFAULT_SETTINGS = {
                 {
                     "id": "1",
                     "enabled": True,
-                    "deviceName": "Plum Audio",
+                    "deviceName": DEFAULT_ENDPOINT_NAME,
                     "port": 5050,
                     "udpPortBase": 6001,
                 }
@@ -72,7 +109,7 @@ DEFAULT_SETTINGS = {
                 {
                     "id": "1",
                     "enabled": False,
-                    "deviceName": "Plum Audio",
+                    "deviceName": DEFAULT_ENDPOINT_NAME,
                     "adapter": "hci0",
                 }
             ],
@@ -83,7 +120,7 @@ DEFAULT_SETTINGS = {
                 {
                     "id": "1",
                     "enabled": False,
-                    "deviceName": "Plum Audio",
+                    "deviceName": DEFAULT_ENDPOINT_NAME,
                     "zeroconfPort": 5354,
                 }
             ],
@@ -130,26 +167,6 @@ SETTINGS_FILE = os.environ.get("PLUM_SETTINGS_FILE", "/data/settings.json")
 # SettingsManager._migrate_audio_output.
 LEGACY_OUTPUT_PLACEHOLDERS = {"hw:Headphones", "hw:headphones", ""}
 
-# A device name is not free text: it is interpolated into shairport-sync's libconfig
-# (`name = "<here>";`) and go-librespot's YAML (`device_name: "<here>"`), then a daemon is respooled
-# to read it. Quotes, braces, semicolons and newlines all terminate the surrounding scalar, and
-# shairport's sessioncontrol block can run shell commands — so an unfiltered name is remote code
-# execution as root, reachable from any LAN page via the blanket-CORS POST /api/settings.
-#
-# This is the OUTER of two layers. The renderers escape as well (sources/*_config.py); neither is
-# trusted alone. Permissive enough for real names ("Mike's Room", "Kitchen (Main)").
-DEVICE_NAME_ALLOWED = re.compile(r"^[A-Za-z0-9 ._\-'()&+]{1,50}$")
-_DEVICE_NAME_STRIP = re.compile(r"[^A-Za-z0-9 ._\-'()&+]")
-
-
-def sanitize_device_name(name: Any) -> str | None:
-    """Reduce a name to the safe charset, or None if nothing usable survives."""
-    if not isinstance(name, str):
-        return None
-    cleaned = _DEVICE_NAME_STRIP.sub("", name).strip()[:50]
-    return cleaned or None
-
-
 def _sanitize_device_names(settings: Dict[str, Any]) -> None:
     """Scrub every device name in place, whatever route wrote it.
 
@@ -172,7 +189,7 @@ def _sanitize_device_names(settings: Dict[str, Any]) -> None:
             safe = sanitize_device_name(endpoint.get("deviceName"))
             if safe != endpoint.get("deviceName"):
                 logger.warning("sanitized endpoint deviceName %r -> %r", endpoint.get("deviceName"), safe)
-            endpoint["deviceName"] = safe or "Plum Audio"
+            endpoint["deviceName"] = safe or DEFAULT_ENDPOINT_NAME
 
 
 # An output spec is a `<card_name>:<device>` id, an `hw:C,D` address, a bare ALSA card name, or a
@@ -321,7 +338,7 @@ class SettingsManager:
                     # The old flag was the whole integration's on/off switch; it becomes this
                     # endpoint's, which is the same thing while there is one adapter.
                     "enabled": bool(section.get("enabled", False)),
-                    "deviceName": section.get("deviceName", "Plum Audio"),
+                    "deviceName": section.get("deviceName", DEFAULT_ENDPOINT_NAME),
                     "adapter": section.get("adapter", "hci0"),
                 }
             ],

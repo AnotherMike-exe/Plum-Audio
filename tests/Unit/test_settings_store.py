@@ -66,25 +66,68 @@ def test_read_on_a_damaged_file_still_answers_defaults(manager):
     assert settings["deviceName"] == settings_api.DEFAULT_SETTINGS["deviceName"]
 
 
-def test_an_unnamed_unit_boots_under_its_PLUM_UNIT_NAME(monkeypatch):
+def _endpoint_names(mod):
+    """Every source endpoint's default name, from the defaults as the module currently holds them."""
+    return {
+        section: [e["deviceName"] for e in body["endpoints"]]
+        for section, body in mod.DEFAULT_SETTINGS["integrations"].items()
+        if isinstance(body, dict) and body.get("endpoints")
+    }
+
+
+def test_an_unnamed_unit_and_its_endpoints_boot_under_PLUM_UNIT_NAME(monkeypatch):
     """The env tier of unit_identity's documented precedence has to actually be reachable.
 
     DEFAULT_SETTINGS is WRITTEN to settings.json on the first read, so a hardcoded literal outranks
-    PLUM_UNIT_NAME permanently and on every unit at once. That made two freshly imaged units both
-    come up as "Plum Sendspin" — one name for two units in the mesh view, the GUI and mDNS, which
-    reads as a discovery bug. Found deploying the alpha to the .201 units, 2026-08-06.
+    PLUM_UNIT_NAME permanently and on every unit at once. That produced two collisions on the freshly
+    imaged .201 units (2026-08-06): both came up as the unit "Plum Sendspin", one name for two units
+    in the mesh view / GUI cards / mDNS; and both offered an AirPlay receiver called "Plum Audio",
+    indistinguishable to a sender on the LAN. Every source endpoint shares that fallback, so Spotify
+    and Bluetooth collided identically once enabled.
 
-    Reloaded rather than monkeypatched in place: the default is evaluated at import.
+    Reloaded rather than monkeypatched in place: the defaults are evaluated at import.
     """
     monkeypatch.setenv("PLUM_UNIT_NAME", "Pi4-02")
     reloaded = importlib.reload(settings_api)
     try:
         assert reloaded.DEFAULT_SETTINGS["deviceName"] == "Pi4-02"
+        # airplay, bluetooth and spotify — not just the one that surfaced the bug.
+        names = _endpoint_names(reloaded)
+        assert set(names) == {"airplay", "bluetooth", "spotify"}, names
+        assert all(n == "Pi4-02" for ns in names.values() for n in ns), names
 
         monkeypatch.delenv("PLUM_UNIT_NAME")
-        assert importlib.reload(settings_api).DEFAULT_SETTINGS["deviceName"] == "Plum Sendspin"
+        bare = importlib.reload(settings_api)
+        assert bare.DEFAULT_SETTINGS["deviceName"] == "Plum Sendspin"
+        assert all(n == "Plum Audio" for ns in _endpoint_names(bare).values() for n in ns)
     finally:
         # Leave the module as the rest of the suite expects to find it.
+        monkeypatch.delenv("PLUM_UNIT_NAME", raising=False)
+        importlib.reload(settings_api)
+
+
+def test_a_hostile_PLUM_UNIT_NAME_is_scrubbed_before_it_reaches_the_defaults(monkeypatch):
+    """`_sanitize_device_names` runs on the WRITE path only, so a default reaches disk unscrubbed.
+
+    A device name is interpolated into shairport's libconfig and go-librespot's YAML and a daemon is
+    respooled to read it, so the env value has to be reduced to the safe charset at import — not
+    trusted because units.conf happens to be operator-controlled.
+    """
+    monkeypatch.setenv("PLUM_UNIT_NAME", 'Kitchen"; system("rm -rf /")')
+    reloaded = importlib.reload(settings_api)
+    try:
+        for name in [reloaded.DEFAULT_SETTINGS["deviceName"], *(
+            n for ns in _endpoint_names(reloaded).values() for n in ns
+        )]:
+            assert reloaded.DEVICE_NAME_ALLOWED.match(name), name
+            assert '"' not in name and ";" not in name, name
+
+        # A name with nothing usable in it falls back rather than becoming empty.
+        monkeypatch.setenv("PLUM_UNIT_NAME", "!!!@@@###")
+        fallback = importlib.reload(settings_api)
+        assert fallback.DEFAULT_SETTINGS["deviceName"] == "Plum Sendspin"
+        assert all(n == "Plum Audio" for ns in _endpoint_names(fallback).values() for n in ns)
+    finally:
         monkeypatch.delenv("PLUM_UNIT_NAME", raising=False)
         importlib.reload(settings_api)
 

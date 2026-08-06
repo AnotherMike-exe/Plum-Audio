@@ -382,15 +382,15 @@ are in **`docs/OPERATIONS.md`**; commissioning in **`docs/HOST-PROVISIONING.md`*
     background throttling would stretch, possibly past whatever the server tolerates. Re-measure in
     a FOCUSED, foreground tab before concluding this is user-visible rather than an artifact.
 
-19. **Two greenfield units advertise the same AirPlay receiver name.** Found deploying the alpha to
-    the re-imaged `.201` units, 2026-08-06. `DEFAULT_SETTINGS`' AirPlay endpoint is
-    `deviceName: "Plum Audio"`, enabled, on RAOP 5050 — so every fresh unit offers an identical
-    receiver and an iPhone on that VLAN sees "Plum Audio" twice with no way to tell them apart. This
-    is the same defect as the unit name (fixed in `1cd8701`) one level down, and the same one-line
-    fix would work: derive the endpoint default from `PLUM_UNIT_NAME` too. **Not done, because
-    per-endpoint names are the user's naming scheme, not ours** — "Kitchen" as both unit and AirPlay
-    name is probably what is wanted, but that is a call to make explicitly rather than to infer.
-    Workaround meanwhile: rename the endpoint in Settings → Integrations. Awaiting a call.
+19. ~~Two greenfield units advertise the same AirPlay receiver name~~ — **fixed 2026-08-06**, on
+    Michael's call. Found deploying the alpha to the re-imaged `.201` units: `DEFAULT_SETTINGS`'
+    endpoints all defaulted to `deviceName: "Plum Audio"`, and AirPlay's is enabled on RAOP 5050 out
+    of the box, so every fresh unit offered an identical receiver — "Plum Audio" twice on the LAN with
+    nothing to tell them apart. Same defect as the unit name (`1cd8701`) one level down. All three
+    source endpoints now derive from `PLUM_UNIT_NAME` via `DEFAULT_ENDPOINT_NAME`; Spotify and
+    Bluetooth were collision-bound the same way once enabled. Both env-derived defaults are
+    `sanitize_device_name`'d **at import**, because `_sanitize_device_names` runs on the write path
+    only — a default otherwise reaches disk, and the config renderers, unscrubbed.
 
 ## Resources
 - Sendspin spec: <https://www.sendspin-audio.com/spec/> · Org: <https://github.com/Sendspin>
