@@ -1,4 +1,8 @@
-# Plum-Audio R&D rig — one line per unit, consumed by deploy.sh.
+# Plum-Audio unit table — one line per unit, consumed by deploy.sh.
+#
+# COPY THIS FILE to `units.conf` (which is gitignored) and put your own units in it. The addresses
+# below are RFC 5737 documentation addresses and route nowhere; they are shaped like a real two-VLAN
+# rig only to show what the columns mean.
 #
 #   host | unit id | unit name | player id | player name | DAC device
 #
@@ -9,7 +13,7 @@
 #
 # KEEP EVERY COLUMN UNIQUE ACROSS ROWS. A clash does not stop a deploy — deploy.sh appends a stable
 # per-unit token (the Pi's SoC serial, last four hex) to whichever field is duplicated and warns, so
-# `Pi4-02` twice becomes `Pi4-02-EE12` and `Pi4-02-A17B`. That is a fallback, not a feature: the names
+# `Kitchen` twice becomes `Kitchen-EE12` and `Kitchen-A17B`. That is a fallback, not a feature: the names
 # it produces are nobody's choice, and the ids are what the mesh routes on.
 #
 # The unit-name column is the one whose reach is easy to underestimate. deploy.sh writes it as
@@ -19,13 +23,13 @@
 # a speaker. Renaming a unit later, in Settings, overrides it permanently on that unit — this column
 # only decides what an unnamed unit boots as, and is NOT re-applied by a later deploy.
 #
-# .201.x is the two-unit mesh rig; .7.122 sits on the third-party VLAN beside Music Assistant and
-# a Home Assistant Voice PE — the only segment where interop (mDNS is link-local) can be tested.
-# See tests/Integration/README.md.
+# 192.0.2.x below is a two-unit mesh rig; 198.51.100.x sits on a second VLAN alongside a third-party
+# Sendspin server (Music Assistant) — interop can only be tested on the same segment, because mDNS is
+# link-local. See tests/Integration/README.md.
 #
 # The DAC column is matched by PortAudio as a SUBSTRING of its own device name, not handed to ALSA
 # — so it must appear in `sd.query_devices()`, which is not the same list as `aplay -l`. Prefer the
-# card's long name over an `hw:C,D` id: card NUMBERS move (on .7.204 the HAT is card 2, behind two
+# card's long name over an `hw:C,D` id: card NUMBERS move (on .100.21 the HAT is card 2, behind two
 # vc4hdmi cards), the long name does not. `bcm2835` and `snd_rpi_hifiberry_dacplus` are both
 # verified to open at 44100/2/16.
 #
@@ -36,7 +40,10 @@
 # and advertises no _sendspin._tcp speaker. The player id and name columns are still required — they
 # are the row's shape — but unused.
 
-192.0.2.10 | unit-133  | Pi4-02          | player-133  | Player-133 | bcm2835
-192.0.2.11 | unit-113  | Pi4-01          | player-113  | Player-113 | bcm2835
-198.51.100.20   | unit-7122 | Plum VLAN7 Test | player-7122 | Plum VLAN7 | bcm2835
-198.51.100.21   | unit-7204 | Plum Amp100     | player-7204 | Plum Amp100 | snd_rpi_hifiberry_dacplus
+192.0.2.10     | unit-kitchen | Kitchen     | player-kitchen | Kitchen Speaker | bcm2835
+192.0.2.11     | unit-living  | Living Room | player-living  | Living Room     | snd_rpi_hifiberry_dacplus
+198.51.100.20  | unit-office  | Office      | player-office  | Office Speaker  | bcm2835
+
+# A unit with no sound card at all: it ingests AirPlay/Spotify/Bluetooth and routes to other rooms,
+# but renders nothing itself. The player columns are still required — they are the row's shape.
+# 198.51.100.21  | unit-hall | Hallway | player-hall | Hallway | none

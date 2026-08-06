@@ -15,7 +15,11 @@
 
 set -uo pipefail
 
-PW="${PLUM_TEST_PW:-REDACTED-USE-PLUM_TEST_PW}"
+# The rig credential is NOT stored in this repo. Export PLUM_TEST_PW, or put it in
+# docker/.deploy.env (gitignored), which is sourced here when it exists.
+_PLUM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+[[ -f "${_PLUM_ROOT}/docker/.deploy.env" ]] && source "${_PLUM_ROOT}/docker/.deploy.env"
+PW="${PLUM_TEST_PW:?not set — export it, or create docker/.deploy.env containing PLUM_TEST_PW=<rig password>}"
 USER_="${PLUM_TEST_USER:-plum-admin}"
 SSH_OPTS="-o ConnectTimeout=20 -o StrictHostKeyChecking=no -o LogLevel=ERROR"
 

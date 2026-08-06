@@ -12,7 +12,9 @@ tier 4, which runs against live third-party devices in someone's home.
 
 - `sshpass` on the machine running the tests (the scripts ssh into the Pis).
 - The Pis reachable, with the Plum stack running (server + player + config API + mesh API).
-- Creds default to `plum-admin` / `REDACTED-USE-PLUM_TEST_PW`; override with `PLUM_TEST_USER` / `PLUM_TEST_PW`.
+- Credentials come from the environment: `PLUM_TEST_PW` is **required** (the scripts refuse to run
+  without it), `PLUM_TEST_USER` defaults to `plum-admin`. Put them in `docker/.deploy.env`, which is
+  gitignored and sourced automatically — no password is stored in this repo.
 
 ## What each tier needs, and how to run it
 
@@ -26,15 +28,15 @@ tier 4, which runs against live third-party devices in someone's home.
 | `t4_interop_ma.sh` | a unit **on Music Assistant's L2 segment** | `./t4_interop_ma.sh <host>` |
 | `t4_adopt_release.sh` | a unit + a foreign Sendspin speaker on-segment | `./t4_adopt_release.sh <host> [speaker-url]` |
 
-Rigs as of this writing (see the memory note `vlan7-interop-rig`):
+Rigs as of this writing (see the memory note `interop-rig`):
 - **Two-unit mesh**: `192.0.2.10` + `192.0.2.11`.
-- **Third-party interop**: `198.51.100.20`, alongside Music Assistant (`.226`) and a Home Assistant
-  Voice PE (`.214`). mDNS is link-local, so tier 4 can ONLY run on the third party's segment.
+- **Third-party interop**: `198.51.100.20`, alongside Music Assistant (`.32`) and a Home Assistant
+  Voice PE (`.31`). mDNS is link-local, so tier 4 can ONLY run on the third party's segment.
 
 Run everything for one rig via `./run.sh`:
 ```
 ./run.sh mesh    192.0.2.10 192.0.2.11   # tier 2 + tier 3
-./run.sh interop 198.51.100.20                      # tier 2 + tier 4
+./run.sh interop 198.51.100.20            # tier 2 + tier 4
 ```
 
 ## Notes

@@ -2,7 +2,7 @@
 # Deploy the Plum-Audio unit container to the R&D Pis.
 #
 #   ./deploy.sh all                          # every unit in units.conf
-#   ./deploy.sh 192.0.2.10              # one unit
+#   ./deploy.sh 192.0.2.10                   # one unit
 #   ./deploy.sh all --tarball dist/x.tar.gz  # a specific build (default: newest in dist/)
 #   ./deploy.sh all --no-migrate             # skip importing the ~/plum-test state
 #
@@ -21,18 +21,26 @@ INVOKED_FROM="$PWD"          # captured BEFORE the cd — see the --tarball reso
 cd "$(dirname "$0")"
 HERE="$PWD"
 
+# The rig credential is NOT stored in this repo. Export PLUM_TEST_PW, or put it in
+# docker/.deploy.env (gitignored), which is sourced here when it exists.
+[[ -f "${HERE}/.deploy.env" ]] && source "${HERE}/.deploy.env"
 USER_="${PLUM_TEST_USER:-plum-admin}"
-PW="${PLUM_TEST_PW:-REDACTED-USE-PLUM_TEST_PW}"
+PW="${PLUM_TEST_PW:?not set — export it, or create docker/.deploy.env containing PLUM_TEST_PW=<rig password>}"
 # UserKnownHostsFile=/dev/null, not just StrictHostKeyChecking=no: a REIMAGED unit presents a new
 # host key, and a conflicting known_hosts entry makes ssh refuse the connection outright — password
 # auth is disabled in that state, so the deploy fails on the very first ssh of every unit with a
-# man-in-the-middle warning. StrictHostKeyChecking=no only covers a host ssh has never seen. Since
-# the password is in this file there is no key-pinning posture to preserve, and the alternative is
-# telling the operator to run ssh-keygen -R by hand on exactly the runs (a fresh image) where they
-# are least expecting the failure. Found re-imaging the .201 units for the alpha, 2026-08-06.
+# man-in-the-middle warning. StrictHostKeyChecking=no only covers a host ssh has never seen. These
+# units are a password-auth lab rig, so there is no key-pinning posture to preserve, and the
+# alternative is telling the operator to run ssh-keygen -R by hand on exactly the runs (a fresh
+# image) where they are least expecting the failure. Found re-imaging the mesh-pair units for the
+# alpha, 2026-08-06.
 SSH_OPTS="-o ConnectTimeout=20 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 REMOTE_ROOT="/opt/plum-audio"
 UNITS_FILE="${HERE}/units.conf"
+[[ -f "$UNITS_FILE" ]] || {
+    echo "no docker/units.conf — copy docker/units.conf.example to it and list your units" >&2
+    exit 1
+}
 
 MIGRATE=1
 TARBALL=""

@@ -2,7 +2,7 @@
 # Plum-Audio — commission a fresh unit's HOST, from the workstation.
 #
 #   ./provision.sh all                           # every unit in docker/units.conf
-#   ./provision.sh 192.0.2.10               # one unit
+#   ./provision.sh 192.0.2.10                    # one unit
 #   ./provision.sh all --overlay hifiberry-amp100 --unity   # a unit with an audio HAT (reboots)
 #   ./provision.sh all --with-bluez              # + rebuild bluetoothd for AVRCP position (~30 min)
 #   ./provision.sh all --check                   # report only, change nothing
@@ -12,7 +12,7 @@
 #   command in it runs ON the unit, against files that live in THIS repo — and a freshly imaged Pi
 #   has no copy of the repo and no git remote to fetch one from. Before this script the gap was
 #   filled by hand, differently each time, which is exactly how a unit ends up missing the one file
-#   whose absence is silent (see the bluealsa D-Bus policy: 178 respawns on .7.204).
+#   whose absence is silent (see the bluealsa D-Bus policy: 178 respawns on .100.21).
 #
 #   So: this pushes the host-setup payload to the unit and runs the checklist, idempotently. It is
 #   the step BEFORE docker/deploy.sh, and it needs to run exactly once per image — not per deploy.
@@ -36,15 +36,22 @@ cd "$(dirname "$0")"
 HERE="$PWD"
 ROOT="$(cd ../.. && pwd)"
 
+# The rig credential is NOT stored in this repo. Export PLUM_TEST_PW, or put it in
+# docker/.deploy.env (gitignored), which is sourced here when it exists.
+[[ -f "${ROOT}/docker/.deploy.env" ]] && source "${ROOT}/docker/.deploy.env"
 USER_="${PLUM_TEST_USER:-plum-admin}"
-PW="${PLUM_TEST_PW:-REDACTED-USE-PLUM_TEST_PW}"
+PW="${PLUM_TEST_PW:?not set — export it, or create docker/.deploy.env containing PLUM_TEST_PW=<rig password>}"
 # UserKnownHostsFile=/dev/null, not just StrictHostKeyChecking=no: a REIMAGED unit presents a new
 # host key, and a conflicting known_hosts entry makes ssh refuse the connection outright —
-# StrictHostKeyChecking=no only covers a host it has never seen. Since the password is in this file,
-# there is no key-pinning posture to preserve, and the alternative is telling every operator to run
+# StrictHostKeyChecking=no only covers a host it has never seen. These units are a password-auth
+# lab rig, so there is no key-pinning posture to preserve, and the alternative is telling every operator to run
 # ssh-keygen -R by hand on exactly the runs where they are least expecting a failure.
 SSH_OPTS="-o ConnectTimeout=20 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 UNITS_FILE="${ROOT}/docker/units.conf"
+[[ -f "$UNITS_FILE" ]] || {
+    echo "no docker/units.conf — copy docker/units.conf.example to it and list your units" >&2
+    exit 1
+}
 PAYLOAD="plum-audio-hostsetup"      # lands in the unit's home directory
 
 OVERLAY=""
@@ -109,7 +116,7 @@ note() { printf '    \033[36m--\033[0m   %-26s %s\n' "$1" "$2"; }
 
 note "host" "$(hostname) / $(dpkg --print-architecture) / $(. /etc/os-release; echo "$PRETTY_NAME")"
 # [^] ]* not [^ ]*: a card id long enough to fill the padding has no space before the ']', so the
-# looser class swallows the bracket and colon too (seen on .7.204's sndrpihifiberry).
+# looser class swallows the bracket and colon too (seen on .100.21's sndrpihifiberry).
 note "cards" "$(sed -n 's/^ *[0-9]* \[\([^] ]*\).*/\1/p' /proc/asound/cards 2>/dev/null | tr '\n' ' ')"
 
 systemctl is-active --quiet avahi-daemon && ok "avahi-daemon" "active" || bad "avahi-daemon" "NOT active"
@@ -231,7 +238,7 @@ esac
 
 # 5. The bluealsa system D-Bus policy. Debian's own grants own_prefix=org.bluealsa to root ONLY, and
 #    the source manager spawns the daemon as our user — so without this it exits rc=1 about 3 s after
-#    every start and is respawned forever (178 times on .7.204), burying unrelated diagnosis.
+#    every start and is respawned forever (178 times on .100.21), burying unrelated diagnosis.
 if s cmp -s "$PAYLOAD/bluealsa-plum-dbus.conf" /etc/dbus-1/system.d/bluealsa-plum-dbus.conf 2>/dev/null; then
     echo "    bluealsa D-Bus policy: already current"
 else
