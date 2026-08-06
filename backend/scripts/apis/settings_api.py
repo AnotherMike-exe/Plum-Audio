@@ -17,11 +17,15 @@ import json
 import logging
 import os
 import re
+import sys
 import tempfile
 import threading
 from typing import Dict, Any
 
 from flask import Blueprint, jsonify, request
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/ on path
+import audio_devices  # noqa: E402  — the sentinel's spelling has exactly one owner
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +165,56 @@ def _sanitize_device_names(settings: Dict[str, Any]) -> None:
             if safe != endpoint.get("deviceName"):
                 logger.warning("sanitized endpoint deviceName %r -> %r", endpoint.get("deviceName"), safe)
             endpoint["deviceName"] = safe or "Plum Audio"
+
+
+# An output spec is a `<card_name>:<device>` id, an `hw:C,D` address, a bare ALSA card name, or a
+# PortAudio name fragment — all of which live in this charset. Deliberately permissive: this checks
+# SHAPE, never existence. A spec that resolves nowhere on THIS unit is legitimate (PLUM_DAC_DEVICE
+# values are fragments that only match on the unit they were written for, and the tier-2 test writes
+# an unopenable device on purpose to prove the renderer falls back rather than going silent).
+AUDIO_OUTPUT_ALLOWED = re.compile(r"^[A-Za-z0-9_.:,\- ]{1,64}$")
+
+
+def _validate_audio_output(settings: Dict[str, Any]) -> None:
+    """Normalise and validate `audio.output` in place; raise ValueError on a bad shape.
+
+    POST /api/settings takes arbitrary JSON and merges ONE level deep, which means it REPLACES this
+    whole sub-dict wholesale — and it never went through audio_api's find_device/404/409 checks. So
+    an arbitrary string could become the spec the player hands to PortAudio, and now also the input
+    the output gate reads to decide whether this unit runs a player at all. Same chokepoint argument
+    as _sanitize_device_names: this is the only place both write paths share.
+    """
+    audio = settings.get("audio")
+    if not isinstance(audio, dict):
+        return
+    output = audio.get("output")
+    if not isinstance(output, dict):
+        audio["output"] = {"device": None, "device_type": None}
+        return
+
+    device = output.get("device")
+    if device is None:
+        return
+    if not isinstance(device, str):
+        raise ValueError("audio.output.device must be a string or null")
+
+    stripped = device.strip()
+    if stripped in LEGACY_OUTPUT_PLACEHOLDERS:
+        # Same meaning as _migrate_audio_output gives them: unset. Handled here too so a POST cannot
+        # write a placeholder back in between migrations.
+        output["device"] = None
+        output["device_type"] = None
+        return
+    if audio_devices.is_no_output(stripped):
+        # Normalise to the canonical spelling. NOTE: "none" must never join
+        # LEGACY_OUTPUT_PLACEHOLDERS — _migrate_audio_output would then clear it on every read, and
+        # a unit deliberately set to no output would silently grow a player back at its next start.
+        output["device"] = audio_devices.NO_OUTPUT
+        output["device_type"] = audio_devices.DeviceType.NONE.value
+        return
+    if not AUDIO_OUTPUT_ALLOWED.match(stripped):
+        raise ValueError(f"audio.output.device is not a valid device spec: {device!r}")
+    output["device"] = stripped
 
 
 class SettingsManager:
@@ -376,6 +430,7 @@ class SettingsManager:
                     current[key] = new_settings[key]
 
             _sanitize_device_names(current)
+            _validate_audio_output(current)
 
             current["version"] = current.get("version", 0) + 1
             logger.info(f"Settings updated to version {current['version']}")
@@ -508,6 +563,11 @@ def create_settings_blueprint(settings_manager: SettingsManager = None) -> Bluep
             if not new_settings:
                 return jsonify({"error": "No settings provided"}), 400
             return jsonify(settings_manager.update_settings(new_settings))
+        except ValueError as e:
+            # A rejected value is the caller's fault, not ours — _validate_audio_output raises this.
+            # Must be caught BEFORE the generic handler, or a bad device spec reads as a 500.
+            logger.warning(f"Rejected a settings update: {e}")
+            return jsonify({"error": str(e)}), 400
         except Exception as e:
             logger.error(f"Update settings failed: {e}")
             return jsonify({"error": str(e)}), 500

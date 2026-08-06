@@ -172,3 +172,100 @@ def test_a_name_with_nothing_usable_falls_back(manager):
     manager.update_settings({"integrations": {"airplay": {"endpoints": [{"id": "1", "deviceName": '"""'}]}}})
     stored = manager.get_settings()["integrations"]["airplay"]["endpoints"][0]["deviceName"]
     assert stored == "Plum Audio"
+
+
+# -- audio.output validation: the POST /api/settings bypass ---------------------------------------
+#
+# POST /api/settings takes arbitrary JSON and merges one level deep, so it REPLACES audio.output
+# wholesale without ever passing audio_api's find_device/404/409 checks. Whatever lands here is what
+# the player hands to PortAudio — and now also what the output gate reads to decide whether this
+# unit runs a player at all.
+
+
+def test_the_no_output_sentinel_persists(manager):
+    manager.update_settings({"audio": {"output": {"device": "none"}}})
+    output = manager.get_settings()["audio"]["output"]
+    assert output["device"] == "none"
+    assert output["device_type"] == "NONE"
+
+
+def test_the_sentinel_survives_a_subsequent_read(manager):
+    """The regression that would silently give a headless unit its player back.
+
+    "none" must never join LEGACY_OUTPUT_PLACEHOLDERS: _migrate_audio_output runs on every read and
+    would clear it, so the gate would see an unset output at the next container start and install
+    the player program again — on a box with no audio hardware.
+    """
+    manager.update_settings({"audio": {"output": {"device": "none"}}})
+    for _ in range(3):
+        assert manager.get_settings()["audio"]["output"]["device"] == "none"
+
+
+@pytest.mark.parametrize("raw", ["None", "NONE", " none "])
+def test_sentinel_spellings_normalise(manager, raw):
+    manager.update_settings({"audio": {"output": {"device": raw}}})
+    assert manager.get_settings()["audio"]["output"]["device"] == "none"
+
+
+def test_a_real_device_spec_is_stored_stripped(manager):
+    manager.update_settings({"audio": {"output": {"device": "  sndrpihifiberry:0 "}}})
+    assert manager.get_settings()["audio"]["output"]["device"] == "sndrpihifiberry:0"
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "snd_rpi_hifiberry_dacplus",  # a PortAudio name fragment, resolves nowhere on another unit
+        "hw:2,0",
+        "bcm2835",
+        "vc4hdmi0:0",
+    ],
+)
+def test_specs_that_resolve_nowhere_here_are_still_accepted(manager, spec):
+    """SHAPE only, never existence — the tier-2 test writes an unopenable device on purpose."""
+    manager.update_settings({"audio": {"output": {"device": spec}}})
+    assert manager.get_settings()["audio"]["output"]["device"] == spec
+
+
+def test_the_legacy_placeholder_still_means_unset(manager):
+    manager.update_settings({"audio": {"output": {"device": "hw:Headphones"}}})
+    assert manager.get_settings()["audio"]["output"]["device"] is None
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        123,
+        {"device": "nested"},
+        ["sndrpihifiberry:0"],
+        "x" * 65,
+        'evil"; }; sessioncontrol = { run_this_before_play_begins = "/bin/sh -c id";',
+        "card\nname",
+        "card;name",
+    ],
+)
+def test_a_bogus_device_spec_is_refused(manager, bad):
+    with pytest.raises(ValueError):
+        manager.update_settings({"audio": {"output": {"device": bad}}})
+
+
+def test_a_refused_update_does_not_persist(manager):
+    manager.update_settings({"audio": {"output": {"device": "sndrpihifiberry:0"}}})
+    before = manager.get_settings()["version"]
+    with pytest.raises(ValueError):
+        manager.update_settings({"audio": {"output": {"device": "bad;spec"}}})
+    after = manager.get_settings()
+    assert after["audio"]["output"]["device"] == "sndrpihifiberry:0"
+    assert after["version"] == before  # nothing written, so the GUI's poller has nothing to miss
+
+
+def test_an_empty_output_dict_does_not_resurrect_the_previous_device(manager):
+    """Pins the one-level-merge semantics this validator now sits on top of."""
+    manager.update_settings({"audio": {"output": {"device": "sndrpihifiberry:0"}}})
+    manager.update_settings({"audio": {"output": {}}})
+    assert manager.get_settings()["audio"]["output"].get("device") is None
+
+
+def test_a_non_dict_output_is_replaced_rather_than_trusted(manager):
+    manager.update_settings({"audio": {"output": "sndrpihifiberry:0"}})
+    assert manager.get_settings()["audio"]["output"] == {"device": None, "device_type": None}
