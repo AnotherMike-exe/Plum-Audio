@@ -351,6 +351,26 @@ debugging cookbook are in **`docs/OPERATIONS.md`**.
     from an earlier date — a real go-librespot crash, which our source manager respawns. Worth
     watching for a pattern away from restarts before treating it as ours.
 
+18. **The visualizer's periodic drop-to-zero is CONTROLLER-WS CHURN, not the audio path.** Measured
+    in the running GUI on `.201.133` (2026-08-06) by hooking `WebSocket` and timestamping every
+    binary frame: spectrum arrives at **31 Hz with a 2000 ms gap every 3 s**, like clockwork
+    (1.1 s, 4.1 s, 7.1 s, 10.1 s …). In the same window, **48 controller sockets were created AND
+    closed in 22 s** — six (one per source across both units) every ~3 s, all close code 1000.
+    Ruled OUT: `refresh_stream`. The server re-acquired the stream only 3 times in the whole log,
+    each right after a container restart, so steady playback is not churning the group. The player
+    logs no xruns and no starvation.
+    **The amplifier is `sendspinControllerClient.open()`**: `reconnectAttempts = 0` is reset in
+    `onopen`, the instant the socket opens rather than once it has proven STABLE. So a socket that
+    dies shortly after connecting resets the counter every cycle and the backoff is pinned at
+    `RECONNECT_BASE_MS` (1 s) forever — the exponential backoff can never engage on a flapping
+    connection. That is a real flaw regardless of the trigger, and it turns any brief instability
+    into a permanent 3-second sawtooth.
+    **The TRIGGER — what closes the socket ~1 s after open — is NOT yet identified.** One strong
+    candidate not yet excluded: the measurement tab was backgrounded (confirmed — a 100 ms sampler
+    was throttled to ~1 Hz), and `client/time` is sent on an adaptive `setTimeout` (0.2–3 s) which
+    background throttling would stretch, possibly past whatever the server tolerates. Re-measure in
+    a FOCUSED, foreground tab before concluding this is user-visible rather than an artifact.
+
 ## Resources
 - Sendspin spec: <https://www.sendspin-audio.com/spec/> · Org: <https://github.com/Sendspin>
 - `aiosendspin`: <https://github.com/Sendspin/aiosendspin>
