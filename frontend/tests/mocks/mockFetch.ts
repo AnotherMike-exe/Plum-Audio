@@ -191,12 +191,9 @@ export const handlers = [
     })
   }),
 
-  http.get('/api/integrations/dlna/endpoints', () => {
-    return HttpResponse.json({
-      success: true,
-      endpoints: mockSettings.integrations.dlna.endpoints
-    })
-  }),
+  // NOTE: there is deliberately no /api/integrations/dlna handler here. No blueprint registers that
+  // route (create_integrations_blueprint covers airplay/spotify/bluetooth only), so mocking it made
+  // a whole describe() block in integrationsService.test.ts pass against an API that does not exist.
 
   // -------------------------------------------------------------------------
   // Audio API

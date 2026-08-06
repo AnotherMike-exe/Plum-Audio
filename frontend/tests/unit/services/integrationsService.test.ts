@@ -1,13 +1,29 @@
 /**
- * Unit tests for integrationsService
- * Tests: Enable/disable calls, status handling, endpoint management
+ * Unit tests for integrationsService — the REAL module.
+ *
+ * The previous version imported none of it. It built endpoint literals inline, asserted properties
+ * on those literals, and had a whole `describe('DLNA integration')` block exercising
+ * `/api/integrations/dlna/*` — a route NO blueprint registers. It passed while testing an API that
+ * does not exist.
+ *
+ * `create_integrations_blueprint` registers airplay, spotify and bluetooth only. `dlnaService` and
+ * `plexampService` are dead scaffolding in this file; every one of their calls 404s against a real
+ * unit. That is asserted below rather than mocked into working, so the next person reads the truth.
+ *
+ * What is worth guarding is the error contract: these methods are called straight from
+ * IntegrationsTab's click handlers, and a rejected promise is what surfaces the failure to the user.
+ * A method that swallowed a non-2xx and resolved would leave the tab showing success for an endpoint
+ * that was never created.
  */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeAll, afterEach, afterAll } from 'vitest'
+import { http, HttpResponse } from 'msw'
 import { server, resetMockState } from '../../mocks/mockFetch'
-import { createMockAirPlayEndpoint, createMockSpotifyEndpoint, createMockDLNAEndpoint } from '../../mocks/mockTypes'
+import { airplayService, bluetoothService, spotifyService, dlnaService } from '../../../services/integrationsService'
 
-// Setup MSW
+// The service builds absolute URLs from window.location, so handlers must match that origin.
+const base = `${window.location.protocol}//${window.location.hostname}:${window.location.port}/api/integrations`
+
 beforeAll(() => server.listen({ onUnhandledRequest: 'error' }))
 afterEach(() => {
   server.resetHandlers()
@@ -15,255 +31,148 @@ afterEach(() => {
 })
 afterAll(() => server.close())
 
-describe('integrationsService', () => {
-  describe('AirPlay integration', () => {
-    it('should get AirPlay status', async () => {
-      const response = await fetch('/api/integrations/airplay/status')
+describe('integrationsService — endpoint CRUD', () => {
+  it('creates an AirPlay endpoint with the name the user typed', async () => {
+    let sent: Record<string, unknown> | null = null
+    server.use(
+      http.post(`${base}/airplay/endpoints`, async ({ request }) => {
+        sent = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json({ success: true, message: 'created', endpoint: { id: '2' } })
+      }),
+    )
 
-      expect(response.ok).toBe(true)
-      const data = await response.json()
-      expect(data.success).toBe(true)
-    })
+    const result = await airplayService.addEndpoint('Kitchen')
 
-    it('should enable AirPlay', async () => {
-      const response = await fetch('/api/integrations/airplay/enable', {
-        method: 'POST'
-      })
-
-      expect(response.ok).toBe(true)
-      const data = await response.json()
-      expect(data.success).toBe(true)
-    })
-
-    it('should disable AirPlay', async () => {
-      const response = await fetch('/api/integrations/airplay/disable', {
-        method: 'POST'
-      })
-
-      expect(response.ok).toBe(true)
-    })
-
-    it('should list AirPlay endpoints', async () => {
-      const response = await fetch('/api/integrations/airplay/endpoints')
-
-      expect(response.ok).toBe(true)
-      const data = await response.json()
-      expect(data.endpoints).toBeDefined()
-      expect(Array.isArray(data.endpoints)).toBe(true)
-    })
-
-    it('should add AirPlay endpoint', async () => {
-      const response = await fetch('/api/integrations/airplay/endpoints', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ deviceName: 'New AirPlay' })
-      })
-
-      expect(response.ok).toBe(true)
-      const data = await response.json()
-      expect(data.success).toBe(true)
-    })
-
-    it('should have valid AirPlay endpoint structure', () => {
-      const endpoint = createMockAirPlayEndpoint()
-
-      expect(endpoint.id).toBeDefined()
-      expect(endpoint.enabled).toBeDefined()
-      expect(endpoint.deviceName).toBeDefined()
-      expect(endpoint.port).toBeDefined()
-      expect(endpoint.udpPortBase).toBeDefined()
-      expect(typeof endpoint.port).toBe('number')
-    })
+    expect(sent).toMatchObject({ deviceName: 'Kitchen', enabled: true })
+    expect(result.success).toBe(true)
   })
 
-  describe('Bluetooth integration', () => {
-    it('should get Bluetooth status', async () => {
-      const response = await fetch('/api/integrations/bluetooth/status')
+  it('sends only the fields being changed on an update', async () => {
+    let sent: Record<string, unknown> | null = null
+    server.use(
+      http.put(`${base}/spotify/endpoints/3`, async ({ request }) => {
+        sent = (await request.json()) as Record<string, unknown>
+        return HttpResponse.json({ success: true, message: 'updated' })
+      }),
+    )
 
-      expect(response.ok).toBe(true)
-    })
+    await spotifyService.updateEndpoint('3', undefined, false)
 
-    it('should enable Bluetooth', async () => {
-      const response = await fetch('/api/integrations/bluetooth/enable', {
-        method: 'POST'
-      })
-
-      expect(response.ok).toBe(true)
-    })
-
-    it('should disable Bluetooth', async () => {
-      const response = await fetch('/api/integrations/bluetooth/disable', {
-        method: 'POST'
-      })
-
-      expect(response.ok).toBe(true)
-    })
-
-    it('should have Bluetooth settings structure', () => {
-      const bluetoothSettings = {
-        enabled: false,
-        deviceName: 'Plum Audio',
-        adapter: 'hci0',
-        autoPair: true,
-        discoverable: true
-      }
-
-      expect(bluetoothSettings).toHaveProperty('enabled')
-      expect(bluetoothSettings).toHaveProperty('deviceName')
-      expect(bluetoothSettings).toHaveProperty('autoPair')
-      expect(bluetoothSettings).toHaveProperty('discoverable')
-    })
+    expect(sent).toMatchObject({ enabled: false })
+    expect(sent!.deviceName).toBeUndefined()  // an unchanged name must not be re-sent
   })
 
-  describe('Spotify integration', () => {
-    it('should get Spotify status', async () => {
-      const response = await fetch('/api/integrations/spotify/status')
+  it('deletes by id', async () => {
+    let hit = false
+    server.use(
+      http.delete(`${base}/bluetooth/endpoints/7`, () => {
+        hit = true
+        return HttpResponse.json({ success: true, message: 'removed' })
+      }),
+    )
 
-      expect(response.ok).toBe(true)
-    })
-
-    it('should enable Spotify', async () => {
-      const response = await fetch('/api/integrations/spotify/enable', {
-        method: 'POST'
-      })
-
-      expect(response.ok).toBe(true)
-    })
-
-    it('should disable Spotify', async () => {
-      const response = await fetch('/api/integrations/spotify/disable', {
-        method: 'POST'
-      })
-
-      expect(response.ok).toBe(true)
-    })
-
-    it('should list Spotify endpoints', async () => {
-      const response = await fetch('/api/integrations/spotify/endpoints')
-
-      expect(response.ok).toBe(true)
-      const data = await response.json()
-      expect(data.endpoints).toBeDefined()
-    })
-
-    it('should have valid Spotify endpoint structure', () => {
-      const endpoint = createMockSpotifyEndpoint()
-
-      expect(endpoint.id).toBeDefined()
-      expect(endpoint.enabled).toBeDefined()
-      expect(endpoint.deviceName).toBeDefined()
-      expect(endpoint.zeroconfPort).toBeDefined()
-      expect(typeof endpoint.zeroconfPort).toBe('number')
-    })
-
-    it('should support Spotify bitrate values', () => {
-      const validBitrates = [96, 160, 320]
-
-      validBitrates.forEach(bitrate => {
-        expect([96, 160, 320]).toContain(bitrate)
-      })
-    })
+    await bluetoothService.removeEndpoint('7')
+    expect(hit).toBe(true)
   })
 
-  describe('DLNA integration', () => {
-    it('should get DLNA status', async () => {
-      const response = await fetch('/api/integrations/dlna/status')
+  it('lists endpoints', async () => {
+    server.use(
+      http.get(`${base}/airplay/endpoints`, () =>
+        HttpResponse.json({ success: true, endpoints: [{ id: '1', enabled: true, deviceName: 'Lounge', port: 5050, udpPortBase: 6001 }] }),
+      ),
+    )
 
-      expect(response.ok).toBe(true)
-    })
+    const result = await airplayService.listEndpoints()
+    expect(result.endpoints.map(e => e.deviceName)).toEqual(['Lounge'])
+  })
+})
 
-    it('should enable DLNA', async () => {
-      const response = await fetch('/api/integrations/dlna/enable', {
-        method: 'POST'
-      })
+describe('integrationsService — failures must reach the user', () => {
+  it('rejects rather than resolving when the unit refuses a name', async () => {
+    // A device name is interpolated into shairport's libconfig and a daemon is respooled, so the
+    // backend rejects anything outside its allowlist. Swallowing that would show success in the tab
+    // for a rename that never happened.
+    server.use(
+      http.post(`${base}/airplay/device-name`, () =>
+        HttpResponse.json({ message: 'Invalid device name' }, { status: 400 }),
+      ),
+    )
 
-      expect(response.ok).toBe(true)
-    })
-
-    it('should disable DLNA', async () => {
-      const response = await fetch('/api/integrations/dlna/disable', {
-        method: 'POST'
-      })
-
-      expect(response.ok).toBe(true)
-    })
-
-    it('should list DLNA endpoints', async () => {
-      const response = await fetch('/api/integrations/dlna/endpoints')
-
-      expect(response.ok).toBe(true)
-      const data = await response.json()
-      expect(data.endpoints).toBeDefined()
-    })
-
-    it('should have valid DLNA endpoint structure', () => {
-      const endpoint = createMockDLNAEndpoint()
-
-      expect(endpoint.id).toBeDefined()
-      expect(endpoint.enabled).toBeDefined()
-      expect(endpoint.deviceName).toBeDefined()
-      expect(endpoint.port).toBeDefined()
-      expect(endpoint.uuid).toBeDefined()
-    })
+    await expect(airplayService.updateDeviceName('evil";}')).rejects.toThrow(/Invalid device name/)
   })
 
-  describe('Plexamp integration', () => {
-    it('should get Plexamp status', async () => {
-      const response = await fetch('/api/integrations/plexamp/status')
+  it('surfaces the server message rather than a bare status code', async () => {
+    server.use(
+      http.post(`${base}/spotify/enable`, () =>
+        HttpResponse.json({ message: 'go-librespot is not installed' }, { status: 500 }),
+      ),
+    )
 
-      expect(response.ok).toBe(true)
-    })
-
-    it('should enable Plexamp when available', async () => {
-      const response = await fetch('/api/integrations/plexamp/enable', {
-        method: 'POST'
-      })
-
-      // May succeed or fail depending on availability
-      expect([200, 400, 500]).toContain(response.status)
-    })
-
-    it('should disable Plexamp', async () => {
-      const response = await fetch('/api/integrations/plexamp/disable', {
-        method: 'POST'
-      })
-
-      expect(response.ok).toBe(true)
-    })
-
-    it('should have Plexamp settings structure', () => {
-      const plexampSettings = {
-        available: false,
-        enabled: false,
-        sourceName: 'Plexamp'
-      }
-
-      expect(plexampSettings).toHaveProperty('available')
-      expect(plexampSettings).toHaveProperty('enabled')
-      expect(plexampSettings).toHaveProperty('sourceName')
-    })
+    await expect(spotifyService.enable()).rejects.toThrow(/go-librespot is not installed/)
   })
 
-  describe('response structure', () => {
-    it('should return consistent success response', async () => {
-      const response = await fetch('/api/integrations/airplay/enable', {
-        method: 'POST'
-      })
+  it('falls back to the status code when the body is JSON without a message', async () => {
+    server.use(http.post(`${base}/airplay/disable`, () => HttpResponse.json({}, { status: 503 })))
 
-      const data = await response.json()
+    await expect(airplayService.disable()).rejects.toThrow(/503/)
+  })
 
-      expect(data).toHaveProperty('success')
-      expect(typeof data.success).toBe('boolean')
-    })
+  it('uses a generic message when the body is not JSON at all', async () => {
+    // Documented, not endorsed: an empty or HTML body (nginx returning a 502 page) hits the
+    // .catch() default, so the STATUS CODE is lost and the user sees only "Failed to disable
+    // AirPlay". Worth knowing when a report says that and the logs say something else entirely.
+    server.use(http.post(`${base}/airplay/disable`, () => new HttpResponse(null, { status: 503 })))
 
-    it('should include message in response', async () => {
-      const response = await fetch('/api/integrations/bluetooth/enable', {
-        method: 'POST'
-      })
+    await expect(airplayService.disable()).rejects.toThrow('Failed to disable AirPlay')
+  })
 
-      const data = await response.json()
+  it('rejects on a network failure', async () => {
+    server.use(http.get(`${base}/bluetooth/status`, () => HttpResponse.error()))
 
-      expect(data).toHaveProperty('message')
-    })
+    await expect(bluetoothService.getStatus()).rejects.toThrow()
+  })
+})
+
+describe('integrationsService — Bluetooth pairing', () => {
+  it('lists bonded devices with their connection state', async () => {
+    server.use(
+      http.get(`${base}/bluetooth/devices`, () =>
+        HttpResponse.json({
+          success: true,
+          devices: [{ address: 'AA:BB:CC:DD:EE:FF', name: 'iPhone', connected: true, trusted: true }],
+        }),
+      ),
+    )
+
+    const result = await bluetoothService.listPairedDevices()
+    expect(result.devices[0]).toMatchObject({ name: 'iPhone', connected: true })
+  })
+
+  it('forgets a bond by address', async () => {
+    // The stale-link-key case: "pairing unsuccessful" is usually OUR key being stale, and the fix is
+    // removing the bond on this side — the phone forgetting it cannot help.
+    let hit = ''
+    server.use(
+      http.delete(`${base}/bluetooth/devices/:address`, ({ params }) => {
+        hit = params.address as string
+        return HttpResponse.json({ success: true, message: 'removed' })
+      }),
+    )
+
+    await bluetoothService.forgetPairedDevice('AA:BB:CC:DD:EE:FF')
+    expect(hit).toBe('AA:BB:CC:DD:EE:FF')
+  })
+})
+
+describe('integrationsService — DLNA has no backend', () => {
+  it('404s against a real unit, because no blueprint registers the route', async () => {
+    // Asserted rather than mocked into working. create_integrations_blueprint registers airplay,
+    // spotify and bluetooth only; dlnaService and plexampService are dead scaffolding in this file.
+    // The old version of this suite mocked these routes and tested them as though they worked.
+    server.use(
+      http.get(`${base}/dlna/status`, () => HttpResponse.json({ error: 'Not Found' }, { status: 404 })),
+    )
+
+    await expect(dlnaService.getStatus()).rejects.toThrow()
   })
 })

@@ -353,7 +353,17 @@ class SettingsService {
    * Notify all listeners of settings changes
    */
   private notifyListeners(settings: Settings): void {
-    this.listeners.forEach((listener) => listener(settings));
+    // Isolated per listener. MeshApp and useThemeSettings both subscribe, and an unguarded forEach
+    // lets the FIRST one to throw abort the loop — so a render error in one silently froze the
+    // other's settings, and the exception surfaced out of whatever called updateLocalSettings,
+    // which looks like a bug in the caller rather than in a subscriber.
+    this.listeners.forEach((listener) => {
+      try {
+        listener(settings);
+      } catch (error) {
+        console.error('[Settings] a subscriber threw; continuing with the rest:', error);
+      }
+    });
   }
 
   /**
