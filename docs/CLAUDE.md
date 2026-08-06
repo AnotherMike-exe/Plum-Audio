@@ -233,12 +233,19 @@ debugging cookbook are in **`docs/OPERATIONS.md`**.
 
 ## Open
 
-1. **DLNA and Plexamp have no backend.** Scope, corrected 2026-08-06: the GUI does **not** render
-   cards for them — `IntegrationsTab` shows airplay/bluetooth/spotify only, so nothing 404s (the
-   earlier "live DLNA card" entry here was wrong). What remains is dead scaffolding: `types.ts`
-   declares `DLNAEndpoint` and the two settings shapes, `settings_api.py` seeds
-   `integrations.dlna`/`.plexamp` defaults (Plexamp's gated on `PLEXAMP_ENABLED`), and the frontend
-   test mocks serve `/api/integrations/dlna/endpoints` — a route no blueprint registers.
+1. **DLNA and Plexamp have no backend.** Established by *watching the running GUI* on `.7.204`
+   (2026-08-06) after two wrong descriptions here — a truncated `grep | head -20` produced the
+   second, so **read the whole grep**:
+   - `IntegrationsTab.tsx` **does** contain full DLNA (`:1250`) and Plexamp (`:1433`) sections,
+     ~330 lines with handlers and CRUD.
+   - They do not RENDER: `Settings.tsx:43` passes `enabledSources={['airplay','spotify','bluetooth']}`
+     and `show()` gates both out.
+   - But `loadDlnaEndpoints()` ran on mount regardless of that gate, so every open of the
+     Integrations tab logged two console errors against `/api/integrations/dlna/endpoints` — a route
+     `create_integrations_blueprint` does not register. **Fixed 2026-08-06**: the effect now returns
+     early when the section is hidden.
+   Remaining scaffolding: the two card bodies, `types.ts`'s `DLNAEndpoint`, and `settings_api.py`'s
+   `integrations.dlna`/`.plexamp` defaults (Plexamp's gated on `PLEXAMP_ENABLED`).
 2. **Four frontend test suites assert nothing about production code** (`NowPlaying`,
    `PlayerControls`, `integrationsService`, `settingsService`). `PlayerControls` now has a real
    counterpart beside it (`PlayerControlsSourceVolume`); the other three do not. See TESTING.md.

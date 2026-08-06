@@ -19,13 +19,13 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
   // Initialize form from settings
   useEffect(() => {
     setDeviceName(settings.deviceName || 'Plum Sendspin');
-    setHostname(settings.hostname || 'plum-snapcast');
+    setHostname(settings.hostname || 'plum-audio');
   }, [settings.deviceName, settings.hostname]);
 
   // Check if settings have changed
   const hasChanges =
     deviceName !== (settings.deviceName || 'Plum Sendspin') ||
-    hostname !== (settings.hostname || 'plum-snapcast');
+    hostname !== (settings.hostname || 'plum-audio');
 
   // Validate hostname on change
   const handleHostnameChange = async (value: string) => {
@@ -68,7 +68,7 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
         updates.deviceName = deviceName.trim();
       }
 
-      if (hostname.trim() !== (settings.hostname || 'plum-snapcast')) {
+      if (hostname.trim() !== (settings.hostname || 'plum-audio')) {
         updates.hostname = hostname.trim();
       }
 
@@ -114,7 +114,7 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
                   placeholder="Plum Sendspin"
                 />
                 <p className="mt-1 text-xs text-[var(--text-muted)]">
-                  Display name used in Federation and the browser title
+                  Display name shown across the mesh and in the browser title
                 </p>
               </div>
 
@@ -131,13 +131,13 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
                   className={`w-full px-3 py-2 bg-[var(--bg-secondary)] border rounded-md text-[var(--text-primary)] text-sm focus:outline-none focus:ring-2 focus:ring-[var(--accent-color)] disabled:opacity-50 ${
                     hostnameError ? 'border-red-500' : 'border-[var(--border-color)]'
                   }`}
-                  placeholder="plum-snapcast"
+                  placeholder="plum-audio"
                 />
                 {hostnameError ? (
                   <p className="mt-1 text-xs text-red-500">{hostnameError}</p>
                 ) : (
                   <p className="mt-1 text-xs text-[var(--text-muted)]">
-                    Access this device at http://{hostname || 'plum-snapcast'}.local (mDNS/Avahi). Lowercase letters, numbers, and hyphens only.
+                    Access this device at http://{hostname || 'plum-audio'}.local (mDNS/Avahi). Lowercase letters, numbers, and hyphens only.
                   </p>
                 )}
               </div>
@@ -165,10 +165,10 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
       {/* About Section */}
       <div>
         <h3 className="text-base font-semibold text-[var(--text-primary)] mb-4">
-          About Plum-Snapcast
+          About Plum-Audio
         </h3>
         <p className="text-sm text-[var(--text-muted)] mb-6">
-          Multi-room audio streaming with Snapcast
+          Multi-room audio streaming, synchronised with Sendspin
         </p>
       </div>
 
@@ -179,7 +179,7 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
           </h4>
           <div className="space-y-2 text-sm">
             <div className="flex justify-between">
-              <span className="text-[var(--text-muted)]">Plum-Snapcast</span>
+              <span className="text-[var(--text-muted)]">Plum-Audio</span>
               <span className="text-[var(--text-primary)] font-mono">1.0.0</span>
             </div>
             <div className="flex justify-between">
@@ -195,29 +195,29 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
           </h4>
           <div className="space-y-3 text-sm text-[var(--text-muted)]">
             <div>
-              <p className="font-semibold text-[var(--text-primary)] mb-1">Based on</p>
+              <p className="font-semibold text-[var(--text-primary)] mb-1">Sync engine</p>
               <ul className="space-y-1 list-disc list-inside">
                 <li>
                   <a
-                    href="https://github.com/badaix/snapcast"
+                    href="https://www.sendspin-audio.com/spec/"
                     target="_blank"
                     rel="noopener noreferrer"
                     className="text-[var(--accent-color)] hover:underline"
                   >
-                    Snapcast
+                    Sendspin
                   </a>
-                  {' '}by Johannes Pohl
+                  {' '}(Open Home Foundation sync protocol)
                 </li>
                 <li>
                   <a
-                    href="https://github.com/firefrei/docker-snapcast"
+                    href="https://github.com/Sendspin/aiosendspin"
                     target="_blank"
                     rel="noopener noreferrer"
                     className="text-[var(--accent-color)] hover:underline"
                   >
-                    docker-snapcast
+                    aiosendspin
                   </a>
-                  {' '}by firefrei
+                  {' '}(server + client library)
                 </li>
               </ul>
             </div>
@@ -238,25 +238,25 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
                 </li>
                 <li>
                   <a
-                    href="https://github.com/Spotifyd/spotifyd"
+                    href="https://github.com/devgianlu/go-librespot"
                     target="_blank"
                     rel="noopener noreferrer"
                     className="text-[var(--accent-color)] hover:underline"
                   >
-                    Spotifyd
+                    go-librespot
                   </a>
                   {' '}(Spotify Connect)
                 </li>
                 <li>
                   <a
-                    href="https://github.com/hzeller/gmrender-resurrect"
+                    href="https://github.com/arkq/bluez-alsa"
                     target="_blank"
                     rel="noopener noreferrer"
                     className="text-[var(--accent-color)] hover:underline"
                   >
-                    gmrender-resurrect
+                    bluez-alsa
                   </a>
-                  {' '}(DLNA/UPnP)
+                  {' '}(Bluetooth A2DP)
                 </li>
               </ul>
             </div>
@@ -269,7 +269,7 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
           </h4>
           <div className="space-y-2 text-sm">
             <a
-              href="https://github.com/Mprice12337/Plum-Snapcast"
+              href="https://github.com/Mprice12337/Plum-Audio"
               target="_blank"
               rel="noopener noreferrer"
               className="flex items-center gap-2 text-[var(--accent-color)] hover:underline"
@@ -278,13 +278,13 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
               <span>View on GitHub</span>
             </a>
             <a
-              href="https://github.com/badaix/snapcast/blob/develop/doc/json_rpc_api/"
+              href="https://www.sendspin-audio.com/spec/"
               target="_blank"
               rel="noopener noreferrer"
               className="flex items-center gap-2 text-[var(--accent-color)] hover:underline"
             >
               <Icon name="book" className="text-lg" style={{ color: 'inherit' }} />
-              <span>Snapcast API Documentation</span>
+              <span>Sendspin Protocol Specification</span>
             </a>
           </div>
         </div>
