@@ -146,10 +146,10 @@ def test_an_unreadable_settings_file_falls_back_rather_than_raising(monkeypatch,
 
 
 def test_lists_devices(client, monkeypatch):
+    """Hardware first, then the synthetic "No output" row — see the None-row tests at the end."""
     _present(monkeypatch, [_device(active=True)])
     body = client.get("/api/audio/devices/output").get_json()
-    assert len(body) == 1
-    assert body[0]["id"] == "sndrpihifiberry:0"
+    assert [d["id"] for d in body] == ["sndrpihifiberry:0", "none"]
     assert body[0]["is_active"] is True
 
 
@@ -275,3 +275,135 @@ def test_discovery_failure_does_not_take_down_the_tab(client, monkeypatch):
 
     monkeypatch.setattr(audio_devices, "list_output_devices", boom)
     assert client.get("/api/audio/devices/output").status_code == 500
+
+
+# -- "No output": the unit that runs no player ------------------------------------------------------
+
+
+def _echo(monkeypatch, tmp_path, output_device):
+    state = tmp_path / "player_state.json"
+    state.write_text(json.dumps({"volume": 100, "output_device": output_device}))
+    monkeypatch.setenv("PLUM_PLAYER_STATE_FILE", str(state))
+    return state
+
+
+def test_the_none_row_is_offered_on_a_unit_with_hardware(client, monkeypatch):
+    """Turning any unit into an ingest-only node is a choice, not just a fallback."""
+    _present(monkeypatch, [_device()])
+    rows = client.get("/api/audio/devices/output").get_json()
+
+    assert [r["id"] for r in rows] == ["sndrpihifiberry:0", "none"]
+    none_row = rows[-1]
+    assert none_row["type"] == "NONE"
+    assert none_row["is_available"] is True
+    assert none_row["is_active"] is False
+
+
+def test_the_none_row_is_the_only_row_on_a_card_less_host(client, monkeypatch, settings_file):
+    settings_file.write_text(json.dumps({"audio": {"output": {"device": "none"}}}))
+    _present(monkeypatch, [])
+    rows = client.get("/api/audio/devices/output").get_json()
+
+    assert len(rows) == 1
+    assert rows[0]["id"] == "none"
+    assert rows[0]["is_active"] is True
+
+
+def test_selecting_no_output_never_enumerates_devices(client, monkeypatch, settings_file, tmp_path):
+    """Proves the short-circuit is BEFORE list_output_devices, and so before the 404 that follows."""
+    _echo(monkeypatch, tmp_path, "sndrpihifiberry:0")
+    monkeypatch.setattr(
+        audio_devices, "list_output_devices", lambda **k: pytest.fail("enumerated for the sentinel")
+    )
+
+    resp = client.post("/api/audio/output/device", json={"id": "none"})
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["success"] is True
+    assert body["restart_required"] is True
+    assert "restart" in body["message"].lower()
+    assert json.loads(settings_file.read_text())["audio"]["output"]["device"] == "none"
+
+
+def test_no_output_reads_as_resolved_not_as_a_missing_device(client, monkeypatch, settings_file, tmp_path):
+    """Without its own branch this renders as "Not present ('none')" — a fault, not a choice."""
+    _echo(monkeypatch, tmp_path, "none")
+    settings_file.write_text(json.dumps({"audio": {"output": {"device": "none"}}}))
+    _present(monkeypatch, [])
+
+    body = client.get("/api/audio/output/current").get_json()
+    assert body["configured"] == "none"
+    assert body["resolved"] is True
+    assert body["friendly_name"] == "No output"
+    assert body["pending"] is False
+    assert body["restart_required"] is False
+    assert body["is_active"] is True
+
+
+def test_leaving_no_output_is_restart_required(client, monkeypatch, settings_file, tmp_path):
+    _echo(monkeypatch, tmp_path, "none")
+    settings_file.write_text(json.dumps({"audio": {"output": {"device": "sndrpihifiberry:0"}}}))
+    _present(monkeypatch, [_device()])
+
+    body = client.get("/api/audio/output/current").get_json()
+    assert body["pending"] is True
+    assert body["restart_required"] is True
+
+
+def test_entering_no_output_is_restart_required(client, monkeypatch, settings_file, tmp_path):
+    _echo(monkeypatch, tmp_path, "sndrpihifiberry:0")
+    settings_file.write_text(json.dumps({"audio": {"output": {"device": "none"}}}))
+    _present(monkeypatch, [_device()])
+
+    body = client.get("/api/audio/output/current").get_json()
+    assert body["pending"] is True
+    assert body["restart_required"] is True
+    assert body["playing_on"] == "sndrpihifiberry:0"  # still audible until the restart
+
+
+def test_a_device_to_device_switch_still_applies_live(client, monkeypatch, settings_file, tmp_path):
+    """The existing live-switch path must not start demanding a restart."""
+    _echo(monkeypatch, tmp_path, "Headphones:0")
+    settings_file.write_text(json.dumps({"audio": {"output": {"device": "sndrpihifiberry:0"}}}))
+    _present(monkeypatch, [_device()])
+
+    body = client.get("/api/audio/output/current").get_json()
+    assert body["pending"] is True
+    assert body["restart_required"] is False
+
+
+def test_no_echo_yet_never_claims_a_restart_is_needed(client, monkeypatch, settings_file, tmp_path):
+    """A player that has not reported is unknown, not wrong — same guard as `pending`."""
+    monkeypatch.setenv("PLUM_PLAYER_STATE_FILE", str(tmp_path / "absent.json"))
+    settings_file.write_text(json.dumps({"audio": {"output": {"device": "none"}}}))
+    _present(monkeypatch, [])
+
+    body = client.get("/api/audio/output/current").get_json()
+    assert body["restart_required"] is False
+
+
+def test_choosing_a_device_while_playerless_asks_for_a_restart(client, monkeypatch, settings_file, tmp_path):
+    """Coming BACK needs a restart too — there is no player process to hand the device to."""
+    _echo(monkeypatch, tmp_path, "none")
+    _present(monkeypatch, [_device()])
+
+    body = client.post("/api/audio/output/device", json={"id": "sndrpihifiberry:0"}).get_json()
+    assert body["success"] is True
+    assert body["restart_required"] is True
+    assert "restart" in body["message"].lower()
+
+
+def test_choosing_a_device_on_a_normal_unit_does_not_ask_for_a_restart(client, monkeypatch, tmp_path):
+    _echo(monkeypatch, tmp_path, "Headphones:0")
+    _present(monkeypatch, [_device()])
+
+    body = client.post("/api/audio/output/device", json={"id": "sndrpihifiberry:0"}).get_json()
+    assert body["restart_required"] is False
+    assert body["message"] == "Output set to HiFiBerry DAC+ Pro (HAT)"
+
+
+def test_testing_no_output_is_refused(client, monkeypatch):
+    monkeypatch.setattr(audio_devices, "test_device", lambda *a, **k: pytest.fail("ran speaker-test"))
+    resp = client.post("/api/audio/output/test", json={"id": "none"})
+    assert resp.status_code == 409
+    assert "no output to test" in resp.get_json()["message"]

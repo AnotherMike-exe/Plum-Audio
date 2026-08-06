@@ -47,10 +47,32 @@ def _current_output(settings_manager: SettingsManager) -> dict:
     """
     spec = audio_devices.configured_output_spec()
     playing_on = load_active_output(state_file_path())
-    devices = audio_devices.list_output_devices(active_spec=playing_on or spec)
+    active = None if audio_devices.is_no_output(playing_on or spec) else (playing_on or spec)
+    devices = audio_devices.list_output_devices(active_spec=active)
     device = audio_devices.find_device(spec, devices) if spec else None
 
     pending = playing_on is not None and playing_on != spec
+    # Crossing the none<->device boundary is the ONLY change that needs a restart: the player is a
+    # process that either exists or does not, decided once by output_gate.py at container start. A
+    # device->device switch still applies live through watch_output_device and must keep reading
+    # exactly as it does today. Guarded on `playing_on is not None` like `pending`, so a missing echo
+    # reads as "unknown" rather than shouting "restart" at a unit whose player simply has not
+    # reported yet.
+    restart_required = playing_on is not None and audio_devices.is_no_output(spec) != audio_devices.is_no_output(
+        playing_on
+    )
+
+    if audio_devices.is_no_output(spec):
+        # Deliberately nothing — not a device that went missing. Answered before the fallback below,
+        # which would otherwise render this as "Not present ('none')".
+        return {
+            "configured": audio_devices.NO_OUTPUT,
+            "resolved": True,
+            "playing_on": playing_on,
+            "pending": pending,
+            "restart_required": restart_required,
+            **audio_devices.no_output_device(is_active=True),
+        }
 
     if device is not None:
         return {
@@ -58,6 +80,7 @@ def _current_output(settings_manager: SettingsManager) -> dict:
             "resolved": True,
             "playing_on": playing_on,
             "pending": pending,
+            "restart_required": restart_required,
             **device.to_dict(),
         }
 
@@ -69,6 +92,7 @@ def _current_output(settings_manager: SettingsManager) -> dict:
         "resolved": False,
         "playing_on": playing_on,
         "pending": pending,
+        "restart_required": restart_required,
         "id": None,
         "friendly_name": f"Not present ({spec})" if spec else "No output selected",
         "is_available": False,
@@ -86,7 +110,12 @@ def create_audio_blueprint(settings_manager: SettingsManager = None) -> Blueprin
         try:
             spec = audio_devices.configured_output_spec()
             devices = audio_devices.list_output_devices(active_spec=spec)
-            return jsonify([d.to_dict() for d in devices])
+            # "No output" is offered on EVERY unit, not only card-less ones — turning any unit into
+            # an ingest/routing-only node is a deliberate choice, not just a fallback. Synthesised
+            # here rather than in the GUI so the sentinel's spelling has one owner.
+            rows = [d.to_dict() for d in devices]
+            rows.append(audio_devices.no_output_device(is_active=audio_devices.is_no_output(spec)))
+            return jsonify(rows)
         except Exception as exc:  # noqa: BLE001 - a discovery failure must not 500 the whole tab
             logger.error("listing output devices failed: %s", exc, exc_info=True)
             return jsonify({"error": str(exc)}), 500
@@ -108,6 +137,34 @@ def create_audio_blueprint(settings_manager: SettingsManager = None) -> Blueprin
             return jsonify({"success": False, "error": "id is required"}), 400
 
         try:
+            if audio_devices.is_no_output(device_id):
+                # Short-circuit BEFORE the enumeration below, and therefore before the 404: there is
+                # no AudioDevice to find, and asking for one is how this used to fail. Whether this
+                # unit actually runs a player is decided at container start by output_gate.py, so
+                # the honest answer is "saved, restart to apply".
+                playing_on = load_active_output(state_file_path())
+                settings_manager.update_settings(
+                    {
+                        "audio": {
+                            "output": {
+                                "device": audio_devices.NO_OUTPUT,
+                                "device_type": audio_devices.DeviceType.NONE.value,
+                            }
+                        }
+                    }
+                )
+                logger.info("output set to NO OUTPUT — this unit will run no player after a restart")
+                restart_required = playing_on is None or not audio_devices.is_no_output(playing_on)
+                return jsonify(
+                    {
+                        "success": True,
+                        "pending": True,
+                        "restart_required": restart_required,
+                        "message": "Saved. This unit will start with no output after a restart.",
+                        "device": audio_devices.no_output_device(is_active=True),
+                    }
+                )
+
             devices = audio_devices.list_output_devices(active_spec=audio_devices.configured_output_spec())
             device = audio_devices.find_device(device_id, devices)
 
@@ -126,6 +183,10 @@ def create_audio_blueprint(settings_manager: SettingsManager = None) -> Blueprin
                     409,
                 )
 
+            # Coming BACK from no-output needs a restart for the same reason leaving did: there is
+            # no player process to hand the new device to. Read the echo before the write.
+            restart_required = audio_devices.is_no_output(load_active_output(state_file_path()))
+
             # Store the STABLE id, never the hw address — card numbers move across reboots.
             settings_manager.update_settings(
                 {"audio": {"output": {"device": device.id, "device_type": device.type.value}}}
@@ -136,7 +197,12 @@ def create_audio_blueprint(settings_manager: SettingsManager = None) -> Blueprin
                 {
                     "success": True,
                     "pending": True,  # saved; the player applies it on its next poll
-                    "message": f"Output set to {device.friendly_name}",
+                    "restart_required": restart_required,
+                    "message": (
+                        f"Saved. Restart this unit to start playing through {device.friendly_name}."
+                        if restart_required
+                        else f"Output set to {device.friendly_name}"
+                    ),
                     "device": device.to_dict(),
                 }
             )
@@ -151,6 +217,9 @@ def create_audio_blueprint(settings_manager: SettingsManager = None) -> Blueprin
         device_id = (data.get("id") or data.get("hw_id") or "").strip()
         if not device_id:
             return jsonify({"success": False, "message": "id is required"}), 400
+
+        if audio_devices.is_no_output(device_id):
+            return jsonify({"success": False, "message": "There is no output to test on this unit."}), 409
 
         try:
             ok, message = audio_devices.test_device(device_id, active_spec=audio_devices.configured_output_spec())
