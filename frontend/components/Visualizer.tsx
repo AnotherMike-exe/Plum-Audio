@@ -382,10 +382,14 @@ export const Visualizer: React.FC<VisualizerProps> = ({
                         max="100"
                         value={currentVolume}
                         onChange={(e) => onVolumeChange(parseInt(e.target.value))}
-                        className="volume-slider rounded-lg w-full min-w-0"
-                        // Was a hard 240px, which is what pushed this pill under the icon cluster on
-                        // a narrow window. Caps at the old width so the wide layout is unchanged.
-                        style={{ ...volumeSliderStyle, maxWidth: '240px' }}
+                        className="volume-slider rounded-lg min-w-0"
+                        // A 240px BASIS that is allowed to shrink — not `w-full` with a 240px cap.
+                        // `w-full` inside the shrink-to-fit middle grid column resolves against a
+                        // min-content parent, so it collapsed to ~138px at every width: no overlap,
+                        // but a visibly shorter slider than before. Measured in the running page
+                        // across 360-1280px: this gives 240px wherever there is room and shrinks
+                        // cleanly on a small phone, with no overlap anywhere.
+                        style={{ ...volumeSliderStyle, width: '240px', maxWidth: '100%' }}
                         aria-label="Volume control"
                     />
                     <Icon name="volume-high" className="w-5 h-5 text-[var(--text-secondary)]" />
