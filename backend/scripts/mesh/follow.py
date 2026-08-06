@@ -135,6 +135,13 @@ class FollowReconciler:
 
     async def tick(self) -> None:
         """One reconcile cycle. Public (not `_tick`) so unit tests can drive it directly."""
+        if self._local_player_id is None:
+            # This unit has no speaker, so it has nothing to auto-route or auto-follow. Belt and
+            # braces: sendspin_server does not construct a reconciler for such a unit at all, but
+            # both paths below end in routing a player id that resolves to nothing — a RouteError
+            # with a stack trace per source activation, or in slave mode a re-route every tick
+            # forever. Leading is unaffected; that is passive, read from our snapshot by the peers.
+            return
         settings = self._read_settings()
         if settings is None:
             return
@@ -161,7 +168,7 @@ class FollowReconciler:
             self._overridden = False  # follow off: nothing to override
             return
 
-        _leader_idle, leader_target = self._player_status(view, master_unit_id)
+        leader_target = self._leader_status(view, master_unit_id)
 
         # Master idle/none is a natural reset point for the follow relationship — the master session
         # ended. Handle it BEFORE the override check so it can lift a stale opt-out.
@@ -270,3 +277,33 @@ class FollowReconciler:
         if src is None or not src.active:
             return True, None
         return False, (server_unit.unit_id, src.source_id)
+
+    @staticmethod
+    def _leader_status(view: MeshView, unit_id: str) -> tuple[str, str] | None:
+        """(owning_unit_id, source_id) that a LEADER is currently the source of, or None if idle.
+
+        A leader WITH a speaker self-reports where that speaker is, which is authoritative even when
+        it has roamed onto a third unit — so for those, this is exactly `_player_status`.
+
+        A leader with NO speaker cannot self-report anything: `local_player` is permanently None, and
+        the player path reads that as "idle", which the caller treats as "the master's session
+        ended" and responds to by UNROUTING every follower. So an ingest-only unit — whose entire
+        job is to be followed — would kick its followers off within one tick of them joining. For
+        that unit the leader's stream is derived from what it is actually INGESTING instead.
+
+        Among several concurrently active sources, prefer the one with the most endpoints already
+        attached, tie-broken by source_id. Two followers must reach the SAME answer independently,
+        and it must not oscillate: the first follower to join raises that source's count, so the
+        preference reinforces itself rather than flip-flopping. There is deliberately no way for the
+        leader to nominate a source — see the note in docs/CLAUDE.md.
+        """
+        unit = view.unit(unit_id)
+        if unit is None:
+            return None
+        if unit.has_player:
+            return FollowReconciler._player_status(view, unit_id)[1]
+        active = sorted(
+            (s for s in unit.sources if s.active),
+            key=lambda s: (-len(s.player_ids), s.source_id),
+        )
+        return (unit.unit_id, active[0].source_id) if active else None

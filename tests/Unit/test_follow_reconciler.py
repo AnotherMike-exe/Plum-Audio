@@ -391,3 +391,209 @@ def test_follow_does_not_unroute_a_manual_override_when_leader_idle():
     r._last_auto_target = ("unit-B", "spotify-1")  # we followed spotify before; user has since moved us
     _run(r)
     assert unroute.calls == []  # current target (unit-A/airplay-1) != last auto target -> leave it be
+
+
+# -- following a leader that has no speaker of its own ---------------------------------------------
+#
+# An ingest-only unit exists to BE followed: it encodes AirPlay/Spotify and other rooms render it.
+# But it can never self-report a player, and `_player_status` reads a missing self-report as "idle",
+# which the master-idle branch treats as "the session ended" — so before `_leader_status` existed,
+# such a leader unrouted its own followers within one tick of them joining.
+
+
+def _headless(unit_id, *sources) -> UnitSnapshot:
+    """A unit that ingests but has no speaker: has_player False, local_player permanently None."""
+    return UnitSnapshot(unit_id=unit_id, name=unit_id, host="10.0.0.9",
+                        sources=list(sources), local_player=None, has_player=False)
+
+
+def _slave_settings(master="unit-B"):
+    return {"autoSwitch": {"localActivity": False, "slave": {"enabled": True, "masterUnitId": master}}}
+
+
+def test_a_playerless_leader_is_followed_rather_than_unrouting_us():
+    """The regression. Before the fix this produced an UNROUTE on the very first tick."""
+    view = MeshView(units=[
+        _unit("unit-A", local_player=None),
+        _headless("unit-B", _source("airplay-1", "gB", active=True)),
+    ])
+    r, router, delegate, unroute = _reconciler(
+        view, _slave_settings(), peers={"unit-B": FakePeer("unit-B")}
+    )
+    _run(r)
+
+    # Delegated, never routed locally: a source_id is only unique within a unit, and unit-A could
+    # easily have its own "airplay-1".
+    assert delegate.calls == [("unit-B", "airplay-1", "player-A")]
+    assert router.calls == []
+    assert unroute.calls == []
+    assert r._last_auto_target == ("unit-B", "airplay-1")
+
+
+def test_a_playerless_leader_going_quiet_resets_the_relationship():
+    """The other half: leading must end cleanly, not just start.
+
+    No unroute happens here, and that is correct rather than a gap. The follower is attached to the
+    leader's group, so when that source goes quiet BOTH read as idle off the same SourceState — the
+    audio has already stopped, and the existing reset branch simply expires the opt-out so the
+    leader's next stream is followed again without a manual re-join. The unroute path is for a
+    follower still actively playing something else.
+    """
+    view = MeshView(units=[
+        _unit("unit-A", local_player={"attached": True, "group_id": "gB", "server_id": "unit-B"}),
+        _headless("unit-B", _source("airplay-1", "gB", active=False)),
+    ])
+    r, router, delegate, unroute = _reconciler(
+        view, _slave_settings(), peers={"unit-B": FakePeer("unit-B")}
+    )
+    r._last_auto_target = ("unit-B", "airplay-1")
+    _run(r)
+
+    assert (unroute.calls, delegate.calls, router.calls) == ([], [], [])
+    assert r._last_auto_target is None
+    assert r._overridden is False
+
+
+def test_a_playerless_leader_switching_source_behaves_like_any_other_leader():
+    """Pins PARITY, not desirability.
+
+    When a leader moves to a second source and the follower's old source goes quiet, the follower's
+    current_target becomes None — which the override guard reads as "the user moved us" — so it stops
+    following and does NOT move to the new source. That is pre-existing behaviour, identical for a
+    leader WITH a speaker (verified directly), and this test exists so that a headless leader is not
+    accidentally given different semantics while the shared question is decided. See docs/CLAUDE.md.
+    """
+    view = MeshView(units=[
+        _unit("unit-A", local_player={"attached": True, "group_id": "gB1", "server_id": "unit-B"}),
+        _headless(
+            "unit-B",
+            _source("airplay-1", "gB1", active=False),
+            _source("spotify-1", "gB2", active=True),
+        ),
+    ])
+    r, _router, delegate, unroute = _reconciler(
+        view, _slave_settings(), peers={"unit-B": FakePeer("unit-B")}
+    )
+    r._last_auto_target = ("unit-B", "airplay-1")
+    _run(r)
+
+    assert (delegate.calls, unroute.calls) == ([], [])
+    assert r._overridden is True
+
+
+def test_a_playerless_leader_with_no_active_source_routes_nothing():
+    view = MeshView(units=[
+        _unit("unit-A", local_player=None),
+        _headless("unit-B", _source("airplay-1", "gB", active=False)),
+    ])
+    r, router, delegate, unroute = _reconciler(
+        view, _slave_settings(), peers={"unit-B": FakePeer("unit-B")}
+    )
+    _run(r)
+
+    assert (delegate.calls, router.calls, unroute.calls) == ([], [], [])
+    assert r._last_auto_target is None
+
+
+def test_two_concurrent_sources_pick_the_most_attended_one():
+    """Every follower must reach the same answer independently, with no coordination."""
+    view = MeshView(units=[
+        _unit("unit-A", local_player=None),
+        _headless(
+            "unit-B",
+            _source("airplay-1", "gB1", active=True, player_ids=[]),
+            _source("spotify-1", "gB2", active=True, player_ids=["player-C", "player-D"]),
+        ),
+    ])
+    r, _router, delegate, _unroute = _reconciler(
+        view, _slave_settings(), peers={"unit-B": FakePeer("unit-B")}
+    )
+    _run(r)
+    assert delegate.calls == [("unit-B", "spotify-1", "player-A")]
+
+
+def test_the_choice_does_not_oscillate_between_ticks():
+    """A tie must break deterministically, or two followers land on different sources."""
+    view = MeshView(units=[
+        _unit("unit-A", local_player=None),
+        _headless(
+            "unit-B",
+            _source("spotify-1", "gB2", active=True, player_ids=[]),
+            _source("airplay-1", "gB1", active=True, player_ids=[]),
+        ),
+    ])
+    picks = []
+    for _ in range(3):
+        r, _router, delegate, _unroute = _reconciler(
+            view, _slave_settings(), peers={"unit-B": FakePeer("unit-B")}
+        )
+        _run(r)
+        picks.append(delegate.calls)
+    assert picks == [[("unit-B", "airplay-1", "player-A")]] * 3  # source_id order, every time
+
+
+def test_has_player_wins_over_a_stale_self_report():
+    """A unit that just became playerless may still carry an old local_player in a cached snapshot."""
+    stale = UnitSnapshot(
+        unit_id="unit-B", name="unit-B", host="10.0.0.9", has_player=False, local_player=None,
+        sources=[_source("airplay-1", "gB", active=True)],
+    )
+    stale.local_player = {"attached": True, "group_id": "gOLD", "server_id": "unit-B"}
+    view = MeshView(units=[_unit("unit-A", local_player=None), stale])
+    r, _router, delegate, _unroute = _reconciler(
+        view, _slave_settings(), peers={"unit-B": FakePeer("unit-B")}
+    )
+    _run(r)
+    assert delegate.calls == [("unit-B", "airplay-1", "player-A")]  # sources, not the stale report
+
+
+def test_a_leader_with_a_speaker_still_uses_its_self_report():
+    """The existing path must be untouched — a leader that has roamed is still followed correctly."""
+    view = MeshView(units=[
+        _unit("unit-A", local_player=None),
+        _unit("unit-B", local_player={"attached": True, "group_id": "gC", "server_id": "unit-C"}),
+        _unit("unit-C", sources=[_source("spotify-1", "gC", active=True)]),
+    ])
+    r, _router, delegate, _unroute = _reconciler(
+        view, _slave_settings(), peers={"unit-C": FakePeer("unit-C")}
+    )
+    _run(r)
+    assert delegate.calls == [("unit-C", "spotify-1", "player-A")]  # where the leader ACTUALLY is
+
+
+# -- a playerless unit never follows and never auto-routes ------------------------------------------
+
+
+def _playerless_reconciler(view, settings):
+    r = FollowReconciler(
+        FakeAggregator(view), FakeRouter(),
+        local_unit_id="unit-A", local_player_id=None,
+        peer_provider=lambda uid: None,
+        delegate=FakeDelegate(),
+        unroute_delegate=FakeDelegate(),
+        settings_file="/does/not/exist",
+    )
+    r._read_settings = lambda: settings
+    return r
+
+
+def test_a_playerless_unit_does_nothing_with_both_modes_on():
+    """Both paths end in routing a player id that resolves to nothing.
+
+    localActivity raised a RouteError with a stack trace per source activation; slave mode re-routed
+    every tick forever, because a failed route never sets _last_auto_target and the override guard
+    then compares None against None.
+    """
+    view = MeshView(units=[
+        _headless("unit-A", _source("airplay-1", "gA", active=True)),
+        _unit("unit-B", sources=[_source("spotify-1", "gB", active=True)]),
+    ])
+    settings = {"autoSwitch": {"localActivity": True, "slave": {"enabled": True, "masterUnitId": "unit-B"}}}
+    r = _playerless_reconciler(view, settings)
+    r._prev_active = set()
+
+    for _ in range(3):
+        _run(r)
+
+    assert r._last_auto_target is None
+    assert r._overridden is False

@@ -133,6 +133,12 @@ class Router:
             # player's own listener URL, which is exactly what the reclaim below needs.
             url = _idle_player_url(view, player_id)
             if not url:
+                # Name the real cause when we can. A unit with no audio output has no speaker to
+                # route onto, and "unknown player" reads as a lookup bug rather than the correct
+                # answer to an impossible request.
+                owner = next((u for u in view.units if player_id.startswith(u.unit_id)), None)
+                if owner is not None and not owner.has_player:
+                    raise RouteError(f"{owner.name} has no audio output — there is nothing to route onto")
                 raise RouteError(f"unknown player {player_id!r} (not on any unit)")
             logger.info("reclaiming idle player=%s onto source=%s via %s", player_id, source_id, url)
             return await self._engine.reclaim_remote_player(source_id, player_id, url)

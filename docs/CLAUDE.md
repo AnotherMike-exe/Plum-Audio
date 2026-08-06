@@ -274,6 +274,20 @@ debugging cookbook are in **`docs/OPERATIONS.md`**.
     the three `*_config.py` (431 → ~190 on a shared base). None touch the audio path. Also a shared
     progress/metadata helper for the three source handlers — the Spotify timestamp bug was the third
     implementation of the same plumbing getting it wrong, which is the argument for it.
+13. **A follower stops following when its leader switches source.** Found 2026-08-06 while building
+    headless mode, and **pre-existing** — it is not about playerless units, it happens identically to
+    a leader with a speaker (verified directly). When the leader moves to a second source, the
+    follower's old source goes quiet, so its `current_target` becomes `None`; the override guard in
+    `follow.tick()` reads that as "the user moved us" and sets `_overridden`, so it never follows to
+    the new source. Distinguishing "went idle because the source stopped" from "was deliberately
+    moved" needs a real decision, so it was pinned by a parity test
+    (`test_a_playerless_leader_switching_source_behaves_like_any_other_leader`) rather than
+    quietly changed under a feature branch.
+14. **A playerless leader cannot nominate which source it leads with.** With several concurrent
+    active sources, `follow._leader_status` picks the one with the most endpoints attached,
+    tie-broken by `source_id`. Deterministic and self-reinforcing — the first follower to join raises
+    that source's count — and it has to be, because every follower computes it independently with no
+    coordination. But the leader has no say, and there is no GUI for it.
 
 ## Resources
 - Sendspin spec: <https://www.sendspin-audio.com/spec/> · Org: <https://github.com/Sendspin>
