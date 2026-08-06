@@ -20,6 +20,11 @@ build/
 .env.local
 .env.*.local
 
+# Rig-local, never published: the deploy credential and the real unit table.
+# Ship-able templates live beside them as docker/units.conf.example / plum-audio.env.example.
+docker/.deploy.env
+docker/units.conf
+
 # Logs
 logs/
 *.log
@@ -30,9 +35,11 @@ npm-debug.log*
 Thumbs.db
 desktop.ini
 
-# IDE
+# IDE / agent tooling. settings.local.json records local permission grants, which have
+# historically included rig credentials — never let it reach a public remote.
 .vscode/
 .idea/
+.claude/settings.local.json
 *.swp
 *.swo
 *.sublime-*
@@ -55,3 +62,6 @@ app-media/
 tmp/
 temp/
 *.tmp
+
+# macOS AppleDouble sidecars (scp from a Mac creates these on the rigs too)
+._*

@@ -10,11 +10,19 @@ target-version = "py313"
 [tool.ruff.lint]
 # Pragmatic set: pyflakes/pycodestyle/isort/bugbear/comprehensions/pyupgrade + a few extras.
 select = ["E", "F", "I", "B", "C4", "UP", "SIM", "ANN", "BLE"]
-# Docstrings/self/cls annotations aren't worth the noise on internal helpers; keep BLE for the
-# deliberate "must-not-die" broad excepts that are already justified with inline noqa.
-ignore = ["ANN101", "ANN102", "ANN401"]
+# Annotations: PUBLIC surfaces must declare their return type (ANN201/204/205 stay on), internal
+# helpers need not. ANN101/ANN102 used to express that and were REMOVED from ruff — ignoring them
+# silently did nothing, which is why 105 annotation findings accumulated unnoticed.
+# ANN401 stays ignored: `Any` is deliberate where it appears.
+# BLE stays selected for the "must-not-die" broad excepts, justified inline with noqa.
+ignore = ["ANN001", "ANN002", "ANN003", "ANN202", "ANN401"]
 
 [tool.ruff.lint.per-file-ignores]
 # Feeders/listeners intentionally swallow broad exceptions to stay alive; annotated inline.
 "scripts/sendspin_server.py" = ["BLE001"]
 "scripts/sendspin_player.py" = ["BLE001"]
+# Same reasoning one layer up: every broad except in the settings API is a deliberate blanket
+# handler — the best-effort PUID/PGID chown, get_settings' documented "never raises", and the
+# route handlers that turn any failure into a JSON 500. Narrowing any of them changes behaviour
+# (an unexpected type would escape as Flask's HTML 500, or abort a save that had already landed).
+"scripts/apis/settings_api.py" = ["BLE001"]

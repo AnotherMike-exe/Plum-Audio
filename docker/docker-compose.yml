@@ -1,25 +1,86 @@
-# Plum-Audio — Binhex-standard compose. Host networking required for mDNS/Avahi + Sendspin discovery.
+# Plum-Audio — Binhex-standard compose for ONE unit. This file is what `docker/deploy.sh` installs
+# on each Pi (at /opt/plum-audio/docker-compose.yml, beside the per-unit plum-audio.env), so the
+# volume paths are relative to the compose file's own directory and the same file works unmodified
+# on every unit and in the repo.
+#
+# TWO PROFILES, because a host with no sound card cannot run the audio one at all: Docker refuses to
+# CREATE a container whose `devices:` names a missing /dev/snd, and /proc/asound has the same problem
+# — it is not a "degrade gracefully" failure, it is `docker compose up` erroring out. Compose merge
+# APPENDS list keys, so an override file cannot remove either mount; the variants have to be separate
+# services. deploy.sh picks one from the unit's units.conf row and writes COMPOSE_PROFILES into
+# ./.env beside this file, so a plain `docker compose up -d` / `restart` / `logs` in that directory
+# does the right thing with no extra flags. (COMPOSE_PROFILES cannot live in plum-audio.env —
+# env_file is container environment, not compose interpolation.)
+#
+#   audio     a unit with a DAC: four supervisord programs, including sendspin_player
+#   headless  ingest + routing only: three programs, no player, no /dev/snd
+#
+# Both declare the same container_name, so only one can run on a host — which is the intent.
+#
+# Build locally from the repo root:  docker compose -f docker/docker-compose.yml build
+# Deploy to the rig:                 docker/build.sh && docker/deploy.sh all
+x-plum-common: &plum-common
+  build:
+    context: ..
+    dockerfile: backend/Dockerfile
+  image: plum-audio:${PLUM_TAG:-latest}
+  container_name: plum-audio
+  restart: unless-stopped
+  # Host networking, non-negotiable: Sendspin WS (8927/8928), the mesh beacon (8929), mDNS/Avahi
+  # (5353), AirPlay's RAOP + UDP blocks and Spotify's zeroconf ports all need L2 visibility, and
+  # the mesh discovers peers by real LAN address. See CLAUDE.md "Key Ports".
+  network_mode: host
+  # Audio reliability over container purity: the player's PortAudio thread and shairport-sync both
+  # want to raise their scheduling priority, which Docker's default capability set forbids. Without
+  # these the stack still runs, but every priority bump logs a failure and the jitter buffer is one
+  # scheduling hiccup closer to an xrun.
+  cap_add:
+    - SYS_NICE
+  ulimits:
+    rtprio: 95
+    memlock: -1
+  env_file:
+    - ./plum-audio.env
+
 services:
   plum-audio:
-    build:
-      context: ..
-      dockerfile: backend/Dockerfile
-    container_name: plum-audio
-    restart: unless-stopped
-    # Host networking: Sendspin WS (8927/8928), mDNS (5353), source ports all need L2 visibility.
-    network_mode: host
+    <<: *plum-common
+    profiles: ["audio"]
+    # NOTE: `<<:` replaces list keys rather than merging them, so this list must be COMPLETE — the
+    # shared entries are restated here on purpose. Adding a volume above without adding it here is
+    # the drift this arrangement is most likely to suffer from.
     volumes:
-      - ./app-config:/config      # config, logs, settings.json
-      - ./app-data:/data          # app data
-      - ./app-media:/media        # media (Plexamp etc.)
-      # AirPlay advertising uses the HOST's Avahi/D-Bus (host concerns live on the host).
+      - ./config:/config          # logs (supervisord.log first), unit config
+      - ./data:/data              # settings.json + per-source state (go-librespot auth lives here)
+      - ./media:/media            # media (Plexamp etc.)
+      # The HOST owns the daemons we only talk to: Avahi (mDNS for AirPlay/Spotify/Sendspin
+      # advertising) and bluetoothd (the radio + the patched AVRCP path). Both are reached over the
+      # host's SYSTEM D-Bus, so its socket is mounted rather than duplicated in here.
       - /var/run/dbus:/var/run/dbus
       - /var/run/avahi-daemon:/var/run/avahi-daemon
-    environment:
-      - PUID=1000
-      - PGID=29                   # audio group (RPi standard)
-      - UMASK=002
-      - TZ=America/New_York
-      - DEBUG=false
+      # Which sound cards are BUSY, for the output picker. Docker masks /proc/asound, and runc
+      # rejects mounting anything back over it ("cannot be mounted because it is inside /proc"), so
+      # the host's copy lands outside /proc and PLUM_PROC_ASOUND points audio_devices.py at it.
+      # Read-only, and purely informational — without it the picker still works, it just cannot tell
+      # a card held by some other process from one that is genuinely unopenable.
+      - /proc/asound:/host/asound:ro
     devices:
-      - /dev/snd:/dev/snd         # ALSA audio out
+      - /dev/snd:/dev/snd         # ALSA out for the local player, in for the Bluetooth capture
+
+  plum-audio-headless:
+    <<: *plum-common
+    profiles: ["headless"]
+    # No /dev/snd and no /proc/asound: this host has neither. audio_devices tolerates a missing
+    # PROC_ASOUND (the "held by another process" signal is simply unavailable, and meaningless with
+    # no cards), and `aplay -l` reporting nothing is what makes output_gate.py answer `none`.
+    #
+    # D-Bus and Avahi ARE still mounted. This unit advertises its Sendspin SERVER over the host's
+    # Avahi — that is how peers and Music Assistant find it, and it is the entire point of the node.
+    # It advertises no _sendspin._tcp client record, because the player process that publishes one
+    # never runs.
+    volumes:
+      - ./config:/config
+      - ./data:/data
+      - ./media:/media
+      - /var/run/dbus:/var/run/dbus
+      - /var/run/avahi-daemon:/var/run/avahi-daemon

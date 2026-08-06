@@ -1,0 +1,131 @@
+name: Release
+
+# Two ways in, one path out:
+#
+#   push to main      -> auto-bump the PATCH component, tag it, build, release.
+#   push a vX.Y.Z tag -> build and release exactly that version.
+#
+# The split is deliberate. CI never decides a minor or major version — feature work accumulates on
+# dev and ships as patch releases until the maintainer decides a version is a minor, and then tags
+# it by hand. This is why release-please/semantic-release are NOT used: they would bump minor on
+# every feat: commit, and this repo has more feat: commits than releases.
+#
+# No recursion: the tag created below is pushed with GITHUB_TOKEN, and GitHub deliberately does not
+# fire workflows for those, so the auto-tag cannot re-enter this workflow.
+on:
+  push:
+    branches: [main]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    uses: ./.github/workflows/checks.yml
+
+  version:
+    name: Resolve version
+    needs: checks
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags are the source of truth for the version
+
+      - name: Resolve version
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            # Hand-pushed tag: it IS the version. Minor and major arrive only this way.
+            tag="${GITHUB_REF#refs/tags/}"
+            echo "release requested explicitly: $tag"
+          else
+            # Merge to main: bump the patch component of the highest existing tag.
+            latest="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -1)"
+            [[ -n "$latest" ]] || latest="v0.0.0"
+            IFS=. read -r major minor patch <<< "${latest#v}"
+            tag="v${major}.${minor}.$((patch + 1))"
+            echo "latest tag $latest -> bumping patch to $tag"
+            git tag "$tag"
+            git push origin "$tag"
+          fi
+          echo "tag=$tag"            >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}"    >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Build and push ${{ needs.version.outputs.tag }}
+    needs: version
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+
+      # ghcr.io rejects an uppercase path, and the owner here is mixed-case.
+      - name: Resolve image name
+        id: image
+        run: echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      # The tag is the single source of truth for the version, so stamp it into the bundle rather
+      # than keeping a number in the repo that has to be remembered. Not committed — build input only.
+      - name: Stamp version into the frontend bundle
+        run: npm version "${{ needs.version.outputs.version }}" --no-git-tag-version --allow-same-version
+        working-directory: frontend
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: backend/Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ needs.version.outputs.version }}
+            ${{ steps.image.outputs.name }}:latest
+          labels: |
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=GPL-3.0-only
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+          IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          set -euo pipefail
+          notes="$(mktemp)"
+          {
+            echo "## Image"
+            echo
+            echo '```bash'
+            echo "docker pull ${IMAGE}:${TAG#v}"
+            echo '```'
+            echo
+            echo "\`linux/arm64\` only — amd64 has never been built."
+          } > "$notes"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file "$notes" \
+            --generate-notes

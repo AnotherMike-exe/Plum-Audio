@@ -1,340 +1,311 @@
-# Plum Audio — Architecture & Rework Plan
+# Plum-Audio — Architecture
 
-> **Status**: Design / planning (2026-07). Supersedes `SENDSPIN-INTEGRATION-PLAN.md`,
-> which scoped Sendspin as a *coexisting second engine* with federation deferred.
-> **This plan**: Sendspin **replaces** the Snapcast + federation backbone entirely,
-> in a **new `Plum-Audio` repo**, with the **mesh/cross-routing as a first-class,
-> Phase-1 capability** and **multiple concurrent groups** supported.
+> What the system **is**. Read this first, then `docs/CLAUDE.md` for the rules that follow from it.
 >
-> Decisions locked with the user (2026-07):
-> | Question | Decision |
-> |---|---|
-> | Snapcast fate | **Full replacement** — Sendspin is the sole backbone |
-> | Project form | **New repo** (`Plum-Audio`); port integrations + GUI |
-> | Concurrency | **Multiple concurrent groups** (independent audio to independent endpoint sets) |
-> | This session | **Plan + verify the mesh unknown** |
+> This describes what ships today on four Raspberry Pi units. What landed when, and the hardware
+> measurements that proved each piece, are in `docs/PHASE-HISTORY.md`. The failures that shaped
+> particular decisions are in `docs/HARD-WON-LESSONS.md`. Procedures live in `docs/OPERATIONS.md`
+> and `docs/HOST-PROVISIONING.md`.
 
 ---
 
-## 1. Why this pivot
+## 1. Why Sendspin
 
-Yesterday's hardware test showed Sendspin sync over WiFi is a notable improvement over the
-Snapcast pipeline, and Sendspin's protocol structurally removes the pain we've been fighting:
+Plum-Audio replaces Plum-Snapcast's Snapcast server + custom federation backbone entirely. Sendspin
+is the sole sync engine. Three properties drove it:
 
-- **Metadata / artwork / visualizer / color are first-class protocol *roles*, delivered
-  out-of-band from audio.** On Snapcast, every `Plugin.Stream.Player.Properties` push
-  triggers `onResync()` on all clients — the unfixable upstream bug that `CLAUDE.md §6`
-  documents and that five hand-built guards in `airplay-control-script.py` only *mitigate*.
-  On Sendspin a metadata push is not an audio-stream event, so **the resync storm cannot
-  happen by construction.** The guards become unnecessary.
-- **WebSocket transport** (JSON control + binary media) — proxy/firewall friendly, unlike
+- **Metadata, artwork, colour and visualizer are first-class protocol *roles*, delivered out-of-band
+  from audio.** On Snapcast every properties push triggered `onResync()` on every client — an
+  upstream bug that five hand-built guards in the AirPlay control script only *mitigated*. On
+  Sendspin a metadata push is not an audio-stream event, so **the resync storm cannot happen by
+  construction.** Those five guards are gone and must not be ported.
+- **WebSocket transport** (JSON control + binary media) — proxy and firewall friendly, unlike
   Snapcast's raw 1704 protocol.
-- **2-D Kalman time-filter sync**, runs on ESP32 and Linux → cheap future satellite speakers.
-- **The mesh we want is a designed-in capability, not something we bolt on** (see §3).
+- **2-D Kalman time-filter sync** that runs on ESP32 as well as Linux, and a mesh that is a
+  designed-in capability rather than something bolted on.
 
----
+## 2. What the library gives us, and the one thing it does not
 
-## 2. Verified findings (source audit of `aiosendspin` 6.0.5, on R&D unit `.201.133`)
+`aiosendspin` (pinned **6.0.5**) supplies the server, the client, the roles, and the group/stream
+lifecycle. Two carry-over gotchas and one refuted idea:
 
-The load-bearing question was: *can a player be re-pointed at runtime — to a different
-group, and to a different server — cheaply, the way our snapcast auto-switch fast-switch
-does?* **Answer: yes, and the library is architected around exactly this.** Evidence from
-the installed package:
+- **`SendspinServer` always binds mDNS on UDP 5353**, which collides with the host Avahi. It is
+  started with `advertise_addresses=[]` and `discover_clients=False`; all connections are driven by
+  URL, and our mDNS goes through the host's Avahi over D-Bus (`mesh/avahi.py`).
+- **Ingest is via the in-process `PushStream`** (`prepare_audio` + `commit_audio` +
+  `set_live_source`), never `Roles.SOURCE`, which is unmerged upstream.
+- **There is no DISCOVERY pre-connect, and there cannot be.** A `SendspinClient` holds exactly one
+  attached websocket, so a playing player cannot be warmed on a second server — and a DISCOVERY dial
+  would *steal* it rather than stand by. This was tried on hardware and refuted. It is also
+  unnecessary: a roam is already inaudible, because the player never flushes and its ~300 ms jitter
+  buffer drains straight through the ~25-55 ms reconnect.
 
-| Primitive (in `aiosendspin.server`) | What it proves |
-|---|---|
-| `SendspinGroup.add_client()` / `remove_client()` + `_send_group_update_to_clients()` | **Intra-server routing is live control-plane.** Move a player between groups/streams over its existing WS — no reconnect. |
-| `SendspinServer.connect_to_client(url, connection_reason=…)` | **Servers dial players.** A player is addressable (`ws://player:8928/sendspin`); a server initiates the connection to it. |
-| `reclaim_client_for_playback(client_id, timeout_s)` — docstring: *"reclaim clients that disconnected with 'another_server'"* | **Cross-server roaming is first-class.** Contention between servers is a *designed* handoff, not a hack. |
-| `ConnectionReason.{DISCOVERY, PLAYBACK}` | ~~**Two-tier presence.** Hold a player in a lightweight idle (DISCOVERY) connection; upgrade to PLAYBACK when audio routes to it.~~ **❌ REFUTED ON HARDWARE (2026-07-14) — this was a source-reading error.** A `SendspinClient` holds exactly ONE websocket (`attach_websocket` raises if already connected), so a player **cannot** be held on a 2nd server while playing on the 1st. Worse, `connection_reason` is only reported in `server/hello`, which the client sees *after* it attaches — so a player cannot even decline a DISCOVERY dial while busy; it would surrender its current server. Pre-connect is removed. **It is also unnecessary:** the roam is already inaudible (next row). |
-| Player jitter buffer (~300 ms) vs. reconnect (~25–55 ms) | **This is the real gap-masker.** A roam fires no `stream_clear`/`stream_end`, so the buffer is never flushed — the DAC drains straight through the reconnect. Measured: emitted-silence counter (`pad_ms`) is *unchanged* across a roam. ~6× headroom. |
-| `GoodbyeReason.ANOTHER_SERVER` | Explicit protocol reason for a player leaving server A to join server B. |
-| `group.start_stream()` auto-calls `request_client_playback_connection()` for disconnected group members | Multi-server reclaim is wired into the normal "start playing" path. |
-| `Roles = {PLAYER, CONTROLLER, METADATA, ARTWORK, VISUALIZER, COLOR}` | Metadata/artwork/visualizer/color are out-of-band roles — resync storm gone; visualizer feed is native. |
-| `PushStream.prepare_audio()` / `commit_audio(play_start_us=)` / `set_live_source()` | Mature in-process ingest path (MA-proven). No dependency on the unmerged `Roles.SOURCE`. |
+Workarounds we carry for library gaps — including a **conformance bug in `client/state`** — are
+tracked in `docs/UPSTREAM-AIOSENDSPIN.md`, which is the checklist to revisit on every pin bump.
 
-**Conclusion:** the mesh is de-risked at the design level. What remains is the *empirical
-audible cost* of each transition (measured/probed in §7), not whether it's possible.
+## 3. The mesh model — servers stay, players roam
 
-**Carry-over gotchas (still true):**
-- `SendspinServer` always constructs `AsyncZeroconf` (binds UDP 5353) → collides with our
-  container/host Avahi. Mitigation unchanged: `start_server(advertise_addresses=[],
-  discover_clients=False)` and/or monkeypatch the zeroconf constructor; we drive
-  connections by explicit URL, not mDNS.
-- `aiosendspin` is fast-moving — **pin** a known-good version (6.0.5 validated) and add a
-  smoke test around `start_stream` / `PushStream` / `reclaim`.
-
----
-
-## 3. Target architecture — the mesh
-
-**Core model:** every Plum Audio unit runs **both a Sendspin server and a Sendspin
-player**. Servers own audio ingest; players are roamable render endpoints. Cross-routing is
-achieved by **servers dialing/reclaiming players**, not by bridging audio between servers
-(which would need the unmerged source role).
+Every unit runs **both a Sendspin server and a Sendspin player**. Servers own audio ingest; players
+are roamable render endpoints. Cross-routing is achieved by **servers dialing and reclaiming
+players**, never by bridging audio between servers.
 
 ```
-   iPhone ──AirPlay──► LIVING ROOM unit                    KITCHEN unit            BEDROOM unit
-                        ┌───────────────────┐              ┌──────────┐           ┌──────────┐
-                        │ shairport-sync     │              │ player   │           │ player   │
-                        │   ↓ PCM (FIFO)     │              │(hw out)  │           │(hw out)  │
-                        │ Sendspin SERVER    │              └────┬─────┘           └────┬─────┘
-                        │  PushStream→Group A │                   │  reclaimed to LR       │
-                        │   ├── LR player ────┼───────────────────┼── Group A ─────────────┘
-                        │   ├── KIT player ◄──┘ (server dials/reclaims players by URL)
-                        │   └── BED player ◄──┘
-                        │ Sendspin PLAYER (own hw out) │
-                        └───────────────────┘
+ iPhone ──AirPlay──► LIVING ROOM unit                  KITCHEN unit        BEDROOM unit
+                     ┌──────────────────────┐          ┌──────────┐       ┌──────────┐
+                     │ shairport-sync        │          │ player   │       │ player   │
+                     │   ↓ PCM (FIFO)        │          │ (hw out) │       │ (hw out) │
+                     │ Sendspin SERVER       │          └────┬─────┘       └────┬─────┘
+                     │  PushStream → Group A │               │                  │
+                     │   ├── LR  player      │◄──────────────┴── reclaimed ─────┘
+                     │   ├── KIT player      │   (server dials players by URL)
+                     │   └── BED player      │
+                     │ Sendspin PLAYER       │
+                     └──────────────────────┘
 
-   Simultaneously, BEDROOM ingests Bluetooth into its OWN server's Group B — independent
-   clock/stream — playing only to the bedroom player. Multiple concurrent groups = multiple
-   active servers, each hosting its own group(s); players roam to whichever group the user routes.
+ Simultaneously BEDROOM ingests Bluetooth into its OWN server's Group B — independent clock and
+ stream — playing only to itself. Multiple concurrent groups = multiple active servers, each
+ hosting its own group(s); players roam to whichever group the user routes them to.
 ```
 
-**The two routing tiers:**
+**Two routing tiers:**
 
-1. **Intra-server** (players already on the ingesting unit's server): route = live
-   `group.remove_client` / `add_client`. No reconnect, no ALSA reinit (given a stable
-   format). This is the cheap, common case for units already grouped together.
-2. **Cross-server** (pull a player from another unit): the target server calls
-   `connect_to_client(player_url)` → player leaves its current server with
-   `ANOTHER_SERVER` → joins target → `add_client` to the group. No DISCOVERY pre-connect (a
-   client holds one websocket — see §2); the switch is already inaudible because the player's
-   jitter buffer drains through the reconnect.
+1. **Intra-server** — the player is already on the ingesting unit's server. Route is a live
+   `group.remove_client` / `add_client`: no reconnect, no ALSA re-init.
+2. **Cross-server** — the target server calls `connect_to_client(player_url)`; the player leaves its
+   current server with `GoodbyeReason.ANOTHER_SERVER`, joins the target, and is added to the group.
 
-**Why this beats the alternative (single master server + audio bridging):** feeding every
-unit's local source into one master server needs inter-unit PCM transport = the unmerged
-`Roles.SOURCE` path (high risk, per the original plan's risk register). The
-"servers-stay / players-roam" model keeps **all ingest in-process on the unit that
-physically received it** (mature PushStream) and uses only shipped, designed primitives for
-the cross-unit part. It's also the exact conceptual shape of our *current* Snapcast
-federation (remote snapclient roams to the ingesting server) — so the orchestration
-concepts port over.
+**Ordering matters:** correct routing is `remove_client(old)` → `add_client(new)`. A bare
+`add_client` onto an already-grouped player stops that player's current source.
 
----
+### Stream membership is fixed at `start_stream()`
 
-## 4. Reuse vs. replace ledger
+**This is the single most surprising property of the library, and it was live for months looking
+like a dead speaker.** A client that *connects* while a stream is live receives it at handshake. A
+client that was already connected and is *then* added to the group does **not** — it sits in the
+group, visible in the GUI, at the correct volume, and completely silent, with nothing in any log.
 
-**Reused (source/integration layer is protocol-agnostic — it writes PCM to a FIFO and emits
-metadata):**
-- Integration services: `shairport-sync`, `spotifyd`, `gmrender-resurrect`, `bluealsa`, Plexamp.
-- Multi-instance endpoint APIs + control-script wrapper pattern (`airplay_endpoints_api.py`,
-  `spotify_endpoints_api.py`, `dlna_endpoints_api.py`).
-- Metadata/artwork extraction in the control scripts (`airplay-control-script.py` & siblings)
-  — but **re-targeted** from Snapcast Properties to Sendspin metadata/artwork roles.
-- `playback_api.py` position architecture (Sendspin makes it cleaner / possibly redundant
-  once metadata is a native role — TBD).
-- Settings/integrations Flask layer; most of the GUI (NowPlaying, PlayerControls,
-  Visualizer, theming, color extraction).
+`attach_player` therefore calls `SourceFeeder.refresh_stream()` after `add_client`, re-acquiring the
+stream so the new member is in it. The cost is that the whole group's stream restarts, so existing
+listeners take a brief discontinuity on a routing change — the deliberate trade.
 
-**Replaced:**
-| Snapcast-era | Plum Audio |
-|---|---|
-| `snapserver` | in-process `SendspinServer` + per-source `PushStream` feeders |
-| `snapclient` (integrated hw player) | Sendspin player (per unit), `hw:<card>` out |
-| `federation/*` (ws_manager, router, discovery, remote_snapclient_manager, api) | **Mesh orchestrator** — same *concepts* (aggregate N units, route endpoints), new protocol (Sendspin WS + server-dials-player + reclaim) |
-| `auto-switch-service.py` (slave fast-switch) | `reclaim` (library primitive). No pre-connect needed — the roam is inaudible (jitter buffer covers the reconnect); DISCOVERY pre-connect proved impossible (§2) |
-| Browser audio wire protocol (`snapStreamService.ts`, `useBrowserAudioClient.ts`) | `sendspin-js` browser player (if browser playback is kept) |
-| Snapcast JSON-RPC frontend transport (`snapcastService.ts`, `snapcastDataService.ts`) | Sendspin controller-role WS client + engine-agnostic data service |
+Roaming hides this entirely, because a reconnect gets the stream for free. Only the intra-server
+path was ever affected, which is why a passing roam test proves nothing here. Do not optimise the
+refresh away.
 
-**Dropped entirely:** the five AirPlay resync guards (volume debounce, track-change pause
-guard, resume suppression, metadata debounce, content-dedup) — no longer needed once
-metadata is out-of-band. Keep source volume debounce only if the *source* (MPRIS) still
-warrants it.
+### Why not a master server with audio bridging
 
----
+Feeding every unit's local source into one master server needs inter-unit PCM transport, i.e. the
+unmerged `Roles.SOURCE` path. Servers-stay/players-roam keeps **all ingest in-process on the unit
+that physically received it**, using only shipped primitives for the cross-unit part. It is also the
+conceptual shape of the old Snapcast federation, so the orchestration concepts ported directly.
 
-## 5. Per-unit process model (new `Plum-Audio` container)
+## 4. Per-unit process model
 
-One supervised Python process tree per unit:
+One container per unit. **supervisord runs exactly four programs**: `sendspin_server`,
+`sendspin_player`, `config-api` and `nginx`.
 
-- **`sendspin_server`** — in-process `SendspinServer` (port 8927). Owns: PushStream feeders
-  (one per active local source FIFO), the group/stream lifecycle, metadata/artwork/color/
-  visualizer role state. mDNS advertising disabled (we drive by URL); our own discovery.
-- **`sendspin_player`** — the unit's hardware render endpoint (port 8928), `hw:<card>` out.
-  Connected to exactly one server at a time; reclaimed to whichever server is routing to it.
-  Latency knob → `static_delay_ms`. Its jitter buffer is what makes a roam seamless.
-- **Mesh orchestrator** (successor to `federation/`) — discovers peer units, aggregates their
-  server/group/player state into the app's `Server`/`Stream`/`Client`/`Group` types, and
-  executes routing (`connect_to_client` / `reclaim` / `group.add_client`) on user action.
-  Exposes the same REST surface the frontend already calls (route, volume, snapshot) so the
-  GUI port is minimal.
-- **Integration services** (unchanged) writing PCM to `/tmp/<source>-fifo` + control scripts
-  emitting metadata to the server's role state (replacing the Snapcast-properties path).
-- **Flask APIs** (settings, integrations, audio, endpoints) — largely as-is.
+- **`sendspin_server`** (:8927) — the in-process `SendspinServer`, the PushStream feeders (one per
+  active local source FIFO), the group/stream lifecycle, and the metadata/artwork/visualizer role
+  state. Also hosts the **mesh orchestrator** and the **source managers**, because both must reach
+  the audio event loop.
+- **`sendspin_player`** (:8928) — the unit's hardware render endpoint, out to `hw:<card>` via
+  PortAudio. Attached to exactly one server at a time. Its jitter buffer is what makes a roam
+  seamless, and it echoes its volume and its actually-opened output back into
+  `/data/player_state.json`.
+- **`config-api`** (:5002, Flask) — settings, integrations, audio. Pure persistence.
+- **`nginx`** (:80) — serves the built React app and proxies both APIs same-origin.
 
-**FIFO handling is now simpler than the dual-engine plan:** single consumer (the PushStream
-feeder reads each source FIFO once). No `tee` needed — that complexity existed only because
-we were feeding *both* snapserver and Sendspin. Full replacement removes it.
+**Source daemons are not supervisord programs.** The source managers own them, so `ps` inside the
+container is how you confirm shairport-sync / go-librespot / bluealsa are up. A source missing there
+but enabled in `settings.json` is a manager problem, not a supervisord one.
 
----
+**Two processes own persistent state, deliberately kept apart.** The config API owns
+`settings.json`; the audio process owns `/data/player_state.json`. The player's level and chosen
+output are runtime state the player is the source of truth for, not user configuration — a separate
+file means no cross-process writers and no API round-trip just to remember how loud the room was.
 
-## 6. Multiple concurrent groups — routing model
+**FIFO handling is single-consumer** — one feeder reads each source FIFO. No `tee`; that complexity
+existed only in the abandoned dual-engine plan.
 
-Sendspin supports N independent groups across N servers natively (each group = its own
-stream + clock domain). The orchestrator's job is to present this coherently:
+**The host keeps what only the host can do**: the Bluetooth radio and its AVCTP channel, the D-Bus
+policy, Avahi, WiFi (NetworkManager owns `wlan0`), and the audio HAT's device-tree overlay and
+mixer. See `docs/HOST-PROVISIONING.md`.
 
-- **App model:** a *Group* = {a source/stream on some unit's server} + {set of player
-  endpoints currently rendering it}. Multiple groups coexist; a player belongs to at most
-  one group at a time.
-- **Route action:** "play `<source on unit X>` to `<players P…>`" ⇒ for each player: if
-  already on X's server, `group.add_client`; else `connect_to_client`/`reclaim` then
-  `add_client`. Removing = `remove_client` (back to a solo group on its current server).
-- **Contention is defined:** a player can only render one group; routing it elsewhere pulls
-  it (that's the `ANOTHER_SERVER` handoff). The GUI shows current group membership per player.
-- **Volume:** per-player volume via player-role command; group volume = delta-preserving
-  redistribution across the group's players (port existing logic).
+## 5. Sources — the source-manager contract
 
----
+Every multi-instance source follows one shape (`sources/source_manager.py` is the base,
+`spotify_manager.py` the reference):
 
-## 7. Mesh verification — spike status
+- One daemon per configured **endpoint**, writing PCM to `/tmp/<source>-<id>-fifo`.
+- The manager polls `settings.json` **inside the audio loop** and reconciles both the Sendspin
+  sources and the daemon processes — **source first**, so the feeder has created the FIFO before the
+  daemon opens it.
+- The integrations API is **pure persistence**. It does not render configs or respool daemons: that
+  process cannot reach the audio loop, and the dev rig has no supervisord. One reconciler makes rig
+  and container behave alike.
+- Config templates are rendered through `sources/config_render.py`, which **escapes for the target
+  syntax and writes atomically**. A device name reaches a quoted libconfig/YAML scalar and then a
+  daemon is respooled; shairport's `sessioncontrol` can run shell commands.
+- Artwork is decoded through `sources/artwork.py`, on a worker thread. Never on the audio loop.
 
-- **API/design tier — DONE (this session).** Source audit confirms live intra-server
-  re-routing and first-class cross-server reclaim (§2). This was the primary risk.
-- **Protocol-timing tier — `_resources/spike/handoff_probe.py`**: runs a server + a
-  programmatic PLAYER client that renders to the onboard DAC (PortAudio), feeds a continuous
-  tone, performs handoffs, and reports the `stream_end`→`stream_start` gap, WS-disconnect count
-  (live-re-route vs reconnect), and ALSA xruns + jitter-buffer starvations. Runs headless (no
-  speakers); `--no-dac` measures the protocol gap only. **Loopback (dev) results so far**:
-  intra-server re-route is a true **live re-route** — WS stays connected (0 disconnects),
-  sub-ms control gap, and the ~250 ms player buffer lead fully absorbs it → **0 xruns**.
-  Cross-server reclaim is **reconnect-class** (WS drops, ANOTHER_SERVER), ~80 ms control gap in
-  loopback; the player-side reclaim handshake (goodbye-old → attach-new) still needs a proper,
-  race-free implementation (Phase 2). Hardware xrun/gap numbers on `.201.133` still to be taken.
+Per source: **AirPlay** runs a private D-Bus session per endpoint, because shairport's MPRIS bus
+name is fixed and multi-endpoint would otherwise collide. **Spotify** uses go-librespot over HTTP+WS
+(no D-Bus; spotifyd was dropped when 0.4.x removed MPRIS). **Bluetooth** relays metadata over AVRCP
+— A2DP carries none — and its position ceiling lives in `bluetoothd`, which is why the host needs
+patching. **DLNA and Plexamp have no backend at all**: a settings stub and a GUI card, nothing else.
 
-  **Load-bearing lifecycle rule discovered here** (affects all routing code): re-route MUST be
-  `old_group.remove_client(player)` → `new_group.add_client(player)`. A bare `add_client` calls
-  `old_group.stop()`, which would kill the source the player is *leaving* for every other
-  listener. Each source group therefore keeps a stable player member (or the feeder self-heals),
-  and `SourceFeeder` re-acquires its `PushStream` on `StreamStoppedError` rather than dying.
-- **Audible tier — NEXT hardware step (needs user + speakers on two units).** Two-node test:
-  `.133` ingests a source into Group A, `.113`'s player joins; then reclaim `.113` to a
-  second server / move between groups and **listen** for gap/continuity. Mirrors the
-  user-confirmed sync test from the first Sendspin trial. Blocked only on physical speakers +
-  someone to listen.
+## 6. Routing, groups, and the three volumes
 
----
+A *group* is {a source on some unit's server} + {the set of players currently rendering it}. Groups
+coexist; a player belongs to at most one at a time, so **contention is defined**: routing a player
+elsewhere pulls it, and that is the `ANOTHER_SERVER` handoff.
 
-## 8. Phased plan
+A source's group and its anchor client (`src:<source_id>`) persist whether or not anything is
+streaming, so routing survives an idle source. The anchor is a transport-less non-player client,
+which is what stops the group being auto-deleted when the last real player leaves.
 
-### Phase 0 — Repo scaffold + spike harden
-- `/new-project Plum-Audio` scaffold (Plum standards: `docs/`, `_resources/`, `ARCHITECTURE.md`
-  seeded from this file, `CLAUDE.md`, Docker).
-- **Base image decision:** R&D units are **Debian 13 (glibc)**, not Alpine/musl. glibc makes
-  PyAV/PortAudio/numpy wheels trivial (the Alpine PyAV pain in old notes disappears).
-  Recommend a **Debian-slim** base for Plum-Audio. Revisit multi-arch build.
-- Pin `aiosendspin`; vendor a smoke test.
-- Port the spike into a real `sendspin_server.py` skeleton.
+**Three volumes, and only two are the protocol's:**
 
-### Phase 1 — Single-unit core playback
-1. ✅ `sendspin_server.py`: in-process server + AirPlay FIFO feeder (self-healing PushStream).
-2. ✅ `sendspin_player.py` supervised service → onboard DAC out; latency→`static_delay_ms`.
-   Server↔player auto-attach glue (dial + re-attach, self-heals across restarts).
-   shairport-sync config + supervisord/Docker wiring.
-3. ✅ AirPlay metadata/artwork → Sendspin metadata/artwork roles (`sources/airplay_metadata.py`,
-   in-process reader on shairport's metadata pipe; the five Snapcast resync guards dropped, not
-   ported). Title/artist/album + 512×512 cover art confirmed live on hardware.
-4. ✅ supervisord + Dockerfile + entrypoint wiring; mDNS-off. (Full settings/audio Flask APIs +
-   GUI deferred — see Phase 3; not required for the single-unit milestone.)
-5. **Milestone — FULLY ACHIEVED ON HARDWARE, IN DOCKER (2026-07, `.201.133`):** real AirPlay
-   from an iPhone → shairport → FIFO → server → player → onboard DAC → speaker, **with live
-   metadata + album art**, **0 xruns, no resync storm**. Runs as one supervisord container
-   (image builds arm64; onboard DAC opens in-container via `--device /dev/snd`). Live re-route
-   ~0.1 ms / 0 xruns; cross-server reclaim reconnect-class (~85 ms protocol gap). **Later
-   corrected (2026-07-14): the reconnect is INAUDIBLE — the player's jitter buffer drains through
-   it, emitting zero silence. The "~200 ms audible silence" estimate and the DISCOVERY-pre-connect
-   mitigation were both wrong; pre-connect is impossible (§2) and unnecessary.**
-
-### Phase 2 — Mesh (the differentiator)
-6. Mesh orchestrator: peer discovery, state aggregation, routing engine
-   (`connect_to_client`/`reclaim`/`add_client`). [No DISCOVERY-preconnect pool — refuted, see §2.]
-7. REST surface parity with today's federation API (route, volume, snapshot) for GUI reuse.
-8. Multi-concurrent-group model + contention handling.
-9. **Milestone:** ingest on unit A, route to A+B+C; second independent group on unit B; smooth handoffs.
-
-**Backbone BUILT + single-node-validated (2026-07, branch `feature/phase2-mesh`).**
-`backend/scripts/mesh/` + the engine seam, all logic/HTTP-tested; boots inside `sendspin_server`
-(`PLUM_MESH_ENABLED`, in-process — no new supervisord program):
-- `discovery.py` — UDP broadcast beacon (:8929), TTL peer table. **Not** mDNS (python-zeroconf
-  would bind 5353 → Avahi collision). Peer IP taken from the datagram source; derives peer
-  server/player `ws://` URLs. *Two-node broadcast round-trip pending a 2nd LAN unit (loopback
-  can't validate it).*
-- `model.py` — normalized `UnitSnapshot`/`SourceState`/`PlayerState` + aggregated `MeshView`
-  (`find_source`/`find_player`), JSON wire form. `PlumSendspinServer.snapshot()` supplies the local view.
-- `sync_engine/` — `SyncEngine` ABC refit to the router-facing seam; `SendspinEngine` facade over
-  `PlumSendspinServer` keeps the mesh aiosendspin-free. Adds `reclaim_remote_player()` (cross-server
-  roam) to the server. (`preconnect_player()` existed briefly but was removed — see §2.)
-- `aggregator.py` — local snapshot + peers' snapshots (polled via discovery+client) → one `MeshView`;
-  peer `host` filled from the beacon source IP; unreachable peers omitted for the cycle.
-- `router.py` — three paths: intra-server (`attach_local_player`), cross-server (`reclaim_remote_player`),
-  or **delegate to the source's owning unit** (audio never leaves its ingesting unit). Deps injected.
-- `api.py` — **aiohttp** (not Flask: must call the async router/aggregator in the audio event loop;
-  WSGI would need a 2nd process). `/api/mesh/{snapshot,view,route,unroute,volume,source}`,
-  federation-parity, CORS on. `client.py` — aiohttp client (aggregator poll + router delegate).
-- `orchestrator.py` — composes the above around one running server; wired into `sendspin_server` main().
-
-**TWO-NODE HARDWARE VALIDATION PASSED (2026-07-13, `.201.133` Pi4-02 + `.201.113` PoE-Temp):**
-- **Discovery:** mutual beacon over the real LAN (each unit discovers the other; loopback couldn't test this).
-- **Aggregation:** each unit's `/api/mesh/view` shows both units; peer `host` from the beacon IP; group_ids consistent across the HTTP snapshot poll between hosts.
-- **Cross-server roam:** player ping-ponged 4 hops between units — **~54 ms route API, 0 xruns / 0 starvation** through every handoff. (The ~54 ms is the *protocol* gap; it is INAUDIBLE — see the reclaim-gap resolution below.)
-- **Four bugs fixed, only reproducible on hardware** (commit `70ff0ed`): (1) `reclaim_client_for_playback` is synchronous, not awaitable; (2) disconnected clients left routing stubs — snapshot now connected-only; (3) reclaim URL must be the player's *own* listener URL (roamed players keep their origin host), now carried in `PlayerState`; (4) the Phase-1 auto-attach supervisor fought roams — `attach_local_player(supervise=not mesh_enabled)`.
-
-**RECLAIM-GAP + LIVE-AIRPLAY VALIDATION PASSED (2026-07-14):**
-- **The roam is inaudible.** Instrumented the renderer with unconditional silence accounting (`pad_ms`). Across a cross-server roam the player fires no `stream_clear`/`stream_end`, so its jitter buffer is never flushed and the DAC drains straight through the reconnect — measured `pad_ms` is *unchanged* across detach→attach. The DISCOVERY pre-connect idea was refuted (impossible + unnecessary — commit `de50035`, §2).
-- **Live AirPlay end-to-end:** real shairport-sync PCM ingested (not a tone); **title/artist/album + 512×512 JPEG artwork** flowed to the Sendspin metadata/artwork roles; 0 xruns.
-- **Multi-room:** player-133 + player-113 both joined `.133`'s live-AirPlay group and played it in sync.
-- **Roam off live AirPlay:** player-113 detached holding **435 ms of real AirPlay audio** → reattached with the buffer intact, **`pad_ms` unchanged** (zero audible dropout). The tone-based finding holds for real bursty content.
-
-**MULTI-CONCURRENT-GROUP VALIDATED ON HARDWARE (2026-07-13):** item 8 milestone met. Two sources
-active at once on one unit (`airplay` + a runtime-created `spotify` via `POST /api/mesh/source`),
-each anchoring its own group; two players split across them (one local, one roamed cross-server in
-~54 ms) with an idle group coexisting on the other unit; **0 xruns under concurrent load**. Adds
-(commit `77ff59b`): dynamic source create/stop REST, per-player volume/mute (`PlayerV1Role` via
-`roles_by_family`; player applies as render-side gain), idempotent `attach_player`. A 5th
-hardware-only bug fixed (`7e39c47`): the player read volume from the wrong payload level
-(`payload.player.{volume,mute}`). Contention policy: routes idempotent, last-writer-wins player
-placement, source groups persist with 0 players (anchor keeps the feeder alive for instant re-route).
-
-### Phase 3 — Remaining sources + parity
-10. Spotify / DLNA / Bluetooth / Plexamp feeders (same PushStream pattern).
-11. Frontend: controller-role WS client, engine-agnostic data service, wire `App.tsx`
-    handlers, port Settings.
-12. Browser audio via `sendspin-js` (if kept). Visualizer over the native visualizer role.
-13. WiFi setup, theming, polish. Hardware soak test across ≥3 units.
-
-### Phase 4 — Cutover
-14. Migrate the two production units (`.200`/`.203`) once ≥3-unit soak passes; freeze the
-    Snapcast codebase on a tag for rollback.
-
----
-
-## 9. Risk register (updated)
-
-| Risk | Sev | Notes |
+| Level | What it is | How it moves |
 |---|---|---|
-| ~~Audible gap on cross-server reclaim~~ | **RESOLVED** | Measured 2026-07-14: **no audible gap.** The player never flushes on a roam, so its ~300 ms jitter buffer drains through the ~25–55 ms reconnect — emitted-silence counter unchanged. The DISCOVERY-pre-connect mitigation was neither possible nor needed (§2). |
-| `aiosendspin` pin drift | Med | Fast-moving. Pin 6.0.5; smoke test; track releases. |
-| mDNS 5353 collision with our Avahi | Low | Known; disable server mDNS, drive by URL. |
-| Player maturity on `hw:<card>` (PortAudio on Pi) | Med | Validate the `sendspin` player + latency mapping on hardware (Phase 1). |
-| Opus encode CPU on constrained units | Med | Prefer pcm/flac for LAN players; opus for remote/constrained only. |
-| Browser player (`sendspin-js`) maturity | Med | Defer to Phase 3; browser audio is non-core. |
-| Losing federation edge-cases we already solved (dedup, remote naming, stale streams) | Med | Port the *intent* of `federation/api.py` dedup/display logic into the orchestrator. |
+| Per-player | One endpoint's own output | Player-role command · `POST /api/mesh/volume` |
+| Group | Every endpoint on a source | Controller-role `volume`/`mute` — **the library does the delta-preserving redistribution**; do not fan out per client |
+| Source | The level on the **sending device** — the phone's slider, Spotify Connect | Not a Sendspin concept. `POST /api/mesh/source-volume` + `SourceState.source_volume`, driven per source |
 
----
+Source volume stacks with the endpoint levels and must never be conflated with them in the GUI. The
+main card's slider is **this unit's own endpoint**; the group is moved deliberately, via the group
+buttons; the source slider appears only when the source can actually accept one.
 
-## 10. Open questions
-1. **Player: bundled `sendspin` CLI vs. programmatic `SendspinClient(PLAYER)`** in our own
-   process? Programmatic gives tighter control (latency, device, reclaim events) — lean that way.
-2. **Is `playback_api.py` still needed** once position/metadata are native roles? Likely
-   retire; confirm the roles carry position.
-3. **Do we keep browser audio at all**, or is it a nice-to-have we drop for v1?
-4. **Group persistence** across restarts — do routes survive a unit reboot (re-establish
-   routes on boot)?
-5. **Naming**: server_id / player_id scheme for stable identity across reboots and IP changes.
+**A server cannot read a player's level, only command it.** `PlayerV1Role.set_volume()` does not
+move the server's own view — only the player's `client/state` does, and the library sends exactly
+one of those, at connect, carrying `initial_volume`. So the player **must** echo after every
+command, and persist it, or every level in the mesh reads 100% forever while the audio is
+demonstrably quieter.
 
----
+## 7. Auto-route and follow
 
-## 11. Sources
-- `aiosendspin` 6.0.5 (installed, audited): `server/{server,group,push_stream}.py`, `client/client.py`, `models/types.py`.
-- Music Assistant Sendspin provider (reference for the servers-dial-players / reclaim topology).
-- Prior: `docs/SENDSPIN-INTEGRATION-PLAN.md` (dual-engine, superseded), `_resources/Research/sendspin-protocol-research.md`.
+`mesh/follow.py`. Two behaviours, both configured in Settings → Playback and both reconciled by
+polling — there is no event for "a source went active" or "a player was routed".
+
+- **`localActivity`** — when this unit's own player is idle and one of its own local sources becomes
+  active, route the player onto it. Keyed on the **inactive→active edge**, a genuinely new
+  connection, not a source that was already streaming. So "just AirPlay to the kitchen speaker"
+  needs no manual routing, while selecting *None* during a live AirPlay session sticks.
+- **`slave`** — mirror another unit's player (`masterUnitId`): follow whatever stream it is on, and
+  follow it into idle when it stops. **A local override always wins** — once the user moves the
+  follower off what follow put it on, follow keeps hands off until the follower is manually back in
+  sync with the leader, or slave mode is turned off.
+
+Both the follower's and the leader's status come from `UnitSnapshot.local_player` — each unit's
+player self-reports where it is attached, which is the only way to learn this once a player has
+roamed onto a different unit's server. If a leader's speaker is attached to a server outside our
+mesh (Music Assistant, any foreign Sendspin server) there is no `source_id` to route onto, and
+follow degrades to a no-op until it returns.
+
+**A `source_id` is only unique within a unit** — every unit's own AirPlay endpoint is happily also
+`airplay-1`. A target is therefore tracked as an `(owning_unit_id, source_id)` pair everywhere, and
+following a leader's source must go through the explicit peer-delegate primitive rather than
+`Router.route_player`, which resolves a bare id against our own view and would silently attach the
+player locally instead.
+
+## 8. Interop — we are a peer on a standard network
+
+Third-party interop is the point of adopting a standard protocol, not a bonus.
+
+- **mDNS goes through the host's Avahi over D-Bus.** Players advertise `_sendspin._tcp`, servers
+  `_sendspin-server._tcp`. This is what makes us discoverable by Music Assistant. A client picks ONE
+  direction: while advertising we are server-dialed and must not dial out.
+- **The mesh view and the neighbourhood are different things.** The view is our own units,
+  aggregated from peer snapshots over `/api/mesh/*`. The neighbourhood
+  (`GET /api/mesh/neighbourhood`) is every Sendspin service mDNS can see on the segment, ours or not.
+- **Adopt and release** bring a foreign speaker into one of our groups and hand it back. A speaker
+  is identified by its **registered URL**, never by a client id — mDNS names by instance and the
+  handshake by MAC, so those genuinely differ. `connect_to_client(url)` is a no-op when a dial
+  registration already exists, so adopt cancels the existing dial first; without that, re-adopting a
+  speaker that rebooted silently does nothing and then times out claiming it never connected.
+- **The consume relay** (`ws://…/api/mesh/consume`) makes a session on a *foreign* server observable
+  and controllable from our GUI — metadata, artwork and visualizer state relayed from the player
+  that is rendering it. It is our own protocol on our own port; nothing about it touches the wire.
+
+**One spec MUST remains unmet**: multi-server arbitration. We persist the `server_id` of the server
+that most recently had us playing, but we cannot yet *decide* between two servers, because the
+library commits to a dialing server before `connection_reason` is readable. See UPSTREAM §1.
+
+## 9. Metadata, artwork and the visualizer
+
+All out-of-band, on Sendspin roles, never on the audio stream.
+
+Progress is an **anchor**, not a ticker: the source publishes `track_progress` with a server
+timestamp and a playback speed, and every consumer extrapolates
+`progress + (now − timestamp) × speed`. This is why a source's own 1 Hz updates are suppressed by
+the library when they merely track wall clock — client frame rate is not a health signal.
+
+The **visualizer role is per-SOURCE and server-computed**: the server bins its own FFT of the source
+audio to the shape the client requested. That is what makes it cheap, and it is also the boundary —
+audio rendered from a foreign server has no source on our side to analyse, so it cannot be
+visualized. The wire format the GUI implements is documented in
+`docs/SENDSPIN-CONTROLLER-PROTOCOL.md`.
+
+## 10. Audio output selection
+
+**The output device's identity is the ALSA card name, never `hw:C,D`.** Card numbers move — the
+HiFiBerry on one unit was card 2, then 1, then 2, then 0 across four reboots with config unchanged.
+`settings.json` stores `<card_name>:<device>`; `hw:C,D` is re-derived on every scan, for display and
+`speaker-test` only.
+
+**Availability rests on three signals that fail in different places** and must not be collapsed into
+one: `is_active` (what we are configured to render to — survives everywhere), `in_use` (read from
+`/proc/asound`, which is masked in the container and so bind-mounted from the host at
+`/host/asound`), and PortAudio exposure. PortAudio **enumerates by opening**, so a card we hold
+exclusively vanishes from its device list entirely.
+
+A switch applies live, without restarting the player, and the player **echoes the device it actually
+opened** — which is what lets the API report `pending` rather than claiming a switch that never
+happened. A failed switch restores the previous device rather than leaving silence.
+
+## 11. The GUI
+
+nginx serves the built app from inside the unit container, so the GUI is same-origin and needs no
+CORS, no dev proxy, and no build-time host baked in.
+
+- **The page IS the unit that served it.** The mesh view is identical from every unit, so identity
+  can only come from the responder — `local_unit_id`. "Our own" players are matched by listener host.
+- **One controller WebSocket per SOURCE**, not per unit (`ctrl:<source_id>:<nonce>` client id): a
+  client sits in exactly one group, so one socket sees exactly one source. The nonce is persisted so
+  a page reload does not mint a new identity.
+- **The browser player dials IN** — the inverse of the native player, which is dialed by servers.
+  A browser tab has no listener socket, so cross-server roam does not apply to it.
+- **Device pickers list active sources only.** A source exists for every configured endpoint whether
+  or not anyone is feeding it, so the unfiltered list shows ghosts long after the phone
+  disconnected. Idle devices are still routable — the router always supported it.
+
+## 12. Container and deployment
+
+The base image is pinned to **`python:3.13-slim-trixie`** — glibc for trivial PyAV/PortAudio/numpy
+wheels, and *trixie specifically* to match the units' Debian 13 so bluez-alsa and shairport-sync
+behave as validated. The Dockerfile **asserts its build-time dependencies**, because every one of
+those failures is invisible at runtime: a dead transport control, or a Bluetooth source that simply
+never appears.
+
+Host networking is required — mDNS needs layer 2. `/config` holds config and logs, `/data` holds
+runtime state; there is no `/media`. Procedures, and the deploy conflicts that fail deceptively, are
+in `docs/OPERATIONS.md`.
+
+## 13. Risks and open questions
+
+| Risk | Standing |
+|---|---|
+| `aiosendspin` moves fast | Pinned 6.0.5; smoke-test on bump; workarounds tracked in UPSTREAM |
+| Multi-server arbitration unmet | Spec MUST; needs a library change (UPSTREAM §1) |
+| Third-party players vary | Codec choice belongs to the client; a heterogeneous group is normal |
+| No unit coverage on `sendspin_server.py` | Including `refresh_stream` — the guard for the worst bug found so far |
+| Bluetooth depends on host patches | Unpatched units silently lose scrub reporting |
+
+**Open question:** route persistence across a reboot. Groups and anchors survive an idle source, but
+nothing restores routing after a unit restarts.
+
+## 14. Sources
+
+- Sendspin spec: <https://www.sendspin-audio.com/spec/> · `aiosendspin`:
+  <https://github.com/Sendspin/aiosendspin>
+- Predecessor: the **Plum-Snapcast** repo — this repo implements the design its architecture doc set out.

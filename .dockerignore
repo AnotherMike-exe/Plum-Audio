@@ -1,0 +1,36 @@
+# Build context is the REPO ROOT (the Dockerfile needs both backend/ and frontend/), so the
+# excludes live here rather than in backend/. Without this the context carries ~200 MB of
+# node_modules, _resources and git history on every build.
+.git/
+.gitignore
+.idea/
+.claude/
+_resources/
+
+# Frontend: the image runs `npm ci` + `vite build` itself; a host-built tree would only shadow it
+# (and node_modules is arch-specific — a macOS tree in an arm64 Linux image is worse than useless).
+frontend/node_modules/
+frontend/dist/
+
+# Python build/test detritus
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.ruff_cache/
+**/.venv/
+**/venv/
+
+# Not needed at runtime
+docs/
+tests/
+scripts/
+README.md
+CLAUDE.md
+
+# Bind-mount targets used by the local compose file — never image content
+app-config/
+app-data/
+app-media/
+
+*.log
+.DS_Store

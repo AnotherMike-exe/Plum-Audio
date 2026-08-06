@@ -17,18 +17,41 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import socket
 from collections.abc import Awaitable, Callable
+
+from sync_engine.base import SyncEngine
 
 from mesh.discovery import MeshDiscovery, Peer
 from mesh.model import MeshView, UnitSnapshot
-from sync_engine.base import SyncEngine
 
 logger = logging.getLogger("plum.mesh.aggregator")
+
+
+def _detect_local_host() -> str | None:
+    """This unit's own IP on the default-route interface.
+
+    A unit ignores its own beacon, so it never learns the address peers reach it on — yet the
+    local half of the view must still carry a host, or a GUI bootstrapped against this unit can't
+    open its controller WS / address its REST. The connect-to-TEST-NET trick sends no packets; it
+    just asks the kernel which source IP the default route would use (the wlan0 address peers see).
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("192.0.2.1", 9))  # RFC 5737 TEST-NET-1 — unroutable, never actually contacted
+        return sock.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
 
 # fetch_snapshot(peer) -> the peer's UnitSnapshot.to_dict(), or None if unreachable this cycle.
 FetchSnapshot = Callable[[Peer], Awaitable["dict | None"]]
 
 DEFAULT_INTERVAL_S = 2.0
+# Comfortably above any real rig, so normal operation is still one round trip for everyone at once.
+MAX_CONCURRENT_FETCHES = 16
 
 
 class DataAggregator:
@@ -42,11 +65,13 @@ class DataAggregator:
         interval_s: float = DEFAULT_INTERVAL_S,
     ) -> None:
         self.local_unit_id = local_unit_id
+        self._local_player_state: dict | None = None  # our speaker's self-report (see model)
         self._engine = engine
         self._discovery = discovery
         self._fetch = fetch_snapshot
         self.interval_s = interval_s
-        self._view = MeshView(units=[engine.snapshot()])
+        self._local_host = _detect_local_host()
+        self._view = MeshView(units=[self.local_snapshot()])
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
@@ -65,11 +90,36 @@ class DataAggregator:
         """The most recently built mesh view (updated each poll cycle)."""
         return self._view
 
+    def set_local_player_state(self, state: dict) -> None:
+        """Record our own speaker's self-report (pushed by the player process)."""
+        self._local_player_state = state
+
+    def local_snapshot(self) -> UnitSnapshot:
+        """The engine's snapshot, with this unit's own host stamped in (the engine can't know it)."""
+        snap = self._engine.snapshot()
+        if snap.host is None:
+            snap.host = self._local_host
+        # The engine only knows clients attached to ITS server; our speaker may be attached to
+        # someone else's (a peer, Music Assistant, any Sendspin server). Its self-report travels
+        # with the snapshot so every unit's GUI can still show where it went and what it's playing.
+        snap.local_player = self._local_player_state
+        return snap
+
     async def refresh(self) -> MeshView:
         """Rebuild the view now: local snapshot + every reachable peer's snapshot."""
-        units: list[UnitSnapshot] = [self._engine.snapshot()]
+        units: list[UnitSnapshot] = [self.local_snapshot()]
         peers = self._discovery.peers()
-        results = await asyncio.gather(*(self._fetch_peer(p) for p in peers))
+        # Bounded fan-out. This runs in the AUDIO event loop every interval_s, so the number of
+        # sockets it opens at once has to be a property of our code, not of how many beacons
+        # happen to have arrived — the beacon is unauthenticated broadcast. Discovery caps the
+        # table; this caps the concurrency, and the two together bound the work per tick.
+        sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
+
+        async def fetch(peer: Peer) -> UnitSnapshot | None:
+            async with sem:
+                return await self._fetch_peer(peer)
+
+        results = await asyncio.gather(*(fetch(p) for p in peers))
         units.extend(u for u in results if u is not None)
         self._view = MeshView(units=units)
         return self._view

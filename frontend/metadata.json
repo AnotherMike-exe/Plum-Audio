@@ -1,0 +1,5 @@
+{
+  "name": "Sync Audio Controller",
+  "description": "A web application to control audio playback across multiple devices on a network. Manage volume, playback, and stream sources for local and remote clients seamlessly.",
+  "requestFramePermissions": []
+}

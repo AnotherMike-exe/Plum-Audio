@@ -1,5 +1,10 @@
 # Plum-Audio backend — dev/test tooling (not shipped in the image).
 -r requirements.txt
-pytest>=8
-black>=24
-ruff>=0.6
+pytest>=8,<9
+
+# black and ruff are PINNED to a minor, not floated. Both change their stable style between
+# releases, so an unpinned range turns CI red on a day nobody committed anything — which is
+# exactly how the 24 unformatted files and 173 ruff findings accumulated unnoticed. Bump these
+# deliberately, and re-run both across backend/ in the same commit.
+black>=26.3,<26.4
+ruff>=0.16,<0.17

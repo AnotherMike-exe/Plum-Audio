@@ -14,7 +14,6 @@ not stall the aggregator poll), failures surface as None/False for the caller to
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
 import aiohttp
@@ -52,7 +51,7 @@ class MeshClient:
                 if resp.status != 200:
                     return None
                 return await resp.json()
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+        except (TimeoutError, aiohttp.ClientError):
             return None
 
     async def delegate_route(self, peer: Peer, source_id: str, player_id: str) -> bool:
@@ -66,6 +65,22 @@ class MeshClient:
                     return False
                 body = await resp.json()
                 return bool(body.get("ok"))
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+        except (TimeoutError, aiohttp.ClientError):
             logger.warning("delegated route to %s unreachable", peer.unit_id)
+            return False
+
+    async def delegate_unroute(self, peer: Peer, source_id: str, player_id: str) -> bool:
+        """POST an unroute to the unit that owns the source (a player attached to its group is
+        detached by its own server); True on success. Used to follow a leader into idle."""
+        assert self._session is not None
+        payload = {"player_id": player_id, "source_id": source_id}
+        try:
+            async with self._session.post(self._url(peer, "/api/mesh/unroute"), json=payload) as resp:
+                if resp.status != 200:
+                    logger.warning("delegated unroute to %s failed: HTTP %d", peer.unit_id, resp.status)
+                    return False
+                body = await resp.json()
+                return bool(body.get("ok"))
+        except (TimeoutError, aiohttp.ClientError):
+            logger.warning("delegated unroute to %s unreachable", peer.unit_id)
             return False

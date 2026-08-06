@@ -27,6 +27,10 @@ class PlayerState:
     connected: bool
     group_id: str | None  # the group it currently renders, if any
     url: str | None = None  # the player's own LAN listener URL (how any server reclaims it)
+    # Render level as the PLAYER last reported it (client/state), not as we last commanded it —
+    # the player is the source of truth for its own gain, and it persists it across restarts.
+    volume: int = 100
+    muted: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -35,16 +39,20 @@ class PlayerState:
             "connected": self.connected,
             "group_id": self.group_id,
             "url": self.url,
+            "volume": self.volume,
+            "muted": self.muted,
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "PlayerState":
+    def from_dict(cls, d: dict) -> PlayerState:
         return cls(
             player_id=d["player_id"],
             name=d.get("name", d["player_id"]),
             connected=bool(d.get("connected", False)),
             group_id=d.get("group_id"),
             url=d.get("url"),
+            volume=int(d.get("volume", 100)),
+            muted=bool(d.get("muted", False)),
         )
 
 
@@ -57,6 +65,20 @@ class SourceState:
     group_name: str
     streaming: bool  # feeder is pushing audio right now
     player_ids: list[str] = field(default_factory=list)  # players attached to this group
+    # Display name = the endpoint's device name ("Kitchen"), so the GUI shows what the user named
+    # in Settings rather than the internal source_id. Follows a rename live.
+    name: str = ""
+    # A sender is actually using this source (audio arrived recently and the writer is still open).
+    # Idle sources stay routable but drop out of the GUI's stream list — see SourceFeeder.is_active.
+    active: bool = False
+    # The volume ON THE SENDING DEVICE (the phone's AirPlay/Bluetooth slider, the Spotify Connect
+    # device volume) — NOT any endpoint's output level. Sendspin has no concept of it (the protocol's
+    # controller volume is the group's player volume), so it rides our own snapshot instead.
+    # None = this source cannot report/accept one right now; `supports_source_volume` is what the
+    # GUI gates the second slider on, so a source with no live sender hides it rather than lying.
+    source_volume: int | None = None
+    source_muted: bool | None = None
+    supports_source_volume: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -65,16 +87,30 @@ class SourceState:
             "group_name": self.group_name,
             "streaming": self.streaming,
             "player_ids": list(self.player_ids),
+            # Never emit an empty label: a source with no endpoint name falls back to its id, which
+            # also keeps to_dict/from_dict a stable round trip.
+            "name": self.name or self.source_id,
+            "active": self.active,
+            "source_volume": self.source_volume,
+            "source_muted": self.source_muted,
+            "supports_source_volume": self.supports_source_volume,
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "SourceState":
+    def from_dict(cls, d: dict) -> SourceState:
+        volume = d.get("source_volume")
+        muted = d.get("source_muted")
         return cls(
             source_id=d["source_id"],
             group_id=d["group_id"],
             group_name=d.get("group_name", d["group_id"]),
             streaming=bool(d.get("streaming", False)),
             player_ids=list(d.get("player_ids", [])),
+            name=d.get("name", "") or d["source_id"],
+            active=bool(d.get("active", False)),
+            source_volume=None if volume is None else int(volume),
+            source_muted=None if muted is None else bool(muted),
+            supports_source_volume=bool(d.get("supports_source_volume", False)),
         )
 
 
@@ -87,6 +123,25 @@ class UnitSnapshot:
     host: str | None  # filled in by the aggregator from the beacon source IP
     sources: list[SourceState] = field(default_factory=list)
     players: list[PlayerState] = field(default_factory=list)
+    # This unit's OWN speaker, as reported by the player process itself (mesh/api player-state).
+    # `players` above can only list clients attached to THIS server, so a speaker claimed by
+    # another server — a peer unit, Music Assistant, any Sendspin server — would otherwise just
+    # disappear. The self-report is how the GUI keeps seeing it, and learns what it is playing.
+    local_player: dict | None = None
+    # Does this unit have an audio output at all? False for an ingest/routing-only node — no player
+    # process, no local speaker, nothing to route audio ONTO. It is not the same question as
+    # `players == []` or `local_player is None`, both of which are also true for a moment at boot
+    # and while a speaker is claimed by another server. Every consumer that has to tell "no speaker
+    # here, ever" from "no speaker right now" keys off this.
+    #
+    # DEFAULTS TRUE, deliberately: a peer running an older image sends a snapshot without the field,
+    # and reading that as "playerless" would make every existing unit look like an ingest node.
+    has_player: bool = True
+    # What this unit calls itself on the network (socket.gethostname()). Peers only ever learn each
+    # other's IPs from the beacon, but a person reaches the GUI at `plum-amp100.local` — so without
+    # this a peer cannot recognise a page served BY this unit as a legitimate origin. See
+    # cors_policy.known_hosts.
+    hostname: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -95,16 +150,22 @@ class UnitSnapshot:
             "host": self.host,
             "sources": [s.to_dict() for s in self.sources],
             "players": [p.to_dict() for p in self.players],
+            "local_player": self.local_player,
+            "has_player": self.has_player,
+            "hostname": self.hostname,
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "UnitSnapshot":
+    def from_dict(cls, d: dict) -> UnitSnapshot:
         return cls(
             unit_id=d["unit_id"],
             name=d.get("name", d["unit_id"]),
             host=d.get("host"),
             sources=[SourceState.from_dict(s) for s in d.get("sources", [])],
             players=[PlayerState.from_dict(p) for p in d.get("players", [])],
+            local_player=d.get("local_player"),
+            has_player=bool(d.get("has_player", True)),
+            hostname=d.get("hostname"),
         )
 
 

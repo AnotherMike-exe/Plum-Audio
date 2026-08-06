@@ -1,0 +1,5 @@
+/* Tailwind entrypoint — imported by index.tsx so Vite compiles it into the bundle.
+   Replaces the old cdn.tailwindcss.com script tag (see tailwind.config.js). */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;

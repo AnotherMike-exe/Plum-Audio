@@ -46,6 +46,22 @@ class SyncEngine(ABC):
     async def set_player_volume(self, player_id: str, volume: int, muted: bool) -> None:
         """Set a player's volume/mute (per-client)."""
 
+    async def set_source_volume(self, source_id: str, volume: int | None = None, muted: bool | None = None) -> None:
+        """Set the volume/mute ON THE SENDING DEVICE feeding a source (AirPlay/BT/Spotify).
+
+        Distinct from `set_player_volume`, which is our own output gain. Optional: an engine whose
+        sources have no back-channel to their sender simply doesn't implement it.
+        """
+        raise NotImplementedError
+
     @abstractmethod
-    def snapshot(self) -> UnitSnapshot:
+    async def adopt_client(self, source_id: str, url: str, player_id: str | None = None) -> bool:
+        """Dial a foreign Sendspin speaker (discovered by mDNS) onto a source. Optional."""
+        raise NotImplementedError
+
+    async def release_client(self, source_id: str, player_id: str, url: str | None = None) -> None:
+        """Hand a foreign speaker back to whatever server had it. Optional."""
+        raise NotImplementedError
+
+    def snapshot(self) -> UnitSnapshot:  # noqa: B027 - optional hook; an engine with no structural view may leave it
         """This unit's local structural state for the aggregator / REST snapshot."""
