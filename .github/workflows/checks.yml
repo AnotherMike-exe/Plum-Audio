@@ -1,0 +1,89 @@
+name: Checks
+
+# Runs on every PR, and is called by the dev and release workflows so a build can never
+# publish an image that did not pass. Deliberately NOT triggered on push to main/dev —
+# those go through release.yml / dev.yml, which call this via workflow_call.
+on:
+  pull_request:
+  workflow_call:
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend — ruff, black, pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      # sounddevice binds PortAudio at import time, so the shared library has to exist even
+      # though no test opens a device.
+      - name: Install PortAudio
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libportaudio2
+
+      - name: Install dependencies
+        run: pip install -r backend/requirements-dev.txt
+
+      - name: ruff
+        run: ruff check backend
+
+      - name: black
+        run: black --check backend
+
+      - name: pytest
+        run: python -m pytest tests/Unit -q
+
+  frontend:
+    name: Frontend — tsc, vitest, build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        run: npm run test:run
+
+      - name: Production build
+        run: npm run build
+
+  image:
+    name: Image builds (arm64)
+    # Free native arm64 runner for public repos. The units are arm64 and amd64 has never
+    # been built, so this is the only architecture worth gating on — and native means no
+    # QEMU, which would otherwise put this job into the tens of minutes.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: backend/Dockerfile
+          platforms: linux/arm64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
