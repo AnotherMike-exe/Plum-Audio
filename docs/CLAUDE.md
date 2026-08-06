@@ -258,15 +258,15 @@ debugging cookbook are in **`docs/OPERATIONS.md`**.
    independent bugs that fixtures could not have caught: it left an out-of-block `dtparam=audio=off`
    armed, and omitting `audio=off` is not the same as asking for `audio=on` (the firmware default is
    off). Both fixed and verified across a reboot.
-5. **Reviewed in-browser on `.7.204` 2026-08-06 — but with NOTHING PLAYING.** The visualizer under a
-   live stream and album-art theming are therefore still unverified; that half of this item stands.
-   Settings → Integrations / Audio / Playback / Theme / Visualizer all render correctly. The review
-   found two real defects, both fixed: the About tab was unported from Plum-Snapcast wholesale, and
-   the DLNA console errors in item 1. Card numbers had moved again — the HiFiBerry is now `hw:3,0`.
-   Original note:
-   Confirmed live on 2026-08-05: AirPlay/Spotify/Bluetooth end to end, cross-routing in both
-   directions with two concurrent groups, the source-volume slider, rename propagation, adopt/release
-   of a third-party speaker, and switching output between the HAT and the 3.5 mm jack.
+5. ~~Visualizer, About and Integrations have no visual review under a live stream~~ — **DONE
+   2026-08-06**, in-browser on `.7.204` (idle) and `.201.133` (live Spotify). Everything renders:
+   artwork, metadata, progress, both volume sliders, shuffle/repeat shown only because Spotify
+   advertises them, and a track change updating metadata + artwork live. The **visualizer is
+   audio-reactive under a live stream** — successive frames show different spectra — and **album-art
+   theming works**, re-colouring the whole UI from the artwork with contrast preserved. It is
+   opt-in: Settings → Theme → *Album Art Colors*, off by default, per-browser. Left OFF as found.
+   Two real defects were found and fixed: the About tab was unported from Plum-Snapcast wholesale,
+   and the DLNA console errors in item 1. Console is otherwise clean.
 6. **Multi-server arbitration** is a spec MUST we only half-implement — we persist the last playing
    `server_id` but cannot yet decide, pending UPSTREAM §1.
 7. **amd64 has never been built.**
