@@ -40,6 +40,29 @@ const service = new SendspinDataService();
 const EMPTY: Model = { servers: [], streams: [], clients: [], localPlayerIds: [] };
 const clampVol = (v: number) => Math.max(0, Math.min(100, v));
 
+/**
+ * Which stream the main card features.
+ *
+ * An explicit pick always wins. Otherwise a normal unit shows wherever ITS OWN speaker is playing —
+ * that is the whole meaning of the left card. A unit with no speaker has no such answer, so it shows
+ * what it is INGESTING instead; without this it reads "Nothing Playing" while actively feeding other
+ * rooms, and everything gated on a featured stream stays inert.
+ *
+ * Exported and pure so the fallback is unit-testable — same reason as playerControlsPropsEqual
+ * below, which exists because a comparator bug here is invisible until someone notices stale UI.
+ */
+export const pickFeaturedId = (
+  selectedStreamId: string | null,
+  myStream: Stream | undefined,
+  playerless: boolean,
+  localActiveStreams: Stream[],
+): string | null => {
+  if (selectedStreamId) return selectedStreamId;
+  if (myStream?.active) return myStream.id;
+  if (playerless) return localActiveStreams[0]?.id ?? null;
+  return null;
+};
+
 // Memoized interactive controls: the parent re-renders ~2x/s (position tick) + on every WS message,
 // x2 under StrictMode. Reconciling a control's DOM mid-click silently drops the click, so give each
 // a stable DOM by memoizing on the fields it actually shows (paired with identity-stable array +
@@ -63,6 +86,7 @@ export const playerControlsPropsEqual = (
     // slider's value tracked the sender correctly while its disabled state stayed frozen, so it
     // came back from a pause showing the right number and refusing to move.
     a.sourceVolumeUnavailable === b.sourceVolumeUnavailable &&
+    a.hideEndpointVolume === b.hideEndpointVolume &&
     a.canShuffle === b.canShuffle &&
     a.canRepeat === b.canRepeat &&
     a.shuffle === b.shuffle &&
@@ -126,11 +150,20 @@ export default function MeshApp(): React.ReactElement {
   // This unit's OWN output level — what the main card's slider shows and moves.
   const myVolume = myPlayers[0]?.volume ?? 100;
 
+  // An ingest/routing-only unit: it encodes AirPlay/Spotify for other rooms but renders nothing
+  // itself. Read from the unit's own flag, NOT from `myPlayers.length === 0` — that is also true for
+  // a second at every boot on a normal unit, and deriving layout from it would make the whole card
+  // flicker on load.
+  const playerless = localUnit?.hasPlayer === false;
+
   // A route takes a moment to land (a cross-server reclaim reconnects the player), so hold the
-  // user's choice until the mesh view catches up; then the view wins again.
+  // user's choice until the mesh view catches up; then the view wins again. A playerless unit has no
+  // route to converge ON, so its selection is a pure VIEW choice and must simply stick — otherwise
+  // myStreamId stays null forever and the effect could never release it anyway.
   useEffect(() => {
+    if (playerless) return;
     if (selectedStreamId && selectedStreamId === myStreamId) setSelectedStreamId(null);
-  }, [selectedStreamId, myStreamId]);
+  }, [playerless, selectedStreamId, myStreamId]);
 
   // Our stream only counts as "on" while a sender is using it: when the source goes idle (writer
   // closed, or long silence) the card falls back to the holding state, as the Snapcast build did.
@@ -139,19 +172,28 @@ export default function MeshApp(): React.ReactElement {
     () => model.streams.find((s) => s.id === myStreamId),
     [model.streams, myStreamId],
   );
-  const featuredId = selectedStreamId ?? (myStream?.active ? myStream.id : null);
+  // The local unit's active sources. `localActiveTarget` (exactly one) is the browser player's join
+  // target when the unit's OWN player is idle, so "Listen in Browser" joins what the unit is actually
+  // playing rather than starting idle. Sorted so the featured fallback below cannot reshuffle
+  // between polls — the list order out of the mesh view is not guaranteed stable.
+  const localActiveStreams = useMemo(
+    () =>
+      model.streams
+        .filter((s) => s.active && s.serverId === model.localUnitId)
+        .sort((a, b) => a.id.localeCompare(b.id)),
+    [model.streams, model.localUnitId],
+  );
+  const localActiveTarget = localActiveStreams.length === 1 ? localActiveStreams[0].id : null;
+
+  // What the main card shows. On a playerless unit there is no "where my speaker is", so fall back
+  // to what this unit is INGESTING — otherwise the card reads "Nothing Playing" while the unit is
+  // actively feeding four other rooms, and everything gated on `featured` (the transport controls,
+  // ClientManager's "Join Stream", the synced-devices list and its group volume) stays dead.
+  const featuredId = pickFeaturedId(selectedStreamId, myStream, playerless, localActiveStreams);
   const featured: Stream | undefined = useMemo(
     () => model.streams.find((s) => s.id === featuredId),
     [model.streams, featuredId],
   );
-
-  // The local unit's single active source, if exactly one is streaming. Used as the browser player's
-  // join target when the unit's OWN player is idle (auto-switch hasn't grabbed the source), so
-  // "Listen in Browser" still joins what the unit is actually playing rather than starting idle.
-  const localActiveTarget = useMemo(() => {
-    const act = model.streams.filter((s) => s.active && s.serverId === model.localUnitId);
-    return act.length === 1 ? act[0].id : null;
-  }, [model.streams, model.localUnitId]);
 
   // Theme: also drives album-art colors from the featured track's artwork; returns the extracted
   // palette so the visualizer can share it.
@@ -310,6 +352,9 @@ export default function MeshApp(): React.ReactElement {
   const onSelectStream = useCallback((streamId: string | null) => {
     setSelectedStreamId(streamId);
     const mine = modelRef.current.clients.filter((c) => c.isLocal);
+    // On a unit with no speaker `mine` is empty, so this loop did nothing while the selector still
+    // looked like it had routed something. Selecting there is a VIEW choice — which source this page
+    // is looking at — and the selection is what makes it stick.
     for (const c of mine) moveClient(c, streamId);
   }, [moveClient]);
   const onClientStreamChange = useCallback((clientId: string, streamId: string | null) => {
@@ -452,7 +497,16 @@ export default function MeshApp(): React.ReactElement {
         <div className="lg:col-span-2 bg-[var(--bg-secondary)] p-6 rounded-2xl shadow-2xl flex flex-col">
           <div className="border-b border-[var(--border-color)] pb-4">
             <div className="flex items-center justify-between mb-4">
-              <h1 className="text-xl font-semibold text-[var(--accent-color)]">{serverName}</h1>
+              <div className="flex items-center gap-2 min-w-0">
+                <h1 className="text-xl font-semibold text-[var(--accent-color)] truncate">{serverName}</h1>
+                {/* Say what this page is. Without it a unit that renders nothing looks like one whose
+                    speaker is broken — same layout, no explanation. */}
+                {playerless && (
+                  <span className="px-2 py-0.5 rounded text-xs font-medium bg-slate-500/20 text-slate-300 flex-shrink-0">
+                    No output
+                  </span>
+                )}
+              </div>
               <div className="flex items-center text-sm text-[var(--text-muted)]">
                 <Icon name="tower-broadcast" className="mr-2" />
                 <span>{connected ? 'Connected' : 'Offline'}</span>
@@ -480,6 +534,7 @@ export default function MeshApp(): React.ReactElement {
                   stream={featured}
                   volume={myVolume}
                   onVolumeChange={onMyVolume}
+                  hideEndpointVolume={playerless}
                   sourceVolume={featured.sourceVolume}
                   onSourceVolumeChange={onSourceVolume}
                   sourceVolumeUnavailable={!featured.supportsSourceVolume}
@@ -507,7 +562,9 @@ export default function MeshApp(): React.ReactElement {
               <Icon name="music" className="text-6xl text-[var(--text-muted)] mb-4" />
               <h2 className="text-2xl font-semibold text-[var(--text-primary)]">Nothing Playing</h2>
               <p className="text-[var(--text-secondary)] mt-2">
-                Start playing to an endpoint, or choose an active source above.
+                {playerless
+                  ? 'This unit has no audio output. Send it AirPlay, Spotify or Bluetooth and it will play in the rooms you route it to.'
+                  : 'Start playing to an endpoint, or choose an active source above.'}
               </p>
               {/* Our own speaker only needs a row here when some OTHER Sendspin server has claimed
                   it — that's information the top selector can't show (it has nothing to select),

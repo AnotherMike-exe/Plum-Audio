@@ -227,6 +227,18 @@ export const handlers = [
           'PortAudio cannot open this device. For an HDMI output this normally means no display is attached.',
         in_use: false,
         is_active: false
+      },
+      // The synthetic "No output" row the backend appends on every unit (audio_api.py). Shaped like
+      // a real device on purpose, so the GUI has one mapper rather than a special case.
+      {
+        id: 'none',
+        hw_id: '',
+        friendly_name: 'No output',
+        type: 'NONE',
+        is_available: true,
+        unavailable_reason: null,
+        in_use: false,
+        is_active: false
       }
     ])
   }),
@@ -236,6 +248,8 @@ export const handlers = [
       configured: 'Headphones:0',
       playing_on: mockPlayingOn,
       pending: mockPlayingOn !== 'Headphones:0',
+      // Crossing to or from "No output" is the only change that needs a restart.
+      restart_required: mockPlayingOn === 'none',
       resolved: true,
       id: 'Headphones:0',
       friendly_name: 'Built-in Headphones (3.5mm)',

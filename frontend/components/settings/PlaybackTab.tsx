@@ -25,6 +25,11 @@ export const PlaybackTab: React.FC<PlaybackTabProps> = ({settings, onSettingsCha
     const autoSwitch = settings.autoSwitch ?? DEFAULT_AUTO_SWITCH;
 
     const [units, setUnits] = useState<MeshUnit[]>([]);
+    // An ingest/routing-only unit has no speaker, so it has nothing to auto-switch OR to follow with.
+    // Both toggles below drive routing of THIS unit's player; the backend refuses outright (its
+    // FollowReconciler is never even started), so leaving them live would offer a setting that
+    // silently does nothing.
+    const [playerless, setPlayerless] = useState(false);
 
     // Other mesh units to follow, from the same aggregated view the rest of the GUI already
     // polls — no separate federation API (that surface is inert; the mesh discovers peers itself).
@@ -35,8 +40,13 @@ export const PlaybackTab: React.FC<PlaybackTabProps> = ({settings, onSettingsCha
                 .then(r => r.json())
                 .then(d => {
                     if (cancelled) return;
-                    const others = (d.units ?? []).filter((u: MeshUnit & {unit_id: string}) => u.unit_id !== d.local_unit_id);
+                    const all = d.units ?? [];
+                    const others = all.filter((u: MeshUnit & {unit_id: string}) => u.unit_id !== d.local_unit_id);
                     setUnits(others);
+                    const me = all.find((u: {unit_id: string}) => u.unit_id === d.local_unit_id);
+                    // `!== false`, never `=== false`: a response without the field (an older image)
+                    // must read as "has a speaker".
+                    setPlayerless(me ? me.has_player === false : false);
                 })
                 .catch(() => {});
         };
@@ -90,13 +100,15 @@ export const PlaybackTab: React.FC<PlaybackTabProps> = ({settings, onSettingsCha
             <div className="space-y-2">
                 <Switch
                     label="Auto-switch on local activity"
-                    checked={autoSwitch.localActivity}
+                    checked={autoSwitch.localActivity && !playerless}
                     onChange={handleLocalActivityToggle}
                     icon="tower-broadcast"
+                    disabled={playerless}
                 />
                 <p className="text-xs text-[var(--text-muted)] pl-8">
-                    When a source connects to this unit (AirPlay, Bluetooth, Spotify, etc.) and the
-                    output is idle, automatically switch to that stream.
+                    {playerless
+                        ? 'This unit has no audio output, so it has nothing to switch. Other units can still follow it — they join whatever it is receiving.'
+                        : 'When a source connects to this unit (AirPlay, Bluetooth, Spotify, etc.) and the output is idle, automatically switch to that stream.'}
                 </p>
             </div>
 
@@ -104,13 +116,15 @@ export const PlaybackTab: React.FC<PlaybackTabProps> = ({settings, onSettingsCha
             <div className="pt-4 border-t border-[var(--border-color)] space-y-2">
                 <Switch
                     label="Follow another unit (slave mode)"
-                    checked={autoSwitch.slave.enabled}
+                    checked={autoSwitch.slave.enabled && !playerless}
                     onChange={handleSlaveToggle}
                     icon="network-wired"
+                    disabled={playerless}
                 />
                 <p className="text-xs text-[var(--text-muted)] pl-8">
-                    When a master unit starts playing and this unit is idle, automatically join
-                    the master's stream. Local connections always take priority.
+                    {playerless
+                        ? 'This unit has no speaker to send to another unit\u2019s stream.'
+                        : "When a master unit starts playing and this unit is idle, automatically join the master's stream. Local connections always take priority."}
                 </p>
 
                 {autoSwitch.slave.enabled && (

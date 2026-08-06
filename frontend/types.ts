@@ -40,6 +40,12 @@ export interface Server {
     port: number;         // 1780
     connected: boolean;
     isLocal: boolean;
+    /**
+     * Does this unit have an audio output at all? False for an ingest/routing-only node — no player
+     * process, no speaker, and nothing to route audio ONTO. Not the same as "no players connected
+     * right now", which is also briefly true at every boot.
+     */
+    hasPlayer: boolean;
 }
 
 // Playback position data from backend (server-side interpolation)
@@ -514,9 +520,10 @@ export interface Settings {
     snapclientTarget?: string; // Runtime: where snapclient is currently connected (host:port)
     audio?: {
         output?: {
-            device: string;
-            device_type: string;
-            fallback_device: string;
+            // Null until the user picks one; "none" means this unit deliberately renders nothing.
+            // (`fallback_device` used to be here — _migrate_audio_output deletes it on read.)
+            device: string | null;
+            device_type: string | null;
         };
         input?: {
             devices: Array<{

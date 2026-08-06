@@ -24,6 +24,11 @@ export enum DeviceType {
   USB = 'USB',
   HAT = 'HAT',
   OTHER = 'OTHER',
+  /**
+   * The synthetic "No output" row. Not a device: this unit renders nothing and runs no player
+   * process at all. Offered on every unit, and the ONLY option on one with no sound card.
+   */
+  NONE = 'NONE',
 }
 
 export interface AudioDevice {
@@ -51,6 +56,12 @@ export interface CurrentOutput {
    */
   playingOn: string | null;
   pending: boolean;
+  /**
+   * The pending change needs a container restart, because it crosses the no-output boundary: the
+   * player is a process that either exists or does not, decided once at start-up. A device-to-device
+   * switch is never restartRequired — it still applies live.
+   */
+  restartRequired: boolean;
   /** Whether `configured` names a device present on this unit at all. */
   resolved: boolean;
   friendlyName: string;
@@ -99,6 +110,7 @@ export const audioService = {
       configured: string | null;
       playing_on: string | null;
       pending: boolean;
+      restart_required?: boolean;
       resolved: boolean;
       friendly_name: string;
       unavailable_reason: string | null;
@@ -107,6 +119,7 @@ export const audioService = {
       configured: raw.configured,
       playingOn: raw.playing_on,
       pending: raw.pending,
+      restartRequired: raw.restart_required === true,
       resolved: raw.resolved,
       friendlyName: raw.friendly_name,
       unavailableReason: raw.unavailable_reason,
@@ -114,8 +127,8 @@ export const audioService = {
   },
 
   /** Persist a device. Resolves once SAVED — the switch itself lands a moment later. */
-  async setOutputDevice(id: string): Promise<{message: string}> {
-    return request<{message: string}>('/output/device', {
+  async setOutputDevice(id: string): Promise<{message: string; restart_required?: boolean}> {
+    return request<{message: string; restart_required?: boolean}>('/output/device', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({id}),
@@ -137,6 +150,7 @@ export const audioService = {
       case DeviceType.BUILTIN_HDMI: return 'HDMI';
       case DeviceType.USB: return 'USB';
       case DeviceType.HAT: return 'HAT';
+      case DeviceType.NONE: return 'No output';
       default: return 'Other';
     }
   },
@@ -147,6 +161,7 @@ export const audioService = {
       case DeviceType.BUILTIN_HDMI: return 'desktop';
       case DeviceType.USB: return 'volume-high';
       case DeviceType.HAT: return 'waveform';
+      case DeviceType.NONE: return 'volume-xmark';
       default: return 'volume-high';
     }
   },

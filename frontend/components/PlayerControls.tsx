@@ -8,6 +8,12 @@ interface PlayerControlsProps {
     // the server redistributes it across them, preserving their relative levels.
     volume: number;
     onVolumeChange: (volume: number) => void;
+    /**
+     * Hide the endpoint slider entirely. True on an ingest/routing-only unit: there is no local
+     * speaker, so there is no level to show — the slider rendered a phantom 100% whose onChange
+     * found no client and silently did nothing, then snapped back on the next poll.
+     */
+    hideEndpointVolume?: boolean;
     // Source volume: the level on the SENDING device (AirPlay/Bluetooth phone, Spotify Connect).
     // Undefined when this source has never reported one — only then is the row hidden.
     sourceVolume?: number;
@@ -81,6 +87,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
                                                                   stream,
                                                                   volume,
                                                                   onVolumeChange,
+                                                                  hideEndpointVolume = false,
                                                                   sourceVolume,
                                                                   onSourceVolumeChange,
                                                                   sourceVolumeUnavailable,
@@ -173,6 +180,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
                 )}
 
                 {/* Group volume — the output level of every endpoint rendering this source */}
+                {!hideEndpointVolume && (
                 <div className="flex items-center gap-3 w-full">
                     <Icon name="volume-low" className="text-[var(--text-secondary)] w-6 text-center flex-shrink-0" style={{ color: 'inherit' }} aria-hidden />
                     <input
@@ -187,6 +195,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
                     />
                     <Icon name="volume-high" className="text-[var(--text-secondary)] w-6 text-center flex-shrink-0" style={{ color: 'inherit' }} aria-hidden />
                 </div>
+                )}
             </div>
         </div>
     );

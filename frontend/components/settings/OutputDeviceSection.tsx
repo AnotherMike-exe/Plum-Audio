@@ -12,6 +12,12 @@ import {audioService, DeviceType, type AudioDevice, type CurrentOutput} from '..
  * echo never moves — that state is drawn as a warning naming the device still in use, rather than
  * as a completed change. A picker that goes green while the audio is somewhere else is the exact
  * failure this slice was built to remove.
+ *
+ * There are TWO kinds of pending and they must not look alike. A device-to-device switch applies
+ * live and resolves on its own, so it gets the spinner. Crossing to or from "No output" does not:
+ * the player is a PROCESS that either exists or does not, decided once at container start, so it
+ * waits for a restart and gets a static warning. A spinner there would promise something that is
+ * never going to happen on its own.
  */
 
 const TYPE_BADGE: Record<DeviceType, string> = {
@@ -20,6 +26,7 @@ const TYPE_BADGE: Record<DeviceType, string> = {
   [DeviceType.USB]: 'bg-green-500/20 text-green-300',
   [DeviceType.HAT]: 'bg-orange-500/20 text-orange-300',
   [DeviceType.OTHER]: 'bg-gray-500/20 text-gray-300',
+  [DeviceType.NONE]: 'bg-slate-500/20 text-slate-300',
 };
 
 // While a switch is in flight the echo is the only thing that moves, so poll a little faster than
@@ -98,7 +105,8 @@ export const OutputDeviceSection: React.FC = () => {
         <h3 className="text-base font-semibold text-[var(--text-primary)] mb-1">Audio Output</h3>
         <p className="text-sm text-[var(--text-muted)]">
           The speaker this unit plays through. Switching takes a few seconds and briefly interrupts
-          any audio already playing.
+          any audio already playing. Choosing <span className="font-medium">No output</span> — or
+          moving away from it — needs this unit to be restarted.
         </p>
       </div>
 
@@ -118,9 +126,22 @@ export const OutputDeviceSection: React.FC = () => {
         </div>
       )}
 
+      {/* Saved, but it needs a restart to take effect. Static icon, not the spinner: nothing is in
+          flight and nothing will resolve this on its own. */}
+      {current?.pending && current.restartRequired && (
+        <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-lg flex items-start gap-2">
+          <Icon name="triangle-exclamation" className="text-amber-400 mt-0.5 flex-shrink-0" />
+          <p className="text-sm text-amber-300">
+            Saved. Restart this unit to switch to <span className="font-medium">{current.friendlyName}</span> —
+            the player is started or skipped when the unit boots. Until then it is{' '}
+            {playingOn ? <>still playing through <span className="font-medium">{playingOn}</span></> : 'producing no output'}.
+          </p>
+        </div>
+      )}
+
       {/* The configured device is not the one playing: either mid-switch, or the switch failed and
           the player fell back. Both must be visible — neither is success. */}
-      {current?.pending && (
+      {current?.pending && !current.restartRequired && (
         <div className="p-3 bg-yellow-500/10 border border-yellow-500/20 rounded-lg flex items-start gap-2">
           <Icon name="spinner" className="text-yellow-400 mt-0.5 flex-shrink-0 animate-spin" />
           <p className="text-sm text-yellow-300">
@@ -141,8 +162,14 @@ export const OutputDeviceSection: React.FC = () => {
         </div>
       )}
 
-      {!loading && devices.length === 0 && !error && (
-        <p className="text-xs text-[var(--text-muted)]">No playback devices found on this unit.</p>
+      {/* The "No output" row always comes back, so an EMPTY list no longer happens — "only that row"
+          is what a host with no sound card looks like. Say what the unit can still do, because it is
+          a great deal more than "no devices found" implies. */}
+      {!loading && !error && devices.length > 0 && devices.every(d => d.type === DeviceType.NONE) && (
+        <p className="text-xs text-[var(--text-muted)]">
+          No playback hardware was detected on this unit. It can still receive AirPlay, Spotify and
+          Bluetooth, and send them to other rooms.
+        </p>
       )}
 
       <div className="space-y-2">
@@ -185,11 +212,16 @@ export const OutputDeviceSection: React.FC = () => {
                       <span className="text-xs text-green-400 font-medium">Playing</span>
                     )}
                     {isChosen && !isPlaying && (
-                      <span className="text-xs text-yellow-400 font-medium">Switching…</span>
+                      current?.restartRequired
+                        ? <span className="text-xs text-amber-400 font-medium">Restart to apply</span>
+                        : <span className="text-xs text-yellow-400 font-medium">Switching…</span>
                     )}
                   </div>
-                  {/* hw address is informational: it changes when cards renumber. */}
-                  <span className="text-xs text-[var(--text-muted)] font-mono">{device.hwId}</span>
+                  {/* hw address is informational: it changes when cards renumber. The "No output"
+                      row has none, and an empty mono line reads as a rendering bug. */}
+                  {device.hwId && (
+                    <span className="text-xs text-[var(--text-muted)] font-mono">{device.hwId}</span>
+                  )}
                   {device.unavailableReason && (
                     <p className="text-xs text-[var(--text-muted)] mt-1">{device.unavailableReason}</p>
                   )}
@@ -199,7 +231,7 @@ export const OutputDeviceSection: React.FC = () => {
 
               {/* Testing the device already in use returns EBUSY, so the backend refuses it with an
                   explanation — do not offer the button there at all. */}
-              {device.isAvailable && !device.inUse && !isPlaying && (
+              {device.isAvailable && !device.inUse && !isPlaying && device.type !== DeviceType.NONE && (
                 <div className="px-3 pb-3 -mt-1">
                   <button
                     type="button"

@@ -72,6 +72,8 @@ interface WireUnit {
     title?: string;
     artist?: string;
   } | null;
+  /** Absent from a peer running an older image — treat that as "has one", never as playerless. */
+  has_player?: boolean;
 }
 /** GET /api/mesh/neighbourhood — every Sendspin service mDNS can see on this segment. */
 export interface Neighbourhood {
@@ -136,6 +138,9 @@ export function mapViewToModel(
       port: MESH_API_PORT,
       connected: true,
       isLocal: false,
+      // `!== false`, not `=== true`: a peer on an older image omits the field entirely, and reading
+      // that as playerless would make every existing unit look like an ingest-only node.
+      hasPlayer: unit.has_player !== false,
     });
     for (const src of unit.sources) {
       const sid = streamId(unit.unit_id, src.source_id);

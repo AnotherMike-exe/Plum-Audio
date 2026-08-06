@@ -83,6 +83,7 @@ export function createMockServer(overrides: Partial<Server> = {}): Server {
     port: 1780,
     connected: true,
     isLocal: true,
+    hasPlayer: true,
     ...overrides
   }
 }

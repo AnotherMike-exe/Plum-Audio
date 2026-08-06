@@ -28,7 +28,8 @@ describe('audioService', () => {
     it('maps the API payload to camelCase', async () => {
       const devices = await audioService.getOutputDevices()
 
-      expect(devices).toHaveLength(2)
+      // Two real devices plus the synthetic "No output" row the backend always appends.
+      expect(devices).toHaveLength(3)
       expect(devices[0]).toMatchObject({
         id: 'Headphones:0',
         hwId: 'hw:0,0',
@@ -112,10 +113,61 @@ describe('audioService', () => {
     })
 
     it('returns icon names that exist in the icon set', () => {
-      const valid = ['headphones', 'desktop', 'volume-high', 'waveform']
+      const valid = ['headphones', 'desktop', 'volume-high', 'waveform', 'volume-xmark']
       for (const type of Object.values(DeviceType)) {
         expect(valid).toContain(audioService.getDeviceTypeIcon(type))
       }
     })
+  })
+})
+
+describe('audioService — the "No output" option', () => {
+  it('carries the synthetic row through the same mapper as real hardware', async () => {
+    // The backend shapes this row exactly like AudioDevice.to_dict() so the GUI needs no second code
+    // path. If that ever diverges, it surfaces here rather than as a blank row in the picker.
+    const devices = await audioService.getOutputDevices()
+    const none = devices.find(d => d.id === 'none')!
+
+    expect(none).toMatchObject({
+      id: 'none',
+      hwId: '',
+      friendlyName: 'No output',
+      type: DeviceType.NONE,
+      isAvailable: true,   // always selectable — that is the entire point of offering it
+      inUse: false,
+    })
+  })
+
+  it('is offered alongside real devices, not instead of them', async () => {
+    const devices = await audioService.getOutputDevices()
+    expect(devices.map(d => d.id)).toEqual(['Headphones:0', 'vc4hdmi0:0', 'none'])
+  })
+
+  it('labels and icons the None type', () => {
+    expect(audioService.getDeviceTypeLabel(DeviceType.NONE)).toBe('No output')
+    expect(audioService.getDeviceTypeIcon(DeviceType.NONE)).toBe('volume-xmark')
+  })
+
+  it('reports restartRequired when the change crosses the no-output boundary', async () => {
+    setMockPlayingOn('none')
+    const current = await audioService.getCurrentOutput()
+
+    expect(current.pending).toBe(true)
+    expect(current.restartRequired).toBe(true)
+  })
+
+  it('does not report restartRequired for a device-to-device switch', async () => {
+    // The live-switch path must not start demanding a restart — that would be a real regression.
+    setMockPlayingOn('sndrpihifiberry:0')
+    const current = await audioService.getCurrentOutput()
+
+    expect(current.pending).toBe(true)
+    expect(current.restartRequired).toBe(false)
+  })
+
+  it('treats a response without the field as not needing a restart', async () => {
+    // A GUI served by a unit on an older image omits restart_required entirely.
+    const current = await audioService.getCurrentOutput()
+    expect(current.restartRequired).toBe(false)
   })
 })
