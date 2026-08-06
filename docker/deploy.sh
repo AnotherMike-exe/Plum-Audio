@@ -103,7 +103,9 @@ deploy_one() {
     # A DAC column of `none` means this host has no audio output: no player process, no /dev/snd, and
     # the headless compose profile (the audio one cannot even be CREATED without /dev/snd).
     local profile player_enabled expected_programs
-    if [[ "${dac,,}" == "none" ]]; then
+    # `tr`, not ${dac,,}: that is bash 4+, and macOS — where this script is RUN — ships bash 3.2,
+    # so the parameter expansion is a hard syntax error before any unit is contacted.
+    if [[ "$(printf '%s' "$dac" | tr '[:upper:]' '[:lower:]')" == "none" ]]; then
         profile="headless"; player_enabled=0; expected_programs=3
     else
         profile="audio";    player_enabled=1; expected_programs=4

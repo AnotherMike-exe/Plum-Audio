@@ -176,3 +176,31 @@ def test_extras_are_read_from_the_environment(monkeypatch):
 def test_no_environment_means_no_extras(monkeypatch):
     monkeypatch.delenv("PLUM_ALLOWED_ORIGINS", raising=False)
     assert cors_policy.configured_extra_origins() == []
+
+
+# -- own_hosts(): the API with no mesh view to derive a host set from --------------------------------
+
+
+def test_own_hosts_includes_the_real_lan_ip(monkeypatch):
+    """The gap found on .201.133: :5002 refused the unit's OWN IP.
+
+    It resolved its identity via gethostbyname(gethostname()), which inside the container answers
+    127.0.1.1 from /etc/hosts — so the LAN address a person actually types never entered the set.
+    """
+    monkeypatch.setattr(cors_policy, "local_ip", lambda: "192.0.2.10")
+    hosts = cors_policy.own_hosts()
+    assert "192.0.2.10" in hosts
+    assert is_allowed("http://192.0.2.10", hosts, extras=[]) is True
+
+
+def test_own_hosts_still_covers_the_hostname_forms(monkeypatch):
+    monkeypatch.setattr(cors_policy, "local_ip", lambda: "10.0.0.5")
+    monkeypatch.setattr(cors_policy.socket, "gethostname", lambda: "Plum-Test-Pi4-02")
+    hosts = cors_policy.own_hosts()
+    assert {"plum-test-pi4-02", "plum-test-pi4-02.local"} <= hosts
+
+
+def test_own_hosts_survives_a_box_with_no_route(monkeypatch):
+    """No default route yet (early boot) must not empty the set and lock out loopback."""
+    monkeypatch.setattr(cors_policy, "local_ip", lambda: None)
+    assert set(cors_policy.LOOPBACK_HOSTS) <= cors_policy.own_hosts()

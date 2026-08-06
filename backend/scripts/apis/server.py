@@ -15,7 +15,6 @@ peer-derived host set is not needed and would be a needless dependency on the au
 
 import logging
 import os
-import socket
 import sys
 
 from flask import Flask, request
@@ -30,28 +29,6 @@ from settings_api import SettingsManager, create_settings_blueprint  # noqa: E40
 logger = logging.getLogger(__name__)
 
 
-def _own_hosts() -> set[str]:
-    """Host forms that mean "this box" — recomputed per request, since a rename applies live.
-
-    A unit's mDNS hostname is user-editable from the GUI (Settings -> Device), and the rename takes
-    effect without restarting this process. Caching this set at start-up would lock the config API
-    to the OLD name and lock the user out of the page they just renamed.
-    """
-    hosts = set(cors_policy.LOOPBACK_HOSTS)
-    try:
-        name = socket.gethostname()
-    except OSError:
-        return hosts
-    hosts |= cors_policy.name_forms(name)
-    try:
-        hosts.add(socket.gethostbyname(name))
-    except OSError:
-        # A box that cannot resolve its own name is normal under host networking; the page is then
-        # reached by IP, and nginx forwards that Origin, so the mesh API's view-derived set covers it.
-        pass
-    return hosts
-
-
 def create_app() -> Flask:
     app = Flask(__name__)
     # One SettingsManager shared across blueprints so settings + integrations read/write the same file.
@@ -64,7 +41,7 @@ def create_app() -> Flask:
     def _cors(response):
         # No Origin: not a browser request. CORS never applied — add nothing, refuse nothing.
         origin = request.headers.get("Origin")
-        allow = cors_policy.origin_header(origin, _own_hosts())
+        allow = cors_policy.origin_header(origin, cors_policy.own_hosts())
         if allow is not None:
             response.headers["Access-Control-Allow-Origin"] = allow
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"

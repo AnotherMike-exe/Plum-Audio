@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 from urllib.parse import urlsplit
 
 logger = logging.getLogger("plum.cors")
@@ -72,6 +73,45 @@ def name_forms(host: str) -> set[str]:
     host = host.lower().rstrip(".")
     bare = host.split(".", 1)[0]
     return {host, bare, f"{bare}.local", f"{bare}.lan"}
+
+
+def local_ip() -> str | None:
+    """This box's own IP on the default-route interface.
+
+    The same trick mesh/aggregator.py uses, and for the same reason: a unit cannot learn the address
+    peers reach it on from its own beacon. It sends no packets — it asks the kernel which source
+    address the default route would use.
+
+    Deliberately NOT `gethostbyname(gethostname())`: inside the container that resolves to 127.0.1.1
+    from /etc/hosts, so the unit's real LAN address never enters the allowlist and a page loaded at
+    `http://<ip>` is refused. Measured on .201.133 (2026-08-06).
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("192.0.2.1", 9))  # RFC 5737 TEST-NET-1 — unroutable, never contacted
+        return sock.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
+
+def own_hosts() -> set[str]:
+    """Every host form that means "this box" — for an API with no mesh view to derive one from.
+
+    Recomputed per request rather than cached: the mDNS hostname is user-editable from Settings and
+    applies live, so a cached set would lock the config API to the OLD name and lock the user out of
+    the page they just renamed.
+    """
+    hosts = set(LOOPBACK_HOSTS)
+    ip = local_ip()
+    if ip:
+        hosts.add(ip)
+    try:
+        hosts |= name_forms(socket.gethostname())
+    except OSError:
+        pass
+    return hosts
 
 
 def known_hosts(units) -> set[str]:
