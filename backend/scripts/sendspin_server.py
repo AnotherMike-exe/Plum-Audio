@@ -421,6 +421,17 @@ class PlumSendspinServer:
         await handle.feeder.stop()
         with contextlib.suppress(Exception):
             handle.group.stop_stream()
+        if self._primary_source == source_id:
+            # Hand the fallback on rather than leaving a dead source id behind: _maybe_group_controller
+            # resolves it through self.sources, so a stale id makes every controller WITHOUT a
+            # "ctrl:<source>:" hint silently stop being grouped — no error, just a GUI that never
+            # sees a source. Insertion order gives the oldest survivor, which is what "first source"
+            # meant when it was set.
+            self._primary_source = next(iter(self.sources), None)
+            logger.info(
+                "[%s] was the primary source; controller fallback is now %s",
+                source_id, self._primary_source or "(none — no sources left)",
+            )
         logger.info("[%s] source stopped", source_id)
 
     async def attach_player(self, source_id: str, player_id: str) -> None:
