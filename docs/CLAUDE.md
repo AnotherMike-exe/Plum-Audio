@@ -298,6 +298,12 @@ debugging cookbook are in **`docs/OPERATIONS.md`**.
     tie-broken by `source_id`. Deterministic and self-reinforcing — the first follower to join raises
     that source's count — and it has to be, because every follower computes it independently with no
     coordination. But the leader has no say, and there is no GUI for it.
+15. **A playerless unit's main card has NO endpoint slider** (`hideEndpointVolume`, 2026-08-06).
+    It previously rendered a phantom 100% whose `onChange` found no client, did nothing, and snapped
+    back on the next poll. Hiding it is rule-conformant — *"the main card's slider is this unit's own
+    endpoint, not the group"* — and the group control still exists one panel down in `SyncedDevices`.
+    Repurposing that slider to group volume on playerless units would be more useful, but it needs
+    that rule **amended explicitly**, not silently excepted. Awaiting a call.
 
 ## Resources
 - Sendspin spec: <https://www.sendspin-audio.com/spec/> · Org: <https://github.com/Sendspin>
