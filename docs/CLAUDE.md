@@ -223,15 +223,19 @@ debugging cookbook are in **`docs/OPERATIONS.md`**.
 
 ## Open
 
-1. **DLNA and Plexamp have no backend at all.** Worse than unimplemented: the Integrations tab
-   renders a **live DLNA card** that calls `/api/integrations/dlna/*`, and
-   `create_integrations_blueprint` registers only airplay/spotify/bluetooth — so every control on
-   that card 404s. Either build the slice or hide the card; do not leave it inert.
+1. **DLNA and Plexamp have no backend.** Scope, corrected 2026-08-06: the GUI does **not** render
+   cards for them — `IntegrationsTab` shows airplay/bluetooth/spotify only, so nothing 404s (the
+   earlier "live DLNA card" entry here was wrong). What remains is dead scaffolding: `types.ts`
+   declares `DLNAEndpoint` and the two settings shapes, `settings_api.py` seeds
+   `integrations.dlna`/`.plexamp` defaults (Plexamp's gated on `PLEXAMP_ENABLED`), and the frontend
+   test mocks serve `/api/integrations/dlna/endpoints` — a route no blueprint registers.
 2. **Four frontend test suites assert nothing about production code** (`NowPlaying`,
    `PlayerControls`, `integrationsService`, `settingsService`). `PlayerControls` now has a real
    counterpart beside it (`PlayerControlsSourceVolume`); the other three do not. See TESTING.md.
-3. **`sendspin_server.py` has no unit coverage**, including `refresh_stream` — the regression guard
-   for the highest-profile bug in the repo does not exist.
+3. ~~`sendspin_server.py` has no unit coverage~~ — **done 2026-08-06**,
+   `tests/Unit/test_sendspin_server.py` (29 tests). `refresh_stream` and its `attach_player` caller
+   are pinned in call order against fakes; deleting the refresh fails two tests. Also covers the
+   `_primary_source` handoff, controller grouping and source lifecycle.
 4. **`configure-audio-hat.sh`'s no-`dtoverlay` fallback has never run on real hardware** — unit-tested
    against fixtures only. `--keep-onboard` HAS now run, on `.7.204` (2026-08-05), and had two
    independent bugs that fixtures could not have caught: it left an out-of-block `dtparam=audio=off`
@@ -248,21 +252,28 @@ debugging cookbook are in **`docs/OPERATIONS.md`**.
    both bound to `0.0.0.0`). The injection chain behind it is closed at three layers, but any page on
    the LAN can still change a unit's settings. Deliberately deferred 2026-08-05: restricting CORS
    needs a rig test, because peers and the GUI both call peer `:5001` cross-origin.
-9. **`_primary_source` is set but never cleared** (`sendspin_server.stop_source`). Disable the
-   first-created endpoint and `_maybe_group_controller` resolves a dead source id, so a controller
-   with no `ctrl:<source>:` hint silently stops being grouped. Found by audit, never reproduced.
+9. ~~`_primary_source` is set but never cleared~~ — **fixed 2026-08-06**. Confirmed real by reading:
+   `stop_source` popped `sources` and left the id behind, so `_maybe_group_controller` resolved a
+   dead source and returned early — a controller with no `ctrl:<source>:` hint silently stopped
+   being grouped. It now hands the fallback to the oldest surviving source (`None` when the last one
+   goes). Regression-guarded in `test_sendspin_server.py`. Never reproduced on hardware, but the
+   read is unambiguous.
 10. **A volume change emits two identical `client/state` frames ~2ms apart.** Harmless (it is a full
     report, not a delta) but it means `_publish_render_state` runs twice per command. Seen on the rig
     2026-08-05, not chased.
-11. **`bluetooth_adapter._is_audio_source` returns True for `A2DP_SINK_UUID`**, which contradicts the
-    comment above it ("we are the sink — a device offering only 110d has nothing to send"). One of
-    the two is wrong. Investigate; do not blind-fix.
+11. ~~`_is_audio_source` returns True for `A2DP_SINK_UUID`~~ — **resolved 2026-08-06: the comment was
+    right, the code was wrong.** 110d (AudioSink) is what a *speaker* advertises; a device offering
+    only it cannot send us audio, so adopting it started an `arecord` that could never produce a
+    sample and — most-recently-connected wins — took the capture slot from a phone that was already
+    playing. The both-match test came in with the original Bluetooth commit (`5d1beb2`), carried
+    from Plum-Snapcast. Now requires 110a; a device that advertises both (phones that can also be a
+    speaker) is unaffected, and a skipped sink-only device is logged rather than dropped silently.
 12. **Three duplications worth real lines**, from the 2026-08-05 audit: `integrationsService.ts`
     (944 → ~250 with the helper that already exists in `audioService.ts`), `IntegrationsTab.tsx`
-    (~880 → ~280 with one endpoint-CRUD card), and the three `*_config.py` (312 → ~190 on a shared
-    base). None touch the audio path. Also a shared progress/metadata helper for the three source
-    handlers — the Spotify timestamp bug was the third implementation of the same plumbing getting it
-    wrong, which is the argument for it.
+    (**1490** as of 2026-08-06, not the ~880 first recorded → ~350 with one endpoint-CRUD card), and
+    the three `*_config.py` (431 → ~190 on a shared base). None touch the audio path. Also a shared
+    progress/metadata helper for the three source handlers — the Spotify timestamp bug was the third
+    implementation of the same plumbing getting it wrong, which is the argument for it.
 
 ## Resources
 - Sendspin spec: <https://www.sendspin-audio.com/spec/> · Org: <https://github.com/Sendspin>
