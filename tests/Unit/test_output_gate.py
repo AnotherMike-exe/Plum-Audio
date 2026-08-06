@@ -35,29 +35,49 @@ from output_gate import MODE_DEVICE, MODE_NONE, decide  # noqa: E402
 
 def test_the_operator_override_wins_over_present_hardware():
     """deploy.sh writes this from a units.conf row, before any settings.json exists."""
-    mode, _why, auto = decide(settings_spec="sndrpihifiberry:0", player_enabled=False, hardware_present=True)
+    mode, _why, auto = decide(settings_spec="sndrpihifiberry:0", stored_spec="sndrpihifiberry:0", player_enabled=False, hardware_present=True)
     assert (mode, auto) == (MODE_NONE, False)
 
 
 def test_the_configured_sentinel_makes_a_unit_playerless():
-    mode, _why, auto = decide(settings_spec="none", player_enabled=True, hardware_present=True)
+    mode, _why, auto = decide(settings_spec="none", stored_spec="none", player_enabled=True, hardware_present=True)
     assert (mode, auto) == (MODE_NONE, False)
 
 
 def test_no_hardware_auto_selects_no_output():
-    """Nothing else this unit could do — and it beats crash-looping a player against a missing card."""
-    mode, _why, auto = decide(settings_spec="bcm2835", player_enabled=True, hardware_present=False)
+    """A genuinely card-less box: nothing STORED, so the env default does not count as a choice."""
+    mode, _why, auto = decide(
+        settings_spec="bcm2835", stored_spec=None, player_enabled=True, hardware_present=False
+    )
     assert (mode, auto) == (MODE_NONE, True)
 
 
+def test_a_stored_choice_is_never_overwritten_when_the_card_is_merely_LATE():
+    """The destructive case, and not a rare one.
+
+    An I2S HAT registers asynchronously (overlay probe + i2c) — which is the very mechanism that
+    makes card numbers move on these units. If the container wins that race, the old code persisted
+    `none` over the user's deliberate choice, ran no player, and never re-checked. Still answers
+    `none` (a player cannot open an absent card, and crash-looping is worse) but writes NOTHING, so
+    the next start with the card present recovers on its own.
+    """
+    mode, why, auto = decide(
+        settings_spec="sndrpihifiberry:0", stored_spec="sndrpihifiberry:0",
+        player_enabled=True, hardware_present=False,
+    )
+    assert mode == MODE_NONE
+    assert auto is False  # <- the write is what auto_selected gates
+    assert "keeping the stored choice" in why
+
+
 def test_a_normal_unit_keeps_its_player():
-    mode, _why, auto = decide(settings_spec="sndrpihifiberry:0", player_enabled=True, hardware_present=True)
+    mode, _why, auto = decide(settings_spec="sndrpihifiberry:0", stored_spec="sndrpihifiberry:0", player_enabled=True, hardware_present=True)
     assert (mode, auto) == (MODE_DEVICE, False)
 
 
 def test_an_unset_output_with_hardware_still_keeps_its_player():
     """settings.json ships with device=None; that means "not chosen yet", never "no output"."""
-    mode, _why, auto = decide(settings_spec=None, player_enabled=True, hardware_present=True)
+    mode, _why, auto = decide(settings_spec=None, stored_spec=None, player_enabled=True, hardware_present=True)
     assert (mode, auto) == (MODE_DEVICE, False)
 
 
@@ -177,3 +197,26 @@ def test_an_unwritable_echo_still_reports_the_mode(rig, monkeypatch, capsys):
 
     assert _run(capsys) == MODE_NONE
     assert json.loads(rig["settings"].read_text())["audio"]["output"]["device"] == "none"
+
+
+def test_a_late_card_does_not_destroy_the_stored_device(rig, monkeypatch, capsys):
+    """End-to-end version of the same case: settings.json must come out untouched."""
+    rig["settings"].write_text(
+        json.dumps({"version": 9, "audio": {"output": {"device": "sndrpihifiberry:0", "device_type": "HAT"}}})
+    )
+    monkeypatch.setattr(audio_devices, "has_output_hardware", lambda: False)
+
+    assert _run(capsys) == MODE_NONE
+    stored = json.loads(rig["settings"].read_text())
+    assert stored["audio"]["output"]["device"] == "sndrpihifiberry:0"  # survived
+    assert stored["version"] == 9  # not even a version bump
+
+
+def test_stored_output_spec_ignores_the_environment(rig, monkeypatch):
+    """The distinction the guard rests on: a PLUM_DAC_DEVICE is not a choice."""
+    monkeypatch.setenv("PLUM_DAC_DEVICE", "bcm2835")
+    assert audio_devices.stored_output_spec() is None
+    assert audio_devices.configured_output_spec() == "bcm2835"
+
+    rig["settings"].write_text(json.dumps({"audio": {"output": {"device": "sndrpihifiberry:0"}}}))
+    assert audio_devices.stored_output_spec() == "sndrpihifiberry:0"

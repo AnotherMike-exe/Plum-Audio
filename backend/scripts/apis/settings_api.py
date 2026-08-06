@@ -212,6 +212,13 @@ def _validate_audio_output(settings: Dict[str, Any]) -> None:
         output["device"] = audio_devices.NO_OUTPUT
         output["device_type"] = audio_devices.DeviceType.NONE.value
         return
+    if stripped.lower().startswith("hw:") and stripped not in LEGACY_OUTPUT_PLACEHOLDERS:
+        # Refused rather than silently accepted — see _migrate_audio_output. The picker stores
+        # `<card_name>:<device>`; anything writing an ALSA address here is either a hand-edit or a
+        # caller that has not been told card numbers move.
+        raise ValueError(
+            f"audio.output.device must be a stable '<card_name>:<device>' id, not an ALSA address: {device!r}"
+        )
     if not AUDIO_OUTPUT_ALLOWED.match(stripped):
         raise ValueError(f"audio.output.device is not a valid device spec: {device!r}")
     output["device"] = stripped
@@ -339,6 +346,24 @@ class SettingsManager:
         # so get_settings() persisted the file on every read, and the GUI polls it every 10s per tab.
         device = output.get("device")
         if isinstance(device, str) and device.strip() in LEGACY_OUTPUT_PLACEHOLDERS:
+            output["device"] = None
+            output["device_type"] = None
+            changed = True
+        elif isinstance(device, str) and device.strip().lower().startswith("hw:"):
+            # An `hw:C,D` address is not an identity, it is a position — and card numbers move (the
+            # HAT on .7.204 has been 2, 1, 2, 0 and 3). Left stored, find_device's address pass
+            # resolves it against TODAY's numbering and returns whatever card holds that slot now:
+            # measured, `hw:2,0` gave sndrpihifiberry:0 before a reboot and vc4hdmi1:0 after. Worse,
+            # the next write through set_output_device canonicalises that wrong card's STABLE id
+            # into this file permanently, at which point it is indistinguishable from a real choice.
+            #
+            # Clearing it falls back to PLUM_DAC_DEVICE, which is the documented "never chosen"
+            # behaviour and is honest. Only reachable via a hand-edit or POST /api/settings — the
+            # picker has always stored `<card_name>:<device>`.
+            logger.warning(
+                "clearing stored output %r: an ALSA address is not a stable identity (card numbers move)",
+                device,
+            )
             output["device"] = None
             output["device_type"] = None
             changed = True

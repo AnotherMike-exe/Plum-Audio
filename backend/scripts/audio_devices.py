@@ -351,6 +351,22 @@ def _run(cmd: list[str], timeout: int = 10) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def stored_output_spec() -> str | None:
+    """The output the USER chose, from settings.json only — never the environment.
+
+    Distinct from configured_output_spec(), which folds in PLUM_DAC_DEVICE. The gate needs to tell
+    "this person picked the HAT" from "this unit booted with a PLUM_DAC_DEVICE nobody has ever
+    changed": the first must never be overwritten when a card is merely late to register, the second
+    is exactly what auto-selection is for. Same never-raise contract.
+    """
+    try:
+        with open(unit_identity.settings_path(), encoding="utf-8") as f:
+            output = ((json.load(f).get("audio") or {}).get("output") or {}).get("device")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+    return output.strip() or None if isinstance(output, str) else None
+
+
 def configured_output_spec(fallback: str | None = None) -> str | None:
     """The output this unit should render to: settings.json > PLUM_DAC_DEVICE > fallback.
 
@@ -365,10 +381,17 @@ def configured_output_spec(fallback: str | None = None) -> str | None:
     try:
         with open(unit_identity.settings_path(), encoding="utf-8") as f:
             output = ((json.load(f).get("audio") or {}).get("output") or {}).get("device")
-        if output and str(output).strip():
-            return str(output).strip()
-    except (OSError, ValueError):
-        pass
+        # isinstance, not truthiness: a non-string device (a dict or list from a hand-edit) would
+        # otherwise be handed on as its repr — "{'nested': 'object'}" — straight to PortAudio.
+        if isinstance(output, str) and output.strip():
+            return output.strip()
+    except (OSError, ValueError, AttributeError, TypeError):
+        # AttributeError/TypeError too: the chained .get() walk assumes `audio` and `output` are
+        # dicts, and a settings.json whose top level is a list — or whose `audio` is a string —
+        # raises rather than returning None. sendspin_player.main() and watch_output_device() both
+        # call this UNWRAPPED, so a raise there kills the player at boot or silently kills the
+        # output watcher. The docstring promises this never raises; now it does not.
+        logger.warning("could not read the configured output; falling back to the environment", exc_info=True)
     return (os.environ.get("PLUM_DAC_DEVICE") or "").strip() or fallback
 
 
@@ -465,6 +488,15 @@ def find_device(spec: str, devices: list[AudioDevice] | None = None) -> AudioDev
             return dev
     for dev in devices:
         if spec == dev.hw_id:
+            # An hw:C,D address is only meaningful within the scan that produced it — dev.hw_id is
+            # re-derived every time. It is legitimate for a request the GUI built from the CURRENT
+            # list; it is dangerous as a stored identity, because after a renumber it resolves to
+            # whatever card holds that number now. Measured: `hw:2,0` -> sndrpihifiberry:0 before a
+            # reboot, vc4hdmi1:0 after. Loud, because the caller cannot tell the two cases apart.
+            logger.warning(
+                "resolved %r by CURRENT ALSA address -> %s (%s). Card numbers move; store %r instead.",
+                spec, dev.id, dev.friendly_name, dev.id,
+            )
             return dev
     for dev in devices:
         if spec == dev.card_name:

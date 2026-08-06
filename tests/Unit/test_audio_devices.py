@@ -502,3 +502,78 @@ def test_has_output_hardware_reads_aplay_only(monkeypatch, run_result, expected)
     )
     assert audio_devices.has_output_hardware() is expected
     assert calls == [["aplay", "-l"]]
+
+
+# -- card renumbering: the hazard, pinned ------------------------------------------------------------
+#
+# Same HAT, after a reboot where the I2S card registered late: it lands at 3, the onboard jack takes
+# 0, and the two HDMI cards shift up. The stable id is unaffected; the ALSA ADDRESS now names a
+# completely different card. This capture is the one that makes that visible.
+
+APLAY_AFTER_LATE_I2S = """**** List of PLAYBACK Hardware Devices ****
+card 0: Headphones [bcm2835 Headphones], device 0: bcm2835 Headphones [bcm2835 Headphones]
+  Subdevices: 7/8
+  Subdevice #0: subdevice #0
+card 1: vc4hdmi0 [vc4-hdmi-0], device 0: MAI PCM i2s-hifi-0 [MAI PCM i2s-hifi-0]
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 2: vc4hdmi1 [vc4-hdmi-1], device 0: MAI PCM i2s-hifi-0 [MAI PCM i2s-hifi-0]
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+card 3: sndrpihifiberry [snd_rpi_hifiberry_dacplus], device 0: HiFiBerry DAC+ Pro HiFi pcm512x-hifi-0 \
+[HiFiBerry DAC+ Pro HiFi pcm512x-hifi-0]
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+"""
+
+
+def test_the_stable_id_survives_a_late_registering_card():
+    """The identity model working: the HAT moved 2 -> 3 and its id did not change."""
+    before = find_device("sndrpihifiberry:0", parse_aplay_output(APLAY_AMP100))
+    after = find_device("sndrpihifiberry:0", parse_aplay_output(APLAY_AFTER_LATE_I2S))
+    assert before.id == after.id == "sndrpihifiberry:0"
+    assert (before.card, after.card) == (2, 3)  # the NUMBER moved underneath it
+
+
+def test_an_alsa_address_resolves_to_a_different_card_after_a_renumber(caplog):
+    """The hazard, asserted rather than assumed — this is why hw:C,D is never stored.
+
+    `hw:2,0` was the HiFiBerry. After the renumber it is an HDMI port. find_device still answers,
+    because dev.hw_id is re-derived from the CURRENT scan, so the caller cannot tell. The only
+    defence at this layer is the warning; settings_api refuses to store the form at all.
+    """
+    assert find_device("hw:2,0", parse_aplay_output(APLAY_AMP100)).id == "sndrpihifiberry:0"
+
+    with caplog.at_level("WARNING", logger="plum.audio_devices"):
+        after = find_device("hw:2,0", parse_aplay_output(APLAY_AFTER_LATE_I2S))
+
+    assert after.id == "vc4hdmi1:0"  # a DIFFERENT card, and it answered confidently
+    assert "Card numbers move" in caplog.text  # ...but not silently
+
+
+def test_a_portaudio_name_fragment_still_follows_its_card():
+    """PLUM_DAC_DEVICE values are description fragments, so they track the card, not the number."""
+    dev = find_device("snd_rpi_hifiberry_dacplus", parse_aplay_output(APLAY_AFTER_LATE_I2S))
+    assert dev.id == "sndrpihifiberry:0"
+    assert dev.hw_id == "hw:3,0"  # re-derived, never persisted
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        '{"audio": "not-a-dict"}',
+        '["a", "list", "at", "top", "level"]',
+        '{"audio": {"output": ["not", "a", "dict"]}}',
+        '{"audio": {"output": {"device": {"nested": "object"}}}}',
+    ],
+)
+def test_reading_a_structurally_broken_settings_file_never_raises(tmp_path, monkeypatch, broken):
+    """The docstring promises this. sendspin_player.main() and watch_output_device() both call it
+    UNWRAPPED, so a raise kills the player at boot or silently kills the output watcher."""
+    settings = tmp_path / "settings.json"
+    settings.write_text(broken)
+    monkeypatch.setattr(audio_devices.unit_identity, "settings_path", lambda: str(settings))
+    monkeypatch.setenv("PLUM_DAC_DEVICE", "bcm2835")
+
+    assert audio_devices.configured_output_spec() == "bcm2835"
+    assert audio_devices.stored_output_spec() is None

@@ -216,7 +216,6 @@ def test_a_real_device_spec_is_stored_stripped(manager):
     "spec",
     [
         "snd_rpi_hifiberry_dacplus",  # a PortAudio name fragment, resolves nowhere on another unit
-        "hw:2,0",
         "bcm2835",
         "vc4hdmi0:0",
     ],
@@ -269,3 +268,34 @@ def test_an_empty_output_dict_does_not_resurrect_the_previous_device(manager):
 def test_a_non_dict_output_is_replaced_rather_than_trusted(manager):
     manager.update_settings({"audio": {"output": "sndrpihifiberry:0"}})
     assert manager.get_settings()["audio"]["output"] == {"device": None, "device_type": None}
+
+
+def test_a_stored_alsa_address_is_refused(manager):
+    """`hw:C,D` is a POSITION, not an identity, and card numbers move.
+
+    Left stored, find_device's address pass resolves it against TODAY's numbering: measured,
+    `hw:2,0` gave sndrpihifiberry:0 before a reboot and vc4hdmi1:0 after. The next write through
+    set_output_device would then canonicalise that wrong card's stable id into settings.json
+    permanently, where it is indistinguishable from a deliberate choice.
+    """
+    with pytest.raises(ValueError, match="stable"):
+        manager.update_settings({"audio": {"output": {"device": "hw:2,0"}}})
+
+
+def test_an_alsa_address_already_on_disk_is_cleared_on_read(manager):
+    """A hand-edited or pre-existing file must not keep the hazard — falling back to
+    PLUM_DAC_DEVICE is the documented "never chosen" behaviour and is honest."""
+    import json as _json
+    path = manager.settings_file
+    with open(path, "w", encoding="utf-8") as f:
+        _json.dump({"version": 3, "audio": {"output": {"device": "hw:2,0", "device_type": "HAT"}}}, f)
+
+    output = manager.get_settings()["audio"]["output"]
+    assert output["device"] is None
+    assert output["device_type"] is None
+
+
+def test_the_legacy_headphones_placeholder_still_takes_its_own_path(manager):
+    """It is also `hw:`-prefixed; the two clauses must not fight over it."""
+    manager.update_settings({"audio": {"output": {"device": "hw:Headphones"}}})
+    assert manager.get_settings()["audio"]["output"]["device"] is None

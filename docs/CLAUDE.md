@@ -317,6 +317,31 @@ debugging cookbook are in **`docs/OPERATIONS.md`**.
     Repurposing that slider to group volume on playerless units would be more useful, but it needs
     that rule **amended explicitly**, not silently excepted. Awaiting a call.
 
+16. **Card-identity hardening — what is still open** (audit 2026-08-06; the confirmed-dangerous ones
+    are fixed, see HARD-WON-LESSONS). Ranked:
+    - **A failed output switch is never retried.** `watch_output_device` advances `current` *before*
+      calling `on_change`, and `reopen` failing is terminal — so a card that is briefly unopenable
+      during a switch leaves the unit on the old device (or silent) and it will not self-heal even
+      once the card is back. GUI shows `pending` forever. Most likely of these to bite.
+    - **`renderer.device` records the REQUEST, not the card actually opened** (`sendspin_player.py`
+      `_open`), and that is what is echoed to `player_state.json`. So `pending` compares a string to
+      itself and is *structurally* unable to detect "opened, but on the wrong card". Fixing means
+      echoing the resolved `<card_name>:<device>` — careful, `reopen`'s no-op check compares against
+      the same field.
+    - **`_open`'s raw-spec fallback can open the wrong card.** When `aplay -l` fails, resolution
+      returns nothing and the raw spec goes to PortAudio, whose names embed `(hw:C,D)` — so an
+      `hw:2,0` substring-matches whatever is at that address now and opens it, with one warning.
+    - **USB card names are enumeration-order-derived.** Two identical DACs give `Device` and
+      `Device_1`, and which is which is decided by the same probe race that moves card numbers, so
+      `card_name` is NOT stable for exactly the device class where hot-plugging is normal. Passes
+      1–3 of `find_device` have no ambiguity guard at all (only the substring pass does).
+    - **`_portaudio_outputs` is last-write-wins** on a duplicate `(card, device)` key, and its 2 s
+      cache is keyed on that volatile pair — a hotplug inside the window can hand back an index for
+      a device that no longer exists. `resolve_portaudio_index` forces a refresh; no `audio_api`
+      caller does.
+    - **`parse_aplay_output` silently drops any line the regex misses** — the device then vanishes
+      everywhere downstream with nothing logged.
+
 ## Resources
 - Sendspin spec: <https://www.sendspin-audio.com/spec/> · Org: <https://github.com/Sendspin>
 - `aiosendspin`: <https://github.com/Sendspin/aiosendspin>

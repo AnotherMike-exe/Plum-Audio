@@ -45,7 +45,9 @@ MODE_NONE = "none"
 MODE_DEVICE = "device"
 
 
-def decide(*, settings_spec: str | None, player_enabled: bool, hardware_present: bool) -> tuple[str, str, bool]:
+def decide(
+    *, settings_spec: str | None, stored_spec: str | None, player_enabled: bool, hardware_present: bool
+) -> tuple[str, str, bool]:
     """(mode, why, auto_selected) — pure, so the precedence is testable without a filesystem.
 
     Precedence, highest first:
@@ -53,8 +55,9 @@ def decide(*, settings_spec: str | None, player_enabled: bool, hardware_present:
          unit whose units.conf row says `none`, so a headless box is correct on its very first boot,
          before any settings.json exists.
       2. The sentinel in settings.json — the user's own choice in Settings -> Audio.
-      3. No output hardware at all. Auto-selected: there is nothing else this unit could do, and
-         saying so is better than crash-looping a player against a card that is not there.
+      3. No output hardware at all. Auto-selected ONLY if nothing is STORED — `stored_spec` is
+         settings.json alone, so a PLUM_DAC_DEVICE the unit merely booted with does not count as a
+         choice, while a device picked in Settings does.
       4. Otherwise a device, which is every unit that exists today.
     """
     if not player_enabled:
@@ -62,6 +65,17 @@ def decide(*, settings_spec: str | None, player_enabled: bool, hardware_present:
     if audio_devices.is_no_output(settings_spec):
         return MODE_NONE, "the configured output is 'No output'", False
     if not hardware_present:
+        # Auto-select ONLY when nothing was deliberately chosen. A unit whose user picked a real
+        # device and whose card is merely LATE is the common case, not the rare one: an I2S HAT
+        # registers asynchronously (overlay probe + i2c), which is the very mechanism that makes
+        # card numbers move on these units. Persisting `none` there would overwrite that choice
+        # permanently, leave the unit with no player, and never re-check.
+        #
+        # We still answer `none` — a player cannot open a card that is not there, and crash-looping
+        # is worse — but with auto_selected False, so nothing is written and the next container
+        # start with the card present comes back on its own.
+        if stored_spec and not audio_devices.is_no_output(stored_spec):
+            return MODE_NONE, f"no playback hardware YET; keeping the stored choice {stored_spec!r}", False
         return MODE_NONE, "this host has no playback hardware", True
     return MODE_DEVICE, f"configured output {settings_spec!r}", False
 
@@ -74,6 +88,7 @@ def main(argv: list[str] | None = None) -> int:
         spec = audio_devices.configured_output_spec()
         mode, why, auto_selected = decide(
             settings_spec=spec,
+            stored_spec=audio_devices.stored_output_spec(),
             player_enabled=os.environ.get("PLUM_PLAYER_ENABLED", "1") != "0",
             hardware_present=audio_devices.has_output_hardware(),
         )
