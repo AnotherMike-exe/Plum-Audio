@@ -244,6 +244,25 @@ debugging cookbook are in **`docs/OPERATIONS.md`**.
 6. **Multi-server arbitration** is a spec MUST we only half-implement — we persist the last playing
    `server_id` but cannot yet decide, pending UPSTREAM §1.
 7. **amd64 has never been built.**
+8. **The APIs are unauthenticated with blanket CORS** (`CORS(app)`, `Access-Control-Allow-Origin: *`,
+   both bound to `0.0.0.0`). The injection chain behind it is closed at three layers, but any page on
+   the LAN can still change a unit's settings. Deliberately deferred 2026-08-05: restricting CORS
+   needs a rig test, because peers and the GUI both call peer `:5001` cross-origin.
+9. **`_primary_source` is set but never cleared** (`sendspin_server.stop_source`). Disable the
+   first-created endpoint and `_maybe_group_controller` resolves a dead source id, so a controller
+   with no `ctrl:<source>:` hint silently stops being grouped. Found by audit, never reproduced.
+10. **A volume change emits two identical `client/state` frames ~2ms apart.** Harmless (it is a full
+    report, not a delta) but it means `_publish_render_state` runs twice per command. Seen on the rig
+    2026-08-05, not chased.
+11. **`bluetooth_adapter._is_audio_source` returns True for `A2DP_SINK_UUID`**, which contradicts the
+    comment above it ("we are the sink — a device offering only 110d has nothing to send"). One of
+    the two is wrong. Investigate; do not blind-fix.
+12. **Three duplications worth real lines**, from the 2026-08-05 audit: `integrationsService.ts`
+    (944 → ~250 with the helper that already exists in `audioService.ts`), `IntegrationsTab.tsx`
+    (~880 → ~280 with one endpoint-CRUD card), and the three `*_config.py` (312 → ~190 on a shared
+    base). None touch the audio path. Also a shared progress/metadata helper for the three source
+    handlers — the Spotify timestamp bug was the third implementation of the same plumbing getting it
+    wrong, which is the argument for it.
 
 ## Resources
 - Sendspin spec: <https://www.sendspin-audio.com/spec/> · Org: <https://github.com/Sendspin>
@@ -251,7 +270,7 @@ debugging cookbook are in **`docs/OPERATIONS.md`**.
 - Predecessor: the **Plum-Snapcast** repo — this repo implements the design its architecture doc set out.
 
 ## Maintaining this file
-Update on: architecture changes, new sources, new env vars, new workflows. **Keep it under ~250
+Update on: architecture changes, new sources, new env vars, new workflows. **Keep it under ~280
 lines** — it loads into every session, and it reached 465 by absorbing things that belong elsewhere.
 War stories → `docs/HARD-WON-LESSONS.md`. Dated narrative → `docs/PHASE-HISTORY.md`. Procedures →
 `docs/OPERATIONS.md`. A rule earns its place here only if an agent would break something without it.
