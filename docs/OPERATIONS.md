@@ -77,10 +77,34 @@ not stay up. Per-endpoint daemon logs live under `/data`, one directory per endp
 /data/bluetooth/<id>/bluealsa.log           /data/bluetooth/<id>/obexd.log  obex-dbus.log
 ```
 
-### supervisord runs exactly four programs
+### supervisord runs four programs — or three on a unit with no output
 
-`sendspin_server` (priority 10), `sendspin_player` (20), `config_api` (15) and `nginx` (20). That is
-the whole of `backend/supervisord/conf.d/`.
+`sendspin_server` (priority 10), `sendspin_player` (20), `config_api` (15) and `nginx` (20). Those
+are the templates in `backend/supervisord/conf.d/`.
+
+**The set that actually runs is composed at start-up**, into `/run/plum-supervisor.d`, which is what
+supervisord's `[include]` reads. `entrypoint.sh` runs `output_gate.py` first and DELETES
+`sendspin_player.ini` when this unit has no audio output — so such a unit has **three** programs and
+that is correct, not a failed deploy. Deliberately an absent file rather than `autostart=false`:
+supervisord does not expand `%(ENV_x)s` in `autostart`, and a STOPPED program is exactly what
+`deploy.sh` treats as a failure.
+
+To see what a unit decided, and why, without changing anything:
+
+```bash
+docker exec plum-audio python3 /app/scripts/output_gate.py --dry-run   # prints none|device
+docker exec plum-audio cat /config/logs/output_gate.log                # and the reason
+ls /run/plum-supervisor.d                                              # the composed program set
+```
+
+**Changing the output to or from "No output" needs a container restart.** Nothing applies it live —
+that is the whole design, since the player either exists or does not. The GUI says so with an amber
+banner rather than a spinner; if you see "Restart to apply", `docker compose restart` is the answer.
+A device-to-device switch is unaffected and still applies live.
+
+**Deploy the image to EVERY unit before making any unit playerless.** A peer running an older image
+sends no `has_player` in its snapshot, which defaults to True — it would read the playerless leader as
+idle and unroute its own followers, which is precisely the bug this feature fixes.
 
 **The source daemons are NOT supervisord programs.** shairport-sync, go-librespot, bluealsa, obexd
 and their private `dbus-daemon`s are spawned and reconciled by the source managers

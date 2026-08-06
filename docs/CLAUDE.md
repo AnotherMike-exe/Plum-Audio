@@ -196,6 +196,16 @@ The *reasoning* behind these, and the failures that produced them, is in
   `/etc/avahi` or restarting a service. Setting the name it already has raises "invalid because
   redundant" (a no-op), and a real change drops the D-Bus connection mid-call, so success surfaces as
   failure. Always reconnect and read the name back.
+- **The player is a PROCESS, not a setting.** `audio.output.device = "none"` (`audio_devices.NO_OUTPUT`)
+  means a unit renders nothing and runs **no `sendspin_player` at all** — `output_gate.py` decides
+  before supervisord and omits the program file. It cannot be a running player with nothing open:
+  `AlsaRenderer.start()` raises when PortAudio can't open a device and `SendspinPlayer.start()` calls
+  it *before* the listener and the mDNS publish, so a card-less host crash-loops forever. Hence the
+  restart requirement, and hence `has_player` on the snapshot — **defaulting True**, or a peer on an
+  older image reads as playerless. A playerless unit **leads** follow but never follows; a leader with
+  no `local_player` used to read as "session ended" and unroute its own followers. `find_device` must
+  short-circuit the sentinel *before* its substring pass, and the compose `headless` profile exists
+  because Docker refuses to create a container whose `devices:` names a missing `/dev/snd`.
 - **Host provisioning is not optional.** The bluez patches, `bluealsa-plum-dbus.conf` and the HAT
   mixer must be installed on the host by hand — nothing does it automatically, and each absence
   fails silently or catastrophically. See `docs/HOST-PROVISIONING.md`.
