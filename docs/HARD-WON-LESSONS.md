@@ -200,10 +200,20 @@ device usually publishes no `name` TXT key, leaving the bare instance name
 ("home-assistant-voice-a1b2c3"). One device therefore read as two and appeared to rename itself on
 every join and leave. The two views share exactly **one** identifier: the **listener URL**. Not the
 client id — mDNS names by instance, the handshake by MAC, the same asymmetry that forces `adopt` to
-match by URL. The protocol name is memoised against the URL and **persisted to localStorage**,
-because "idle at page load" is the common case and an in-memory memo would still flip on the first
-reload.
-See: `frontend/services/sendspinDataService.ts` (~L300).
+match by URL.
+
+The memo was first built in the GUI and **persisted to localStorage** — right instinct ("idle at page
+load" is the common case, so an in-memory memo would flip on the first reload), wrong place. Being
+per-browser and per-origin, it was blank until *that* tab had watched *that* speaker attach, so a
+fresh browser's first idle sighting still showed the technical name, and two units' GUIs could
+disagree. Reported from the rig on 2026-08-05 and briefly mistaken for a regression: the memo was
+working, it had simply never seen the name.
+
+The name belongs to the speaker, not to whoever is looking. It now lives on the unit
+(`speaker_names.py`, beside `player_state.json`), learned by the server whenever a speaker is
+attached and served from `/api/mesh/neighbourhood` — so one observation by anything serves every
+browser, and the GUI needed no change because it already prefers `friendly_name`.
+See: `backend/scripts/speaker_names.py`, `frontend/services/sendspinDataService.ts` (~L300).
 
 **Avahi resolves once per interface *and* family.** One player arrives as loopback, link-local v6,
 `docker0` and the real LAN address. Addresses are merged per instance and ranked — a `docker0`-only

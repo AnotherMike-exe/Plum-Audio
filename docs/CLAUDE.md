@@ -228,14 +228,19 @@ debugging cookbook are in **`docs/OPERATIONS.md`**.
    `create_integrations_blueprint` registers only airplay/spotify/bluetooth — so every control on
    that card 404s. Either build the slice or hide the card; do not leave it inert.
 2. **Four frontend test suites assert nothing about production code** (`NowPlaying`,
-   `PlayerControls`, `integrationsService`, `settingsService` — 77 of 112 tests). See TESTING.md.
+   `PlayerControls`, `integrationsService`, `settingsService`). `PlayerControls` now has a real
+   counterpart beside it (`PlayerControlsSourceVolume`); the other three do not. See TESTING.md.
 3. **`sendspin_server.py` has no unit coverage**, including `refresh_stream` — the regression guard
    for the highest-profile bug in the repo does not exist.
-4. **`configure-audio-hat.sh --keep-onboard` and the no-`dtoverlay` fallback have never run on real
-   hardware** — unit-tested against fixtures only.
-5. **Most of the GUI has no visual review under a live stream.** The output picker, Settings tab bar,
-   scrollbars and idle-device picker were confirmed in a browser; Integrations, Visualizer, About and
-   the now-playing card have only been exercised through the API and the bundle.
+4. **`configure-audio-hat.sh`'s no-`dtoverlay` fallback has never run on real hardware** — unit-tested
+   against fixtures only. `--keep-onboard` HAS now run, on `.7.204` (2026-08-05), and had two
+   independent bugs that fixtures could not have caught: it left an out-of-block `dtparam=audio=off`
+   armed, and omitting `audio=off` is not the same as asking for `audio=on` (the firmware default is
+   off). Both fixed and verified across a reboot.
+5. **Visualizer, About and the Integrations tab still have no visual review under a live stream.**
+   Confirmed live on 2026-08-05: AirPlay/Spotify/Bluetooth end to end, cross-routing in both
+   directions with two concurrent groups, the source-volume slider, rename propagation, adopt/release
+   of a third-party speaker, and switching output between the HAT and the 3.5 mm jack.
 6. **Multi-server arbitration** is a spec MUST we only half-implement — we persist the last playing
    `server_id` but cannot yet decide, pending UPSTREAM §1.
 7. **amd64 has never been built.**
