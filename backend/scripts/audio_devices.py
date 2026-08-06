@@ -93,6 +93,26 @@ class DeviceType(Enum):
     USB = "USB"
     HAT = "HAT"
     OTHER = "OTHER"
+    NONE = "NONE"  # the synthetic "No output" row — never returned by _identify()
+
+
+# "No output": this unit renders nothing and runs no player process at all. One spelling, owned
+# here, used by settings.json `audio.output.device`, by PLUM_DAC_DEVICE, and on the API wire.
+#
+# It is a DELIBERATE ABSENCE, not a device that happens to be missing, and the two must never be
+# confused: a missing device means "the card moved or died, tell the user"; this means "there is no
+# card and that is the answer". output_gate.py turns it into the absence of a player program.
+NO_OUTPUT = "none"
+
+
+def is_no_output(spec: str | None) -> bool:
+    """Is this spec the no-output sentinel? Case- and whitespace-insensitive.
+
+    Every layer that can receive a device spec from outside — the API, settings.json, the env —
+    goes through this rather than comparing to the literal, because the three of them disagree
+    about casing and stray spaces often enough to matter.
+    """
+    return bool(spec) and str(spec).strip().lower() == NO_OUTPUT
 
 
 # Substrings that mark an I2S add-on board. Checked only AFTER headphones/HDMI/USB, because several
@@ -430,6 +450,12 @@ def find_device(spec: str, devices: list[AudioDevice] | None = None) -> AudioDev
     """
     if not spec:
         return None
+    if is_no_output(spec):
+        # Short-circuit BEFORE the substring pass below, which matches a case-insensitive fragment
+        # of a card or device DESCRIPTION — it would happily resolve "none" against a product string
+        # and hand back a real card as the user's "No output" choice. Callers that need to tell
+        # "deliberately nothing" from "device gone" ask is_no_output() first; both are None here.
+        return None
     if devices is None:
         devices = list_output_devices()
     spec = spec.strip()
@@ -457,6 +483,44 @@ def find_device(spec: str, devices: list[AudioDevice] | None = None) -> AudioDev
     return None
 
 
+def no_output_device(*, is_active: bool = False) -> dict:
+    """The synthetic "No output" row the picker offers on every unit.
+
+    Shaped exactly like AudioDevice.to_dict() so the GUI's single mapper handles it with no special
+    case, and built HERE rather than hardcoded in the frontend because the backend owns the
+    sentinel's spelling — one place to change, one place to be wrong.
+    """
+    return {
+        "id": NO_OUTPUT,
+        "hw_id": "",  # there is no ALSA address; the GUI hides the line when it is empty
+        "card": -1,
+        "device": -1,
+        "card_name": NO_OUTPUT,
+        "card_description": "No output",
+        "device_description": "",
+        "type": DeviceType.NONE.value,
+        "friendly_name": "No output",
+        "is_available": True,  # always selectable — that is the whole point of offering it
+        "unavailable_reason": None,
+        "in_use": False,
+        "is_active": is_active,
+    }
+
+
+def has_output_hardware() -> bool:
+    """Does this host have ANY ALSA playback device at all?
+
+    `aplay -l` only — deliberately NOT _portaudio_outputs(). This runs at container start, from
+    output_gate.py, and initialising PortAudio rebuilds process-global state that the project rule
+    says must be serialised. One `aplay -l` answers "is there a card here", which is all the gate
+    needs; whether a card can be OPENED is a different question, asked later and by the player.
+    """
+    ok, output = _run(["aplay", "-l"])
+    if not ok:
+        return False  # "no soundcards found", or no aplay at all — either way, nothing to open
+    return bool(parse_aplay_output(output))
+
+
 def resolve_portaudio_index(spec: str) -> tuple[int | None, AudioDevice | None]:
     """(PortAudio index, device) for a spec — what the player needs to open a stream.
 
@@ -466,6 +530,8 @@ def resolve_portaudio_index(spec: str) -> tuple[int | None, AudioDevice | None]:
     Forces a fresh enumeration: the player calls this right after closing its stream, and a cached
     map taken while that card was still held would be missing the very device we are reopening.
     """
+    if is_no_output(spec):
+        return None, None  # nothing to resolve; must never reach sd.RawOutputStream
     devices = list_output_devices(active_spec=spec, force_refresh=True)
     dev = find_device(spec, devices)
     if dev is None:
@@ -483,6 +549,8 @@ def test_device(spec: str, active_spec: str | None = None) -> tuple[bool, str]:
     exclusively, so speaker-test against the active card returns EBUSY, which reads as "this device
     is broken" when it means the opposite. Say so plainly instead of running it.
     """
+    if is_no_output(spec):
+        return False, "There is no output to test on this unit."
     devices = list_output_devices(active_spec=active_spec)
     dev = find_device(spec, devices)
     if dev is None:

@@ -18,6 +18,7 @@ No hardware and no PortAudio needed — everything here is pure parsing plus mon
 Run: `pytest tests/Unit/test_audio_devices.py`.
 """
 
+import json
 import sys
 import threading
 import time
@@ -397,3 +398,107 @@ def test_testing_the_active_device_explains_itself(monkeypatch):
     assert ok is False
     assert "already this unit's output" in message
     assert ran == []  # and we never shelled out to find that out
+
+
+# -- the "No output" sentinel ------------------------------------------------------------------------
+
+
+# A card whose DESCRIPTION contains the sentinel as a substring. find_device's loosest pass is a
+# case-insensitive substring match on descriptions, so this is the fixture that proves the
+# short-circuit runs BEFORE it rather than merely alongside it.
+APLAY_NONESUCH = """**** List of PLAYBACK Hardware Devices ****
+card 0: Nonesuch [Nonesuch USB DAC], device 0: Nonesuch USB Audio [Nonesuch USB Audio]
+  Subdevices: 1/1
+  Subdevice #0: subdevice #0
+"""
+
+
+@pytest.mark.parametrize(
+    "spec,expected",
+    [
+        ("none", True),
+        ("None", True),
+        ("NONE", True),
+        (" none ", True),
+        ("", False),
+        (None, False),
+        ("bcm2835", False),
+        ("none:0", False),  # a real card could be called this; only the bare word is the sentinel
+        ("nonesuch", False),
+    ],
+)
+def test_is_no_output_recognises_the_sentinel_and_nothing_else(spec, expected):
+    assert audio_devices.is_no_output(spec) is expected
+
+
+def test_the_sentinel_never_resolves_to_a_device_whose_description_contains_it():
+    """The regression guard for find_device's substring pass adopting 'none' as a real card."""
+    devices = parse_aplay_output(APLAY_NONESUCH)
+    assert audio_devices.find_device("nonesuch", devices) is devices[0]  # the loose pass still works
+    assert audio_devices.find_device("none", devices) is None  # but not for the sentinel
+
+
+def test_the_sentinel_resolves_to_nothing_against_real_hardware():
+    devices = parse_aplay_output(APLAY_AMP100)
+    assert audio_devices.find_device(audio_devices.NO_OUTPUT, devices) is None
+
+
+def test_configured_output_spec_carries_the_sentinel_from_settings(tmp_path, monkeypatch):
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"audio": {"output": {"device": "none"}}}))
+    monkeypatch.setattr(audio_devices.unit_identity, "settings_path", lambda: str(settings))
+    assert audio_devices.configured_output_spec() == "none"
+
+
+def test_configured_output_spec_carries_the_sentinel_from_the_environment(tmp_path, monkeypatch):
+    """How a headless unit boots with no output before anyone has opened the GUI."""
+    monkeypatch.setattr(audio_devices.unit_identity, "settings_path", lambda: str(tmp_path / "absent.json"))
+    monkeypatch.setenv("PLUM_DAC_DEVICE", "none")
+    assert audio_devices.configured_output_spec() == "none"
+
+
+def test_resolving_the_sentinel_never_touches_portaudio(monkeypatch):
+    """It must not reach sd.RawOutputStream — there is nothing to open, and opening is destructive."""
+    monkeypatch.setattr(
+        audio_devices, "list_output_devices", lambda **k: pytest.fail("enumerated for the sentinel")
+    )
+    assert audio_devices.resolve_portaudio_index("none") == (None, None)
+
+
+def test_testing_the_sentinel_is_refused_without_shelling_out(monkeypatch):
+    monkeypatch.setattr(audio_devices, "_run", lambda *a, **k: pytest.fail("ran speaker-test for the sentinel"))
+    ok, message = audio_devices.test_device("none")
+    assert ok is False
+    assert "no output to test" in message
+
+
+def test_no_output_row_is_shaped_like_a_real_device():
+    """The GUI has one mapper; the synthetic row must go through it unchanged."""
+    row = audio_devices.no_output_device()
+    real = parse_aplay_output(APLAY_AMP100)[0].to_dict()
+    assert set(row) == set(real)
+    assert row["id"] == audio_devices.NO_OUTPUT
+    assert row["type"] == "NONE"
+    assert row["is_available"] is True  # always selectable — that is the point
+    assert row["is_active"] is False
+    assert audio_devices.no_output_device(is_active=True)["is_active"] is True
+
+
+@pytest.mark.parametrize(
+    "run_result,expected",
+    [
+        ((True, APLAY_AMP100), True),
+        ((True, APLAY_ONBOARD), True),
+        ((False, "aplay: device_list:279: no soundcards found..."), False),
+        ((False, "sh: 1: aplay: not found"), False),  # fail closed: no aplay, no hardware to claim
+        ((True, "**** List of PLAYBACK Hardware Devices ****\n"), False),
+    ],
+)
+def test_has_output_hardware_reads_aplay_only(monkeypatch, run_result, expected):
+    calls = []
+    monkeypatch.setattr(audio_devices, "_run", lambda cmd, **k: calls.append(cmd) or run_result)
+    monkeypatch.setattr(
+        audio_devices, "_portaudio_outputs", lambda **k: pytest.fail("initialised PortAudio in the gate path")
+    )
+    assert audio_devices.has_output_hardware() is expected
+    assert calls == [["aplay", "-l"]]
