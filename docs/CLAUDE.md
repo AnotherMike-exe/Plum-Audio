@@ -192,6 +192,17 @@ The *reasoning* behind these, and the failures that produced them, is in
   are only what an unnamed unit boots with. A rename applies live to the mesh view and mDNS TXT; the
   Sendspin-level names are fixed at connect and catch up on the next restart, deliberately, because
   restarting the audio process to apply a rename would drop playback.
+- **Every default name must be unique per unit, and a clash NEVER blocks a deploy.** `DEFAULT_SETTINGS`
+  is written to `settings.json` on the first read, so any literal there outranks the env permanently
+  and *identically on every unit* — which is how two greenfield units both became "Plum Sendspin"
+  offering a "Plum Audio" receiver. The unit name and all three endpoint names derive from
+  `PLUM_UNIT_NAME`, and when that is unset from `unit_identity.default_device_name()`, which appends a
+  stable per-unit token. `deploy.sh` appends the same token to whatever `units.conf` duplicates and
+  warns — it must not refuse, because that turns a cosmetic slip into a rig that will not deploy.
+  The token is the **Pi's SoC serial**, not a default-route MAC: a MAC moves when a unit is put on
+  `wlan0` instead of `eth0`, silently renaming it. No token readable → bare name; unknown beats
+  invented. Env-derived defaults are `sanitize_device_name`'d **at import**, since
+  `_sanitize_device_names` only runs on the write path.
 - **mDNS hostname changes go through Avahi's D-Bus `SetHostName`** on the HOST bus — never by writing
   `/etc/avahi` or restarting a service. Setting the name it already has raises "invalid because
   redundant" (a no-op), and a real change drops the D-Bus connection mid-call, so success surfaces as

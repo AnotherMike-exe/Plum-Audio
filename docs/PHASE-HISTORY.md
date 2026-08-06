@@ -43,7 +43,7 @@ image compares as different across units.
 
 ## Phase 3 — remaining sources, GUI, container (`feature/phase3-sources-gui`, in progress)
 
-### Alpha deployment onto bare Raspberry Pi OS Lite — 2026-08-06 (`3d90f1d`)
+### Alpha deployment onto bare Raspberry Pi OS Lite — 2026-08-06 (`5973175`)
 
 **The first deploy onto units carrying nothing but a stock image.** `.201.133` and `.201.113` were
 re-flashed to Raspberry Pi OS Lite 64-bit (Debian 13 trixie, kernel 6.18.34, arm64), then taken to a
@@ -94,6 +94,30 @@ The AVRCP patch series **applies cleanly to bluez 5.82-1.1+rpt1**, which is newe
 was written against; both units now run `5.82-1.1+rpt1+plum1`, held. Each build took ~28 min at 2
 jobs, peaked at load ~2.0, and reported `throttled=0x0` throughout, at 42 °C and 64 °C — so the
 brown-out trap from 2026-07-29 stays a `-j$(nproc)` problem, not a 2-job one.
+
+**Review pass on the running units** (`c1aacc9`, `5973175`). Three findings from watching the deployed
+GUI, in the order they were raised:
+
+- **The Audio tab showed a permanent "switching to Built-in Headphones" warning** on a unit where
+  nothing had ever been changed — beside that same device's own "playing" tag. Real bug, and the API
+  contradicted itself in one response: `resolved: true`, `is_active: true`,
+  `playing_on == id == "Headphones:0"`, `pending: true`. `pending` compared the raw configured **spec**
+  against the player's **resolved** echo, and the spec may be a PortAudio name fragment
+  (`PLUM_DAC_DEVICE=bcm2835`), an `hw:C,D`, a bare card name, or an id — so string equality only ever
+  held for a choice made in the GUI. **Every unit that had never had an output picked reported a switch
+  pending forever, to the device it was already playing on.** Now compares resolved identities. Missed
+  by all six existing `pending` tests because each configures an id rather than a fragment.
+- **AirPlay confirmed from an iPhone on VLAN 201** — both receivers visible, audio playing out the
+  headphone jack. That closes the one thing the workstation could not verify.
+- **Name clashes now disambiguate instead of refusing.** The first attempt made `deploy.sh` refuse a
+  `units.conf` with duplicates; that was the wrong trade — it turns a cosmetic slip into a rig that
+  will not deploy, after a card has already been re-flashed. A duplicated field now gets a stable
+  per-unit token appended, at two layers: `deploy.sh` for anything `units.conf` repeats, and the
+  container itself when `PLUM_UNIT_NAME` is unset at all (a hand-run `docker compose up`), which
+  `deploy.sh` cannot cover. Token = the Pi's SoC serial, last four hex — **not** a default-route MAC,
+  which moves between `eth0` and `wlan0` and would silently rename the unit. Verified by deploying a
+  fully clashing table to both units: distinct identities, no failure, and `deploy.sh` and the
+  in-container derivation agreed independently (`EE12`, `A17B`).
 
 **Known cosmetic artifact, not fixed.** `audio_devices.configured_output_spec` logs a full
 `FileNotFoundError` traceback at WARNING when `settings.json` does not exist yet, then falls back to
