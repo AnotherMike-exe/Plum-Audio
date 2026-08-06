@@ -95,6 +95,38 @@ unit_field() {  # unit_field <host> <1-based field>
         | awk -F'|' -v h="$1" -v f="$2" '{gsub(/^[ \t]+|[ \t]+$/,"",$1); if ($1==h) {v=$f; gsub(/^[ \t]+|[ \t]+$/,"",v); print v}}'
 }
 
+# units.conf is the ONLY thing that makes units distinguishable, and nothing else checks it.
+#
+# The unit-name column becomes PLUM_UNIT_NAME, which a unit with no settings.json yet adopts as its
+# own display name AND as the name of every source endpoint it offers — so two rows sharing a name
+# produce two units that are indistinguishable in the mesh view, in the GUI's unit cards, and to an
+# AirPlay sender picking a speaker. That is exactly the confusion the greenfield alpha hit on
+# 2026-08-06, and there is no auto-uniquifying to fall back on: a duplicate here IS a duplicate on
+# the network. The ids are worse than cosmetic — the mesh keys routing, group membership and
+# per-player volume off them, so two units claiming one unit_id corrupt each other's routing.
+#
+# Checked once, up front, for the WHOLE file rather than per selected host: a clash is a property of
+# the table, and finding out on the second unit means the first is already misconfigured.
+check_units_unique() {
+    local bad=0 col name dupes
+    for col in 1:host 2:unit_id 3:unit_name 4:player_id 5:player_name; do
+        name="${col#*:}"
+        dupes="$(grep -vE '^\s*(#|$)' "$UNITS_FILE" \
+            | awk -F'|' -v f="${col%%:*}" '{v=$f; gsub(/^[ \t]+|[ \t]+$/,"",v); if (v!="") print v}' \
+            | sort | uniq -d)"
+        if [[ -n "$dupes" ]]; then
+            echo "    !! ${UNITS_FILE##*/}: duplicate ${name}:" >&2
+            echo "$dupes" | sed 's/^/       /' >&2
+            bad=1
+        fi
+    done
+    if [[ $bad -ne 0 ]]; then
+        echo "    !! every unit must be unique in all five columns — fix units.conf and re-run" >&2
+        exit 1
+    fi
+}
+check_units_unique
+
 if [[ " ${HOSTS[*]} " == *" all "* ]]; then
     # Plain read loop, not `mapfile`: this is normally run from macOS, whose /bin/bash is 3.2 and
     # has no mapfile. The failure only ever showed on `deploy.sh all`, since single-host runs skip it.

@@ -46,10 +46,38 @@ A re-imaged Pi has no dev stack, so the import is skipped and the container writ
 - **`audio.output.device` is `null`**, which deliberately means "whatever `PLUM_DAC_DEVICE` says", so
   the player opens the DAC column from `units.conf` (`bcm2835` → PortAudio 0 → `hw:0,0`) and echoes
   the resolved card back as `Headphones:0`. Nothing needs choosing in the GUI for audio to work.
-- **`deviceName` comes from `PLUM_UNIT_NAME`** (i.e. the unit-name column of `units.conf`) — but only
-  since `1cd8701`. Before that every fresh unit came up as "Plum Sendspin", so a two-unit greenfield
-  mesh showed one name twice in the mesh view, the unit cards and mDNS. On an image built before that
-  commit, rename each unit in Settings → General.
+- **`deviceName` and every source endpoint's name come from `PLUM_UNIT_NAME`** (the unit-name column
+  of `units.conf`) — but only since `1cd8701`/`3d90f1d`. Before that every fresh unit came up as
+  "Plum Sendspin" offering a "Plum Audio" AirPlay receiver, so a two-unit greenfield mesh showed one
+  name twice in the mesh view, the unit cards, mDNS and to a sender. On an older image, rename each
+  unit in Settings → General and each endpoint in Settings → Integrations.
+
+### Naming across multiple units — nothing auto-uniquifies
+
+`units.conf` is the **only** thing that keeps units distinguishable, and its unit-name column reaches
+further than it looks: `deploy.sh` writes it as `PLUM_UNIT_NAME`, and a unit with no `settings.json`
+yet adopts it as its own display name **and** as the name of every source endpoint it offers. There is
+no de-duplication downstream — a duplicate in this file is a duplicate on the network, in the mesh
+view, on the unit cards, and in an AirPlay sender's speaker list.
+
+So `deploy.sh` refuses to run at all when any of the five columns repeats a value, rather than
+deploying part of a rig and leaving you to notice:
+
+```
+    !! units.conf: duplicate unit_name:
+       Pi4-02
+    !! every unit must be unique in all five columns — fix units.conf and re-run
+```
+
+The ids matter more than the names: the mesh keys routing, group membership and per-player volume off
+`unit_id`/`player_id`, so two units claiming one id corrupt each other's routing rather than merely
+looking alike.
+
+**A rename in the GUI wins permanently** on that unit — `PLUM_UNIT_NAME` only decides what an
+*unnamed* unit boots as, and is not re-applied on later deploys (`settings.json` is never overwritten
+after the first). So changing the column and redeploying does **not** rename a unit that has already
+come up once; rename it in Settings → General, or clear `/opt/plum-audio/data/settings.json` and
+restart to re-derive everything from the env.
 
 Everything else about a greenfield deploy is identical, and `deploy.sh`'s own verify pass is
 sufficient: four RUNNING programs, three APIs answering, 8927 and 8928 listening.
