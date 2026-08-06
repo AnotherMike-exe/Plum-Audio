@@ -33,7 +33,7 @@ rather than reappearing as a stranger.
 
 Production units `.50` / `.51` are still on Plum-Snapcast; their cutover is Phase 4.
 
-**Image uniformity as of 2026-08-05**: all four units run the same image (`6a64b88`). Verify by the
+**Image uniformity as of 2026-08-05**: all four units run the same image (`bfa4812`). Verify by the
 served bundle hash (`curl -s http://<unit>/ | grep -o 'assets/index-[^"]*\.js'`), **not** by image
 id — `.100.21` uses Docker's containerd image store while the other three use the classic one, so
 `docker inspect` reports a manifest digest there and a config digest everywhere else, and the same
@@ -43,7 +43,7 @@ image compares as different across units.
 
 ## Phase 3 — remaining sources, GUI, container (`feature/phase3-sources-gui`, in progress)
 
-### Alpha deployment onto bare Raspberry Pi OS Lite — 2026-08-06 (`5973175`)
+### Alpha deployment onto bare Raspberry Pi OS Lite — 2026-08-06 (`dd13071`)
 
 **The first deploy onto units carrying nothing but a stock image.** `.2.10` and `.2.11` were
 re-flashed to Raspberry Pi OS Lite 64-bit (Debian 13 trixie, kernel 6.18.34, arm64), then taken to a
@@ -66,7 +66,7 @@ What the documented path could not do, and now can:
 - **`deploy.sh --tarball dist/...`, exactly as OPERATIONS.md documented it, always failed** — the
   script `cd`s to its own directory first, so it looked under `docker/dist/`.
 - **Both units came up named "Plum Sendspin", and both advertised an AirPlay receiver called "Plum
-  Audio"** (`1cd8701`, then the endpoint half on Michael's call). `DEFAULT_SETTINGS` is written to
+  Audio"** (`2f9c1d9`, then the endpoint half on Michael's call). `DEFAULT_SETTINGS` is written to
   settings.json on first read, so its literals outranked `PLUM_UNIT_NAME` permanently — making the env
   tier that `unit_identity.py` documents unreachable. One name for two units in the mesh view, the
   unit cards and mDNS reads exactly like a discovery bug; one AirPlay name for two receivers is
@@ -95,7 +95,7 @@ was written against; both units now run `5.82-1.1+rpt1+plum1`, held. Each build 
 jobs, peaked at load ~2.0, and reported `throttled=0x0` throughout, at 42 °C and 64 °C — so the
 brown-out trap from 2026-07-29 stays a `-j$(nproc)` problem, not a 2-job one.
 
-**Review pass on the running units** (`c1aacc9`, `5973175`). Three findings from watching the deployed
+**Review pass on the running units** (`2333f8d`, `dd13071`). Three findings from watching the deployed
 GUI, in the order they were raised:
 
 - **The Audio tab showed a permanent "switching to Built-in Headphones" warning** on a unit where
@@ -126,7 +126,7 @@ GUI, in the order they were raised:
 greenfield boot and appeared on `.10` and not `.11`. Worth distinguishing "missing" from "damaged"
 there, given how much this project has paid for misread logs.
 
-### GUI polish pass — 2026-08-05 (`8dfaca2`..`6a64b88`)
+### GUI polish pass — 2026-08-05 (`7dab126`..`bfa4812`)
 
 The first real visual review in a browser on a live unit. Four defects, all in the GUI, none of them
 visible from the API or the bundle:
@@ -222,7 +222,7 @@ running past the end of its own track.
 ~2 s, verified.** This is host provisioning, in the same class as the rfkill unblock and the D-Bus
 policy; an unpatched unit simply loses scrub reporting. See `docs/HOST-PROVISIONING.md`.
 
-### Consume, observe and control foreign playback — 2026-07-23 (`6148204`)
+### Consume, observe and control foreign playback — 2026-07-23 (`8761446`)
 
 Our player negotiates PLAYER + METADATA + CONTROLLER + VISUALIZER + ARTWORK, so wherever it plays —
 our source, a peer's, or a foreign server — it observes that group's controller state and visualizer
@@ -238,7 +238,7 @@ The key finding: a freshly connected controller lands in MA's **own solo group**
 stopped, `[volume, mute, switch]` only) — the wrong bridge. Our **player** is a member of the playing
 group, and to a member MA emits the full command set plus metadata plus the visualizer role.
 
-### Visualizer on the native Sendspin role — 2026-07-23 (`9114149`)
+### Visualizer on the native Sendspin role — 2026-07-23 (`24d06f4`)
 
 aiosendspin's `visualizer@v1` role auto-computes `spectrum` and `loudness` from the source's
 PushStream audio, in-library. **The server side is therefore free** — no browser audio, no "Listen in

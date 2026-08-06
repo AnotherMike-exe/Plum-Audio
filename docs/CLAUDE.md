@@ -146,7 +146,7 @@ The *reasoning* behind these, and the failures that produced them, is in
 - **Codec choice belongs to the CLIENT.** `supported_formats` is in priority order and the server
   takes the first match it implements. A player that cannot sustain its own choice renegotiates with
   `stream/request-format`. Do not add a server-side override without a live, proven case — one was
-  written and reverted (`f19a428`). A heterogeneous group is normal, not a problem.
+  written and reverted (`0d7c6ab`). A heterogeneous group is normal, not a problem.
 - **Announce idle, don't imply it.** On EOF or `PLUM_SOURCE_IDLE_TIMEOUT` silence call
   `group.stop()` (playback_state=**stopped**), never `stop_stream()` (which keeps clients logically
   PLAYING). The spec has no distinct idle state — `stopped` is it. Groups/anchors persist, so
@@ -302,7 +302,7 @@ are in **`docs/OPERATIONS.md`**; commissioning in **`docs/HOST-PROVISIONING.md`*
     right, the code was wrong.** 110d (AudioSink) is what a *speaker* advertises; a device offering
     only it cannot send us audio, so adopting it started an `arecord` that could never produce a
     sample and — most-recently-connected wins — took the capture slot from a phone that was already
-    playing. The both-match test came in with the original Bluetooth commit (`5d1beb2`), carried
+    playing. The both-match test came in with the original Bluetooth commit (`0ff2ceb`), carried
     from Plum-Snapcast. Now requires 110a; a device that advertises both (phones that can also be a
     speaker) is unaffected, and a skipped sink-only device is logged rather than dropped silently.
 12. **Three duplications worth real lines**, from the 2026-08-05 audit: `integrationsService.ts`
@@ -382,7 +382,7 @@ are in **`docs/OPERATIONS.md`**; commissioning in **`docs/HOST-PROVISIONING.md`*
     forever. Now forgiven only after `RECONNECT_STABLE_MS` (10 s) of survival. This removes the
     AMPLIFIER, not the cause — a real trigger will now present as a visibly SLOWING retry rather
     than a fixed 3-second sawtooth, which is more diagnosable, not less.
-    **STATUS 2026-08-06: not reproducing on `e5f1bfc`.** Michael reports it looks good with that
+    **STATUS 2026-08-06: not reproducing on `5801dfe`.** Michael reports it looks good with that
     build deployed, after the localActivity/slave ping-pong fix (#13) and the layout fixes landed.
     That is an observation from watching, NOT a measurement, and the sawtooth above WAS measured on
     the same build — so treat this as "intermittent / trigger-dependent", not "fixed". If it returns,
@@ -397,7 +397,7 @@ are in **`docs/OPERATIONS.md`**; commissioning in **`docs/HOST-PROVISIONING.md`*
     Michael's call. Found deploying the alpha to the re-imaged mesh-pair units: `DEFAULT_SETTINGS`'
     endpoints all defaulted to `deviceName: "Plum Audio"`, and AirPlay's is enabled on RAOP 5050 out
     of the box, so every fresh unit offered an identical receiver — "Plum Audio" twice on the LAN with
-    nothing to tell them apart. Same defect as the unit name (`1cd8701`) one level down. All three
+    nothing to tell them apart. Same defect as the unit name (`2f9c1d9`) one level down. All three
     source endpoints now derive from `PLUM_UNIT_NAME` via `DEFAULT_ENDPOINT_NAME`; Spotify and
     Bluetooth were collision-bound the same way once enabled. Both env-derived defaults are
     `sanitize_device_name`'d **at import**, because `_sanitize_device_names` runs on the write path

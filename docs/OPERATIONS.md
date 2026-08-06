@@ -10,7 +10,7 @@
 docker/build.sh                     # linux/arm64 (native on Apple Silicon) -> dist/plum-audio-<tag>-arm64.tar.gz
 docker/deploy.sh all                # every unit in docker/units.conf
 docker/deploy.sh 192.0.2.10    # one unit
-docker/deploy.sh all --tarball dist/plum-audio-6a64b88-arm64.tar.gz   # a specific build
+docker/deploy.sh all --tarball dist/plum-audio-bfa4812-arm64.tar.gz   # a specific build
 ```
 
 There is no registry. `docker save | gzip -1` + scp + `docker load` beats standing one up for four
@@ -47,7 +47,7 @@ A re-imaged Pi has no dev stack, so the import is skipped and the container writ
   the player opens the DAC column from `units.conf` (`bcm2835` → PortAudio 0 → `hw:0,0`) and echoes
   the resolved card back as `Headphones:0`. Nothing needs choosing in the GUI for audio to work.
 - **`deviceName` and every source endpoint's name come from `PLUM_UNIT_NAME`** (the unit-name column
-  of `units.conf`) — but only since `1cd8701`/`3d90f1d`. Before that every fresh unit came up as
+  of `units.conf`) — but only since `2f9c1d9`/`f381ce3`. Before that every fresh unit came up as
   "Plum Sendspin" offering a "Plum Audio" AirPlay receiver, so a two-unit greenfield mesh showed one
   name twice in the mesh view, the unit cards, mDNS and to a sender. On an older image, rename each
   unit in Settings → General and each endpoint in Settings → Integrations.

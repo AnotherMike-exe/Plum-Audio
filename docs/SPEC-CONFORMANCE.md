@@ -95,7 +95,7 @@ server answers with a fresh `stream/start` carrying a new `codec_header`.
 
 Sample-rate conversion is the library's job and it does it: our sources are 44.1 kHz (AirPlay
 native) and a 48 kHz-only client is served resampled 48 kHz FLAC with no work from us. A
-server-side codec override was written and **reverted** (`f19a428`) — the device that motivated it
+server-side codec override was written and **reverted** (`0d7c6ab`) — the device that motivated it
 turned out not to play from Music Assistant either, so it bought nothing and left us deviating from
 the client-preference rule for no reason. Do not re-add one without a case that survives a
 cross-server check.
@@ -154,7 +154,7 @@ number.
   renderer, is already a member of the playing group — and to a member MA emits the FULL controller
   command set (play/pause/next/previous/stop/volume/mute/repeat/shuffle), metadata, AND the
   visualizer role (256-bin spectrum + loudness), and honors transport commands sent back. This is
-  how Plum observes/controls/visualizes MA-served audio (commit 6148204): the player negotiates
+  how Plum observes/controls/visualizes MA-served audio (commit 8761446): the player negotiates
   PLAYER+METADATA+CONTROLLER+VISUALIZER+ARTWORK and relays to the GUI (album art included). Fully spec-native at the MA boundary.
 - **A freshly connected CONTROLLER (not a member) lands in its OWN solo group, not the session.**
   Resolved 2026-07-23 with MA actively streaming to our player: our player was in MA group

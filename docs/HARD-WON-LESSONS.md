@@ -19,7 +19,7 @@ joins a group, acknowledges our `stream/start` codec header, reports `PLAYING` â
 It also plays nothing from **Music Assistant**, under both FLAC and PCM. Device-side. Chased at
 length 2026-08-04. **Play the device from MA first** before spending a minute blaming our server.
 
-**Server-side codec override: written, then reverted (`f19a428`).** The spec says a client's
+**Server-side codec override: written, then reverted (`0d7c6ab`).** The spec says a client's
 `supported_formats` is in priority order and the server takes the first match it implements;
 aiosendspin does exactly that, and a player that cannot sustain its own choice renegotiates with
 `stream/request-format`. The override existed only for the Voice PE above. Do not re-add it without
