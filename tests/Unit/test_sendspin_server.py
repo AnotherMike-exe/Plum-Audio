@@ -39,10 +39,16 @@ class FakeGroup:
 
     def __init__(self, group_id="g" * 8):
         self.group_id = group_id
+        self.group_name = group_id
         self.calls = []
         self.streams = []
         self.members = []
+        self.has_active_stream = False
         self._roles = {}
+
+    @property
+    def clients(self):
+        return list(self.members)
 
     def start_stream(self, *_a, **_kw):
         self.calls.append("start_stream")
@@ -372,3 +378,49 @@ def test_controller_grouping_is_a_noop_with_no_sources():
     unit = make_unit()
     unit.server.add(FakeClient("ctrl:airplay-1:n1"))
     asyncio.run(unit._maybe_group_controller("ctrl:airplay-1:n1"))  # must not raise
+
+
+# -- headless: the unit that has no speaker ----------------------------------------------------------
+
+
+def test_local_player_config_derives_the_pair_by_default():
+    player_id, url = ss.local_player_config({}, "unit-133")
+    assert player_id == "unit-133-player"
+    assert url == "ws://127.0.0.1:8928/sendspin"
+
+
+def test_local_player_config_honours_explicit_values():
+    env = {"PLUM_LOCAL_PLAYER_ID": "player-133", "PLUM_LOCAL_PLAYER_URL": "ws://10.0.0.9:8928/sendspin"}
+    assert ss.local_player_config(env, "unit-133") == ("player-133", "ws://10.0.0.9:8928/sendspin")
+
+
+def test_the_operator_flag_removes_the_local_player():
+    """deploy.sh writes this from a units.conf row whose DAC column is `none`."""
+    env = {"PLUM_PLAYER_ENABLED": "0", "PLUM_LOCAL_PLAYER_ID": "player-133"}
+    assert ss.local_player_config(env, "unit-133") == (None, None)
+
+
+def test_an_empty_url_also_removes_the_local_player():
+    """The older way of saying it, still used on the dev rig — must keep working."""
+    assert ss.local_player_config({"PLUM_LOCAL_PLAYER_URL": ""}, "unit-133") == (None, None)
+
+
+def test_the_flag_wins_over_an_explicit_url():
+    env = {"PLUM_PLAYER_ENABLED": "0", "PLUM_LOCAL_PLAYER_URL": "ws://10.0.0.9:8928/sendspin"}
+    assert ss.local_player_config(env, "unit-133") == (None, None)
+
+
+def test_a_unit_reports_whether_it_has_a_speaker_at_all():
+    """Not the same question as `players == []`, which is also true for a moment at every boot."""
+    assert ss.PlumSendspinServer("unitA", "A").snapshot().has_player is True
+    assert ss.PlumSendspinServer("unitA", "A", has_player=False).snapshot().has_player is False
+
+
+def test_a_playerless_unit_still_reports_its_sources():
+    """The whole point of the unit: it ingests, and peers route those sources to their own speakers."""
+    unit = make_unit("airplay-1")
+    unit.has_player = False
+    snapshot = unit.snapshot()
+    assert snapshot.has_player is False
+    assert [s.source_id for s in snapshot.sources] == ["airplay-1"]
+    assert snapshot.players == []

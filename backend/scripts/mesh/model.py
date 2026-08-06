@@ -128,6 +128,15 @@ class UnitSnapshot:
     # another server — a peer unit, Music Assistant, any Sendspin server — would otherwise just
     # disappear. The self-report is how the GUI keeps seeing it, and learns what it is playing.
     local_player: dict | None = None
+    # Does this unit have an audio output at all? False for an ingest/routing-only node — no player
+    # process, no local speaker, nothing to route audio ONTO. It is not the same question as
+    # `players == []` or `local_player is None`, both of which are also true for a moment at boot
+    # and while a speaker is claimed by another server. Every consumer that has to tell "no speaker
+    # here, ever" from "no speaker right now" keys off this.
+    #
+    # DEFAULTS TRUE, deliberately: a peer running an older image sends a snapshot without the field,
+    # and reading that as "playerless" would make every existing unit look like an ingest node.
+    has_player: bool = True
 
     def to_dict(self) -> dict:
         return {
@@ -137,6 +146,7 @@ class UnitSnapshot:
             "sources": [s.to_dict() for s in self.sources],
             "players": [p.to_dict() for p in self.players],
             "local_player": self.local_player,
+            "has_player": self.has_player,
         }
 
     @classmethod
@@ -148,6 +158,7 @@ class UnitSnapshot:
             sources=[SourceState.from_dict(s) for s in d.get("sources", [])],
             players=[PlayerState.from_dict(p) for p in d.get("players", [])],
             local_player=d.get("local_player"),
+            has_player=bool(d.get("has_player", True)),
         )
 
 

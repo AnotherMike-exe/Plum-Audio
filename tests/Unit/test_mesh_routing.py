@@ -164,3 +164,35 @@ def test_genuinely_unknown_player_still_raises():
     router = Router("unitA", FakeEngine(), view_provider=_view_with_idle_player, peer_provider=PEERS.get)
     with pytest.raises(RouteError):
         asyncio.run(router.route_player("ghost", "airplay"))
+
+
+# -- has_player on the wire ------------------------------------------------------------------------
+
+
+def test_has_player_defaults_true_for_a_peer_on_an_older_image():
+    """Wire compat, and it is not cosmetic.
+
+    A peer that predates this field sends no `has_player`. Reading that as "playerless" would make
+    every existing unit look like an ingest-only node — and FollowReconciler would start deriving
+    their leader stream from sources instead of their self-reported player.
+    """
+    snap = UnitSnapshot.from_dict(
+        {"unit_id": "unit-113", "name": "Pi4-01", "host": "10.0.0.1", "sources": [], "players": []}
+    )
+    assert snap.has_player is True
+
+
+def test_has_player_survives_a_round_trip():
+    original = UnitSnapshot("unit-hl", "Headless", host="10.0.0.9", has_player=False)
+    assert UnitSnapshot.from_dict(original.to_dict()).has_player is False
+
+
+def test_routing_onto_a_playerless_unit_is_refused():
+    """There is no speaker to route onto — the correct answer is an error, not a silent no-op."""
+    headless = UnitSnapshot("unit-hl", "Headless", host="10.0.0.9", has_player=False,
+                            sources=[SourceState("airplay", "g9", "AirPlay", True, [])])
+    view = MeshView([headless])
+    router = Router("unit-hl", FakeEngine(), view_provider=lambda: view, peer_provider=lambda _u: None)
+
+    with pytest.raises(RouteError):
+        asyncio.run(router.route_player("unit-hl-player", "airplay"))

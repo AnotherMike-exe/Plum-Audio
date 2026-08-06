@@ -313,10 +313,14 @@ class SourceHandle:
 class PlumSendspinServer:
     """Owns the unit's SendspinServer and its per-source feeders/groups."""
 
-    def __init__(self, unit_id: str, unit_name: str, port: int = SERVER_PORT) -> None:
+    def __init__(self, unit_id: str, unit_name: str, port: int = SERVER_PORT, *, has_player: bool = True) -> None:
         self.unit_id = unit_id
         self.unit_name = unit_name
         self.port = port
+        # False on an ingest/routing-only unit: no player process, no local speaker, and nothing for
+        # a peer to route audio onto. Travels in the snapshot so peers can tell "no speaker here,
+        # ever" from "no speaker connected right now" — see UnitSnapshot.has_player.
+        self.has_player = has_player
         self.server: SendspinServer | None = None
         self.sources: dict[str, SourceHandle] = {}
         # What each speaker calls itself over the protocol, keyed by listener URL and persisted.
@@ -781,7 +785,14 @@ class PlumSendspinServer:
                     )
                 )
 
-        return UnitSnapshot(unit_id=self.unit_id, name=self.unit_name, host=None, sources=sources, players=players)
+        return UnitSnapshot(
+            unit_id=self.unit_id,
+            name=self.unit_name,
+            host=None,
+            sources=sources,
+            players=players,
+            has_player=self.has_player,
+        )
 
     def start_airplay_metadata(self, source_id: str, metadata_fifo: str) -> None:
         """Attach the shairport metadata/artwork → Sendspin roles reader to a source's group."""
@@ -1152,6 +1163,26 @@ class PlumSendspinServer:
             await asyncio.sleep(1.0)
 
 
+def local_player_config(env: dict, unit_id: str) -> tuple[str | None, str | None]:
+    """(player id, player URL) for this unit's own speaker — (None, None) if it has none.
+
+    Extracted from main() because it is the hinge of headless mode and main() cannot be unit-tested.
+    A unit with no audio output has no player process at all (output_gate.py decided that before
+    supervisord started), so there is nothing to register, nothing to dial, and nothing for a peer to
+    route audio onto.
+
+    PLUM_PLAYER_ENABLED is the container-level answer, written by deploy.sh from the units.conf row,
+    and the entrypoint sets it from the gate. The empty-URL check stays as a second way to say the
+    same thing — it predates the flag and the dev rig still uses it.
+    """
+    if env.get("PLUM_PLAYER_ENABLED", "1") == "0":
+        return None, None
+    url = env.get("PLUM_LOCAL_PLAYER_URL", "ws://127.0.0.1:8928/sendspin")
+    if not url:
+        return None, None
+    return env.get("PLUM_LOCAL_PLAYER_ID", f"{unit_id}-player"), url
+
+
 async def main() -> None:
     logging.basicConfig(
         level=os.environ.get("PLUM_LOG_LEVEL", "INFO"),
@@ -1164,12 +1195,11 @@ async def main() -> None:
     # Single-unit glue: auto-attach our own player to this source once it comes up. Empty URL
     # disables it (Phase 2: the mesh orchestrator drives routing instead).
     home_source = os.environ.get("PLUM_LOCAL_PLAYER_SOURCE", "airplay-1")
-    local_player_id = os.environ.get("PLUM_LOCAL_PLAYER_ID", f"{unit_id}-player")
-    local_player_url = os.environ.get("PLUM_LOCAL_PLAYER_URL", "ws://127.0.0.1:8928/sendspin")
+    local_player_id, local_player_url = local_player_config(os.environ, unit_id)
 
     mesh_enabled = os.environ.get("PLUM_MESH_ENABLED", "1") != "0"
 
-    srv = PlumSendspinServer(unit_id, unit_name)
+    srv = PlumSendspinServer(unit_id, unit_name, has_player=local_player_id is not None)
     await srv.start()
 
     # Sources are config-driven: each manager owns a Sendspin source + the daemon process(es) per
@@ -1179,7 +1209,12 @@ async def main() -> None:
     for manager in managers:
         manager.start()
 
-    if local_player_url:
+    if local_player_id is None:
+        # Ingest/routing only. Skipping register_player matters beyond tidiness: it dials with
+        # retry_initial_connection=True, so on a unit with no player that is a permanent reconnect
+        # loop against a port nothing is listening on.
+        logger.info("no local player on this unit — ingesting and routing only")
+    elif local_player_url:
         if mesh_enabled:
             # Register the player so peers can reclaim it and the mesh can route it, but leave it
             # IDLE. Where it goes is owned by the autoSwitch settings (localActivity auto-route /
@@ -1206,9 +1241,13 @@ async def main() -> None:
         )
         await mesh.start()
 
-    # Auto-route-on-connect + auto-follow ("slave" mode) — only meaningful with the mesh present.
+    # Auto-route-on-connect + auto-follow ("slave" mode) — only meaningful with the mesh present, and
+    # only on a unit that HAS a speaker. Both paths end in routing local_player_id; with no player
+    # that is a RouteError per source activation (localActivity) or, in slave mode, a re-route every
+    # tick forever, because a failed route never sets _last_auto_target and the override guard then
+    # compares None against None. A playerless unit still LEADS — peers read that from our snapshot.
     follow = None
-    if mesh is not None:
+    if mesh is not None and local_player_id is not None:
         from mesh.follow import FollowReconciler  # local import: avoids an import cycle
 
         follow = FollowReconciler(
