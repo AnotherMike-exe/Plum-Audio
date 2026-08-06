@@ -319,15 +319,17 @@ debugging cookbook are in **`docs/OPERATIONS.md`**.
 
 16. **Card-identity hardening — what is still open** (audit 2026-08-06; the confirmed-dangerous ones
     are fixed, see HARD-WON-LESSONS). Ranked:
-    - **A failed output switch is never retried.** `watch_output_device` advances `current` *before*
-      calling `on_change`, and `reopen` failing is terminal — so a card that is briefly unopenable
-      during a switch leaves the unit on the old device (or silent) and it will not self-heal even
-      once the card is back. GUI shows `pending` forever. Most likely of these to bite.
-    - **`renderer.device` records the REQUEST, not the card actually opened** (`sendspin_player.py`
-      `_open`), and that is what is echoed to `player_state.json`. So `pending` compares a string to
-      itself and is *structurally* unable to detect "opened, but on the wrong card". Fixing means
-      echoing the resolved `<card_name>:<device>` — careful, `reopen`'s no-op check compares against
-      the same field.
+    - ~~A failed output switch is never retried~~ — **fixed 2026-08-06.** `watch_output_device` now
+      holds its baseline until `on_change` reports success (False or a raise = retry), so a card
+      that is merely late is picked up on the next tick instead of stranding the unit until a human
+      toggles the setting. Logging throttles after the first few attempts. Returning None still
+      counts as success.
+    - ~~`renderer.device` records the REQUEST, not the card actually opened~~ — **fixed 2026-08-06.**
+      `AlsaRenderer.open_device` carries the RESOLVED `<card_name>:<device>` and is what is echoed to
+      `player_state.json`; `device` still holds the requested spec, so `reopen`'s no-op check is
+      unchanged. `pending` can now detect "opened, but on a different card than intended" — exactly
+      what a stale `hw:C,D` produces after a renumber. None when resolution found nothing and
+      PortAudio name-matched the raw spec: unknown beats invented.
     - **`_open`'s raw-spec fallback can open the wrong card.** When `aplay -l` fails, resolution
       returns nothing and the raw spec goes to PortAudio, whose names embed `(hw:C,D)` — so an
       `hw:2,0` substring-matches whatever is at that address now and opens it, with one warning.
@@ -359,12 +361,12 @@ debugging cookbook are in **`docs/OPERATIONS.md`**.
     Ruled OUT: `refresh_stream`. The server re-acquired the stream only 3 times in the whole log,
     each right after a container restart, so steady playback is not churning the group. The player
     logs no xruns and no starvation.
-    **The amplifier is `sendspinControllerClient.open()`**: `reconnectAttempts = 0` is reset in
-    `onopen`, the instant the socket opens rather than once it has proven STABLE. So a socket that
-    dies shortly after connecting resets the counter every cycle and the backoff is pinned at
-    `RECONNECT_BASE_MS` (1 s) forever — the exponential backoff can never engage on a flapping
-    connection. That is a real flaw regardless of the trigger, and it turns any brief instability
-    into a permanent 3-second sawtooth.
+    ~~The amplifier is `sendspinControllerClient.open()`~~ — **fixed 2026-08-06.** `reconnectAttempts`
+    was reset in `onopen`, the instant the socket opened rather than once it had proven stable, so a
+    socket dying shortly after connecting reset the counter every cycle and retried at a flat 1 s
+    forever. Now forgiven only after `RECONNECT_STABLE_MS` (10 s) of survival. This removes the
+    AMPLIFIER, not the cause — a real trigger will now present as a visibly SLOWING retry rather
+    than a fixed 3-second sawtooth, which is more diagnosable, not less.
     **STATUS 2026-08-06: not reproducing on `e5f1bfc`.** Michael reports it looks good with that
     build deployed, after the localActivity/slave ping-pong fix (#13) and the layout fixes landed.
     That is an observation from watching, NOT a measurement, and the sawtooth above WAS measured on
