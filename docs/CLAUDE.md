@@ -258,7 +258,12 @@ debugging cookbook are in **`docs/OPERATIONS.md`**.
    independent bugs that fixtures could not have caught: it left an out-of-block `dtparam=audio=off`
    armed, and omitting `audio=off` is not the same as asking for `audio=on` (the firmware default is
    off). Both fixed and verified across a reboot.
-5. **Visualizer, About and the Integrations tab still have no visual review under a live stream.**
+5. **Reviewed in-browser on `.7.204` 2026-08-06 — but with NOTHING PLAYING.** The visualizer under a
+   live stream and album-art theming are therefore still unverified; that half of this item stands.
+   Settings → Integrations / Audio / Playback / Theme / Visualizer all render correctly. The review
+   found two real defects, both fixed: the About tab was unported from Plum-Snapcast wholesale, and
+   the DLNA console errors in item 1. Card numbers had moved again — the HiFiBerry is now `hw:3,0`.
+   Original note:
    Confirmed live on 2026-08-05: AirPlay/Spotify/Bluetooth end to end, cross-routing in both
    directions with two concurrent groups, the source-volume slider, rename propagation, adopt/release
    of a third-party speaker, and switching output between the HAT and the 3.5 mm jack.
