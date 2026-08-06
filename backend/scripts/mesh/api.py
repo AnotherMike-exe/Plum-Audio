@@ -32,6 +32,7 @@ import logging
 
 from aiohttp import web
 
+import cors_policy
 from mesh.aggregator import DataAggregator
 from mesh.router import Router, RouteError
 from sync_engine.base import SyncEngine
@@ -42,16 +43,50 @@ logger = logging.getLogger("plum.mesh.api")
 DEFAULT_API_PORT = 5001
 
 
-@web.middleware
-async def _cors(request: web.Request, handler):
-    if request.method == "OPTIONS":
-        resp = web.Response()
-    else:
-        resp = await handler(request)
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    return resp
+def make_cors_middleware(hosts_provider):
+    """CORS restricted to origins a Plum GUI is actually served from.
+
+    `hosts_provider()` returns the currently-known host set — read per request, not captured once,
+    because peers come and go and a unit discovered after start-up must still be able to drive this
+    one from its own page.
+
+    The GUI POSTs cross-origin to :5001 for EVERY unit including the one serving the page (its GETs
+    go through nginx same-origin), so "self" has to be in the set too, or the very page you are
+    looking at loses route/volume/adopt.
+
+    Requests with NO Origin — peer snapshot polls, delegated routes, the loopback player-state POST —
+    pass through untouched. They are not browser requests and CORS never applied to them; refusing
+    them would break mesh aggregation from the inside with nothing visible in any browser.
+    """
+
+    @web.middleware
+    async def _cors(request: web.Request, handler):
+        origin = request.headers.get("Origin")
+        allow = cors_policy.origin_header(origin, hosts_provider())
+
+        if request.method == "OPTIONS":
+            resp = web.Response()
+        else:
+            resp = await handler(request)
+
+        if allow is not None:
+            resp.headers["Access-Control-Allow-Origin"] = allow
+            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+            # Preflights are otherwise re-sent for every POST; the allowlist changes on the scale of
+            # units joining the mesh, not seconds.
+            resp.headers["Access-Control-Max-Age"] = "600"
+            resp.headers["Vary"] = "Origin"
+        elif origin:
+            # Loud on purpose. This is the failure mode that takes the mesh view down on every unit
+            # at once, and the fix (PLUM_ALLOWED_ORIGINS) needs to know exactly what was rejected.
+            logger.warning(
+                "CORS: refused origin %r (known hosts: %s) — set PLUM_ALLOWED_ORIGINS to allow it",
+                origin, ", ".join(sorted(hosts_provider())) or "none",
+            )
+        return resp
+
+    return _cors
 
 
 class MeshApi:
@@ -80,8 +115,19 @@ class MeshApi:
         self._last_ctrl: dict | None = None  # cache so a GUI that connects mid-session gets it
         self._last_art: dict | None = None   # ditto for album art (per-track, low rate)
 
+    def _known_hosts(self) -> set[str]:
+        """Every host a Plum GUI on this mesh can legitimately be served from, right now.
+
+        Derived from the aggregator's view rather than the discovery table: the view already carries
+        this unit's OWN host (which the peer table never does — a unit ignores its own beacon), and
+        that entry is exactly the one whose absence would break the page being looked at.
+        """
+        with contextlib.suppress(Exception):
+            return cors_policy.known_hosts(self._agg.view().units)
+        return set(cors_policy.LOOPBACK_HOSTS)
+
     async def start(self) -> None:
-        app = web.Application(middlewares=[_cors])
+        app = web.Application(middlewares=[make_cors_middleware(self._known_hosts)])
         app.add_routes(
             [
                 web.get("/api/mesh/snapshot", self._snapshot),

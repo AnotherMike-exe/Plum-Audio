@@ -45,6 +45,7 @@ import functools
 import logging
 import os
 import signal
+import socket
 import time
 
 from aiosendspin.models.types import GoodbyeReason, MediaCommand, has_role_family
@@ -792,6 +793,7 @@ class PlumSendspinServer:
             sources=sources,
             players=players,
             has_player=self.has_player,
+            hostname=socket.gethostname(),
         )
 
     def start_airplay_metadata(self, source_id: str, metadata_fifo: str) -> None:

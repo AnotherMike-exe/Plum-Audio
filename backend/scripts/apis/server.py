@@ -4,31 +4,79 @@ Flask host for Plum-Audio's config REST APIs.
 
 Runs on port 5002 as a SEPARATE process from the mesh API (aiohttp on 5001). The mesh API must live
 in the audio event loop (it calls the async router/aggregator), so WSGI Flask can't share it — hence
-two processes. This host currently mounts the settings blueprint; the integrations/audio blueprints
-slot in here alongside their Phase-3 source services.
+two processes. This host mounts the settings, integrations and audio blueprints.
+
+CORS here is far simpler than on :5001, because of a fact worth stating plainly: **nothing in the
+frontend ever calls a PEER's :5002.** Settings, integrations and audio are all same-origin through
+nginx. So this port only needs to recognise pages served by THIS unit — its own IP, its own
+hostname, loopback, and whatever `PLUM_ALLOWED_ORIGINS` adds for a dev server. The mesh API's
+peer-derived host set is not needed and would be a needless dependency on the audio process.
 """
 
 import logging
 import os
+import socket
+import sys
 
-from flask import Flask
-from flask_cors import CORS
+from flask import Flask, request
 
-from audio_api import create_audio_blueprint
-from integrations_api import create_integrations_blueprint
-from settings_api import SettingsManager, create_settings_blueprint
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/ on path
+import cors_policy  # noqa: E402
+
+from audio_api import create_audio_blueprint  # noqa: E402
+from integrations_api import create_integrations_blueprint  # noqa: E402
+from settings_api import SettingsManager, create_settings_blueprint  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 
+def _own_hosts() -> set[str]:
+    """Host forms that mean "this box" — recomputed per request, since a rename applies live.
+
+    A unit's mDNS hostname is user-editable from the GUI (Settings -> Device), and the rename takes
+    effect without restarting this process. Caching this set at start-up would lock the config API
+    to the OLD name and lock the user out of the page they just renamed.
+    """
+    hosts = set(cors_policy.LOOPBACK_HOSTS)
+    try:
+        name = socket.gethostname()
+    except OSError:
+        return hosts
+    hosts |= cors_policy.name_forms(name)
+    try:
+        hosts.add(socket.gethostbyname(name))
+    except OSError:
+        # A box that cannot resolve its own name is normal under host networking; the page is then
+        # reached by IP, and nginx forwards that Origin, so the mesh API's view-derived set covers it.
+        pass
+    return hosts
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
-    CORS(app)  # blanket CORS — the GUI is served from a different origin (Vite dev / proxy)
     # One SettingsManager shared across blueprints so settings + integrations read/write the same file.
     settings_manager = SettingsManager()
     app.register_blueprint(create_settings_blueprint(settings_manager))
     app.register_blueprint(create_integrations_blueprint(settings_manager))
     app.register_blueprint(create_audio_blueprint(settings_manager))
+
+    @app.after_request
+    def _cors(response):
+        # No Origin: not a browser request. CORS never applied — add nothing, refuse nothing.
+        origin = request.headers.get("Origin")
+        allow = cors_policy.origin_header(origin, _own_hosts())
+        if allow is not None:
+            response.headers["Access-Control-Allow-Origin"] = allow
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+            response.headers["Access-Control-Max-Age"] = "600"
+            response.headers["Vary"] = "Origin"
+        elif origin:
+            logger.warning(
+                "CORS: refused origin %r — set PLUM_ALLOWED_ORIGINS to allow it", origin
+            )
+        return response
+
     return app
 
 

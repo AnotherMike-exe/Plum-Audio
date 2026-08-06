@@ -137,6 +137,11 @@ class UnitSnapshot:
     # DEFAULTS TRUE, deliberately: a peer running an older image sends a snapshot without the field,
     # and reading that as "playerless" would make every existing unit look like an ingest node.
     has_player: bool = True
+    # What this unit calls itself on the network (socket.gethostname()). Peers only ever learn each
+    # other's IPs from the beacon, but a person reaches the GUI at `plum-amp100.local` — so without
+    # this a peer cannot recognise a page served BY this unit as a legitimate origin. See
+    # cors_policy.known_hosts.
+    hostname: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -147,6 +152,7 @@ class UnitSnapshot:
             "players": [p.to_dict() for p in self.players],
             "local_player": self.local_player,
             "has_player": self.has_player,
+            "hostname": self.hostname,
         }
 
     @classmethod
@@ -159,6 +165,7 @@ class UnitSnapshot:
             players=[PlayerState.from_dict(p) for p in d.get("players", [])],
             local_player=d.get("local_player"),
             has_player=bool(d.get("has_player", True)),
+            hostname=d.get("hostname"),
         )
 
 
