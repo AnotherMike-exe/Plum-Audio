@@ -40,7 +40,15 @@ _SETTINGS_LOCK = threading.RLock()
 # shape); `version` increments on every update so the GUI's poller detects changes.
 DEFAULT_SETTINGS = {
     "version": 1,
-    "deviceName": "Plum Sendspin",
+    # PLUM_UNIT_NAME first, for the same reason `audio.output` below is empty: this default is WRITTEN
+    # to settings.json on the first read, so a concrete literal here outranks the env on every unit at
+    # once and permanently. unit_identity.py documents the precedence as
+    # `settings.json deviceName > PLUM_* env > DEFAULT_DEVICE_NAME`, and with a literal here the env
+    # tier was unreachable — a freshly imaged unit came up as "Plum Sendspin" no matter what
+    # units.conf said. Two greenfield units then appear under ONE name in the mesh view, the GUI and
+    # mDNS, which is indistinguishable from a discovery bug. Found deploying the alpha to the .201
+    # units, 2026-08-06. A GUI rename still wins, and still only needs writing once.
+    "deviceName": os.environ.get("PLUM_UNIT_NAME", "").strip() or "Plum Sendspin",
     "hostname": "plum-audio",
     "integrations": {
         "airplay": {

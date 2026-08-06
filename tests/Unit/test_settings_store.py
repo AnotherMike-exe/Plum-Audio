@@ -19,6 +19,7 @@ one, because Flask serves this API with threaded=True.
 Run: `pytest tests/Unit/test_settings_store.py`.
 """
 
+import importlib
 import json
 import sys
 import threading
@@ -30,6 +31,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "backend" / "scripts"))
 sys.path.insert(0, str(REPO / "backend" / "scripts" / "apis"))
 
+import settings_api  # noqa: E402  — the module itself, for DEFAULT_SETTINGS and reload
 from settings_api import SettingsManager, sanitize_device_name  # noqa: E402
 
 
@@ -58,7 +60,33 @@ def test_read_on_a_damaged_file_still_answers_defaults(manager):
     """The read path keeps its never-raise contract, so the GUI renders something."""
     Path(manager.settings_file).write_text("{ this is not json")
     settings = manager.get_settings()
-    assert settings["deviceName"] == "Plum Sendspin"
+    # Against the module's own default, not a literal: that default now derives from PLUM_UNIT_NAME
+    # (see below), so a literal here fails for the wrong reason whenever the var is set in the
+    # environment the suite runs in.
+    assert settings["deviceName"] == settings_api.DEFAULT_SETTINGS["deviceName"]
+
+
+def test_an_unnamed_unit_boots_under_its_PLUM_UNIT_NAME(monkeypatch):
+    """The env tier of unit_identity's documented precedence has to actually be reachable.
+
+    DEFAULT_SETTINGS is WRITTEN to settings.json on the first read, so a hardcoded literal outranks
+    PLUM_UNIT_NAME permanently and on every unit at once. That made two freshly imaged units both
+    come up as "Plum Sendspin" — one name for two units in the mesh view, the GUI and mDNS, which
+    reads as a discovery bug. Found deploying the alpha to the .201 units, 2026-08-06.
+
+    Reloaded rather than monkeypatched in place: the default is evaluated at import.
+    """
+    monkeypatch.setenv("PLUM_UNIT_NAME", "Pi4-02")
+    reloaded = importlib.reload(settings_api)
+    try:
+        assert reloaded.DEFAULT_SETTINGS["deviceName"] == "Pi4-02"
+
+        monkeypatch.delenv("PLUM_UNIT_NAME")
+        assert importlib.reload(settings_api).DEFAULT_SETTINGS["deviceName"] == "Plum Sendspin"
+    finally:
+        # Leave the module as the rest of the suite expects to find it.
+        monkeypatch.delenv("PLUM_UNIT_NAME", raising=False)
+        importlib.reload(settings_api)
 
 
 def test_a_missing_file_is_not_damage(manager):
