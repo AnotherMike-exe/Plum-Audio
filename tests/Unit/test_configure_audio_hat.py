@@ -20,6 +20,7 @@ Four bugs, all found on hardware on 2026-08-04, all cheap to have caught here:
 Run: `pytest tests/Unit/test_configure_audio_hat.py`.
 """
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -121,6 +122,59 @@ def test_onboard_audio_is_commented_out_by_default(tmp_path):
     run(path, "--overlay", "hifiberry-dac")
 
     assert "#plum-audio-disabled: dtparam=audio=on" in path.read_text()
+
+
+# A unit configured BEFORE this script existed: someone followed HiFiBerry's own instructions and
+# added `dtparam=audio=off` by hand, outside anything we manage. Taken verbatim from .7.204.
+HAND_DISABLED = """\
+dtparam=i2c_arm=on
+
+# HiFiBerry AMP100 - disabling onboard audio as recommended
+dtparam=audio=off
+
+camera_auto_detect=1
+dtoverlay=vc4-kms-v3d
+max_framebuffers=2
+"""
+
+
+def test_keep_onboard_disarms_a_hand_written_audio_off(tmp_path):
+    """--keep-onboard has to REMOVE an existing off, not merely decline to add one.
+
+    The block is the only region this script rewrites, so a `dtparam=audio=off` anywhere else in the
+    file still kills the jack. On .7.204 exactly that line sat 17 lines above the managed block, and
+    without this the flag would have "run successfully" and changed nothing observable.
+    """
+    path = tmp_path / "config.txt"
+    path.write_text(HAND_DISABLED)
+    run(path, "--overlay", "hifiberry-amp100", "--keep-onboard")
+
+    text = path.read_text()
+    assert "#plum-audio-disabled: dtparam=audio=off" in text, "the hand-written off must be disarmed"
+    assert not re.search(r"^\s*dtparam=audio=off\s*$", text, re.M), "no live audio=off may remain"
+
+
+def test_the_default_still_leaves_a_hand_written_audio_off_alone(tmp_path):
+    """Without --keep-onboard, an existing off is already what we want — do not churn it."""
+    path = tmp_path / "config.txt"
+    path.write_text(HAND_DISABLED)
+    run(path, "--overlay", "hifiberry-amp100")
+
+    text = path.read_text()
+    assert "#plum-audio-disabled: dtparam=audio=off" not in text
+    block = text.split("# >>> plum-audio hat")[1].split("# <<< plum-audio hat")[0]
+    assert "dtparam=audio=off" in block
+
+
+def test_revert_puts_a_disarmed_audio_off_back(tmp_path):
+    """--revert is meant to be exact, in both directions."""
+    path = tmp_path / "config.txt"
+    original = HAND_DISABLED
+    path.write_text(original)
+    run(path, "--overlay", "hifiberry-amp100", "--keep-onboard")
+    run(path, "--revert")
+
+    assert path.read_text() == original
 
 
 # -- adoption ----------------------------------------------------------------------------------

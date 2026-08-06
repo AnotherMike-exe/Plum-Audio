@@ -76,6 +76,7 @@ from sources.spotify_manager import SpotifyManager
 
 import unit_identity
 from lifecycle import install_shutdown_handlers
+from speaker_names import SpeakerNames
 
 logger = logging.getLogger("plum.sendspin_server")
 
@@ -318,6 +319,9 @@ class PlumSendspinServer:
         self.port = port
         self.server: SendspinServer | None = None
         self.sources: dict[str, SourceHandle] = {}
+        # What each speaker calls itself over the protocol, keyed by listener URL and persisted.
+        # Attached is the only time a handshake name is observable — see speaker_names.py.
+        self._speaker_names = SpeakerNames()
         self._primary_source: str | None = None  # source group that controller-only clients join
         self._local_player_tasks: list[asyncio.Task] = []
         self._metadata_readers: dict[str, AirplayMetadataReader] = {}  # source_id -> shairport pipe reader
@@ -748,13 +752,19 @@ class PlumSendspinServer:
                 # set_volume() alone does not move it, so this is the endpoint's real gain, not our
                 # last command. See sendspin_player._publish_render_state.
                 role = next((r for r in client.roles_by_family("player") if isinstance(r, PlayerV1Role)), None)
+                client_url = self.server.get_client_url(client.client_id)
+                # Remember what this speaker calls itself, against its listener URL. Attached is the
+                # ONLY time a handshake name is visible, and mDNS gives a third-party device's bare
+                # instance name once it goes idle — so without this the GUI has nothing to show but
+                # "home-assistant-voice-a1b2c3". `learn` is a no-op unless the pair actually changed.
+                self._speaker_names.learn(client_url, client.name)
                 players.append(
                     PlayerState(
                         player_id=client.client_id,
                         name=client.name or client.client_id,
                         connected=True,
                         group_id=client.group.group_id if client.group is not None else None,
-                        url=self.server.get_client_url(client.client_id),
+                        url=client_url,
                         volume=int(getattr(role, "volume", 100)) if role is not None else 100,
                         muted=bool(getattr(role, "muted", False)) if role is not None else False,
                     )

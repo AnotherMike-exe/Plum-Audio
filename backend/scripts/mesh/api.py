@@ -35,6 +35,7 @@ from aiohttp import web
 from mesh.aggregator import DataAggregator
 from mesh.router import Router, RouteError
 from sync_engine.base import SyncEngine
+from speaker_names import SpeakerNames
 
 logger = logging.getLogger("plum.mesh.api")
 
@@ -64,6 +65,9 @@ class MeshApi:
         self._agg = aggregator
         self._router = router
         self._neighbourhood = neighbourhood
+        # Read-only here: the audio process learns these while a speaker is attached (see
+        # sendspin_server.snapshot). Its own instance, so a reload picks up whatever is on disk.
+        self._speaker_names = SpeakerNames()
         self.port = port
         self._runner: web.AppRunner | None = None
         # Consume relay: the local player (producer) forwards what it observes as a group MEMBER of
@@ -233,7 +237,24 @@ class MeshApi:
         """
         if self._neighbourhood is None:
             return web.json_response({"players": [], "servers": []})
-        return web.json_response(self._neighbourhood.to_dict())
+        payload = self._neighbourhood.to_dict()
+
+        # Announce an idle speaker under the name it actually calls ITSELF, not its mDNS instance
+        # name. A handshake name is only observable while the speaker is attached, and a third-party
+        # device typically publishes no `name` TXT key — so mDNS alone gives
+        # "home-assistant-voice-a1b2c3" for something that calls itself "Home Assistant Voice PE - 01".
+        #
+        # The GUI used to memoise this itself, in localStorage: per-browser, per-origin, and blank
+        # until that particular tab had watched that particular speaker attach. Doing it here makes
+        # one answer for every client, and needs no GUI change at all — it already prefers
+        # `friendly_name`. See speaker_names.py.
+        names = self._speaker_names.all()
+        if names:
+            for entry in payload.get("players", []):
+                learned = names.get(entry.get("url"))
+                if learned:
+                    entry["friendly_name"] = learned
+        return web.json_response(payload)
 
     async def _route(self, request: web.Request) -> web.Response:
         body = await self._json(request)

@@ -46,8 +46,10 @@
 # WHAT IT DOES
 #   Writes an idempotent, clearly-marked block into /boot/firmware/config.txt (or /boot/config.txt on
 #   older images). Everything outside the markers is left exactly as found; re-running rewrites only
-#   the block. A conflicting `dtparam=audio=on` outside the block is commented out, with the original
-#   line preserved beside it, because the onboard codec otherwise competes for card 0.
+#   the block. A conflicting `dtparam=audio=` outside the block is commented out, with the original
+#   line preserved beside it: `audio=on` by default (the onboard codec otherwise competes for card 0)
+#   and `audio=off` under --keep-onboard (an `off` anywhere in the file kills the jack, and the block
+#   is the only part this script rewrites — so not writing `off` into the block is not enough).
 #
 # USAGE (on the unit, as root)
 #   sudo ./configure-audio-hat.sh --list                 # supported overlays
@@ -341,6 +343,18 @@ main() {
     if [[ "$KEEP_ONBOARD" == 0 ]]; then
         # Comment rather than delete, and keep the original text, so --revert is exact.
         edit_in_place "$CONFIG" 's|^\([[:space:]]*dtparam=audio=on[[:space:]]*\)$|#plum-audio-disabled: \1|'
+    else
+        # ...and the mirror image, which is what --keep-onboard actually has to do to work.
+        #
+        # Refraining from writing `dtparam=audio=off` into the block is NOT enough: a
+        # `dtparam=audio=off` sitting OUTSIDE the block still kills the jack, and the block is the
+        # only thing this script rewrites. Found on .7.204, where a hand edit predating this script
+        # ("HiFiBerry AMP100 - disabling onboard audio as recommended") sat at line 11 while the
+        # managed block was at line 28 — so --keep-onboard would have left the card missing and
+        # looked like the flag simply did not work.
+        #
+        # Same #plum-audio-disabled: marker as the other direction, so --revert restores it verbatim.
+        edit_in_place "$CONFIG" 's|^\([[:space:]]*dtparam=audio=off[[:space:]]*\)$|#plum-audio-disabled: \1|'
     fi
 
     # POSITION MATTERS — do not "simplify" this to an append.
