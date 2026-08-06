@@ -43,7 +43,7 @@ image compares as different across units.
 
 ## Phase 3 — remaining sources, GUI, container (`feature/phase3-sources-gui`, in progress)
 
-### Alpha deployment onto bare Raspberry Pi OS Lite — 2026-08-06 (`8e255a9`)
+### Alpha deployment onto bare Raspberry Pi OS Lite — 2026-08-06 (`3d90f1d`)
 
 **The first deploy onto units carrying nothing but a stock image.** `.201.133` and `.201.113` were
 re-flashed to Raspberry Pi OS Lite 64-bit (Debian 13 trixie, kernel 6.18.34, arm64), then taken to a
@@ -89,6 +89,18 @@ on VLAN 201.
 Sections 1 (audio HAT) and 4 (mask the user obexd) of the checklist were correctly **no-ops** here —
 no HAT fitted, and Pi OS Lite does not ship `obex.service`. Both are now documented as such, because
 "not-found" and "no HAT card found" read like failures otherwise.
+
+The AVRCP patch series **applies cleanly to bluez 5.82-1.1+rpt1**, which is newer than the version it
+was written against; both units now run `5.82-1.1+rpt1+plum1`, held. Each build took ~28 min at 2
+jobs, peaked at load ~2.0, and reported `throttled=0x0` throughout, at 42 °C and 64 °C — so the
+brown-out trap from 2026-07-29 stays a `-j$(nproc)` problem, not a 2-job one.
+
+**Known cosmetic artifact, not fixed.** `audio_devices.configured_output_spec` logs a full
+`FileNotFoundError` traceback at WARNING when `settings.json` does not exist yet, then falls back to
+`PLUM_DAC_DEVICE` correctly. A missing file is a legitimate state ("no file at all means defaults" —
+`test_a_missing_file_is_not_damage`), so this is noise, but it races the config API's first write on a
+greenfield boot and appeared on `.133` and not `.113`. Worth distinguishing "missing" from "damaged"
+there, given how much this project has paid for misread logs.
 
 ### GUI polish pass — 2026-08-05 (`8dfaca2`..`6a64b88`)
 
