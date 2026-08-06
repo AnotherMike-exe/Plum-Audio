@@ -17,12 +17,20 @@
 # is `docker compose down` on the unit plus ~/plum-test/run_*.sh, with no restore step.
 set -euo pipefail
 
+INVOKED_FROM="$PWD"          # captured BEFORE the cd — see the --tarball resolution below
 cd "$(dirname "$0")"
 HERE="$PWD"
 
 USER_="${PLUM_TEST_USER:-plum-admin}"
 PW="${PLUM_TEST_PW:-REDACTED-USE-PLUM_TEST_PW}"
-SSH_OPTS="-o ConnectTimeout=20 -o StrictHostKeyChecking=no -o LogLevel=ERROR"
+# UserKnownHostsFile=/dev/null, not just StrictHostKeyChecking=no: a REIMAGED unit presents a new
+# host key, and a conflicting known_hosts entry makes ssh refuse the connection outright — password
+# auth is disabled in that state, so the deploy fails on the very first ssh of every unit with a
+# man-in-the-middle warning. StrictHostKeyChecking=no only covers a host ssh has never seen. Since
+# the password is in this file there is no key-pinning posture to preserve, and the alternative is
+# telling the operator to run ssh-keygen -R by hand on exactly the runs (a fresh image) where they
+# are least expecting the failure. Found re-imaging the .201 units for the alpha, 2026-08-06.
+SSH_OPTS="-o ConnectTimeout=20 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 REMOTE_ROOT="/opt/plum-audio"
 UNITS_FILE="${HERE}/units.conf"
 
@@ -47,8 +55,16 @@ command -v sshpass >/dev/null || { echo "sshpass required (brew install sshpass)
 # Newest tarball wins when none was named — the common case is "I just ran build.sh".
 if [[ -z "$TARBALL" ]]; then
     TARBALL="$(ls -t ../dist/plum-audio-*.tar.gz 2>/dev/null | head -1 || true)"
+elif [[ "$TARBALL" != /* ]]; then
+    # A relative --tarball has to be resolved against the caller's cwd, not this script's. We have
+    # already cd'd into docker/, so `--tarball dist/plum-audio-<tag>-arm64.tar.gz` — the form
+    # docs/OPERATIONS.md documents, run from the repo root — would look for docker/dist/... and fail
+    # with "no image tarball (run build.sh first)" about a file that is plainly there.
+    for cand in "${INVOKED_FROM}/${TARBALL}" "${HERE}/../${TARBALL}" "${TARBALL}"; do
+        [[ -f "$cand" ]] && { TARBALL="$cand"; break; }
+    done
 fi
-[[ -f "$TARBALL" ]] || { echo "no image tarball (run docker/build.sh first)" >&2; exit 1; }
+[[ -f "$TARBALL" ]] || { echo "no image tarball at '${TARBALL:-<none>}' (run docker/build.sh first)" >&2; exit 1; }
 TARBALL="$(cd "$(dirname "$TARBALL")" && pwd)/$(basename "$TARBALL")"
 
 # A deploy opens a dozen authenticated connections per unit in quick succession, and sshd will

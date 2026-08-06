@@ -22,6 +22,11 @@ code is this?" without guessing. `PLUM_PLATFORM=linux/amd64` and `PLUM_TAG=` ove
 `/opt/plum-audio` → import rig state (first deploy only) → load the image → install compose + a
 generated per-unit env → `up -d` → verify.
 
+**Host provisioning comes first, and is a separate job.** `scripts/host-setup/provision.sh all` —
+once per Pi *image*, not per deploy. `deploy.sh` warns about an unpatched `bluez` and a stopped
+`avahi-daemon`/`bluetooth`, but it does not warn about a missing bluealsa D-Bus policy or a
+soft-blocked radio, and both of those fail silently later. See docs/HOST-PROVISIONING.md.
+
 **First deploy vs every later one.** The import step is gated on `~/plum-test` existing *and*
 `/opt/plum-audio/data/settings.json` being absent. On that one run it copies the unit's
 `settings.json` (endpoints, device name, theme, audio output — the unit's whole identity) and the
@@ -29,6 +34,31 @@ generated per-unit env → `up -d` → verify.
 and `*.pid` artefacts that would make a fresh `dbus-daemon` refuse to bind. Afterwards it never
 touches `/opt/plum-audio/{config,data}` again. **A rebuild is not a re-authorisation** — Spotify
 endpoints keep their authorisation across any number of deploys. `--no-migrate` skips the import.
+
+### A greenfield unit — no `~/plum-test` to import from
+
+A re-imaged Pi has no dev stack, so the import is skipped and the container writes
+`DEFAULT_SETTINGS`. What that means in practice, measured on the `.201` units on 2026-08-06:
+
+- **One AirPlay endpoint, enabled**, named "Plum Audio" on RAOP 5050. Spotify and Bluetooth endpoints
+  exist but are `enabled: false` — so a fresh unit is an AirPlay receiver and nothing else until
+  someone opens Settings → Integrations.
+- **`audio.output.device` is `null`**, which deliberately means "whatever `PLUM_DAC_DEVICE` says", so
+  the player opens the DAC column from `units.conf` (`bcm2835` → PortAudio 0 → `hw:0,0`) and echoes
+  the resolved card back as `Headphones:0`. Nothing needs choosing in the GUI for audio to work.
+- **`deviceName` comes from `PLUM_UNIT_NAME`** (i.e. the unit-name column of `units.conf`) — but only
+  since `1cd8701`. Before that every fresh unit came up as "Plum Sendspin", so a two-unit greenfield
+  mesh showed one name twice in the mesh view, the unit cards and mDNS. On an image built before that
+  commit, rename each unit in Settings → General.
+
+Everything else about a greenfield deploy is identical, and `deploy.sh`'s own verify pass is
+sufficient: four RUNNING programs, three APIs answering, 8927 and 8928 listening.
+
+**A re-imaged unit presents a new SSH host key.** `deploy.sh` and `provision.sh` both pass
+`UserKnownHostsFile=/dev/null`, because `StrictHostKeyChecking=no` alone does *not* override a
+*conflicting* `known_hosts` entry — ssh disables password auth in that state, so every unit fails on
+its first connection with a man-in-the-middle warning. If you reach a unit with your own `ssh`
+instead, `ssh-keygen -R <host>` first.
 
 **Reverting a unit to the dev stack** is `docker compose down` in `/opt/plum-audio` plus
 `~/plum-test/run_*.sh`. The dev tree is left on disk; only its processes are stopped, so there is no

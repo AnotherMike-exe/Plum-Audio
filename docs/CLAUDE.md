@@ -206,9 +206,12 @@ The *reasoning* behind these, and the failures that produced them, is in
   no `local_player` used to read as "session ended" and unroute its own followers. `find_device` must
   short-circuit the sentinel *before* its substring pass, and the compose `headless` profile exists
   because Docker refuses to create a container whose `devices:` names a missing `/dev/snd`.
-- **Host provisioning is not optional.** The bluez patches, `bluealsa-plum-dbus.conf` and the HAT
-  mixer must be installed on the host by hand — nothing does it automatically, and each absence
-  fails silently or catastrophically. See `docs/HOST-PROVISIONING.md`.
+- **Host provisioning is not optional, and is once per IMAGE.** The bluez patches,
+  `bluealsa-plum-dbus.conf`, the rfkill unblock and the HAT mixer are not installed by anything the
+  container does, and each absence fails silently or catastrophically. `scripts/host-setup/provision.sh`
+  runs the checklist from the workstation and pushes the payload — **a freshly imaged Pi has no copy
+  of this repo**, which is what every by-hand command in `docs/HOST-PROVISIONING.md` assumes. `all`
+  means all four units across both VLANs; name hosts to scope it.
 - **WiFi/host concerns** (NetworkManager owns `wlan0`) live on the host, not the container.
 
 ## Common tasks
@@ -228,8 +231,9 @@ reach the audio loop, and the dev rig has no supervisord.
 6. Deploy to the rig → verify live add/rename/disable/remove → then build the image.
 
 ### Build, deploy, debug
-`docker/build.sh` then `docker/deploy.sh all`. Full loop, the deceptive failure modes, and the
-debugging cookbook are in **`docs/OPERATIONS.md`**.
+`scripts/host-setup/provision.sh all` once per Pi image, then `docker/build.sh` and
+`docker/deploy.sh all` per deploy. Full loop, the deceptive failure modes, and the debugging cookbook
+are in **`docs/OPERATIONS.md`**; commissioning in **`docs/HOST-PROVISIONING.md`**.
 
 ## Open
 

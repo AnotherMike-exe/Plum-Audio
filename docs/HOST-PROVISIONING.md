@@ -1,8 +1,38 @@
 # Host provisioning — commissioning a new unit
 
-> Everything that must be true on the **host** before the container can work. Done once per Pi, in
-> this order. Read it when adding a unit to the rig, or when a working feature is inexplicably dead
-> on one unit only. The daily build/deploy/debug loop is docs/OPERATIONS.md.
+> Everything that must be true on the **host** before the container can work. Done once per Pi
+> **image**, in this order. Read it when adding a unit to the rig, after re-flashing a card, or when
+> a working feature is inexplicably dead on one unit only. The daily build/deploy/debug loop is
+> docs/OPERATIONS.md.
+
+## Just run the script
+
+```bash
+scripts/host-setup/provision.sh all --check      # report only — what is missing on every unit
+scripts/host-setup/provision.sh all              # steps 2, 3b, 4, 5, 6 below
+scripts/host-setup/provision.sh 192.0.2.10 --overlay hifiberry-amp100   # step 1 (reboots)
+scripts/host-setup/provision.sh 192.0.2.10 --unity                      # step 1, after that reboot
+scripts/host-setup/provision.sh all --with-bluez                            # step 3a (~30 min/unit)
+```
+
+It runs from the **workstation**, against `docker/units.conf`, and pushes the host-setup payload
+(`configure-audio-hat.sh`, `backend/config/bluez/`, `bluealsa-plum-dbus.conf`) to `~/plum-audio-hostsetup`
+on each unit before running the checklist. That push is the whole reason it exists: **every command in
+the rest of this document runs on the unit, against files that live in this repo — and a freshly
+imaged Pi has no copy of the repo and no git remote to fetch one from.** That gap used to be filled by
+hand, differently each time, which is exactly how a unit ends up missing the one file whose absence is
+silent (§5).
+
+Everything below is still the authority on *what* and *why*, and every step is reachable by hand. The
+two opt-in steps are opt-in because neither can be inferred: the overlay is a hardware choice and
+needs a reboot between `--overlay` and `--unity`, and `--with-bluez` costs ~30 min per unit for a
+capability that is genuinely optional (§3).
+
+`--check` changes nothing and is the fastest way to answer "is this unit provisioned?".
+
+> **`provision.sh all` means all four units in `units.conf`**, across both VLANs — name the hosts
+> explicitly when you mean a subset. Every step is idempotent, but §3b restarts `bluetoothd`, which
+> drops a connected phone on a unit that was mid-playback.
 
 ## Why any of this is on the host
 
@@ -21,6 +51,13 @@ nothing in the container can substitute for any of it:
 - **NetworkManager owns `wlan0`** — WiFi was a host concern in Plum-Snapcast and stays one.
 
 ## 1. Audio HAT — `scripts/host-setup/configure-audio-hat.sh`
+
+**A unit with no HAT needs nothing here.** A stock Raspberry Pi OS image already carries
+`dtparam=audio=on`, enumerates `bcm2835 Headphones` as card 0, and leaves its `PCM` control at
+0.00 dB — verified on both `.201` units on 2026-08-06, where the whole of this section was correctly
+a no-op. `--unity` is not applicable either: it resolves the **HAT** card and exits with "no HAT card
+found in aplay -l" on such a unit, which is the right answer, not a failure to work around. Give
+`units.conf` a DAC column of `bcm2835` and skip to §2.
 
 Raspberry Pi OS does not auto-detect audio HATs, and the boards on this rig expose no ID EEPROM
 (`/proc/device-tree/hat` does not exist on the Amp100), so there is no auto-detect to fall back on —
@@ -83,6 +120,10 @@ BlueZ **will not clear a soft block itself**. While the adapter is blocked, sett
 fails with a bare `"Failed"` and no explanation, and we cannot fix it from the container (it would
 need `/dev/rfkill` plus `CAP_NET_ADMIN`). `bluetooth_adapter.py` names rfkill in the error it logs,
 which is the only hint you get.
+
+**A fresh Raspberry Pi OS image boots soft-blocked** — both `.201` units did on 2026-08-06 — so this
+is not an edge case, it is the default state of every new card. `systemd-rfkill` persists the unblock
+in `/var/lib/systemd/rfkill`, so it survives reboots; re-flashing the card loses it again.
 
 ## 3. Patched `bluetoothd` — `backend/config/bluez/install_patched_bluez.sh`
 
@@ -153,6 +194,10 @@ A phone serves **one** AVRCP BIP (cover art) session at a time. The distro's D-B
 `obexd` steals the channel and ours is refused with `ECONNREFUSED` — with nothing in the log,
 because we never got to ask. Same class as disabling `bluealsa-aplay.service`.
 
+**`not-found` here is the desired state, not a problem.** Raspberry Pi OS **Lite** does not ship
+`obex.service` at all, so there is nothing to mask — both `.201` units reported `not-found` on
+2026-08-06 and are correctly provisioned. It is present on the full desktop image.
+
 ## 5. Install the bluealsa D-Bus policy
 
 ```bash
@@ -198,6 +243,12 @@ host keeps answering :80 — a GUI that looks perfect and is a stale build. Conf
 left on disk.
 
 ## Verify it took
+
+```bash
+scripts/host-setup/provision.sh all --check   # every check below, from the workstation
+```
+
+or by hand on the unit:
 
 ```bash
 # Audio

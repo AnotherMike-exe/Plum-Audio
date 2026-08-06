@@ -14,15 +14,28 @@ the source managers, the config API, and the nginx that serves the GUI all run i
 
 ## Quick start
 
+Everything runs from the workstation against `docker/units.conf`; nothing is fetched from a registry
+or a git remote, so a Pi needs no credentials and no copy of the repo.
+
 ```bash
-docker/build.sh                    # arm64 image -> dist/*.tar.gz
-docker/deploy.sh all               # every unit in docker/units.conf
-docker/deploy.sh 192.0.2.10   # or just one
+# once per Pi image — see docs/HOST-PROVISIONING.md
+scripts/host-setup/provision.sh all --check   # report what is missing, change nothing
+scripts/host-setup/provision.sh all           # rfkill, bluez config, D-Bus policy, host nginx
+
+# every deploy — see docs/OPERATIONS.md
+docker/build.sh                               # arm64 image -> dist/*.tar.gz
+docker/deploy.sh all                          # every unit in docker/units.conf
+docker/deploy.sh 192.0.2.10              # or just one
 ```
 
-A new Pi needs host provisioning first — the audio HAT overlay and mixer, the patched `bluetoothd`,
-and a D-Bus policy that nothing installs automatically. Do that before the first deploy; after
-that, `docs/OPERATIONS.md` is the daily loop.
+`provision.sh` pushes the host-setup payload to each unit and works through the
+docs/HOST-PROVISIONING.md checklist idempotently. Two of its steps are opt-in, because neither can
+be inferred: `--overlay <name> [--unity]` for a unit with an audio HAT (the boards on this rig carry
+no ID EEPROM, so choosing the overlay is the operator's job, and it needs a reboot), and
+`--with-bluez` for the ~30 min `bluetoothd` rebuild that AVRCP scrub reporting needs. A unit on the
+Pi's onboard 3.5 mm output needs neither.
+
+Provisioning is once per **image**, not per deploy. Re-run it after re-flashing a card.
 
 ## Documentation
 
