@@ -285,7 +285,9 @@ export const Visualizer: React.FC<VisualizerProps> = ({
             </svg>
 
             {/* Top Left: Metadata */}
-            <div className="absolute top-8 left-8 text-left max-w-md space-y-3 z-10">
+            {/* pr-16 reserves the close button's lane: the title is the one string here with no
+                length limit, and `max-w-md` alone let it slide under the button on a narrow window. */}
+            <div className="absolute top-4 sm:top-8 left-4 sm:left-8 right-4 sm:right-8 pr-16 text-left max-w-md space-y-3 z-10">
                 {/* Metadata */}
                 {currentTrack && (
                     <div>
@@ -303,7 +305,7 @@ export const Visualizer: React.FC<VisualizerProps> = ({
             </div>
 
             {/* Top Right: Close Button */}
-            <div className="absolute top-8 right-8 z-10">
+            <div className="absolute top-4 sm:top-8 right-4 sm:right-8 z-10">
                 <button
                     onClick={onClose}
                     className="w-12 h-12 flex items-center justify-center rounded-full bg-[var(--bg-secondary)]/80 backdrop-blur-sm hover:bg-[var(--bg-tertiary)] transition-colors"
@@ -314,8 +316,22 @@ export const Visualizer: React.FC<VisualizerProps> = ({
                 </button>
             </div>
 
+            {/* Bottom bar — ONE grid, not three independently-positioned islands.
+                Previously the selector (bottom-8 left-8), the controls (bottom-8 left-1/2) and the
+                icon cluster (bottom-8 right-8) were absolute siblings that knew nothing about each
+                other, with a hard-coded 240px slider and a `calc(50% - 200px)` selector. Narrow the
+                window and the volume slider ran UNDERNEATH the icon cluster — its right end was
+                unreachable — and below 400px that calc goes negative. Observed on a tall window,
+                2026-08-06.
+
+                `1fr auto 1fr` keeps the controls optically centred (the outer tracks are forced
+                equal) while making collision impossible, because they are now grid cells rather
+                than overlapping layers. Below `sm` it stacks instead of squeezing. */}
+            <div className="absolute inset-x-0 bottom-0 z-10 p-4 sm:p-8 grid gap-4 items-end
+                            grid-cols-1 justify-items-center sm:grid-cols-[1fr_auto_1fr]">
+
             {/* Bottom Left: Stream Selector */}
-            <div className="absolute bottom-8 left-8 z-10 w-full" style={{ maxWidth: 'calc(50% - 200px)' }}>
+            <div className="w-full min-w-0 max-w-xs sm:justify-self-start order-2 sm:order-none">
                 <StreamSelector
                     streams={streams}
                     currentStreamId={stream?.id || null}
@@ -326,7 +342,7 @@ export const Visualizer: React.FC<VisualizerProps> = ({
             </div>
 
             {/* Bottom Center: Media Controls & Volume */}
-            <div className="absolute bottom-8 left-1/2 transform -translate-x-1/2 flex flex-col items-center gap-6 z-10">
+            <div className="flex flex-col items-center gap-4 sm:gap-6 min-w-0 max-w-full order-1 sm:order-none">
                 {/* Media Control Buttons */}
                 <div className="flex items-center gap-6">
                     <button
@@ -358,7 +374,7 @@ export const Visualizer: React.FC<VisualizerProps> = ({
                 </div>
 
                 {/* Volume Control - same width as media controls */}
-                <div className="flex items-center gap-4 bg-[var(--bg-secondary)]/80 backdrop-blur-sm rounded-full px-6 py-3">
+                <div className="flex items-center gap-4 bg-[var(--bg-secondary)]/80 backdrop-blur-sm rounded-full px-4 sm:px-6 py-3 max-w-full">
                     <Icon name="volume-low" className="w-5 h-5 text-[var(--text-secondary)]" />
                     <input
                         type="range"
@@ -366,8 +382,10 @@ export const Visualizer: React.FC<VisualizerProps> = ({
                         max="100"
                         value={currentVolume}
                         onChange={(e) => onVolumeChange(parseInt(e.target.value))}
-                        className="volume-slider rounded-lg"
-                        style={{ ...volumeSliderStyle, width: '240px' }}
+                        className="volume-slider rounded-lg w-full min-w-0"
+                        // Was a hard 240px, which is what pushed this pill under the icon cluster on
+                        // a narrow window. Caps at the old width so the wide layout is unchanged.
+                        style={{ ...volumeSliderStyle, maxWidth: '240px' }}
                         aria-label="Volume control"
                     />
                     <Icon name="volume-high" className="w-5 h-5 text-[var(--text-secondary)]" />
@@ -375,7 +393,7 @@ export const Visualizer: React.FC<VisualizerProps> = ({
             </div>
 
             {/* Bottom Right: Fullscreen, Visualizer Settings, Settings, Listen Button */}
-            <div className="absolute bottom-8 right-8 flex gap-3 z-10">
+            <div className="flex gap-2 sm:gap-3 shrink-0 sm:justify-self-end order-3 sm:order-none">
 
                 <button
                     onClick={toggleFullscreen}
@@ -406,6 +424,8 @@ export const Visualizer: React.FC<VisualizerProps> = ({
                 >
                     <Icon name="gear" className="w-6 h-6 text-[var(--text-primary)]" />
                 </button>
+            </div>
+
             </div>
         </div>
     );

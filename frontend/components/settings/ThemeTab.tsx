@@ -186,8 +186,8 @@ export const ThemeTab: React.FC<ThemeTabProps> = ({
 
         {/* Album Art Colors Toggle */}
         <div>
-          <div className="flex items-center justify-between">
-            <div>
+          <div className="flex items-center justify-between gap-4">
+            <div className="min-w-0">
               <h4 className="text-sm font-semibold text-[var(--text-primary)]">
                 Album Art Colors
               </h4>
@@ -207,6 +207,7 @@ export const ThemeTab: React.FC<ThemeTabProps> = ({
                 });
               }}
               label="Album Art Colors"
+              hideLabel  // the h4 above is already the label; rendering it twice wraps on narrow windows
               disabled={isMonochromeMode}
             />
           </div>
