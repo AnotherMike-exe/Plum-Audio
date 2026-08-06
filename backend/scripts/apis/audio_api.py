@@ -51,7 +51,27 @@ def _current_output(settings_manager: SettingsManager) -> dict:
     devices = audio_devices.list_output_devices(active_spec=active)
     device = audio_devices.find_device(spec, devices) if spec else None
 
-    pending = playing_on is not None and playing_on != spec
+    # Compare RESOLVED identities, never the raw strings. `spec` is whatever named the output —
+    # PLUM_DAC_DEVICE's PortAudio name fragment ("bcm2835"), an `hw:C,D`, a bare card name, or a
+    # `<card_name>:<device>` id — while the player's echo is ALWAYS the resolved id. So string
+    # equality only ever held for a choice made in the GUI, which writes the id form.
+    #
+    # A unit still on its PLUM_DAC_DEVICE default therefore reported a switch pending FOREVER, to the
+    # very device it was already playing on: `resolved: true`, `is_active: true`,
+    # `playing_on == id == "Headphones:0"`, and `pending: true` beside it. The tab rendered "switching
+    # to Built-in Headphones" next to that same device's "playing" tag. Seen on both .201 units after
+    # the greenfield alpha, 2026-08-06 — and invisible to every test here, because they all configure
+    # an id rather than a fragment.
+    #
+    # `device` is already `find_device(spec, devices)`, i.e. the one thing that knows how to turn any
+    # of those spellings into an id. When it resolves to nothing (a HAT removed, a spec from another
+    # unit) there is no id to compare against, so fall back to the raw spec — it will differ, which is
+    # the honest answer for a configuration that names a device this unit does not have.
+    if audio_devices.is_no_output(spec):
+        target = audio_devices.NO_OUTPUT
+    else:
+        target = device.id if device is not None else spec
+    pending = playing_on is not None and playing_on != target
     # Crossing the none<->device boundary is the ONLY change that needs a restart: the player is a
     # process that either exists or does not, decided once by output_gate.py at container start. A
     # device->device switch still applies live through watch_output_device and must keep reading

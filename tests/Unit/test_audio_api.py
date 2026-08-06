@@ -36,6 +36,27 @@ from audio_devices import AudioDevice, DeviceType  # noqa: E402
 from settings_api import SettingsManager  # noqa: E402
 
 
+def _headphones(active=True):
+    """The Pi's onboard output, with its REAL descriptions.
+
+    They matter: `PLUM_DAC_DEVICE=bcm2835` resolves through find_device's substring pass against
+    `card_description`, so a stand-in whose descriptions do not contain the fragment resolves to
+    nothing and tests the wrong thing.
+    """
+    return AudioDevice(
+        card=0,
+        device=0,
+        card_name="Headphones",
+        card_description="bcm2835 Headphones",
+        device_description="bcm2835 Headphones",
+        type=DeviceType.BUILTIN_HEADPHONES,
+        friendly_name="Built-in Headphones (3.5mm)",
+        is_available=True,
+        unavailable_reason=None,
+        is_active=active,
+    )
+
+
 def _device(card=2, card_name="sndrpihifiberry", available=True, active=False):
     return AudioDevice(
         card=card,
@@ -260,6 +281,52 @@ def test_no_echo_yet_is_not_reported_as_pending(client, monkeypatch, settings_fi
     _present(monkeypatch, [_device()])
 
     assert client.get("/api/audio/output/current").get_json()["pending"] is False
+
+
+def test_a_PLUM_DAC_DEVICE_fragment_matching_the_echo_is_not_pending(client, monkeypatch, settings_file, tmp_path):
+    """`pending` compares RESOLVED identities, not the strings that named them.
+
+    Every other test here configures a `<card_name>:<device>` id, which is what the GUI writes — so
+    the raw string compare happened to work and this was invisible. A unit whose output comes from
+    PLUM_DAC_DEVICE is named by a PortAudio *fragment* ("bcm2835"), while the player's echo is always
+    the resolved id ("Headphones:0"). Comparing those two reported a switch pending FOREVER, to the
+    device the unit was already playing on: the Audio tab showed "switching to Built-in Headphones"
+    beside that same device's own "playing" tag, on a unit where nothing had ever been changed.
+
+    Seen on both .201 units after the greenfield alpha deploy, 2026-08-06 — i.e. on every unit that
+    has never had an output picked in the GUI.
+    """
+    state = tmp_path / "player_state.json"
+    state.write_text(json.dumps({"output_device": "Headphones:0"}))
+    monkeypatch.setenv("PLUM_PLAYER_STATE_FILE", str(state))
+    # No audio.output.device at all — so configured_output_spec() falls back to the environment.
+    settings_file.write_text(json.dumps({"version": 1, "audio": {"output": {"device": None}}}))
+    monkeypatch.setenv("PLUM_DAC_DEVICE", "bcm2835")
+    _present(monkeypatch, [_headphones()])
+
+    body = client.get("/api/audio/output/current").get_json()
+    assert body["configured"] == "bcm2835"       # the fragment, unresolved
+    assert body["playing_on"] == "Headphones:0"  # the echo, resolved
+    assert body["id"] == "Headphones:0"          # and they are the SAME device
+    assert body["resolved"] is True
+    assert body["pending"] is False, "a unit playing on exactly the device it is configured for"
+
+
+def test_a_fragment_naming_a_DIFFERENT_card_than_the_echo_is_still_pending(
+    client, monkeypatch, settings_file, tmp_path
+):
+    """The fix must not blunt the real signal: resolving both sides still has to detect a mismatch."""
+    state = tmp_path / "player_state.json"
+    state.write_text(json.dumps({"output_device": "Headphones:0"}))
+    monkeypatch.setenv("PLUM_PLAYER_STATE_FILE", str(state))
+    settings_file.write_text(json.dumps({"version": 1, "audio": {"output": {"device": None}}}))
+    monkeypatch.setenv("PLUM_DAC_DEVICE", "snd_rpi_hifiberry_dacplus")
+    _present(monkeypatch, [_headphones(active=False), _device()])
+
+    body = client.get("/api/audio/output/current").get_json()
+    assert body["id"] == "sndrpihifiberry:0"      # the fragment resolves to the HAT...
+    assert body["playing_on"] == "Headphones:0"   # ...but the player has the onboard jack open
+    assert body["pending"] is True
 
 
 def test_test_tone_refuses_the_active_device_with_an_explanation(client, monkeypatch):
