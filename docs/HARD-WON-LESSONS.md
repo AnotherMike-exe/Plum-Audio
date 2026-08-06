@@ -84,7 +84,7 @@ block is trustworthy; the pid is noise. And every subdevice must be checked, not
 eight.
 See: `backend/scripts/audio_devices.py` (`PROC_ASOUND`, the `sub*/status` walk).
 
-**Card numbers move; the ALSA card *name* does not.** The HiFiBerry on `.7.204` was card 2, then 1,
+**Card numbers move; the ALSA card *name* does not.** The HiFiBerry on `.100.21` was card 2, then 1,
 then 2, then 0 across four reboots with the config unchanged. Snapcast persisted the number and got
 away with it only because `get-settings.py` translated to `default:CARD=<name>` at launch — but from
 the **stale** number, so a reboot that renumbered would have resolved to the wrong card. The bug was
@@ -151,7 +151,7 @@ from outside — a stale image or none, with **nothing in the log**, because not
    `player.c` with no `g_dbus_emit_property_changed`. `obexport_exists()` also hides the property
    while it is 0, so an early `GetAll` shows no key and no signal follows. It must be polled after a
    bind.
-3. *Our own obexd starts after the bind* — measured at **10 s on `.201.113`**. Losing that race is
+3. *Our own obexd starts after the bind* — measured at **10 s on `.2.11`**. Losing that race is
    permanent, not transient, so `prepare()` is retried for ~30 s.
 
 Underneath all three: **a phone publishes `ImgHandle` only while a BIP session exists.** No session,
@@ -170,7 +170,7 @@ See: `backend/scripts/sources/bluetooth_coverart.py`, `frontend/services/albumAr
 **A missing host D-Bus policy costs 178 restarts and buries every unrelated diagnosis.** Without
 `backend/config/bluealsa-plum-dbus.conf` at `/etc/dbus-1/system.d/`, `bluealsa` cannot acquire
 `org.bluealsa` and exits `rc=1` about **3 s** after every start; the source manager respawns it
-forever. On `.7.204` that was **178 restarts and a new dbus-daemon every 9.5 s**. The real damage was
+forever. On `.100.21` that was **178 restarts and a new dbus-daemon every 9.5 s**. The real damage was
 not the churn but the log volume: a crash-looping source writes fast enough to push the lines you
 need thousands back, and a filtered `tail` then reads as "this never happened". **Two wrong diagnoses
 on 2026-08-04 came from exactly that.**
@@ -281,7 +281,7 @@ It was also **unnecessary**, which is the part worth keeping. A roam fires no `s
 reconnect: **~300 ms of buffer against a ~25-55 ms reconnect, ~6× headroom.** Instrumented with an
 unconditional emitted-silence counter (`pad_ms`), the measurement across a cross-server roam is
 `pad_ms` **unchanged** — zero emitted silence. Confirmed against real bursty content, not just a
-tone: player-113 detached holding **435 ms of live AirPlay audio** and reattached with the buffer
+tone: player-211 detached holding **435 ms of live AirPlay audio** and reattached with the buffer
 intact. The earlier "~200 ms audible silence" estimate was simply wrong. The design consequence lives
 in ARCHITECTURE §2-3; this is how it was settled.
 
@@ -289,7 +289,7 @@ in ARCHITECTURE §2-3; this is how it was settled.
 stream's client set is fixed at `start_stream()`. A client that **connects** while a stream is live is
 handed it during the handshake; one already connected and then added to the group is **not**. It sits
 in the group, in the GUI, at the right volume, and silent, with nothing in any log. Measured on
-`.7.204`: with `airplay-1` streaming, unrouting and re-routing the attached local player produced no
+`.100.21`: with `airplay-1` streaming, unrouting and re-routing the attached local player produced no
 second `Stream started` on the client and a renderer buffer that never left **0 ms**.
 
 The spike missed it because it measured re-route against an *idle-then-started* source and reported a

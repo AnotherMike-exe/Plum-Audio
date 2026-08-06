@@ -34,8 +34,8 @@ from mesh.model import MeshView, UnitSnapshot  # noqa: E402
 
 def _units():
     return [
-        UnitSnapshot("unit-7204", "Plum Amp100", host="198.51.100.21", hostname="plum-amp100"),
-        UnitSnapshot("unit-7122", "Plum VLAN7", host="198.51.100.20", hostname="plum-vlan7"),
+        UnitSnapshot("unit-10021", "Plum Amp100", host="198.51.100.21", hostname="plum-amp100"),
+        UnitSnapshot("unit-10020", "Plum Interop", host="198.51.100.20", hostname="plum-interop"),
     ]
 
 
@@ -182,7 +182,7 @@ def test_no_environment_means_no_extras(monkeypatch):
 
 
 def test_own_hosts_includes_the_real_lan_ip(monkeypatch):
-    """The gap found on .201.133: :5002 refused the unit's OWN IP.
+    """The gap found on .2.10: :5002 refused the unit's OWN IP.
 
     It resolved its identity via gethostbyname(gethostname()), which inside the container answers
     127.0.1.1 from /etc/hosts — so the LAN address a person actually types never entered the set.

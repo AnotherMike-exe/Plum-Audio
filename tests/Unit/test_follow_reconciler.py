@@ -601,7 +601,7 @@ def test_a_playerless_unit_does_nothing_with_both_modes_on():
 
 # -- localActivity vs slave: both enabled at once ----------------------------------------------------
 #
-# Real configuration, from .201.133 on 2026-08-06: localActivity ON and slave ON with master .113.
+# Real configuration, from .2.10 on 2026-08-06: localActivity ON and slave ON with master .11.
 # Both units have a source called `spotify-1`. The reported symptom was the visualizer dropping to
 # zero and recovering — which is what a listener sees when the player is re-routed, because every
 # attach calls SourceFeeder.refresh_stream() and that replaces the stream for the whole group.

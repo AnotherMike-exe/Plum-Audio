@@ -38,7 +38,7 @@ endpoints keep their authorisation across any number of deploys. `--no-migrate` 
 ### A greenfield unit — no `~/plum-test` to import from
 
 A re-imaged Pi has no dev stack, so the import is skipped and the container writes
-`DEFAULT_SETTINGS`. What that means in practice, measured on the `.201` units on 2026-08-06:
+`DEFAULT_SETTINGS`. What that means in practice, measured on the mesh-pair units on 2026-08-06:
 
 - **One AirPlay endpoint, enabled**, named "Plum Audio" on RAOP 5050. Spotify and Bluetooth endpoints
   exist but are `enabled: false` — so a fresh unit is an AirPlay receiver and nothing else until
@@ -95,7 +95,7 @@ restart to re-derive everything from the env.
 
 ### What a greenfield unit actually offers
 
-Measured on both `.201` units, 2026-08-06. **AirPlay only**, and it is the sole source daemon running:
+Measured on both mesh-pair units, 2026-08-06. **AirPlay only**, and it is the sole source daemon running:
 
 | Section | Enabled | Name | Ports |
 |---|---|---|---|
@@ -129,7 +129,7 @@ instead, `ssh-keygen -R <host>` first.
 `~/plum-test/run_*.sh`. The dev tree is left on disk; only its processes are stopped, so there is no
 restore step.
 
-Compose is reached two ways and that is deliberate: `.7.122` runs Docker CE from Docker's own repo
+Compose is reached two ways and that is deliberate: `.100.20` runs Docker CE from Docker's own repo
 (`docker compose`, the CLI plugin), the Debian-packaged units get trixie's standalone
 `docker-compose` 2.26. Same compose file; `deploy.sh` detects the invocation. Trixie has no
 `docker-compose-v2` package — the name is `docker-compose` and it *is* v2.
@@ -234,7 +234,7 @@ docs/HOST-PROVISIONING.md). Check the restart count before trusting an absence.
 
 ### Comparing image versions across units
 
-`.7.204` uses Docker's containerd image store; the other three use the classic one (`docker info` →
+`.100.21` uses Docker's containerd image store; the other three use the classic one (`docker info` →
 `driver=overlayfs` + `io.containerd.snapshotter.v1` vs `overlay2`). So
 `docker inspect <container> --format '{{.Image}}'` reports the **manifest** digest there and the
 **config** digest everywhere else, and the same image compares as two different ids across units —

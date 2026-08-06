@@ -21,8 +21,8 @@ import { PlayerControls } from '../../../components/PlayerControls'
 import type { Stream } from '../../../types'
 
 const stream = {
-  id: 'unit-113::airplay-1',
-  serverId: 'unit-113',
+  id: 'unit-211::airplay-1',
+  serverId: 'unit-211',
   serverName: 'Pi4-01',
   name: 'AirPlay',
   sourceDevice: 'airplay-1',

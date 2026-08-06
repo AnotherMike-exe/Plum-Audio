@@ -20,7 +20,7 @@ import { playerControlsPropsEqual } from '../../../MeshApp'
 import type { Stream } from '../../../types'
 
 const stream = {
-  id: 'unit-113::airplay-1',
+  id: 'unit-211::airplay-1',
   isPlaying: true,
   volume: 50,
   sourceVolume: 64,

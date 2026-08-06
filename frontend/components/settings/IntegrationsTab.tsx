@@ -140,7 +140,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
   // This used to run unconditionally, which is why every open of the Integrations tab logged two
   // errors on a unit where the section is hidden: `create_integrations_blueprint` registers
   // airplay/spotify/bluetooth only, so /api/integrations/dlna/endpoints 404s and there is no card
-  // to display the failure on. Observed live on .7.204 (2026-08-06) — the fetch fires even though
+  // to display the failure on. Observed live on .100.21 (2026-08-06) — the fetch fires even though
   // Settings.tsx passes enabledSources=['airplay','spotify','bluetooth'].
   useEffect(() => {
     if (!show('dlna')) {

@@ -32,7 +32,7 @@ SCRIPT = REPO / "scripts" / "host-setup" / "configure-audio-hat.sh"
 
 pytestmark = pytest.mark.skipif(not shutil.which("bash"), reason="needs bash")
 
-# Trimmed from the real /boot/firmware/config.txt on .7.204 — including the hand-written HAT overlay
+# Trimmed from the real /boot/firmware/config.txt on .100.21 — including the hand-written HAT overlay
 # a Plum-Snapcast unit arrives with, and the unrelated overlays that must not be touched.
 PRISTINE = """\
 # For more options and information see http://rptl.io/configtxt
@@ -120,7 +120,7 @@ def test_keep_onboard_asks_for_onboard_audio_explicitly(tmp_path):
     """Omitting the line is not the same as asking for it.
 
     With no dtparam=audio at all the firmware leaves the bcm2835 codec OFF and no Headphones card
-    enumerates. Measured on .7.204: both `off` lines removed, rebooted, still only the two HDMI
+    enumerates. Measured on .100.21: both `off` lines removed, rebooted, still only the two HDMI
     outputs and the HAT. So the block has to say `on` out loud.
     """
     path = tmp_path / "config.txt"
@@ -140,7 +140,7 @@ def test_onboard_audio_is_commented_out_by_default(tmp_path):
 
 
 # A unit configured BEFORE this script existed: someone followed HiFiBerry's own instructions and
-# added `dtparam=audio=off` by hand, outside anything we manage. Taken verbatim from .7.204.
+# added `dtparam=audio=off` by hand, outside anything we manage. Taken verbatim from .100.21.
 HAND_DISABLED = """\
 dtparam=i2c_arm=on
 
@@ -157,7 +157,7 @@ def test_keep_onboard_disarms_a_hand_written_audio_off(tmp_path):
     """--keep-onboard has to REMOVE an existing off, not merely decline to add one.
 
     The block is the only region this script rewrites, so a `dtparam=audio=off` anywhere else in the
-    file still kills the jack. On .7.204 exactly that line sat 17 lines above the managed block, and
+    file still kills the jack. On .100.21 exactly that line sat 17 lines above the managed block, and
     without this the flag would have "run successfully" and changed nothing observable.
     """
     path = tmp_path / "config.txt"

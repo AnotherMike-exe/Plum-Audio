@@ -168,7 +168,7 @@ The *reasoning* behind these, and the failures that produced them, is in
   in the deprecated nested `player` object and drops the required field — see UPSTREAM §0. There is
   a canary test; when it fails, delete the workaround.
 - **The output device's identity is the ALSA CARD NAME, never `hw:C,D`.** Card numbers move — the
-  HiFiBerry on `.7.204` was card 2, then 1, then 2, then 0 across four reboots with config
+  HiFiBerry on `.100.21` was card 2, then 1, then 2, then 0 across four reboots with config
   unchanged. `settings.json` stores `<card_name>:<device>`; `hw:C,D` is re-derived every scan.
 - **Serialise every PortAudio re-init.** `sd._terminate()`/`sd._initialize()` rebuild PROCESS-GLOBAL
   state; two threads doing it at once SIGSEGVs the interpreter with no exception and no traceback.
@@ -248,7 +248,7 @@ are in **`docs/OPERATIONS.md`**; commissioning in **`docs/HOST-PROVISIONING.md`*
 
 ## Open
 
-1. **DLNA and Plexamp have no backend.** Established by *watching the running GUI* on `.7.204`
+1. **DLNA and Plexamp have no backend.** Established by *watching the running GUI* on `.100.21`
    (2026-08-06) after two wrong descriptions here — a truncated `grep | head -20` produced the
    second, so **read the whole grep**:
    - `IntegrationsTab.tsx` **does** contain full DLNA (`:1250`) and Plexamp (`:1433`) sections,
@@ -269,12 +269,12 @@ are in **`docs/OPERATIONS.md`**; commissioning in **`docs/HOST-PROVISIONING.md`*
    are pinned in call order against fakes; deleting the refresh fails two tests. Also covers the
    `_primary_source` handoff, controller grouping and source lifecycle.
 4. **`configure-audio-hat.sh`'s no-`dtoverlay` fallback has never run on real hardware** — unit-tested
-   against fixtures only. `--keep-onboard` HAS now run, on `.7.204` (2026-08-05), and had two
+   against fixtures only. `--keep-onboard` HAS now run, on `.100.21` (2026-08-05), and had two
    independent bugs that fixtures could not have caught: it left an out-of-block `dtparam=audio=off`
    armed, and omitting `audio=off` is not the same as asking for `audio=on` (the firmware default is
    off). Both fixed and verified across a reboot.
 5. ~~Visualizer, About and Integrations have no visual review under a live stream~~ — **DONE
-   2026-08-06**, in-browser on `.7.204` (idle) and `.201.133` (live Spotify). Everything renders:
+   2026-08-06**, in-browser on `.100.21` (idle) and `.2.10` (live Spotify). Everything renders:
    artwork, metadata, progress, both volume sliders, shuffle/repeat shown only because Spotify
    advertises them, and a track change updating metadata + artwork live. The **visualizer is
    audio-reactive under a live stream** — successive frames show different spectra — and **album-art
@@ -360,7 +360,7 @@ are in **`docs/OPERATIONS.md`**; commissioning in **`docs/HOST-PROVISIONING.md`*
       everywhere downstream with nothing logged.
 
 17. **Spotify Connect's first transfer after a go-librespot (re)start can fail.** Seen on
-    `.201.133` 2026-08-06 — the first attempt drops immediately, the retry works. It is go-librespot
+    `.2.10` 2026-08-06 — the first attempt drops immediately, the retry works. It is go-librespot
     internal, NOT our pipeline: `/data/go-librespot/<n>/go-librespot.log` shows
     `failed handling dealer request ... failed creating stream ... failed seeking stream: failed
     reading page: EOF`, i.e. it could not fetch the track from Spotify's CDN. The observed instance
@@ -369,7 +369,7 @@ are in **`docs/OPERATIONS.md`**; commissioning in **`docs/HOST-PROVISIONING.md`*
     watching for a pattern away from restarts before treating it as ours.
 
 18. **The visualizer's periodic drop-to-zero is CONTROLLER-WS CHURN, not the audio path.** Measured
-    in the running GUI on `.201.133` (2026-08-06) by hooking `WebSocket` and timestamping every
+    in the running GUI on `.2.10` (2026-08-06) by hooking `WebSocket` and timestamping every
     binary frame: spectrum arrives at **31 Hz with a 2000 ms gap every 3 s**, like clockwork
     (1.1 s, 4.1 s, 7.1 s, 10.1 s …). In the same window, **48 controller sockets were created AND
     closed in 22 s** — six (one per source across both units) every ~3 s, all close code 1000.
@@ -394,7 +394,7 @@ are in **`docs/OPERATIONS.md`**; commissioning in **`docs/HOST-PROVISIONING.md`*
     a FOCUSED, foreground tab before concluding this is user-visible rather than an artifact.
 
 19. ~~Two greenfield units advertise the same AirPlay receiver name~~ — **fixed 2026-08-06**, on
-    Michael's call. Found deploying the alpha to the re-imaged `.201` units: `DEFAULT_SETTINGS`'
+    Michael's call. Found deploying the alpha to the re-imaged mesh-pair units: `DEFAULT_SETTINGS`'
     endpoints all defaulted to `deviceName: "Plum Audio"`, and AirPlay's is enabled on RAOP 5050 out
     of the box, so every fresh unit offered an identical receiver — "Plum Audio" twice on the LAN with
     nothing to tell them apart. Same defect as the unit name (`1cd8701`) one level down. All three

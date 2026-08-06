@@ -153,13 +153,13 @@ non-negotiable for tier 4's live third-party devices. `run.sh` drives a whole ri
 
 | Script | Status |
 |---|---|
-| `t2_source_lifecycle.sh` | ✅ passing (VLAN-7 unit) — the feeder idle contract's home |
+| `t2_source_lifecycle.sh` | ✅ passing (interop unit) — the feeder idle contract's home |
 | `t2_endpoint_crud.sh` | ✅ passing — live add/rename/remove, others untouched |
 | `t4_interop_ma.sh` | ✅ passing — MA discovered, we advertise both ways, claim self-reported |
 | `t4_adopt_release.sh` | ✅ passing — adopt an HA Voice PE, release incl. the socket-closed check |
-| `t2_bt_avrcp_position.sh` | ✅ passing (VLAN-7 unit + iPhone, 2026-07-29) — 8 polls / 12 s, 4 Position signals / 9 s |
-| `t3_mesh_roam.sh` | ✅ passing (`.201` rig, 2026-07-24) |
-| `t3_autofollow.sh` | written, syntax-checked; **pending** a run on the `.201` rig |
+| `t2_bt_avrcp_position.sh` | ✅ passing (interop unit + iPhone, 2026-07-29) — 8 polls / 12 s, 4 Position signals / 9 s |
+| `t3_mesh_roam.sh` | ✅ passing (mesh pair, 2026-07-24) |
+| `t3_autofollow.sh` | written, syntax-checked; **pending** a run on the mesh pair |
 
 **Remaining:** run `t3_autofollow.sh` on the mesh rig; add `t2_airplay_mpris.sh` (per-endpoint
 private-bus MPRIS ownership) and a `t3_multigroup.sh`; the tier-5 soak and tier-6 container tiers.

@@ -20,7 +20,7 @@ DAC — is **`docker/units.conf`**, which `deploy.sh` consumes; do not maintain 
   proven here.
 - **`192.0.2.11` — Pi4-01**, onboard bcm2835. Second node of the `.201.x` mesh rig; two-node
   discovery, aggregation and roam need both.
-- **`198.51.100.20` — Plum VLAN7 Test**, onboard bcm2835. **The interop unit**: it sits on the
+- **`198.51.100.20` — Plum Interop Test**, onboard bcm2835. **The interop unit**: it sits on the
   third-party VLAN beside Music Assistant and a Home Assistant Voice PE, and mDNS is link-local, so
   this is the only segment where interop can be tested at all.
 - **`198.51.100.21` — Plum Amp100**, HiFiBerry Amp100 (`snd_rpi_hifiberry_dacplus`). Recommissioned
@@ -31,11 +31,11 @@ and each unit's `settings.json` already refers to them. They match what the pre-
 `~/plum-test` stack ran with, so a unit moving into the container keeps its identity and its routes
 rather than reappearing as a stranger.
 
-Production units `.200` / `.203` are still on Plum-Snapcast; their cutover is Phase 4.
+Production units `.50` / `.51` are still on Plum-Snapcast; their cutover is Phase 4.
 
 **Image uniformity as of 2026-08-05**: all four units run the same image (`6a64b88`). Verify by the
 served bundle hash (`curl -s http://<unit>/ | grep -o 'assets/index-[^"]*\.js'`), **not** by image
-id — `.7.204` uses Docker's containerd image store while the other three use the classic one, so
+id — `.100.21` uses Docker's containerd image store while the other three use the classic one, so
 `docker inspect` reports a manifest digest there and a config digest everywhere else, and the same
 image compares as different across units.
 
@@ -45,7 +45,7 @@ image compares as different across units.
 
 ### Alpha deployment onto bare Raspberry Pi OS Lite — 2026-08-06 (`5973175`)
 
-**The first deploy onto units carrying nothing but a stock image.** `.201.133` and `.201.113` were
+**The first deploy onto units carrying nothing but a stock image.** `.2.10` and `.2.11` were
 re-flashed to Raspberry Pi OS Lite 64-bit (Debian 13 trixie, kernel 6.18.34, arm64), then taken to a
 working two-node mesh by the documented path alone. This is the run that proved the *documentation* is
 executable, not just the code — and it found four places where it was not.
@@ -82,9 +82,9 @@ listening, `bcm2835` → PortAudio index 0 → `hw:0,0` with `Headphones:0` echo
 server and player mDNS records published under the corrected names.
 
 **Not verified from the workstation**: that the AirPlay receivers actually appear to a sender. mDNS is
-link-local and the workstation is on a routed segment (`192.168.197.x`), and Pi OS Lite ships no
+link-local and the workstation is on a routed segment (`203.0.113.x`), and Pi OS Lite ships no
 `avahi-utils`. shairport-sync is running and errorless on both; confirming the receiver needs a device
-on VLAN 201.
+on the mesh VLAN.
 
 Sections 1 (audio HAT) and 4 (mask the user obexd) of the checklist were correctly **no-ops** here —
 no HAT fitted, and Pi OS Lite does not ship `obex.service`. Both are now documented as such, because
@@ -107,7 +107,7 @@ GUI, in the order they were raised:
   held for a choice made in the GUI. **Every unit that had never had an output picked reported a switch
   pending forever, to the device it was already playing on.** Now compares resolved identities. Missed
   by all six existing `pending` tests because each configures an id rather than a fragment.
-- **AirPlay confirmed from an iPhone on VLAN 201** — both receivers visible, audio playing out the
+- **AirPlay confirmed from an iPhone on the mesh VLAN** — both receivers visible, audio playing out the
   headphone jack. That closes the one thing the workstation could not verify.
 - **Name clashes now disambiguate instead of refusing.** The first attempt made `deploy.sh` refuse a
   `units.conf` with duplicates; that was the wrong trade — it turns a cosmetic slip into a rig that
@@ -123,7 +123,7 @@ GUI, in the order they were raised:
 `FileNotFoundError` traceback at WARNING when `settings.json` does not exist yet, then falls back to
 `PLUM_DAC_DEVICE` correctly. A missing file is a legitimate state ("no file at all means defaults" —
 `test_a_missing_file_is_not_damage`), so this is noise, but it races the config API's first write on a
-greenfield boot and appeared on `.133` and not `.113`. Worth distinguishing "missing" from "damaged"
+greenfield boot and appeared on `.10` and not `.11`. Worth distinguishing "missing" from "damaged"
 there, given how much this project has paid for misread logs.
 
 ### GUI polish pass — 2026-08-05 (`8dfaca2`..`6a64b88`)
@@ -151,7 +151,7 @@ All four units brought onto this image.
 Device discovery, `/api/audio/*`, **live apply without a restart**, the picker in Settings → Audio,
 and `scripts/host-setup/configure-audio-hat.sh` for HAT provisioning.
 
-**Validated on `.7.204` (HiFiBerry Amp100), recommissioned from Plum-Snapcast for this.** Measured:
+**Validated on `.100.21` (HiFiBerry Amp100), recommissioned from Plum-Snapcast for this.** Measured:
 
 - The HAT enumerated as **card 2, then 1, then 2, then 0 across four reboots** with the config
   unchanged — which is why identity is the ALSA card name, not `hw:C,D`.
@@ -183,7 +183,7 @@ against. Bookworm would silently hand us shairport 4.1 and a different bluez-als
 asserts `shairport-sync -V | grep -- -mpris` and the `bluealsa`/`obexd` paths **at build time**,
 because each of those failures is invisible at runtime.
 
-**Verified on `.201.133`**: shairport inside the container advertises `_raop._tcp` through the *host*
+**Verified on `.2.10`**: shairport inside the container advertises `_raop._tcp` through the *host*
 Avahi (`6E1713303D0B@Plum Audio` on :5050), both go-librespot endpoints register Spotify Connect, and
 the mesh publishes `_sendspin-server._tcp` while discovering its peer.
 
@@ -193,7 +193,7 @@ looks fine; a SIGTERM-deaf shairport survives `pkill` still holding RAOP 5050; a
 defaults (`unit-local`, a `127.0.0.1` player URL) advertise an endpoint no peer can reach, so roams
 silently never land.
 
-Compose reaches the units two ways and that is fine: `.7.122` runs Docker CE from Docker's repo
+Compose reaches the units two ways and that is fine: `.100.20` runs Docker CE from Docker's repo
 (compose as a CLI plugin), the Debian-packaged units run trixie's standalone `docker-compose` 2.26.
 Trixie has **no** `docker-compose-v2` package — the name is `docker-compose`, and it is v2.
 
@@ -202,7 +202,7 @@ Still outside the image: DLNA (gmrender) and Plexamp.
 ### Bluetooth album art — 2026-07-30
 
 Cover art over OBEX/BIP with a private per-endpoint obexd. Three silent failure modes found and
-fixed, one measured on hardware: **our obexd started 10 s after the player bind on `.201.113`**, and
+fixed, one measured on hardware: **our obexd started 10 s after the player bind on `.2.11`**, and
 losing that race is permanent rather than transient, so `prepare()` retries for ~30 s. Full account
 in `docs/HARD-WON-LESSONS.md`.
 
@@ -252,7 +252,7 @@ by the group's server. Audio a foreign server renders to our player has no sourc
 server we can read, so it cannot be visualized that way — but the player's own member-view relay
 (above) supersedes this for the local speaker's session.
 
-### Interop proven on a third party — 2026-07-21 (VLAN-7 rig)
+### Interop proven on a third party — 2026-07-21 (interop rig)
 
 Music Assistant 2.9.9 and a Home Assistant Voice PE — real foreign implementations on their own
 segment, not stand-ins.
@@ -308,7 +308,7 @@ into `MeshApp`, and `useThemeSettings`.
 Spotify is **go-librespot**, not spotifyd. `zeroconf_backend: avahi` registers Connect discovery
 through the system Avahi so nothing binds 5353 behind our back.
 
-**Hardware-validated on both `.201.x` Pis**: Spotify audio, metadata, artwork, transport, timeline,
+**Hardware-validated on both mesh-pair Pis**: Spotify audio, metadata, artwork, transport, timeline,
 live endpoint CRUD (add/rename/enable/disable/remove apply **live, in seconds**), and cross-server
 roam of a Spotify stream.
 
@@ -331,12 +331,12 @@ day (`de50035`).
 
 - **Live AirPlay end-to-end**: real shairport-sync PCM (not a tone); title/artist/album +
   **512×512 JPEG artwork** to the metadata/artwork roles; **0 xruns**.
-- **Multi-room**: player-133 and player-113 both joined `.133`'s live-AirPlay group, in sync.
-- **Roam off live AirPlay**: player-113 detached holding **435 ms of real AirPlay audio**, reattached
+- **Multi-room**: player-210 and player-211 both joined `.10`'s live-AirPlay group, in sync.
+- **Roam off live AirPlay**: player-211 detached holding **435 ms of real AirPlay audio**, reattached
   with the buffer intact, **`pad_ms` unchanged** — zero audible dropout. The tone-based finding holds
   for real bursty content.
 
-### Two-node hardware validation — 2026-07-13 (`.201.133` + `.201.113`)
+### Two-node hardware validation — 2026-07-13 (`.2.10` + `.2.11`)
 
 - **Discovery**: mutual UDP beacon over the real LAN — each unit discovers the other. Loopback could
   not test this at all.
@@ -381,11 +381,11 @@ Loopback numbers, before hardware:
 
 The probe measured re-route against an *idle-then-started* source, which is exactly why it reported a
 clean live re-route and missed the stream-membership rule that surfaced on hardware a month later
-(2026-08-04, on `.7.204`). Worth remembering when writing the next probe.
+(2026-08-04, on `.100.21`). Worth remembering when writing the next probe.
 
 ---
 
-## Phase 1 — single-unit core playback (2026-07, `.201.133`)
+## Phase 1 — single-unit core playback (2026-07, `.2.10`)
 
 **Milestone fully achieved on hardware, in Docker**: real AirPlay from an iPhone → shairport → FIFO →
 in-process SendspinServer → player → onboard DAC → speaker, **with live metadata and 512×512 album
@@ -411,7 +411,7 @@ spike ported into a real `sendspin_server.py` skeleton.
 
 ## Phase 4 — cutover (not started)
 
-Migrate the two production units (`.200` / `.203`) once a ≥3-unit soak passes; freeze the
+Migrate the two production units (`.50` / `.51`) once a ≥3-unit soak passes; freeze the
 Plum-Snapcast codebase on a tag for rollback.
 
 Remaining before then: DLNA/Plexamp slices, and the conformance gaps in `docs/SPEC-CONFORMANCE.md`.

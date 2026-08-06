@@ -9,18 +9,18 @@ function np(partial: Partial<NowPlaying>): NowPlaying {
 const VIEW: MeshView = {
   units: [
     {
-      unit_id: 'unit-133',
+      unit_id: 'unit-210',
       name: 'Pi4-02',
       host: '192.0.2.10',
-      sources: [{ source_id: 'airplay', group_id: 'gA', group_name: 'AirPlay', streaming: true, player_ids: ['player-133'] }],
-      players: [{ player_id: 'player-133', name: 'Player-133', connected: true, group_id: 'gA', url: 'ws://192.0.2.10:8928/sendspin' }],
+      sources: [{ source_id: 'airplay', group_id: 'gA', group_name: 'AirPlay', streaming: true, player_ids: ['player-210'] }],
+      players: [{ player_id: 'player-210', name: 'Player-210', connected: true, group_id: 'gA', url: 'ws://192.0.2.10:8928/sendspin' }],
     },
     {
-      unit_id: 'unit-113',
+      unit_id: 'unit-211',
       name: 'PoE-Temp',
       host: '192.0.2.11',
       sources: [{ source_id: 'airplay', group_id: 'gB', group_name: 'AirPlay', streaming: true, player_ids: [] }],
-      // player-113 has roamed to unit-133's group gA (appears under the unit it's connected to)
+      // player-211 has roamed to unit-210's group gA (appears under the unit it's connected to)
       players: [],
     },
   ],
@@ -29,24 +29,24 @@ const VIEW: MeshView = {
 describe('mapViewToModel', () => {
   it('maps units->servers, sources->streams, players->clients', () => {
     const m = mapViewToModel(VIEW, new Map(), new Map());
-    expect(m.servers.map((s) => s.id)).toEqual(['unit-133', 'unit-113']);
-    expect(m.streams.map((s) => s.id)).toEqual(['unit-133::airplay', 'unit-113::airplay']);
-    expect(m.clients.map((c) => c.id)).toEqual(['player-133']);
+    expect(m.servers.map((s) => s.id)).toEqual(['unit-210', 'unit-211']);
+    expect(m.streams.map((s) => s.id)).toEqual(['unit-210::airplay', 'unit-211::airplay']);
+    expect(m.clients.map((c) => c.id)).toEqual(['player-210']);
   });
 
   it('derives currentStreamId from the player group_id matching a source group_id', () => {
     const m = mapViewToModel(VIEW, new Map(), new Map());
-    expect(m.clients[0].currentStreamId).toBe('unit-133::airplay');
+    expect(m.clients[0].currentStreamId).toBe('unit-210::airplay');
   });
 
   it('resolves a roamed player to a peer unit source group', () => {
-    // player-113 connected to unit-133's server (group gA) though it lives on unit-113
+    // player-211 connected to unit-210's server (group gA) though it lives on unit-211
     const view: MeshView = structuredClone(VIEW);
-    view.units[0].players.push({ player_id: 'player-113', name: 'Player-113', connected: true, group_id: 'gA', url: 'x' });
+    view.units[0].players.push({ player_id: 'player-211', name: 'Player-211', connected: true, group_id: 'gA', url: 'x' });
     const m = mapViewToModel(view, new Map(), new Map());
-    const roamed = m.clients.find((c) => c.id === 'player-113')!;
-    expect(roamed.currentStreamId).toBe('unit-133::airplay');
-    expect(roamed.serverId).toBe('unit-133');
+    const roamed = m.clients.find((c) => c.id === 'player-211')!;
+    expect(roamed.currentStreamId).toBe('unit-210::airplay');
+    expect(roamed.serverId).toBe('unit-210');
   });
 
   it('null currentStreamId when the player is in no source group', () => {
@@ -60,7 +60,7 @@ describe('mapViewToModel', () => {
     // group playback_state stays 'playing' through a source pause; speed 0 is what flips the UI.
     const npByGroup = new Map([['gA', np({ groupId: 'gA', playbackState: 'playing', title: 'Rebel Yell', playbackSpeed: 0, trackProgressMs: 137749, trackDurationMs: 288580 })]]);
     const m = mapViewToModel(VIEW, npByGroup, new Map());
-    const s = m.streams.find((s) => s.id === 'unit-133::airplay')!;
+    const s = m.streams.find((s) => s.id === 'unit-210::airplay')!;
     expect(s.isPlaying).toBe(false);
     expect(s.playback!.playback_status).toBe('paused');
     expect(s.currentTrack.title).toBe('Rebel Yell'); // metadata retained through the pause
@@ -69,13 +69,13 @@ describe('mapViewToModel', () => {
   it('merges now-playing metadata onto the matching stream', () => {
     const npByGroup = new Map([['gA', np({ groupId: 'gA', playbackState: 'playing', title: 'Redbone', artist: 'Childish Gambino', album: 'Awaken', artworkUrl: 'blob:x', trackDurationMs: 326000 })]]);
     const m = mapViewToModel(VIEW, npByGroup, new Map());
-    const s = m.streams.find((s) => s.id === 'unit-133::airplay')!;
+    const s = m.streams.find((s) => s.id === 'unit-210::airplay')!;
     expect(s.currentTrack.title).toBe('Redbone');
     expect(s.currentTrack.duration).toBe(326); // seconds
     expect(s.currentTrack.albumArtUrl).toBe('blob:x');
     expect(s.isPlaying).toBe(true);
     // the other stream has no now-playing -> structural fallback
-    const other = m.streams.find((s) => s.id === 'unit-113::airplay')!;
+    const other = m.streams.find((s) => s.id === 'unit-211::airplay')!;
     expect(other.currentTrack.title).toBe('');
     expect(other.isPlaying).toBe(true); // from streaming=true
     expect(other.playback!.is_stale).toBe(true);
@@ -84,25 +84,25 @@ describe('mapViewToModel', () => {
 
 describe('streamId helpers', () => {
   it('round-trips unit/source even when source has a colon-ish name', () => {
-    const id = streamId('unit-113', 'airplay');
-    expect(parseStreamId(id)).toEqual({ unitId: 'unit-113', sourceId: 'airplay' });
+    const id = streamId('unit-211', 'airplay');
+    expect(parseStreamId(id)).toEqual({ unitId: 'unit-211', sourceId: 'airplay' });
   });
 });
 
 describe('unit identity + source state', () => {
   it('marks the responder\'s own player local BY LISTENER HOST, even after it roams', () => {
-    // player-113 lives on unit-113 but is currently connected to unit-133's server (a roam):
-    // it must still count as unit-113's own player when unit-113 serves the page.
+    // player-211 lives on unit-211 but is currently connected to unit-210's server (a roam):
+    // it must still count as unit-211's own player when unit-211 serves the page.
     const view: MeshView = structuredClone(VIEW);
-    view.local_unit_id = 'unit-113';
+    view.local_unit_id = 'unit-211';
     view.units[0].players.push({
-      player_id: 'player-113', name: 'Player-113', connected: true, group_id: 'gA',
+      player_id: 'player-211', name: 'Player-211', connected: true, group_id: 'gA',
       url: 'ws://192.0.2.11:8928/sendspin',
     });
     const m = mapViewToModel(view, new Map(), new Map());
-    expect(m.localUnitId).toBe('unit-113');
-    expect(m.localPlayerIds).toEqual(['player-113']);
-    expect(m.clients.find((c) => c.id === 'player-133')!.isLocal).toBe(false);
+    expect(m.localUnitId).toBe('unit-211');
+    expect(m.localPlayerIds).toEqual(['player-211']);
+    expect(m.clients.find((c) => c.id === 'player-210')!.isLocal).toBe(false);
   });
 
   it('claims no players when the view does not say who answered', () => {
@@ -216,10 +216,10 @@ describe('speaker names survive going idle', () => {
   // usually publishes no `name` TXT key). The row used to rename itself on every join/leave.
   const URL = 'ws://198.51.100.30:8927/sendspin';
   const ATTACHED: MeshView = {
-    local_unit_id: 'unit-7204',
+    local_unit_id: 'unit-10021',
     units: [
       {
-        unit_id: 'unit-7204',
+        unit_id: 'unit-10021',
         name: 'Plum Amp100',
         host: '198.51.100.21',
         sources: [{ source_id: 'airplay', group_id: 'gA', group_name: 'AirPlay', streaming: true, player_ids: ['aa:bb:cc'] }],
@@ -228,7 +228,7 @@ describe('speaker names survive going idle', () => {
     ],
   };
   const IDLE: MeshView = {
-    local_unit_id: 'unit-7204',
+    local_unit_id: 'unit-10021',
     units: [{ ...ATTACHED.units[0], players: [] }],
   };
   const NEIGHBOURHOOD = {
@@ -273,7 +273,7 @@ describe('speaker names survive going idle', () => {
 });
 
 describe('a live unit rename reaches its PEERS', () => {
-  // Reported from the rig 2026-08-05: renaming unit-133 updated its own GUI but not unit-113's,
+  // Reported from the rig 2026-08-05: renaming unit-210 updated its own GUI but not unit-211's,
   // and a page refresh did not help.
   //
   // Two names again, but a different pair. `players[].name` is what the speaker declared at the
@@ -287,23 +287,23 @@ describe('a live unit rename reaches its PEERS', () => {
   const URL = 'ws://192.0.2.10:8928/sendspin';
 
   const view = (handshakeName: string, selfReportName: string): MeshView => ({
-    local_unit_id: 'unit-113',
+    local_unit_id: 'unit-211',
     units: [
       {
-        unit_id: 'unit-113',
+        unit_id: 'unit-211',
         name: '113 Sendspin',
         host: '192.0.2.11',
-        sources: [{ source_id: 'airplay-1', group_id: 'gA', group_name: 'AirPlay', streaming: true, player_ids: ['player-133'] }],
-        // The PEER's server holds unit-133's speaker, carrying its handshake name.
-        players: [{ player_id: 'player-133', name: handshakeName, connected: true, group_id: 'gA', url: URL }],
+        sources: [{ source_id: 'airplay-1', group_id: 'gA', group_name: 'AirPlay', streaming: true, player_ids: ['player-210'] }],
+        // The PEER's server holds unit-210's speaker, carrying its handshake name.
+        players: [{ player_id: 'player-210', name: handshakeName, connected: true, group_id: 'gA', url: URL }],
       },
       {
-        unit_id: 'unit-133',
+        unit_id: 'unit-210',
         name: selfReportName,
         host: '192.0.2.10',
         sources: [],
         players: [],
-        local_player: { player_id: 'player-133', name: selfReportName, url: URL, attached: true },
+        local_player: { player_id: 'player-210', name: selfReportName, url: URL, attached: true },
       },
     ],
   });
@@ -319,7 +319,7 @@ describe('a live unit rename reaches its PEERS', () => {
     expect(nameOf(svc)).toBe('Pi4-02');
 
     // The rename: settings.json moved, so the self-report has it. The handshake name has NOT
-    // changed and will not until unit-133's audio process restarts.
+    // changed and will not until unit-210's audio process restarts.
     // @ts-expect-error — private hand-off.
     svc.applyView(view('Pi4-02', 'Pi4-02-Renamed'));
     expect(nameOf(svc)).toBe('Pi4-02-Renamed');

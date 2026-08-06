@@ -1,7 +1,7 @@
 # Sendspin spec conformance — where Plum-Audio stands
 
 > Audited 2026-07-21 against <https://www.sendspin-audio.com/spec/> and `aiosendspin` 6.0.5, with
-> live evidence from the VLAN-7 rig (Music Assistant 2.9.9 + a Home Assistant Voice PE).
+> live evidence from the interop rig (Music Assistant 2.9.9 + a Home Assistant Voice PE).
 > Interop is the reason we build on this protocol, so this file tracks conformance as a first-class
 > property, not a footnote. See ARCHITECTURE §8 for the design behind each item.
 

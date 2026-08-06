@@ -483,7 +483,7 @@ def test_props_adoption_does_not_reseed_a_bound_player():
 def test_player_bind_rebuilds_the_cover_art_session(monkeypatch):
     """Reset BEFORE prepare, in that order — prepare() is a no-op while a session is cached.
 
-    Hardware 2026-07-30 (.201.113): bluetoothd was replaced under a running server. Its objects did
+    Hardware 2026-07-30 (.2.11): bluetoothd was replaced under a running server. Its objects did
     NOT depart with InterfacesRemoved, so there was no player-gone event to invalidate anything; the
     player rebound cleanly the next morning and prepare() returned early on the previous day's dead
     session path. The phone withholds ImgHandle without a live BIP session, so no fetch was ever
@@ -515,7 +515,7 @@ def test_player_bind_rebuilds_the_cover_art_session(monkeypatch):
 def test_cover_art_prepare_is_retried_until_our_obexd_is_up(monkeypatch):
     """Losing the race against our own obexd must not be permanent.
 
-    The source manager starts obexd independently of the player bind — 10 s apart on `.201.113`,
+    The source manager starts obexd independently of the player bind — 10 s apart on `.2.11`,
     where prepare() failed on a bus with no org.bluez.obex yet. Nothing else calls prepare(), and
     without a session the phone withholds ImgHandle, so handle_track never runs to retry: one lost
     race meant no album art for the life of the process.

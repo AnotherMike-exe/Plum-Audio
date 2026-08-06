@@ -54,7 +54,7 @@ nothing in the container can substitute for any of it:
 
 **A unit with no HAT needs nothing here.** A stock Raspberry Pi OS image already carries
 `dtparam=audio=on`, enumerates `bcm2835 Headphones` as card 0, and leaves its `PCM` control at
-0.00 dB — verified on both `.201` units on 2026-08-06, where the whole of this section was correctly
+0.00 dB — verified on both mesh-pair units on 2026-08-06, where the whole of this section was correctly
 a no-op. `--unity` is not applicable either: it resolves the **HAT** card and exits with "no HAT card
 found in aplay -l" on such a unit, which is the right answer, not a failure to work around. Give
 `units.conf` a DAC column of `bcm2835` and skip to §2.
@@ -78,7 +78,7 @@ did not write — the adoption case, since Plum-Snapcast's README told people to
 `dtoverlay=hifiberry-amp100` by hand — and keeps a `.plum.bak`. `--revert` is exact.
 
 **Position in config.txt matters — the block goes BEFORE the first existing `dtoverlay=` line.**
-Appending it after `dtoverlay=vc4-kms-v3d` costs an HDMI audio output: measured on `.7.204`, the
+Appending it after `dtoverlay=vc4-kms-v3d` costs an HDMI audio output: measured on `.100.21`, the
 overlay before `vc4-kms-v3d` enumerates `vc4hdmi0`, `vc4hdmi1` and the HAT (3 boots), while after it
 enumerates only `vc4hdmi1` and the HAT (2 boots) — `vc4hdmi0` never appears. The HAT works either
 way, which is exactly why this would have shipped unnoticed on a unit nobody plugs a display into.
@@ -102,12 +102,12 @@ applied.** Do it before setting listening levels.
 > fallback (a `config.txt` with no `dtoverlay=` line at all, where the block goes at EOF) have
 > **never run on real hardware**. Both are unit-tested against `config.txt` fixtures in
 > `tests/Unit/test_configure_audio_hat.py`; the main path is verified across four reboots on
-> `.7.204`. A unit with no HAT has never been through this script. Related: `.7.204` has no 3.5 mm
+> `.100.21`. A unit with no HAT has never been through this script. Related: `.100.21` has no 3.5 mm
 > jack because the block sets `dtparam=audio=off` — correct and deliberate; re-run with
 > `--keep-onboard` if the jack should be listed alongside the HAT.
 
 Card **numbers** are not stable and nothing depends on them — Plum-Audio persists the ALSA card
-*name*. On `.7.204` the HiFiBerry was card 2, then 1, then 2, then 0 across four reboots with the
+*name*. On `.100.21` the HiFiBerry was card 2, then 1, then 2, then 0 across four reboots with the
 config unchanged. Do not "fix" anything that references `hw:N,M`.
 
 ## 2. rfkill
@@ -121,7 +121,7 @@ fails with a bare `"Failed"` and no explanation, and we cannot fix it from the c
 need `/dev/rfkill` plus `CAP_NET_ADMIN`). `bluetooth_adapter.py` names rfkill in the error it logs,
 which is the only hint you get.
 
-**A fresh Raspberry Pi OS image boots soft-blocked** — both `.201` units did on 2026-08-06 — so this
+**A fresh Raspberry Pi OS image boots soft-blocked** — both mesh-pair units did on 2026-08-06 — so this
 is not an edge case, it is the default state of every new card. `systemd-rfkill` persists the unblock
 in `/var/lib/systemd/rfkill`, so it survives reboots; re-flashing the card loses it again.
 
@@ -160,7 +160,7 @@ behaves exactly as before — it just loses scrub reporting. Verified: 8 polls /
 signals / 9 s, scrubs landing within ~2 s (`t2_bt_avrcp_position.sh`, 2026-07-29).
 
 Two Pi-specific traps, both paid for on 2026-07-29: **do not build at `-j$(nproc)`** (a 4-core LTO
-build browned out the 5 V rail on `.7.122` and the board reset ~10 min in — hence 2 jobs by
+build browned out the 5 V rail on `.100.20` and the board reset ~10 min in — hence 2 jobs by
 default), and **do not log to `/tmp`** (a 1.9 GB tmpfs on Debian 13, so the reset takes the log with
 it, exactly when you need it). Budget ~30 min on a Pi 4 and ~1.5 GB, both reclaimed on success.
 
@@ -195,7 +195,7 @@ A phone serves **one** AVRCP BIP (cover art) session at a time. The distro's D-B
 because we never got to ask. Same class as disabling `bluealsa-aplay.service`.
 
 **`not-found` here is the desired state, not a problem.** Raspberry Pi OS **Lite** does not ship
-`obex.service` at all, so there is nothing to mask — both `.201` units reported `not-found` on
+`obex.service` at all, so there is nothing to mask — both mesh-pair units reported `not-found` on
 2026-08-06 and are correctly provisioned. It is present on the full desktop image.
 
 ## 5. Install the bluealsa D-Bus policy
@@ -212,7 +212,7 @@ Its absence is catastrophic but silent. Debian's own policy
 (`/usr/share/dbus-1/system.d/bluealsa.conf`) grants `own_prefix="org.bluealsa"` to `user="root"`
 only — group `audio` may *send* to it but not own it — and `bluetooth_manager.py` spawns the daemon
 as our user. So `bluealsa` cannot acquire `org.bluealsa`, exits `rc=1` about 3 s after every start,
-and the source manager respawns it forever. **On `.7.204` that was 178 restarts and a new
+and the source manager respawns it forever. **On `.100.21` that was 178 restarts and a new
 `dbus-daemon` every 9.5 s**, and enough log spam to bury unrelated diagnosis — see the `tail`
 warning in docs/OPERATIONS.md. The one line that names it:
 

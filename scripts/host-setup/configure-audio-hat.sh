@@ -158,7 +158,7 @@ find_config() {
 #
 # Plain field splitting on purpose. The obvious `match($0, /re/, m)` is a GAWK extension and Debian
 # ships MAWK, where it is a syntax error — which this function swallowed, so --unity reported "no HAT
-# card found" on a unit with a HAT plainly listed in aplay -l. Caught on .7.204 on 2026-08-04.
+# card found" on a unit with a HAT plainly listed in aplay -l. Caught on .100.21 on 2026-08-04.
 #   card 1: sndrpihifiberry [snd_rpi_hifiberry_dacplus], device 0: ...
 #   $1     $2  $3
 detect_hat_card() {
@@ -348,7 +348,7 @@ main() {
         #
         # Refraining from writing `dtparam=audio=off` into the block is NOT enough: a
         # `dtparam=audio=off` sitting OUTSIDE the block still kills the jack, and the block is the
-        # only thing this script rewrites. Found on .7.204, where a hand edit predating this script
+        # only thing this script rewrites. Found on .100.21, where a hand edit predating this script
         # ("HiFiBerry AMP100 - disabling onboard audio as recommended") sat at line 11 while the
         # managed block was at line 28 — so --keep-onboard would have left the card missing and
         # looked like the flag simply did not work.
@@ -361,7 +361,7 @@ main() {
     #
     # The block goes BEFORE the first existing dtoverlay line, which is where Raspberry Pi's own
     # config.txt keeps audio settings. Appending it after `dtoverlay=vc4-kms-v3d` instead costs an
-    # HDMI audio output: measured on .7.204, overlay before vc4-kms-v3d enumerates vc4hdmi0,
+    # HDMI audio output: measured on .100.21, overlay before vc4-kms-v3d enumerates vc4hdmi0,
     # vc4hdmi1 and the HAT (3 boots), while overlay after it enumerates only vc4hdmi1 and the HAT
     # (2 boots) — vc4hdmi0 never appears. The HAT itself works either way, which is exactly why this
     # would have shipped unnoticed on a unit nobody plugs a display into.
@@ -370,7 +370,7 @@ main() {
         echo "$BEGIN_MARK"
         # Explicit either way. Omitting the line under --keep-onboard is NOT the same as asking for
         # onboard audio: with no dtparam=audio at all the firmware leaves the bcm2835 codec off, so
-        # no Headphones card enumerates. Measured on .7.204 — removed both `off` lines, rebooted,
+        # no Headphones card enumerates. Measured on .100.21 — removed both `off` lines, rebooted,
         # and /proc/asound/cards still showed only the two HDMI outputs and the HAT.
         if [[ "$KEEP_ONBOARD" == 0 ]]; then echo "dtparam=audio=off"; else echo "dtparam=audio=on"; fi
         echo "dtoverlay=${OVERLAY}"

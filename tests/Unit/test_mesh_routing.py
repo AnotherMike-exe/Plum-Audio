@@ -177,7 +177,7 @@ def test_has_player_defaults_true_for_a_peer_on_an_older_image():
     their leader stream from sources instead of their self-reported player.
     """
     snap = UnitSnapshot.from_dict(
-        {"unit_id": "unit-113", "name": "Pi4-01", "host": "10.0.0.1", "sources": [], "players": []}
+        {"unit_id": "unit-211", "name": "Pi4-01", "host": "10.0.0.1", "sources": [], "players": []}
     )
     assert snap.has_player is True
 

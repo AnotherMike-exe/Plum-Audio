@@ -93,7 +93,7 @@ def test_an_unnamed_unit_and_its_endpoints_boot_under_PLUM_UNIT_NAME(monkeypatch
 
     DEFAULT_SETTINGS is WRITTEN to settings.json on the first read, so a hardcoded literal outranks
     PLUM_UNIT_NAME permanently and on every unit at once. That produced two collisions on the freshly
-    imaged .201 units (2026-08-06): both came up as the unit "Plum Sendspin", one name for two units
+    imaged mesh-pair units (2026-08-06): both came up as the unit "Plum Sendspin", one name for two units
     in the mesh view / GUI cards / mDNS; and both offered an AirPlay receiver called "Plum Audio",
     indistinguishable to a sender on the LAN. Every source endpoint shares that fallback, so Spotify
     and Bluetooth collided identically once enabled.

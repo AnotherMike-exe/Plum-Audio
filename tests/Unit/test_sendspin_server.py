@@ -384,30 +384,30 @@ def test_controller_grouping_is_a_noop_with_no_sources():
 
 
 def test_local_player_config_derives_the_pair_by_default():
-    player_id, url = ss.local_player_config({}, "unit-133")
-    assert player_id == "unit-133-player"
+    player_id, url = ss.local_player_config({}, "unit-210")
+    assert player_id == "unit-210-player"
     assert url == "ws://127.0.0.1:8928/sendspin"
 
 
 def test_local_player_config_honours_explicit_values():
-    env = {"PLUM_LOCAL_PLAYER_ID": "player-133", "PLUM_LOCAL_PLAYER_URL": "ws://10.0.0.9:8928/sendspin"}
-    assert ss.local_player_config(env, "unit-133") == ("player-133", "ws://10.0.0.9:8928/sendspin")
+    env = {"PLUM_LOCAL_PLAYER_ID": "player-210", "PLUM_LOCAL_PLAYER_URL": "ws://10.0.0.9:8928/sendspin"}
+    assert ss.local_player_config(env, "unit-210") == ("player-210", "ws://10.0.0.9:8928/sendspin")
 
 
 def test_the_operator_flag_removes_the_local_player():
     """deploy.sh writes this from a units.conf row whose DAC column is `none`."""
-    env = {"PLUM_PLAYER_ENABLED": "0", "PLUM_LOCAL_PLAYER_ID": "player-133"}
-    assert ss.local_player_config(env, "unit-133") == (None, None)
+    env = {"PLUM_PLAYER_ENABLED": "0", "PLUM_LOCAL_PLAYER_ID": "player-210"}
+    assert ss.local_player_config(env, "unit-210") == (None, None)
 
 
 def test_an_empty_url_also_removes_the_local_player():
     """The older way of saying it, still used on the dev rig — must keep working."""
-    assert ss.local_player_config({"PLUM_LOCAL_PLAYER_URL": ""}, "unit-133") == (None, None)
+    assert ss.local_player_config({"PLUM_LOCAL_PLAYER_URL": ""}, "unit-210") == (None, None)
 
 
 def test_the_flag_wins_over_an_explicit_url():
     env = {"PLUM_PLAYER_ENABLED": "0", "PLUM_LOCAL_PLAYER_URL": "ws://10.0.0.9:8928/sendspin"}
-    assert ss.local_player_config(env, "unit-133") == (None, None)
+    assert ss.local_player_config(env, "unit-210") == (None, None)
 
 
 def test_a_unit_reports_whether_it_has_a_speaker_at_all():

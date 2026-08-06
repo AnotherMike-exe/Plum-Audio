@@ -2,8 +2,8 @@
 
 The fixtures are VERBATIM `aplay -l` captures from two real units on 2026-08-04, kept because the
 difference between them is the whole reason this module exists: the same three-card Pi 4 numbers its
-cards differently depending on what is fitted. On `.201.133` the analogue jack is card 0; on the
-Amp100 unit `.7.204` the HAT is card 2, sitting behind two vc4hdmi cards. Anything that persists
+cards differently depending on what is fitted. On `.2.10` the analogue jack is card 0; on the
+Amp100 unit `.100.21` the HAT is card 2, sitting behind two vc4hdmi cards. Anything that persists
 `hw:C,D` is therefore one HDMI hotplug or kernel bump away from opening the wrong output while every
 level in the mesh still reads correct — see test_identity_survives_card_renumbering, which is the
 regression this file exists for.

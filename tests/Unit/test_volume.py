@@ -108,9 +108,9 @@ class FakeEngine:
 def test_router_keeps_the_two_volumes_apart():
     engine = FakeEngine()
     router = _router(engine)
-    asyncio.run(router.set_volume("player-133", 60, False))
+    asyncio.run(router.set_volume("player-210", 60, False))
     asyncio.run(router.set_source_volume("airplay-1", 30, None))
-    assert engine.calls == [("player", "player-133", 60, False), ("source", "airplay-1", 30, None)]
+    assert engine.calls == [("player", "player-210", 60, False), ("source", "airplay-1", 30, None)]
 
 
 def test_router_surfaces_a_source_that_cannot_do_it():

@@ -293,7 +293,7 @@ def test_a_PLUM_DAC_DEVICE_fragment_matching_the_echo_is_not_pending(client, mon
     device the unit was already playing on: the Audio tab showed "switching to Built-in Headphones"
     beside that same device's own "playing" tag, on a unit where nothing had ever been changed.
 
-    Seen on both .201 units after the greenfield alpha deploy, 2026-08-06 — i.e. on every unit that
+    Seen on both mesh-pair units after the greenfield alpha deploy, 2026-08-06 — i.e. on every unit that
     has never had an output picked in the GUI.
     """
     state = tmp_path / "player_state.json"
