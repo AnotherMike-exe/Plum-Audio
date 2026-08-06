@@ -446,7 +446,18 @@ class BluetoothAdapter:
         except Exception:  # noqa: BLE001 - UUIDs not populated yet; we'll be called again
             return False
         lowered = {str(u).lower() for u in uuids}
-        return A2DP_SOURCE_UUID in lowered or A2DP_SINK_UUID in lowered
+        if A2DP_SOURCE_UUID in lowered:
+            return True  # a sender; it may ALSO offer 110d (phones that can be a speaker too)
+        if A2DP_SINK_UUID in lowered:
+            # Sink-only: a speaker, not a sender. Adopting it used to start an arecord that could
+            # never produce audio, and — because most-recently-connected wins — it would take the
+            # capture slot away from a phone that was already playing. Logged rather than silent so
+            # a device that genuinely sends while advertising only 110d is diagnosable.
+            logger.info(
+                "[%s] ignoring a connected A2DP SINK (speaker) — it has nothing to send us",
+                self.instance.source_id,
+            )
+        return False
 
     async def _address_of(self, props, path: str) -> str:
         with contextlib.suppress(Exception):
