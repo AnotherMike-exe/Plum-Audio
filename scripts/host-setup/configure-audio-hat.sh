@@ -368,7 +368,11 @@ main() {
     local block="${CONFIG}.plumblock"
     {
         echo "$BEGIN_MARK"
-        [[ "$KEEP_ONBOARD" == 0 ]] && echo "dtparam=audio=off"
+        # Explicit either way. Omitting the line under --keep-onboard is NOT the same as asking for
+        # onboard audio: with no dtparam=audio at all the firmware leaves the bcm2835 codec off, so
+        # no Headphones card enumerates. Measured on .7.204 — removed both `off` lines, rebooted,
+        # and /proc/asound/cards still showed only the two HDMI outputs and the HAT.
+        if [[ "$KEEP_ONBOARD" == 0 ]]; then echo "dtparam=audio=off"; else echo "dtparam=audio=on"; fi
         echo "dtoverlay=${OVERLAY}"
         echo "$END_MARK"
     } > "$block"

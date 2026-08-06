@@ -116,6 +116,21 @@ def test_keep_onboard_leaves_the_soc_codec_enabled(tmp_path):
     assert "dtparam=audio=off" not in block
 
 
+def test_keep_onboard_asks_for_onboard_audio_explicitly(tmp_path):
+    """Omitting the line is not the same as asking for it.
+
+    With no dtparam=audio at all the firmware leaves the bcm2835 codec OFF and no Headphones card
+    enumerates. Measured on .7.204: both `off` lines removed, rebooted, still only the two HDMI
+    outputs and the HAT. So the block has to say `on` out loud.
+    """
+    path = tmp_path / "config.txt"
+    path.write_text(HAND_DISABLED)
+    run(path, "--overlay", "hifiberry-amp100", "--keep-onboard")
+
+    block = path.read_text().split("# >>> plum-audio hat")[1].split("# <<< plum-audio hat")[0]
+    assert "dtparam=audio=on" in block
+
+
 def test_onboard_audio_is_commented_out_by_default(tmp_path):
     path = tmp_path / "config.txt"
     path.write_text(ONBOARD_DEFAULT)
