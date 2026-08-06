@@ -46,9 +46,7 @@ class SyncEngine(ABC):
     async def set_player_volume(self, player_id: str, volume: int, muted: bool) -> None:
         """Set a player's volume/mute (per-client)."""
 
-    async def set_source_volume(
-        self, source_id: str, volume: int | None = None, muted: bool | None = None
-    ) -> None:
+    async def set_source_volume(self, source_id: str, volume: int | None = None, muted: bool | None = None) -> None:
         """Set the volume/mute ON THE SENDING DEVICE feeding a source (AirPlay/BT/Spotify).
 
         Distinct from `set_player_volume`, which is our own output gain. Optional: an engine whose
@@ -65,5 +63,5 @@ class SyncEngine(ABC):
         """Hand a foreign speaker back to whatever server had it. Optional."""
         raise NotImplementedError
 
-    def snapshot(self) -> UnitSnapshot:
+    def snapshot(self) -> UnitSnapshot:  # noqa: B027 - optional hook; an engine with no structural view may leave it
         """This unit's local structural state for the aggregator / REST snapshot."""

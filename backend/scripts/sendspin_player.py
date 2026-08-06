@@ -40,28 +40,31 @@ import threading
 import time
 
 import numpy as np
-
 from aiosendspin.client.client import SendspinClient
 from aiosendspin.client.listener import ClientListener
+from aiosendspin.models.artwork import ArtworkChannel, ClientHelloArtworkSupport
 from aiosendspin.models.core import ClientStateMessage, ClientStatePayload, DeviceInfo
 from aiosendspin.models.player import ClientHelloPlayerSupport, PlayerStatePayload, SupportedAudioFormat
-from aiosendspin.models.artwork import ArtworkChannel, ClientHelloArtworkSupport
-from aiosendspin.models.types import ArtworkSource, PictureFormat
-from aiosendspin.models.visualizer import ClientHelloVisualizerSpectrum, ClientHelloVisualizerSupport
 from aiosendspin.models.types import (
+    ArtworkSource,
     AudioCodec,
     ClientStateType,
     GoodbyeReason,
     MediaCommand,
+    PictureFormat,
     PlayerCommand,
     Roles,
 )
+from aiosendspin.models.visualizer import ClientHelloVisualizerSpectrum, ClientHelloVisualizerSupport
 
 try:
     import sounddevice as sd
 except Exception:  # noqa: BLE001 - allows --probe-config / import without PortAudio present
     sd = None
 
+import audio_devices
+import unit_identity
+from lifecycle import install_shutdown_handlers
 from mesh.avahi import CLIENT_SERVICE, AvahiClient
 from player_state import (
     STATE_SAVE_DEBOUNCE_S,
@@ -72,10 +75,6 @@ from player_state import (
     save_render_state,
     state_file_path,
 )
-
-import audio_devices
-import unit_identity
-from lifecycle import install_shutdown_handlers
 
 logger = logging.getLogger("plum.sendspin_player")
 
@@ -160,7 +159,7 @@ class AlsaRenderer:
         self.rate = rate
         self.channels = channels
         self.bits = bits
-        self.device = device            # what we were ASKED for (settings/env spec)
+        self.device = device  # what we were ASKED for (settings/env spec)
         self.open_device: str | None = None  # what we actually OPENED, as a stable card id
         self._bpf = channels * (bits // 8)
         self._target_bytes = self._bpf * rate * target_buffer_ms // 1000
@@ -315,7 +314,9 @@ class AlsaRenderer:
                 if self._overrun_since_log >= OVERRUN_LOG_EVERY:
                     logger.warning(
                         "jitter buffer over %dms — %d overruns, %d bytes dropped total",
-                        MAX_BUFFER_MS, self.overruns, self.dropped_bytes,
+                        MAX_BUFFER_MS,
+                        self.overruns,
+                        self.dropped_bytes,
                     )
                     self._overrun_since_log = 0
 
@@ -612,7 +613,7 @@ class SendspinPlayer:
         self._relay_art_dirty = True
 
     @staticmethod
-    def _defined(value):
+    def _defined[T](value: T) -> T | None:
         # mashumaro's omit_default leaves absent fields as an UndefinedField sentinel (not None);
         # treat both as "no value" so we never store the sentinel or a stale field.
         return None if value is None or type(value).__name__ == "UndefinedField" else value

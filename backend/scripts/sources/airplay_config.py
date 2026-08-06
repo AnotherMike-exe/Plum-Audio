@@ -143,7 +143,10 @@ def render_configs(
         instances.append(inst)
         logger.info(
             "rendered shairport config %s (name=%r port=%d udp=%d)",
-            inst.config_path, inst.device_name, inst.port, inst.udp_port_base,
+            inst.config_path,
+            inst.device_name,
+            inst.port,
+            inst.udp_port_base,
         )
 
     return instances

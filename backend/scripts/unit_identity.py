@@ -25,7 +25,7 @@ import asyncio
 import json
 import logging
 import os
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
 
 logger = logging.getLogger("plum.unit_identity")
 

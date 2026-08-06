@@ -524,7 +524,10 @@ def find_device(spec: str, devices: list[AudioDevice] | None = None) -> AudioDev
             # reboot, vc4hdmi1:0 after. Loud, because the caller cannot tell the two cases apart.
             logger.warning(
                 "resolved %r by CURRENT ALSA address -> %s (%s). Card numbers move; store %r instead.",
-                spec, dev.id, dev.friendly_name, dev.id,
+                spec,
+                dev.id,
+                dev.friendly_name,
+                dev.id,
             )
             return dev
     for dev in devices:

@@ -181,9 +181,7 @@ class MeshDiscovery:
         if prev is None:
             self._prune(now)
             if len(self._peers) >= MAX_PEERS:
-                logger.warning(
-                    "peer table full (%d); ignoring new unit %s from %s", MAX_PEERS, unit_id, addr[0]
-                )
+                logger.warning("peer table full (%d); ignoring new unit %s from %s", MAX_PEERS, unit_id, addr[0])
                 return
 
         name = msg.get("name")

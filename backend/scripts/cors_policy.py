@@ -30,6 +30,7 @@ worse than one whose GUI is reachable from the wrong page.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import socket
@@ -84,7 +85,7 @@ def local_ip() -> str | None:
 
     Deliberately NOT `gethostbyname(gethostname())`: inside the container that resolves to 127.0.1.1
     from /etc/hosts, so the unit's real LAN address never enters the allowlist and a page loaded at
-    `http://<ip>` is refused. Measured on .201.133 (2026-08-06).
+    `http://<ip>` is refused. Measured on .2.10 (2026-08-06).
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -107,10 +108,8 @@ def own_hosts() -> set[str]:
     ip = local_ip()
     if ip:
         hosts.add(ip)
-    try:
+    with contextlib.suppress(OSError):
         hosts |= name_forms(socket.gethostname())
-    except OSError:
-        pass
     return hosts
 
 

@@ -12,6 +12,7 @@ stay aiohttp — it runs in the audio event loop).
 """
 
 import asyncio
+import contextlib
 import copy
 import json
 import logging
@@ -20,7 +21,7 @@ import re
 import sys
 import tempfile
 import threading
-from typing import Dict, Any
+from typing import Any
 
 from flask import Blueprint, jsonify, request
 
@@ -67,7 +68,7 @@ def sanitize_device_name(name: Any) -> str | None:
 # `settings.json deviceName > the PLUM_* env var > DEFAULT_DEVICE_NAME`, and with literals here the
 # env tier was unreachable.
 #
-# The cost was two kinds of collision on the freshly imaged .201 units (2026-08-06): both came up as
+# The cost was two kinds of collision on the freshly imaged mesh-pair units (2026-08-06): both came up as
 # the unit "Plum Sendspin" — one name for two units in the mesh view, the GUI cards and mDNS — and
 # both offered an AirPlay receiver called "Plum Audio", indistinguishable to a sender on the LAN.
 # Every source endpoint shares the fallback, so Spotify and Bluetooth collide the same way once
@@ -193,7 +194,8 @@ SETTINGS_FILE = os.environ.get("PLUM_SETTINGS_FILE", "/data/settings.json")
 # SettingsManager._migrate_audio_output.
 LEGACY_OUTPUT_PLACEHOLDERS = {"hw:Headphones", "hw:headphones", ""}
 
-def _sanitize_device_names(settings: Dict[str, Any]) -> None:
+
+def _sanitize_device_names(settings: dict[str, Any]) -> None:
     """Scrub every device name in place, whatever route wrote it.
 
     POST /api/settings takes arbitrary JSON and never went through the endpoint CRUD's validation,
@@ -226,7 +228,7 @@ def _sanitize_device_names(settings: Dict[str, Any]) -> None:
 AUDIO_OUTPUT_ALLOWED = re.compile(r"^[A-Za-z0-9_.:,\- ]{1,64}$")
 
 
-def _validate_audio_output(settings: Dict[str, Any]) -> None:
+def _validate_audio_output(settings: dict[str, Any]) -> None:
     """Normalise and validate `audio.output` in place; raise ValueError on a bad shape.
 
     POST /api/settings takes arbitrary JSON and merges ONE level deep, which means it REPLACES this
@@ -278,7 +280,7 @@ def _validate_audio_output(settings: Dict[str, Any]) -> None:
 class SettingsManager:
     """Manages server-side settings persistence."""
 
-    def __init__(self, settings_file: str = SETTINGS_FILE):
+    def __init__(self, settings_file: str = SETTINGS_FILE) -> None:
         self.settings_file = settings_file
         self._ensure_settings_file()
 
@@ -289,14 +291,22 @@ class SettingsManager:
             os.makedirs(os.path.dirname(self.settings_file), exist_ok=True)
 
             initial_settings = copy.deepcopy(DEFAULT_SETTINGS)
-            plexamp_enabled = os.getenv("PLEXAMP_ENABLED", "0").strip() in ("1", "true", "True", "TRUE", "yes", "Yes", "YES")
+            plexamp_enabled = os.getenv("PLEXAMP_ENABLED", "0").strip() in (
+                "1",
+                "true",
+                "True",
+                "TRUE",
+                "yes",
+                "Yes",
+                "YES",
+            )
             initial_settings["integrations"]["plexamp"]["available"] = plexamp_enabled
             initial_settings["integrations"]["plexamp"]["enabled"] = plexamp_enabled
             logger.info(f"Initializing Plexamp: available={plexamp_enabled}, enabled={plexamp_enabled}")
 
             self._save_settings(initial_settings)
 
-    def _save_settings(self, settings: Dict[str, Any]):
+    def _save_settings(self, settings: dict[str, Any]):
         """Save settings to the JSON file, atomically.
 
         Write-to-temp + os.replace, because this file is a cross-process contract: the audio
@@ -336,13 +346,11 @@ class SettingsManager:
             # A failure before the rename leaves the temp behind; mkstemp names are unique, so
             # without this every failed save leaks a file into /data.
             if os.path.exists(tmp_path):
-                try:
+                with contextlib.suppress(OSError):
                     os.unlink(tmp_path)
-                except OSError:
-                    pass
 
     @staticmethod
-    def _migrate_bluetooth(integrations: Dict[str, Any]) -> bool:
+    def _migrate_bluetooth(integrations: dict[str, Any]) -> bool:
         """Convert a pre-endpoints Bluetooth section in place. Returns True if anything changed.
 
         Bluetooth used to be a single object ({enabled, deviceName, adapter, autoPair,
@@ -373,7 +381,7 @@ class SettingsManager:
         return True
 
     @staticmethod
-    def _migrate_audio_output(audio: Dict[str, Any]) -> bool:
+    def _migrate_audio_output(audio: dict[str, Any]) -> bool:
         """Clear the pre-picker output placeholder in place. Returns True if anything changed.
 
         Every unit built before the output picker carries `audio.output.device = "hw:Headphones"`,
@@ -402,7 +410,7 @@ class SettingsManager:
             changed = True
         elif isinstance(device, str) and device.strip().lower().startswith("hw:"):
             # An `hw:C,D` address is not an identity, it is a position — and card numbers move (the
-            # HAT on .7.204 has been 2, 1, 2, 0 and 3). Left stored, find_device's address pass
+            # HAT on .100.21 has been 2, 1, 2, 0 and 3). Left stored, find_device's address pass
             # resolves it against TODAY's numbering and returns whatever card holds that slot now:
             # measured, `hw:2,0` gave sndrpihifiberry:0 before a reboot and vc4hdmi1:0 after. Worse,
             # the next write through set_output_device canonicalises that wrong card's STABLE id
@@ -425,7 +433,7 @@ class SettingsManager:
             logger.info("cleared the pre-picker audio output placeholder")
         return changed
 
-    def _load_merged(self) -> Dict[str, Any]:
+    def _load_merged(self) -> dict[str, Any]:
         """Load + merge + migrate, RAISING if the file exists but cannot be read.
 
         Split out from get_settings() precisely so a write path can tell "no file yet" (defaults
@@ -433,7 +441,7 @@ class SettingsManager:
         update_settings for what the difference costs.
         """
         try:
-            with open(self.settings_file, "r") as f:
+            with open(self.settings_file) as f:
                 settings = json.load(f)
         except FileNotFoundError:
             # Genuinely absent is not damage: _ensure_settings_file creates it from these defaults.
@@ -458,7 +466,15 @@ class SettingsManager:
                 self._save_settings(merged)
 
             # Keep Plexamp availability in sync with the environment (docker-compose configuration).
-            plexamp_enabled = os.getenv("PLEXAMP_ENABLED", "0").strip() in ("1", "true", "True", "TRUE", "yes", "Yes", "YES")
+            plexamp_enabled = os.getenv("PLEXAMP_ENABLED", "0").strip() in (
+                "1",
+                "true",
+                "True",
+                "TRUE",
+                "yes",
+                "Yes",
+                "YES",
+            )
             if merged["integrations"]["plexamp"]["available"] != plexamp_enabled:
                 logger.info(f"Syncing Plexamp availability from environment: {plexamp_enabled}")
                 merged["integrations"]["plexamp"]["available"] = plexamp_enabled
@@ -473,7 +489,7 @@ class SettingsManager:
             logger.error(f"Failed to load settings: {e}")
             raise
 
-    def get_settings(self) -> Dict[str, Any]:
+    def get_settings(self) -> dict[str, Any]:
         """Load settings, merged over defaults so new keys always exist. Never raises.
 
         A damaged file reads as defaults so the GUI still renders something. Do NOT call this from
@@ -485,7 +501,7 @@ class SettingsManager:
             except Exception:
                 return copy.deepcopy(DEFAULT_SETTINGS)
 
-    def update_settings(self, new_settings: Dict[str, Any]) -> Dict[str, Any]:
+    def update_settings(self, new_settings: dict[str, Any]) -> dict[str, Any]:
         """Update settings (partial or full), deep-merging one level and bumping the version.
 
         Reads through _load_merged, NOT get_settings: get_settings answers a damaged file with

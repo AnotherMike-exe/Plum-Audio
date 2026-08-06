@@ -33,7 +33,7 @@
 #
 # TWO PI-SPECIFIC TRAPS, both paid for on 2026-07-29:
 #   * Do NOT build at -j$(nproc). A 4-core LTO build (Debian's bluez rules pass -flto) pulled enough
-#     current to brown out the 5 V rail on `.7.122` and the board reset ~10 minutes in, killing the
+#     current to brown out the 5 V rail on `.100.20` and the board reset ~10 minutes in, killing the
 #     build. `vcgencmd get_throttled` reported under-voltage afterwards. Hence 2 jobs by default;
 #     raise it only on a unit with a known-good supply.
 #   * Log somewhere other than /tmp. It is a 1.9 GB tmpfs on Debian 13, so a reset takes the build

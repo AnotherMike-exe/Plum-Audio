@@ -20,9 +20,10 @@ import logging
 import socket
 from collections.abc import Awaitable, Callable
 
+from sync_engine.base import SyncEngine
+
 from mesh.discovery import MeshDiscovery, Peer
 from mesh.model import MeshView, UnitSnapshot
-from sync_engine.base import SyncEngine
 
 logger = logging.getLogger("plum.mesh.aggregator")
 

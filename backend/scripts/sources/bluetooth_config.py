@@ -139,6 +139,10 @@ def render_configs(
         os.makedirs(inst.config_dir, exist_ok=True)
         logger.info(
             "bluetooth endpoint ready %s (name=%r adapter=%s auto_pair=%s discoverable=%s)",
-            inst.config_dir, inst.device_name, inst.adapter, inst.auto_pair, inst.discoverable,
+            inst.config_dir,
+            inst.device_name,
+            inst.adapter,
+            inst.auto_pair,
+            inst.discoverable,
         )
     return instances

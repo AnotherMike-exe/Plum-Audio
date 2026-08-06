@@ -248,7 +248,9 @@ class SourceManagerBase:
                 log = open(spec.log_path, "ab", buffering=0)  # noqa: SIM115 - closed in _close_logs
                 proc = await asyncio.create_subprocess_exec(
                     *spec.argv,
-                    stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=log,
+                    stdin=subprocess.DEVNULL,
                     env={**os.environ, **spec.env},
                     start_new_session=True,  # own process group: kill it without touching the server
                 )
@@ -292,7 +294,7 @@ class SourceManagerBase:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=STOP_GRACE)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 with contextlib.suppress(Exception):

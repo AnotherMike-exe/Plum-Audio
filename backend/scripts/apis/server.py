@@ -21,7 +21,6 @@ from flask import Flask, request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/ on path
 import cors_policy  # noqa: E402
-
 from audio_api import create_audio_blueprint  # noqa: E402
 from integrations_api import create_integrations_blueprint  # noqa: E402
 from settings_api import SettingsManager, create_settings_blueprint  # noqa: E402
@@ -49,9 +48,7 @@ def create_app() -> Flask:
             response.headers["Access-Control-Max-Age"] = "600"
             response.headers["Vary"] = "Origin"
         elif origin:
-            logger.warning(
-                "CORS: refused origin %r — set PLUM_ALLOWED_ORIGINS to allow it", origin
-            )
+            logger.warning("CORS: refused origin %r — set PLUM_ALLOWED_ORIGINS to allow it", origin)
         return response
 
     return app

@@ -59,10 +59,9 @@ DEFAULT_PATH = "/sendspin"
 
 def local_ip() -> str | None:
     """This host's primary LAN address (no traffic sent — just asks the routing table)."""
-    with contextlib.suppress(OSError):
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 53))
-            return s.getsockname()[0]
+    with contextlib.suppress(OSError), socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect(("8.8.8.8", 53))
+        return s.getsockname()[0]
     return None
 
 
@@ -86,9 +85,7 @@ def _rank(addr: str, prefer_subnet_of: str | None) -> tuple:
     if ip.version == 4 and prefer_subnet_of:
         with contextlib.suppress(ValueError):
             mine = ipaddress.ip_address(prefer_subnet_of)
-            if ipaddress.ip_network(f"{mine}/24", strict=False).supernet_of(
-                ipaddress.ip_network(f"{ip}/32")
-            ):
+            if ipaddress.ip_network(f"{mine}/24", strict=False).supernet_of(ipaddress.ip_network(f"{ip}/32")):
                 return (0, addr)
     return (1 if ip.version == 4 else 2, addr)
 
@@ -97,7 +94,7 @@ def _rank(addr: str, prefer_subnet_of: str | None) -> tuple:
 class DiscoveredService:
     """One resolved mDNS service instance (all the addresses Avahi gave us for it)."""
 
-    name: str  # instance name, e.g. "player-113"
+    name: str  # instance name, e.g. "player-211"
     service_type: str
     port: int
     addresses: list[str] = field(default_factory=list)
@@ -197,10 +194,15 @@ class AvahiClient:
             intro = await self._bus.introspect(AVAHI_BUS, group_path)
             group = self._bus.get_proxy_object(AVAHI_BUS, group_path, intro).get_interface(ENTRY_GROUP_IFACE)
             await group.call_add_service(
-                IF_UNSPEC, PROTO_UNSPEC, 0,  # interface, protocol, flags
-                name, service_type,  # Avahi wants the bare type ("_sendspin._tcp"), NOT ".local"-suffixed
-                "", "",  # domain, host — empty = Avahi's defaults for this machine
-                port, _txt_to_bytes(txt),
+                IF_UNSPEC,
+                PROTO_UNSPEC,
+                0,  # interface, protocol, flags
+                name,
+                service_type,  # Avahi wants the bare type ("_sendspin._tcp"), NOT ".local"-suffixed
+                "",
+                "",  # domain, host — empty = Avahi's defaults for this machine
+                port,
+                _txt_to_bytes(txt),
             )
             await group.call_commit()
             self._groups.append(group)
@@ -250,9 +252,7 @@ class AvahiClient:
                     IF_UNSPEC, PROTO_UNSPEC, service_type, "", 0
                 )
             else:
-                browser_path = await self._server.call_service_browser_new(
-                    IF_UNSPEC, PROTO_UNSPEC, service_type, "", 0
-                )
+                browser_path = await self._server.call_service_browser_new(IF_UNSPEC, PROTO_UNSPEC, service_type, "", 0)
             intro = await self._bus.introspect(AVAHI_BUS, browser_path)
             browser = self._bus.get_proxy_object(AVAHI_BUS, browser_path, intro).get_interface(BROWSER_IFACE)
         except Exception:  # noqa: BLE001
@@ -278,7 +278,12 @@ class AvahiClient:
         return True
 
     async def _resolve(
-        self, interface: int, protocol: int, name: str, service_type: str, domain: str,
+        self,
+        interface: int,
+        protocol: int,
+        name: str,
+        service_type: str,
+        domain: str,
         on_add: Callable[[DiscoveredService], None],
     ) -> None:
         assert self._server is not None
@@ -295,7 +300,10 @@ class AvahiClient:
         service = self._seen.get(key)
         if service is None:
             service = DiscoveredService(
-                name=name, service_type=service_type, port=port, txt=txt,
+                name=name,
+                service_type=service_type,
+                port=port,
+                txt=txt,
                 _prefer_subnet_of=self._local_ip,
             )
             self._seen[key] = service

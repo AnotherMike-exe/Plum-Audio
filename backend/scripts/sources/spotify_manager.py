@@ -47,7 +47,9 @@ class SpotifyManager(SourceManagerBase):
         instances = spotify_config.instances_from_settings(settings, config_root=self.config_root)
         return {
             str(e.get("id")): ((e.get("deviceName"), int(e.get("zeroconfPort", 5354)), bitrate), inst)
-            for e, inst in zip(endpoints, instances)
+            # strict: instances_from_settings is one _instance per enabled_endpoints entry, from the
+            # same settings dict — a length mismatch means that invariant broke and must not be silent.
+            for e, inst in zip(endpoints, instances, strict=True)
         }
 
     def render(self, settings: dict) -> None:

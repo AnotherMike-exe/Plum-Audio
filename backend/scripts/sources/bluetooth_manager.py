@@ -94,8 +94,13 @@ class BluetoothManager(SourceManagerBase):
             # private bus rather than us adding system-bus policy for org.bluez.obex — the same
             # arrangement multi-endpoint AirPlay uses for shairport's fixed MPRIS name.
             DaemonSpec(
-                argv=[self.dbus_binary, "--session", f"--address={instance.obex_bus_address}",
-                      "--nofork", "--nopidfile"],
+                argv=[
+                    self.dbus_binary,
+                    "--session",
+                    f"--address={instance.obex_bus_address}",
+                    "--nofork",
+                    "--nopidfile",
+                ],
                 log_path=os.path.join(instance.config_dir, "obex-dbus.log"),
                 settle_s=BUS_SETTLE_S,
             ),

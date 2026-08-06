@@ -23,21 +23,26 @@ from __future__ import annotations
 
 import logging
 
+from sendspin_server import PlumSendspinServer
+from sync_engine.sendspin_engine import SendspinEngine
+
 from mesh.aggregator import DataAggregator
 from mesh.api import MeshApi
 from mesh.client import MeshClient
 from mesh.discovery import MeshDiscovery
 from mesh.neighbourhood import Neighbourhood
 from mesh.router import Router
-from sendspin_server import PlumSendspinServer
-from sync_engine.sendspin_engine import SendspinEngine
 
 logger = logging.getLogger("plum.mesh")
 
 
 class MeshOrchestrator:
     def __init__(
-        self, server: PlumSendspinServer, *, beacon_port: int = 8929, api_port: int = 5001,
+        self,
+        server: PlumSendspinServer,
+        *,
+        beacon_port: int = 8929,
+        api_port: int = 5001,
         local_player_id: str | None = None,
     ) -> None:
         self.unit_id = server.unit_id
@@ -62,11 +67,12 @@ class MeshOrchestrator:
         # construction the player has not connected yet, so a snapshot would report nobody and the
         # GUI would offer to send this unit's speaker to itself.
         self.neighbourhood = Neighbourhood(
-            server.unit_id, server.unit_name, server_port=server.port,
+            server.unit_id,
+            server.unit_name,
+            server_port=server.port,
             own_client_ids={local_player_id} if local_player_id else set(),
         )
-        self.api = MeshApi(self.engine, self.aggregator, self.router, port=api_port,
-                           neighbourhood=self.neighbourhood)
+        self.api = MeshApi(self.engine, self.aggregator, self.router, port=api_port, neighbourhood=self.neighbourhood)
 
     async def start(self) -> None:
         await self.neighbourhood.start()

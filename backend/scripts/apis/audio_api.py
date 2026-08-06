@@ -30,7 +30,6 @@ from flask import Blueprint, jsonify, request
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/ on path
 import audio_devices  # noqa: E402
 from player_state import load_active_output, state_file_path  # noqa: E402
-
 from settings_api import SettingsManager  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -59,7 +58,7 @@ def _current_output(settings_manager: SettingsManager) -> dict:
     # A unit still on its PLUM_DAC_DEVICE default therefore reported a switch pending FOREVER, to the
     # very device it was already playing on: `resolved: true`, `is_active: true`,
     # `playing_on == id == "Headphones:0"`, and `pending: true` beside it. The tab rendered "switching
-    # to Built-in Headphones" next to that same device's "playing" tag. Seen on both .201 units after
+    # to Built-in Headphones" next to that same device's "playing" tag. Seen on both mesh-pair units after
     # the greenfield alpha, 2026-08-06 — and invisible to every test here, because they all configure
     # an id rather than a fragment.
     #
@@ -67,7 +66,7 @@ def _current_output(settings_manager: SettingsManager) -> dict:
     # of those spellings into an id. When it resolves to nothing (a HAT removed, a spec from another
     # unit) there is no id to compare against, so fall back to the raw spec — it will differ, which is
     # the honest answer for a configuration that names a device this unit does not have.
-    if audio_devices.is_no_output(spec):
+    if audio_devices.is_no_output(spec):  # noqa: SIM108 - the ternary form nests two conditionals; less readable
         target = audio_devices.NO_OUTPUT
     else:
         target = device.id if device is not None else spec

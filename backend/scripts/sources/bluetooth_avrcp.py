@@ -77,9 +77,8 @@ import logging
 import time
 from dataclasses import replace
 
-from dbus_next import Variant
-
 from aiosendspin.models.types import RepeatMode
+from dbus_next import Variant
 
 logger = logging.getLogger("plum.bluetooth_avrcp")
 
@@ -100,7 +99,7 @@ SEED_ATTEMPTS = 5
 SEED_RETRY_S = 0.5
 
 # Opening the BIP session races our OWN obexd, which the source manager starts separately — 10 s
-# after the player bind on `.201.113`. Cover ~30 s of that (see _reopen_cover_art).
+# after the player bind on `.2.11`. Cover ~30 s of that (see _reopen_cover_art).
 COVER_ART_PREPARE_ATTEMPTS = 10
 COVER_ART_PREPARE_RETRY_S = 3.0
 # After the session opens, re-read Track at these offsets to catch art for the track already
@@ -139,7 +138,13 @@ class BluetoothAvrcp:
     """Drives one Bluetooth source's metadata/transport. Also the source's transport remote."""
 
     def __init__(
-        self, group, instance_id: str, adapter, *, on_commands_changed=None, cover_art=None,
+        self,
+        group,
+        instance_id: str,
+        adapter,
+        *,
+        on_commands_changed=None,
+        cover_art=None,
         on_source_volume=None,
     ) -> None:
         self.group = group
@@ -263,9 +268,7 @@ class BluetoothAvrcp:
                 # LOOKS like it is tracking; what silently stops is every CORRECTION, which is why
                 # this surfaced as "scrubs on the phone never show up in the GUI" rather than as a
                 # frozen timeline.
-                logger.exception(
-                    "[bluetooth-%s] progress tick failed; ticker continues", self.instance_id
-                )
+                logger.exception("[bluetooth-%s] progress tick failed; ticker continues", self.instance_id)
 
     def _tick_once(self) -> None:
         if not self._playing or not self._duration_ms:
@@ -280,8 +283,10 @@ class BluetoothAvrcp:
             if not self._warned_overrun:
                 self._warned_overrun = True
                 logger.info(
-                    "[bluetooth-%s] extrapolated past end of track (%d/%d ms); holding until the "
-                    "next AVRCP event", self.instance_id, int(expected), self._duration_ms,
+                    "[bluetooth-%s] extrapolated past end of track (%d/%d ms); holding until the " "next AVRCP event",
+                    self.instance_id,
+                    int(expected),
+                    self._duration_ms,
                 )
             return
         self._warned_overrun = False
@@ -351,8 +356,7 @@ class BluetoothAvrcp:
         # InterfacesAdded — a bind order we had simply never hit before.
         if self._player_path is None:
             self._player_path = path
-            logger.info("[bluetooth-%s] AVRCP player adopted via PropertiesChanged: %s",
-                        self.instance_id, path)
+            logger.info("[bluetooth-%s] AVRCP player adopted via PropertiesChanged: %s", self.instance_id, path)
             self._ensure_ticker()
             asyncio.ensure_future(self._seed_from_player())
         if path != self._player_path:
@@ -389,12 +393,16 @@ class BluetoothAvrcp:
         if expected is not None and abs(seek_to - expected) <= POSITION_SEEK_EPSILON_MS:
             logger.debug(
                 "[bluetooth-%s] position signal %d ms matches our anchor (~%d ms); no seek",
-                self.instance_id, seek_to, int(expected),
+                self.instance_id,
+                seek_to,
+                int(expected),
             )
             return
         logger.info(
-            "[bluetooth-%s] seek signal -> %d ms (we had ~%s)", self.instance_id, seek_to,
-            "nothing" if expected is None else "%d ms" % int(expected),
+            "[bluetooth-%s] seek signal -> %d ms (we had ~%s)",
+            self.instance_id,
+            seek_to,
+            "nothing" if expected is None else f"{int(expected)} ms",
         )
         if not self._duration_ms:
             # A position means nothing without a track length, and _anchor_progress would drop it.
@@ -439,7 +447,9 @@ class BluetoothAvrcp:
                 # silent return here is exactly what hid a missing repeat/shuffle detection before.
                 logger.info(
                     "[bluetooth-%s] seed for %s abandoned; player is now %s",
-                    self.instance_id, path, self._player_path,
+                    self.instance_id,
+                    path,
+                    self._player_path,
                 )
                 return
             props = await self._player_props()
@@ -456,18 +466,22 @@ class BluetoothAvrcp:
                         break
                     logger.debug(
                         "[bluetooth-%s] player properties incomplete (attempt %d); no Repeat/Shuffle yet",
-                        self.instance_id, attempt + 1,
+                        self.instance_id,
+                        attempt + 1,
                     )
                 except Exception:  # noqa: BLE001 - object still settling; retry below
                     logger.debug(
                         "[bluetooth-%s] player GetAll failed (attempt %d)",
-                        self.instance_id, attempt + 1, exc_info=True,
+                        self.instance_id,
+                        attempt + 1,
+                        exc_info=True,
                     )
             await asyncio.sleep(SEED_RETRY_S)
         if values is None:
             logger.warning(
-                "[bluetooth-%s] could not read player properties after %d attempts; "
-                "repeat/shuffle support unknown", self.instance_id, SEED_ATTEMPTS,
+                "[bluetooth-%s] could not read player properties after %d attempts; " "repeat/shuffle support unknown",
+                self.instance_id,
+                SEED_ATTEMPTS,
             )
             return
         self._set_command_support("Repeat" in values or "Shuffle" in values)
@@ -483,7 +497,7 @@ class BluetoothAvrcp:
         # BlueZ fills it in from the AVRCP SDP record, and media_player_set_obex_port() in player.c
         # does NOT emit PropertiesChanged (every sibling setter does), so a client that read GetAll
         # before the SDP parse completed is NEVER told the port arrived. _reopen_cover_art therefore
-        # re-reads it itself. Observed on `.201.113` 2026-07-30: rebind after an A2DP re-negotiation
+        # re-reads it itself. Observed on `.2.11` 2026-07-30: rebind after an A2DP re-negotiation
         # seeded cleanly with no ObexPort, and album art stayed dead with nothing logged.
         if self.cover_art is not None:
             # ONE rebuild at a time. _reopen_cover_art runs for up to ~30 s (it waits for our obexd),
@@ -509,7 +523,7 @@ class BluetoothAvrcp:
         """Rebuild the BIP session for the player we just bound. Order matters, hence one coroutine.
 
         RETRIED, because losing the race against our own obexd is fatal rather than transient: the
-        source manager starts that daemon independently (10 s after the bind on `.201.113`), nothing
+        source manager starts that daemon independently (10 s after the bind on `.2.11`), nothing
         else calls prepare(), and without a session the phone withholds ImgHandle — so handle_track
         never runs to retry either. One missed window meant no album art for the life of the process.
         """
@@ -525,7 +539,7 @@ class BluetoothAvrcp:
                 ):
                     # A session opened mid-track gets NO art until the next track change, because
                     # the phone publishes ImgHandle when it feels like it and BlueZ has already sent
-                    # the Track dict we would have read it from. Verified from `.201.113`'s log
+                    # the Track dict we would have read it from. Verified from `.2.11`'s log
                     # 2026-07-29: session opened at 16:22:47 over "Ball and Chain", a play event at
                     # 16:22:59 produced nothing, and the first art of the session arrived at
                     # 16:23:28 — one second after the track changed. So ASK. Twice, spaced, because
@@ -537,8 +551,9 @@ class BluetoothAvrcp:
                     return
                 await asyncio.sleep(COVER_ART_PREPARE_RETRY_S)
             logger.info(
-                "[bluetooth-%s] no cover-art session after %d attempts; art stays off until the next "
-                "player bind", self.instance_id, COVER_ART_PREPARE_ATTEMPTS,
+                "[bluetooth-%s] no cover-art session after %d attempts; art stays off until the next " "player bind",
+                self.instance_id,
+                COVER_ART_PREPARE_ATTEMPTS,
             )
 
     async def _refresh_art_for_current_track(self) -> None:
@@ -548,7 +563,7 @@ class BluetoothAvrcp:
         not make BlueZ re-query the phone — `avrcp_get_element_attributes()` is only issued when a
         track-change notification arrives, and no D-Bus method triggers one. So this catches a handle
         BlueZ already holds; it cannot conjure art for a track that was already playing when the BIP
-        session opened. Verified on `.201.113` 2026-07-30: with a session open and the phone playing,
+        session opened. Verified on `.2.11` 2026-07-30: with a session open and the phone playing,
         Track carried Title/Album/Artist/Duration/Item and no ImgHandle, and none ever arrived until
         the track changed. Closing that gap needs a bluetoothd patch that re-issues the query.
         """
@@ -578,8 +593,7 @@ class BluetoothAvrcp:
             port = value.value if isinstance(value, Variant) else value
             if isinstance(port, int) and port > 0:
                 self._obex_port = port
-                logger.info("[bluetooth-%s] cover-art ObexPort arrived late: %d",
-                            self.instance_id, port)
+                logger.info("[bluetooth-%s] cover-art ObexPort arrived late: %d", self.instance_id, port)
 
     async def _seed_from_transport(self) -> None:
         bus = self.adapter.bus
@@ -596,7 +610,8 @@ class BluetoothAvrcp:
             return
         self.supports_repeat_shuffle = supported
         logger.info(
-            "[bluetooth-%s] player %s repeat/shuffle", self.instance_id,
+            "[bluetooth-%s] player %s repeat/shuffle",
+            self.instance_id,
             "supports" if supported else "does not support",
         )
         if self._on_commands_changed is not None:
@@ -624,7 +639,8 @@ class BluetoothAvrcp:
         if kwargs:
             role.update(**kwargs)
             logger.info(
-                "[bluetooth-%s] metadata: %s", self.instance_id,
+                "[bluetooth-%s] metadata: %s",
+                self.instance_id,
                 " · ".join(f"{k}={v}" for k, v in kwargs.items()),
             )
         duration = values.get("Duration")
@@ -634,7 +650,8 @@ class BluetoothAvrcp:
                 pending, self._pending_position_ms = self._pending_position_ms, None
                 logger.info(
                     "[bluetooth-%s] applying held seek %d ms now a duration is known",
-                    self.instance_id, pending,
+                    self.instance_id,
+                    pending,
                 )
                 self._anchor_progress(pending, self._duration_ms)
 
@@ -654,14 +671,14 @@ class BluetoothAvrcp:
             # built from a partial dict differs from the real one, which would read as a new track
             # and clear perfectly good art. So remember the last real key and reuse it.
             if values.get("Title"):
-                self._track_key = "|".join(
-                    str(values.get(k, "")) for k in ("Item", "Title", "Album", "TrackNumber")
-                )
+                self._track_key = "|".join(str(values.get(k, "")) for k in ("Item", "Title", "Album", "TrackNumber"))
                 self.cover_art.note_track(self._track_key)
             if img_handle:
                 asyncio.ensure_future(
                     self.cover_art.handle_track(
-                        self.adapter.active_address, self._obex_port, str(img_handle),
+                        self.adapter.active_address,
+                        self._obex_port,
+                        str(img_handle),
                         self._track_key or "",
                     )
                 )
@@ -677,9 +694,7 @@ class BluetoothAvrcp:
             is_new_track = bool(title) and title != self._last_title
             if title:
                 self._last_title = str(title)
-            asyncio.ensure_future(
-                self._reanchor_now(fallback_freeze=False, new_track=is_new_track)
-            )
+            asyncio.ensure_future(self._reanchor_now(fallback_freeze=False, new_track=is_new_track))
 
     def _apply_status(self, status: str) -> None:
         playing = status.lower() in PLAYING_STATES
@@ -696,9 +711,7 @@ class BluetoothAvrcp:
         # place and, because the role clamps at track_duration, parks at 100%. This is the identical
         # trap spotify_golibrespot._apply_speed documents — BlueZ just makes it easier to hit,
         # because it reports Position sporadically. Async because it needs a D-Bus round trip.
-        asyncio.ensure_future(
-            self._reanchor_now(fallback_freeze=not playing, known_position=position_now)
-        )
+        asyncio.ensure_future(self._reanchor_now(fallback_freeze=not playing, known_position=position_now))
 
     async def _reanchor_now(
         self, *, fallback_freeze: bool, new_track: bool = False, known_position: float | None = None
@@ -727,7 +740,8 @@ class BluetoothAvrcp:
                 # The paused-device lie, kept from the earlier fix: a part-way track cannot be at 0.
                 logger.info(
                     "[bluetooth-%s] paused device reports position 0; keeping our anchor (~%d ms)",
-                    self.instance_id, int(expected),
+                    self.instance_id,
+                    int(expected),
                 )
                 position = int(expected)
 
@@ -777,7 +791,9 @@ class BluetoothAvrcp:
             expected = self._expected_position_ms()
             logger.info(
                 "[bluetooth-%s] position %d ms exceeds track length %d ms; %s",
-                self.instance_id, position_ms, duration_ms,
+                self.instance_id,
+                position_ms,
+                duration_ms,
                 "keeping our anchor" if expected is not None else "ignoring",
             )
             if expected is None or expected > duration_ms:
@@ -792,7 +808,10 @@ class BluetoothAvrcp:
             self._last_speed = speed
             logger.info(
                 "[bluetooth-%s] progress anchor: %d/%d ms speed=%d",
-                self.instance_id, position_ms, duration_ms, speed,
+                self.instance_id,
+                position_ms,
+                duration_ms,
+                speed,
             )
         # All three together or the role emits none; the role stamps a timestamp so clients
         # extrapolate from here (speed 0 freezes at this anchor).
@@ -889,8 +908,7 @@ class BluetoothAvrcp:
             # the GUI slider moves, the local gain follows, and only the phone never changes. Silent
             # here, that costs a btmon capture to diagnose; logged, it names itself. Reconnecting the
             # phone re-registers the session and clears it (cf. the stale-bond recovery above).
-            logger.warning("[bluetooth-%s] source volume -> %d%% REFUSED by BlueZ: %s",
-                           self.instance_id, percent, e)
+            logger.warning("[bluetooth-%s] source volume -> %d%% REFUSED by BlueZ: %s", self.instance_id, percent, e)
 
     async def set_repeat(self, mode: RepeatMode) -> None:
         await self._set_player_prop("Repeat", Variant("s", REPEAT_TO_BLUEZ.get(mode, "off")))

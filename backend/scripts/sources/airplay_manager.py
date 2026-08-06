@@ -58,7 +58,9 @@ class AirplayManager(SourceManagerBase):
         instances = airplay_config.instances_from_settings(settings, config_root=self.config_root)
         return {
             inst.instance_id: ((inst.device_name, inst.port, inst.udp_port_base), inst)
-            for _e, inst in zip(endpoints, instances)
+            # strict: instances_from_settings is one _instance per enabled_endpoints entry, from the
+            # same settings dict — a length mismatch means that invariant broke and must not be silent.
+            for _e, inst in zip(endpoints, instances, strict=True)
         }
 
     def render(self, settings: dict) -> None:
@@ -82,8 +84,7 @@ class AirplayManager(SourceManagerBase):
         log_dir = instance.config_dir
         return [
             DaemonSpec(
-                argv=[self.dbus_binary, "--session", f"--address={instance.bus_address}",
-                      "--nofork", "--nopidfile"],
+                argv=[self.dbus_binary, "--session", f"--address={instance.bus_address}", "--nofork", "--nopidfile"],
                 log_path=os.path.join(log_dir, "dbus.log"),
                 settle_s=BUS_SETTLE_S,
             ),

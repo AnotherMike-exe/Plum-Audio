@@ -34,9 +34,8 @@ import logging
 from dataclasses import replace
 
 import aiohttp
-from PIL import Image
-
 from aiosendspin.models.types import RepeatMode
+from PIL import Image
 
 from .artwork import decode_image
 

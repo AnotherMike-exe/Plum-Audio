@@ -118,8 +118,11 @@ class AirplayMetadataReader:
         # (position @ now) pair the client reads directly. It also refreshes the server's own
         # join-snapshot anchor, so late-joining clients no longer read a clamped 100%.
         md = replace(
-            role.metadata, track_progress=pos_ms, track_duration=self._duration_ms,
-            playback_speed=speed, timestamp_us=None,
+            role.metadata,
+            track_progress=pos_ms,
+            track_duration=self._duration_ms,
+            playback_speed=speed,
+            timestamp_us=None,
         )
         role.set_metadata(md)
 

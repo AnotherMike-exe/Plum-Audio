@@ -44,10 +44,10 @@ import contextlib
 import functools
 import logging
 import os
-import signal
 import socket
 import time
 
+import unit_identity
 from aiosendspin.models.types import GoodbyeReason, MediaCommand, has_role_family
 from aiosendspin.server.audio import AudioFormat
 from aiosendspin.server.group import SendspinGroup
@@ -62,11 +62,11 @@ from aiosendspin.server.roles.controller.events import (
 )
 from aiosendspin.server.roles.player import PlayerV1Role
 from aiosendspin.server.server import ClientAddedEvent, ClientUpdatedEvent, ConnectionReason, SendspinServer
-
+from lifecycle import install_shutdown_handlers
 from mesh.model import PlayerState, SourceState, UnitSnapshot
 from sources import airplay_config, bluetooth_config, spotify_config
-from sources.airplay_metadata import AirplayMetadataReader
 from sources.airplay_manager import AirplayManager
+from sources.airplay_metadata import AirplayMetadataReader
 from sources.airplay_remote import AirplayRemote
 from sources.bluetooth_adapter import BluetoothAdapter
 from sources.bluetooth_avrcp import BluetoothAvrcp
@@ -74,9 +74,6 @@ from sources.bluetooth_coverart import BluetoothCoverArt
 from sources.bluetooth_manager import BluetoothManager
 from sources.spotify_golibrespot import SpotifyGoLibrespot
 from sources.spotify_manager import SpotifyManager
-
-import unit_identity
-from lifecycle import install_shutdown_handlers
 from speaker_names import SpeakerNames
 
 logger = logging.getLogger("plum.sendspin_server")
@@ -176,7 +173,7 @@ class SourceFeeder:
         and is later added to the group is not — it sits in the group, in the GUI, at the right
         volume, and completely silent until the source's next session.
 
-        Measured on .7.204 on 2026-08-04: with airplay-1 streaming, unrouting and re-routing the
+        Measured on .100.21 on 2026-08-04: with airplay-1 streaming, unrouting and re-routing the
         already-connected local player produced no second "Stream started" on the client and a
         renderer whose buffer never left 0 ms. It looked exactly like a dead speaker. The reason
         roaming never showed this is that a cross-server roam RECONNECTS (goodbye another_server),
@@ -252,9 +249,9 @@ class SourceFeeder:
             except asyncio.IncompleteReadError as e:
                 data = e.partial  # flush the trailing partial frame(s), then treat as EOF
                 eof = True
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # Pipe still open, but the sender has gone quiet for a long time.
-                await self._go_idle("no audio for %.0fs" % SOURCE_IDLE_TIMEOUT_S)
+                await self._go_idle(f"no audio for {SOURCE_IDLE_TIMEOUT_S:.0f}s")
                 continue
 
             if data:
@@ -435,7 +432,8 @@ class PlumSendspinServer:
             self._primary_source = next(iter(self.sources), None)
             logger.info(
                 "[%s] was the primary source; controller fallback is now %s",
-                source_id, self._primary_source or "(none — no sources left)",
+                source_id,
+                self._primary_source or "(none — no sources left)",
             )
         logger.info("[%s] source stopped", source_id)
 
@@ -649,7 +647,7 @@ class PlumSendspinServer:
         # its own server) nothing ever re-dials and we time out blaming it — "never connected" about
         # a speaker whose port is plainly open. Only release_foreign_client cancelled the dial, which
         # is why releasing first was the accidental workaround.
-        # Measured on .7.204 against a Home Assistant Voice PE, seconds apart on the same URL:
+        # Measured on .100.21 against a Home Assistant Voice PE, seconds apart on the same URL:
         # adopt alone -> ok:false; release (whose only extra step is this) then adopt -> ok:true.
         with contextlib.suppress(Exception):
             self.server.disconnect_from_client(url)
@@ -667,7 +665,7 @@ class PlumSendspinServer:
                 # adopt it is already in `before`, and its handshake id (a MAC, for a Home Assistant
                 # Voice PE) is not the mDNS name the GUI passes as player_id — so the other two
                 # tests both miss and the adopt fails with "never connected" while the speaker is
-                # sitting there connected. Measured on .7.204: adopted twice, then never again.
+                # sitting there connected. Measured on .100.21: adopted twice, then never again.
                 registered = self.server.get_client_url(client.client_id)
                 if registered == url or client.client_id == player_id or client.client_id not in before:
                     self.server.register_client_url(client.client_id, url)

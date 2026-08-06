@@ -90,7 +90,7 @@ class BluetoothCoverArt:
         # track carrying the same handle is skipped and the previous cover stays on screen.
         self._last_key: tuple[str, str] | None = None
         self._fetching = False
-        self._shown_key: str | None = None   # the track whose art the role is currently serving
+        self._shown_key: str | None = None  # the track whose art the role is currently serving
         self._clear_task: asyncio.Task | None = None
         self._clearing_key: str | None = None  # which track the pending clear is for
         self._warned_unavailable = False
@@ -121,9 +121,7 @@ class BluetoothCoverArt:
         if self._bus is not None:
             if self._bus.connected:
                 return True
-            logger.info(
-                "[bluetooth-%s] obex bus went away (daemon respool); reconnecting", self.instance_id
-            )
+            logger.info("[bluetooth-%s] obex bus went away (daemon respool); reconnecting", self.instance_id)
             with contextlib.suppress(Exception):
                 self._bus.disconnect()
             self._bus = None
@@ -146,7 +144,8 @@ class BluetoothCoverArt:
                 self._warned_unavailable = True
                 logger.info(
                     "[bluetooth-%s] obex bus not available (%s); album art disabled for now",
-                    self.instance_id, self.bus_address,
+                    self.instance_id,
+                    self.bus_address,
                 )
             return False
 
@@ -163,7 +162,7 @@ class BluetoothCoverArt:
         Called on every player bind, and it has to be, because the event we would rather key off does
         not exist: when bluetoothd is REPLACED (an upgrade, or installing our own patched build) its
         objects do not depart with InterfacesRemoved — the service simply vanishes, so the relay sees
-        no "player gone" and nothing here is invalidated. Verified on hardware 2026-07-30: `.201.113`
+        no "player gone" and nothing here is invalidated. Verified on hardware 2026-07-30: `.2.11`
         had a session opened the previous afternoon, was restarted underneath, rebound its player
         cleanly the next morning — and prepare() returned early on the dead `_session_path`, so no
         session was ever reopened. The phone then withheld ImgHandle (it only publishes one while a
@@ -217,11 +216,19 @@ class BluetoothCoverArt:
             refused = "refused" in str(exc).lower()
             logger.info(
                 "[bluetooth-%s] could not open a cover-art session to %s (port %s); %s",
-                self.instance_id, address, obex_port,
-                "the obex bus is gone — will reconnect on the next track" if dead
-                else "the device REFUSED the BIP port — check for a second obexd on this host "
-                     "(pgrep -af obexd; ours is the one started with -n)" if refused
-                else "the device may not support AVRCP cover art",
+                self.instance_id,
+                address,
+                obex_port,
+                (
+                    "the obex bus is gone — will reconnect on the next track"
+                    if dead
+                    else (
+                        "the device REFUSED the BIP port — check for a second obexd on this host "
+                        "(pgrep -af obexd; ours is the one started with -n)"
+                        if refused
+                        else "the device may not support AVRCP cover art"
+                    )
+                ),
                 exc_info=True,
             )
             if dead and self._bus is not None:
@@ -254,12 +261,15 @@ class BluetoothCoverArt:
                     self._image_iface, self._fetch_method = iface, method
                     logger.info(
                         "[bluetooth-%s] cover art ready via %s.%s",
-                        self.instance_id, iface_name, method,
+                        self.instance_id,
+                        iface_name,
+                        method,
                     )
                     return True
         logger.info(
             "[bluetooth-%s] no known cover-art fetch method on this obex session; interfaces=%s",
-            self.instance_id, available,
+            self.instance_id,
+            available,
         )
         return False
 
@@ -328,7 +338,7 @@ class BluetoothCoverArt:
         only surviving record of it, since that code could never actually run on BlueZ 5.70.
 
         Returns True once a session exists, so the caller can retry: our own obexd is started by the
-        source manager and may not be up yet when the player binds (10 s apart on `.201.113`), and a
+        source manager and may not be up yet when the player binds (10 s apart on `.2.11`), and a
         prepare that loses that race is fatal rather than transient — nothing else calls prepare, the
         phone therefore never publishes ImgHandle, and handle_track never runs to retry the session.
         """
@@ -344,8 +354,9 @@ class BluetoothCoverArt:
             return True
         return False
 
-    async def handle_track(self, address: str | None, obex_port: int | None, img_handle: str | None,
-                           track_key: str = "") -> None:
+    async def handle_track(
+        self, address: str | None, obex_port: int | None, img_handle: str | None, track_key: str = ""
+    ) -> None:
         """Fetch and publish art for the current track, if this device offers any."""
         if not address or not obex_port or not img_handle:
             # Log the reason ONCE: a silent return here is indistinguishable from "no art exists",
@@ -354,7 +365,10 @@ class BluetoothCoverArt:
                 self._warned_skipped = True
                 logger.info(
                     "[bluetooth-%s] no art fetch yet (address=%s obex_port=%s img_handle=%s)",
-                    self.instance_id, address, obex_port, img_handle,
+                    self.instance_id,
+                    address,
+                    obex_port,
+                    img_handle,
                 )
             return
         # Dedupe on the handle AND the track it arrived with: see _last_key. Repro that found it —
@@ -380,9 +394,7 @@ class BluetoothCoverArt:
             if role is not None:
                 with contextlib.suppress(Exception):
                     await role.set_album_artwork(image)
-                    logger.info(
-                        "[bluetooth-%s] album art: %dx%d", self.instance_id, image.width, image.height
-                    )
+                    logger.info("[bluetooth-%s] album art: %dx%d", self.instance_id, image.width, image.height)
         finally:
             self._fetching = False
 

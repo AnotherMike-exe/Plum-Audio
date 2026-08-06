@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from mesh.model import UnitSnapshot
 from sendspin_server import PlumSendspinServer
+
 from sync_engine.base import SyncEngine
 
 
@@ -37,9 +38,7 @@ class SendspinEngine(SyncEngine):
     async def set_player_volume(self, player_id: str, volume: int, muted: bool) -> None:
         self._server.set_player_volume(player_id, volume, muted)
 
-    async def set_source_volume(
-        self, source_id: str, volume: int | None = None, muted: bool | None = None
-    ) -> None:
+    async def set_source_volume(self, source_id: str, volume: int | None = None, muted: bool | None = None) -> None:
         await self._server.set_source_volume(source_id, volume, muted)
 
     async def adopt_client(self, source_id: str, url: str, player_id: str | None = None) -> bool:

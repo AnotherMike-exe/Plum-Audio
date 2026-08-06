@@ -29,6 +29,7 @@ name it actually calls itself. That keeps the whole fix server-side: the GUI alr
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -84,10 +85,8 @@ class SpeakerNames:
                 # A failure before the rename leaves the temp behind; mkstemp names are unique, so
                 # without this every failed save leaks a file into /data.
                 if os.path.exists(tmp):
-                    try:
+                    with contextlib.suppress(OSError):
                         os.unlink(tmp)
-                    except OSError:
-                        pass
         except Exception:  # noqa: BLE001 - persistence is a convenience; never break the audio path
             logger.debug("could not persist speaker names to %s", self.path, exc_info=True)
 

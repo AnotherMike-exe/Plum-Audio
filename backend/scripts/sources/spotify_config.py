@@ -3,8 +3,9 @@
 Plum-Audio — Spotify Connect multi-instance config generation (go-librespot).
 
 Renders one go-librespot config.yml per Spotify endpoint (from settings.json
-integrations.spotify.endpoints) and resolves them to SpotifyInstances. One endpoint → one go-librespot process → one instance FIFO → one Sendspin source, plus a
-loopback HTTP+WebSocket control API per instance (see spotify_golibrespot.py).
+integrations.spotify.endpoints) and resolves them to SpotifyInstances. One endpoint → one
+go-librespot process → one instance FIFO → one Sendspin source, plus a loopback HTTP+WebSocket
+control API per instance (see spotify_golibrespot.py).
 
 We use go-librespot rather than spotifyd: spotifyd 0.4.x dropped standard MPRIS (its D-Bus interface
 is now only TransferPlayback/volume, no metadata/transport), and it has no arm64 build with full
@@ -132,7 +133,10 @@ def render_configs(
         instances.append(inst)
         logger.info(
             "rendered go-librespot config %s/config.yml (name=%r zc=%d api=%d)",
-            inst.config_dir, inst.device_name, inst.zeroconf_port, inst.api_port,
+            inst.config_dir,
+            inst.device_name,
+            inst.zeroconf_port,
+            inst.api_port,
         )
 
     return instances

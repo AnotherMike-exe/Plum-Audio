@@ -29,21 +29,28 @@ from __future__ import annotations
 
 import contextlib
 import logging
-
-from aiohttp import web
+from collections.abc import Awaitable, Callable
 
 import cors_policy
-from mesh.aggregator import DataAggregator
-from mesh.router import Router, RouteError
-from sync_engine.base import SyncEngine
+from aiohttp import web
 from speaker_names import SpeakerNames
+from sync_engine.base import SyncEngine
+
+from mesh.aggregator import DataAggregator
+from mesh.router import RouteError, Router
 
 logger = logging.getLogger("plum.mesh.api")
 
 DEFAULT_API_PORT = 5001
 
+# The aiohttp middleware signature, spelled out rather than imported from aiohttp.typedefs: the
+# requirement is `aiohttp>=3.9` and annotations are evaluated at import time on 3.13, so an alias
+# that moved between releases would be an import-time crash in the audio process.
+_Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
+_Middleware = Callable[[web.Request, _Handler], Awaitable[web.StreamResponse]]
 
-def make_cors_middleware(hosts_provider):
+
+def make_cors_middleware(hosts_provider) -> _Middleware:
     """CORS restricted to origins a Plum GUI is actually served from.
 
     `hosts_provider()` returns the currently-known host set — read per request, not captured once,
@@ -82,7 +89,8 @@ def make_cors_middleware(hosts_provider):
             # at once, and the fix (PLUM_ALLOWED_ORIGINS) needs to know exactly what was rejected.
             logger.warning(
                 "CORS: refused origin %r (known hosts: %s) — set PLUM_ALLOWED_ORIGINS to allow it",
-                origin, ", ".join(sorted(hosts_provider())) or "none",
+                origin,
+                ", ".join(sorted(hosts_provider())) or "none",
             )
         return resp
 
@@ -93,8 +101,13 @@ class MeshApi:
     """Serves the mesh REST endpoints backed by the engine, aggregator, and router."""
 
     def __init__(
-        self, engine: SyncEngine, aggregator: DataAggregator, router: Router, *,
-        port: int = DEFAULT_API_PORT, neighbourhood=None,
+        self,
+        engine: SyncEngine,
+        aggregator: DataAggregator,
+        router: Router,
+        *,
+        port: int = DEFAULT_API_PORT,
+        neighbourhood=None,
     ) -> None:
         self._engine = engine
         self._agg = aggregator
@@ -113,7 +126,7 @@ class MeshApi:
         self._consumers: set[web.WebSocketResponse] = set()
         self._producer: web.WebSocketResponse | None = None
         self._last_ctrl: dict | None = None  # cache so a GUI that connects mid-session gets it
-        self._last_art: dict | None = None   # ditto for album art (per-track, low rate)
+        self._last_art: dict | None = None  # ditto for album art (per-track, low rate)
 
     def _known_hosts(self) -> set[str]:
         """Every host a Plum GUI on this mesh can legitimately be served from, right now.

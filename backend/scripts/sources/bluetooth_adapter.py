@@ -170,14 +170,16 @@ class BluetoothAdapter:
             logger.error(
                 "[%s] adapter %s does not exist on this host — remove the endpoint, or attach the "
                 "radio it expects. Available adapters appear under /org/bluez/.",
-                instance.source_id, instance.adapter,
+                instance.source_id,
+                instance.adapter,
             )
             return
         if not await self._set_adapter_prop("Powered", Variant("b", True)):
             logger.error(
                 "[%s] could not power on %s — is it rfkill soft-blocked? "
                 "BlueZ will not clear that itself; run `rfkill unblock bluetooth` on the host.",
-                instance.source_id, instance.adapter,
+                instance.source_id,
+                instance.adapter,
             )
             return
         await self._set_adapter_prop("Alias", Variant("s", instance.device_name))
@@ -189,7 +191,10 @@ class BluetoothAdapter:
         await self._set_adapter_prop("Discoverable", Variant("b", instance.discoverable))
         logger.info(
             "[%s] adapter %s configured (alias=%r discoverable=%s)",
-            instance.source_id, instance.adapter, instance.device_name, instance.discoverable,
+            instance.source_id,
+            instance.adapter,
+            instance.device_name,
+            instance.discoverable,
         )
 
     async def _set_adapter_prop(self, name: str, value: Variant) -> bool:
@@ -233,7 +238,8 @@ class BluetoothAdapter:
         except Exception:  # noqa: BLE001 - another agent holds default, or policy denies us
             logger.warning(
                 "[%s] could not register the pairing agent; pairing will need bluetoothctl",
-                self.instance.source_id, exc_info=True,
+                self.instance.source_id,
+                exc_info=True,
             )
             self._agent = None
 
@@ -400,15 +406,20 @@ class BluetoothAdapter:
 
         if carried_audio or lasted is None or lasted >= STALE_BOND_MAX_CONNECTION_S:
             if self._stale_strikes.pop(address, 0):
-                logger.info("[%s] %s connected properly; clearing its stale-bond strikes",
-                            self.instance.source_id, address)
+                logger.info(
+                    "[%s] %s connected properly; clearing its stale-bond strikes", self.instance.source_id, address
+                )
             return
 
         strikes = self._stale_strikes.get(address, 0) + 1
         self._stale_strikes[address] = strikes
         logger.warning(
             "[%s] %s dropped after %.1fs without audio (strike %d/%d)",
-            self.instance.source_id, address, lasted, strikes, STALE_BOND_STRIKES,
+            self.instance.source_id,
+            address,
+            lasted,
+            strikes,
+            STALE_BOND_STRIKES,
         )
         if strikes >= STALE_BOND_STRIKES:
             await self._forget_stale_bond(path, address)
@@ -426,18 +437,19 @@ class BluetoothAdapter:
             return
         try:
             intro = await self._bus.introspect(BLUEZ, self.instance.adapter_path)
-            adapter = self._bus.get_proxy_object(BLUEZ, self.instance.adapter_path, intro).get_interface(
-                ADAPTER_IFACE
-            )
+            adapter = self._bus.get_proxy_object(BLUEZ, self.instance.adapter_path, intro).get_interface(ADAPTER_IFACE)
             await adapter.call_remove_device(path)
         except Exception:  # noqa: BLE001
-            logger.warning("[%s] could not remove the stale bond for %s", self.instance.source_id, address,
-                           exc_info=True)
+            logger.warning(
+                "[%s] could not remove the stale bond for %s", self.instance.source_id, address, exc_info=True
+            )
             return
         logger.warning(
             "[%s] removed the bond for %s after %d failed connections — its link key was stale "
             "(the device was forgotten on its own side). Pair it again to use it.",
-            self.instance.source_id, address, STALE_BOND_STRIKES,
+            self.instance.source_id,
+            address,
+            STALE_BOND_STRIKES,
         )
 
     async def _is_audio_source(self, props) -> bool:
@@ -498,9 +510,13 @@ class BluetoothAdapter:
         slave = f"bluealsa:DEV={address},PROFILE=a2dp"
         return [
             bluetooth_config.DEFAULT_ARECORD_BIN,
-            "-D", "plug:{SLAVE=\"%s\"}" % slave,
-            "-f", "cd",          # S16_LE, 44100, stereo — DEFAULT_FORMAT
-            "-t", "raw",
+            "-D",
+            # Doubled braces: this is an f-string, and ALSA's brace form is the literal syntax here.
+            f'plug:{{SLAVE="{slave}"}}',
+            "-f",
+            "cd",  # S16_LE, 44100, stereo — DEFAULT_FORMAT
+            "-t",
+            "raw",
             self.instance.fifo_path,
         ]
 
@@ -544,7 +560,7 @@ class BluetoothAdapter:
                 # three of those in a row would drop a perfectly good bond (see _judge_connection).
                 try:
                     await asyncio.wait_for(asyncio.shield(proc.wait()), CAPTURE_HEALTHY_S)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     self._carried_audio.add(address)
                     await proc.wait()
                 if self._active != address:
@@ -560,7 +576,10 @@ class BluetoothAdapter:
                     attempt += 1
                     logger.warning(
                         "[%s] capture for %s exited immediately (rc=%s, attempt %d)",
-                        self.instance.source_id, address, proc.returncode, attempt,
+                        self.instance.source_id,
+                        address,
+                        proc.returncode,
+                        attempt,
                     )
                     # Case (2): bluealsa is up but has no PCM for this device, because the A2DP
                     # transport was negotiated against a PREVIOUS daemon instance and died with it.
@@ -607,7 +626,9 @@ class BluetoothAdapter:
             await asyncio.sleep(0.25)
         logger.warning(
             "[%s] %s did not appear within %.0fs; capture will retry",
-            self.instance.source_id, BLUEALSA_NAME, timeout_s,
+            self.instance.source_id,
+            BLUEALSA_NAME,
+            timeout_s,
         )
         return False
 
@@ -630,7 +651,8 @@ class BluetoothAdapter:
         if self._bus is None:
             logger.warning(
                 "[%s] cannot re-negotiate A2DP with %s: no D-Bus connection",
-                self.instance.source_id, address,
+                self.instance.source_id,
+                address,
             )
             return
         path = next((p for p, addr in self._connected.items() if addr == address), None)
@@ -641,7 +663,9 @@ class BluetoothAdapter:
             path = f"{self.instance.adapter_path}/dev_{address.replace(':', '_')}"
             logger.info(
                 "[%s] %s not in the connected map; trying derived path %s",
-                self.instance.source_id, address, path,
+                self.instance.source_id,
+                address,
+                path,
             )
         try:
             intro = await self._bus.introspect(BLUEZ, path)
@@ -650,7 +674,10 @@ class BluetoothAdapter:
             logger.info("[%s] re-negotiated A2DP with %s", self.instance.source_id, address)
         except Exception as e:  # noqa: BLE001 - phone may refuse; the retry loop carries on regardless
             logger.warning(
-                "[%s] A2DP re-negotiation with %s failed: %s", self.instance.source_id, address, e,
+                "[%s] A2DP re-negotiation with %s failed: %s",
+                self.instance.source_id,
+                address,
+                e,
             )
 
     async def _spawn_capture(self, address: str):
@@ -666,7 +693,9 @@ class BluetoothAdapter:
             self._capture_log = open(log_path, "ab", buffering=0)  # noqa: SIM115 - closed in _stop_capture
             self._capture = await asyncio.create_subprocess_exec(
                 *argv,
-                stdout=self._capture_log, stderr=self._capture_log, stdin=subprocess.DEVNULL,
+                stdout=self._capture_log,
+                stderr=self._capture_log,
+                stdin=subprocess.DEVNULL,
                 start_new_session=True,  # own process group: kill it without touching the server
             )
         except OSError as e:
@@ -689,7 +718,7 @@ class BluetoothAdapter:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 with contextlib.suppress(Exception):

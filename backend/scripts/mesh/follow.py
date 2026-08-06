@@ -57,7 +57,7 @@ import os
 
 from mesh.aggregator import DataAggregator
 from mesh.model import MeshView
-from mesh.router import PeerProvider, RemoteDelegate, Router, RouteError
+from mesh.router import PeerProvider, RemoteDelegate, RouteError, Router
 
 logger = logging.getLogger("plum.mesh.follow")
 
@@ -166,7 +166,7 @@ class FollowReconciler:
                     # and it routes straight back to the master. With both toggles on, the player
                     # ping-pongs — and every hop calls refresh_stream(), so listeners get a
                     # discontinuity and the visualizer drops to zero, twice, per local activation.
-                    # Observed on .201.133 (2026-08-06), which has both enabled with master .113.
+                    # Observed on .2.10 (2026-08-06), which has both enabled with master .11.
                     #
                     # Local winning is the DOCUMENTED intent — PlaybackTab's own copy says "Local
                     # connections always take priority". The override clears the usual way, when the
@@ -256,12 +256,18 @@ class FollowReconciler:
                     return
                 ok = await self._unroute_delegate(peer, source_id, self._local_player_id)
         except RouteError:
-            logger.exception("follow: unrouting %s from %s (%s) failed", self._local_player_id, source_id, owning_unit_id)
+            logger.exception(
+                "follow: unrouting %s from %s (%s) failed", self._local_player_id, source_id, owning_unit_id
+            )
             return
         if ok:
             self._last_auto_target = None
-            logger.info("follow: unrouted %s from %s (%s) — followed leader into idle",
-                        self._local_player_id, source_id, owning_unit_id)
+            logger.info(
+                "follow: unrouted %s from %s (%s) — followed leader into idle",
+                self._local_player_id,
+                source_id,
+                owning_unit_id,
+            )
 
     @staticmethod
     def _player_status(view: MeshView, unit_id: str) -> tuple[bool, tuple[str, str] | None]:

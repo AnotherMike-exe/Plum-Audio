@@ -19,6 +19,7 @@ easy to get wrong in a way nothing notices until it matters:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import tempfile
 
@@ -79,7 +80,5 @@ def write_atomic(path: str, content: str) -> None:
         os.replace(tmp_path, path)
     finally:
         if os.path.exists(tmp_path):
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp_path)
-            except OSError:
-                pass

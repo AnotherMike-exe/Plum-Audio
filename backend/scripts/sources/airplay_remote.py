@@ -216,7 +216,7 @@ class AirplayRemote:
             return
         if "PlaybackStatus" in changed:
             self._note_status(changed["PlaybackStatus"])
-        if "Volume" in changed:
+        if "Volume" in changed:  # noqa: SIM102 - the comment below documents the inner guard, not this test
             # Only while we believe a sender is there. This signal used to force _has_session True
             # and cache the level unconditionally — but shairport emits Volume=0.0 as a session tears
             # down, so the teardown value was being latched as the "last known" level AND briefly

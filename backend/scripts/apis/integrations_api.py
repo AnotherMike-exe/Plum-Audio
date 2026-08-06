@@ -25,10 +25,9 @@ import sys
 from flask import Blueprint, jsonify, request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/ on path
-from sources import airplay_config, bluetooth_config  # noqa: E402
-
 import bluetooth_bonds  # noqa: E402
 from settings_api import DEVICE_NAME_ALLOWED, SettingsManager  # noqa: E402
+from sources import airplay_config, bluetooth_config  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -96,10 +95,13 @@ class EndpointsManager:
 
     def add_endpoint(self, device_name: str, enabled: bool = True) -> dict:
         if not self._valid_name(device_name):
-            return {"success": False, "message": (
+            return {
+                "success": False,
+                "message": (
                     f"Invalid device name (1-{MAX_NAME_LEN} characters; letters, digits, "
                     "space and . _ - ' ( ) & + only)"
-                )}
+                ),
+            }
         section = self._section()
         endpoints = section.get("endpoints", []) or []
         if len(endpoints) >= self.max_endpoints:
@@ -127,10 +129,13 @@ class EndpointsManager:
             return {"success": False, "message": f"Endpoint '{endpoint_id}' not found"}
         if device_name is not None:
             if not self._valid_name(device_name):
-                return {"success": False, "message": (
-                    f"Invalid device name (1-{MAX_NAME_LEN} characters; letters, digits, "
-                    "space and . _ - ' ( ) & + only)"
-                )}
+                return {
+                    "success": False,
+                    "message": (
+                        f"Invalid device name (1-{MAX_NAME_LEN} characters; letters, digits, "
+                        "space and . _ - ' ( ) & + only)"
+                    ),
+                }
             endpoint["deviceName"] = device_name
         if enabled is not None:
             endpoint["enabled"] = enabled
@@ -189,8 +194,11 @@ class SpotifyEndpointsManager(EndpointsManager):
         section = self._section()
         self._save(section.get("endpoints", []) or [], {"bitrate": bitrate})
         logger.info("updated Spotify bitrate to %d", bitrate)
-        return {"success": True, "message": f"Updated bitrate to {bitrate}",
-                "warning": "Restarts Spotify endpoints; active playback is interrupted."}
+        return {
+            "success": True,
+            "message": f"Updated bitrate to {bitrate}",
+            "warning": "Restarts Spotify endpoints; active playback is interrupted.",
+        }
 
 
 class BluetoothEndpointsManager(EndpointsManager):

@@ -44,7 +44,7 @@ class PlayerState:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "PlayerState":
+    def from_dict(cls, d: dict) -> PlayerState:
         return cls(
             player_id=d["player_id"],
             name=d.get("name", d["player_id"]),
@@ -97,7 +97,7 @@ class SourceState:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "SourceState":
+    def from_dict(cls, d: dict) -> SourceState:
         volume = d.get("source_volume")
         muted = d.get("source_muted")
         return cls(
@@ -156,7 +156,7 @@ class UnitSnapshot:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "UnitSnapshot":
+    def from_dict(cls, d: dict) -> UnitSnapshot:
         return cls(
             unit_id=d["unit_id"],
             name=d.get("name", d["unit_id"]),
