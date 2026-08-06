@@ -365,6 +365,11 @@ debugging cookbook are in **`docs/OPERATIONS.md`**.
     `RECONNECT_BASE_MS` (1 s) forever — the exponential backoff can never engage on a flapping
     connection. That is a real flaw regardless of the trigger, and it turns any brief instability
     into a permanent 3-second sawtooth.
+    **STATUS 2026-08-06: not reproducing on `e5f1bfc`.** Michael reports it looks good with that
+    build deployed, after the localActivity/slave ping-pong fix (#13) and the layout fixes landed.
+    That is an observation from watching, NOT a measurement, and the sawtooth above WAS measured on
+    the same build — so treat this as "intermittent / trigger-dependent", not "fixed". If it returns,
+    start from the WebSocket hook rather than from theory; the recipe is in this entry.
     **The TRIGGER — what closes the socket ~1 s after open — is NOT yet identified.** One strong
     candidate not yet excluded: the measurement tab was backgrounded (confirmed — a 100 ms sampler
     was throttled to ~1 Hz), and `client/time` is sent on an adaptive `setTimeout` (0.2–3 s) which
