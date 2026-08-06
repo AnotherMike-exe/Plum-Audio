@@ -160,6 +160,18 @@ class FollowReconciler:
             for src in my_unit.sources:
                 if src.active and src.source_id not in prev_active and self._local_player_id not in src.player_ids:
                     await self._route(src.source_id, self._local_unit_id)
+                    # A local grab counts as an override, or slave mode undoes it on the very next
+                    # tick: the follower is then on a source that IS `_last_auto_target`, so the
+                    # "did the user move us?" check below compares equal, `_overridden` never trips,
+                    # and it routes straight back to the master. With both toggles on, the player
+                    # ping-pongs — and every hop calls refresh_stream(), so listeners get a
+                    # discontinuity and the visualizer drops to zero, twice, per local activation.
+                    # Observed on .201.133 (2026-08-06), which has both enabled with master .113.
+                    #
+                    # Local winning is the DOCUMENTED intent — PlaybackTab's own copy says "Local
+                    # connections always take priority". The override clears the usual way, when the
+                    # master goes idle and this follower is idle too.
+                    self._overridden = True
                     return  # one action per tick; re-derive fresh state next cycle
 
         slave = auto.get("slave") or {}

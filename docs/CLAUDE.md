@@ -342,6 +342,15 @@ debugging cookbook are in **`docs/OPERATIONS.md`**.
     - **`parse_aplay_output` silently drops any line the regex misses** — the device then vanishes
       everywhere downstream with nothing logged.
 
+17. **Spotify Connect's first transfer after a go-librespot (re)start can fail.** Seen on
+    `.201.133` 2026-08-06 — the first attempt drops immediately, the retry works. It is go-librespot
+    internal, NOT our pipeline: `/data/go-librespot/<n>/go-librespot.log` shows
+    `failed handling dealer request ... failed creating stream ... failed seeking stream: failed
+    reading page: EOF`, i.e. it could not fetch the track from Spotify's CDN. The observed instance
+    was ~30 s after a container restart. That log also carries a `panic: send on closed channel`
+    from an earlier date — a real go-librespot crash, which our source manager respawns. Worth
+    watching for a pattern away from restarts before treating it as ours.
+
 ## Resources
 - Sendspin spec: <https://www.sendspin-audio.com/spec/> · Org: <https://github.com/Sendspin>
 - `aiosendspin`: <https://github.com/Sendspin/aiosendspin>

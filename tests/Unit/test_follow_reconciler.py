@@ -597,3 +597,74 @@ def test_a_playerless_unit_does_nothing_with_both_modes_on():
 
     assert r._last_auto_target is None
     assert r._overridden is False
+
+
+# -- localActivity vs slave: both enabled at once ----------------------------------------------------
+#
+# Real configuration, from .201.133 on 2026-08-06: localActivity ON and slave ON with master .113.
+# Both units have a source called `spotify-1`. The reported symptom was the visualizer dropping to
+# zero and recovering — which is what a listener sees when the player is re-routed, because every
+# attach calls SourceFeeder.refresh_stream() and that replaces the stream for the whole group.
+
+
+def _both_modes_view():
+    return MeshView(units=[
+        _unit("unit-A", sources=[_source("spotify-1", "gA", active=True)], local_player=None),
+        _unit("unit-B", sources=[_source("spotify-1", "gB", active=True)],
+              local_player={"attached": True, "group_id": "gB", "server_id": "unit-B"}),
+    ])
+
+
+BOTH_MODES = {"autoSwitch": {"localActivity": True, "slave": {"enabled": True, "masterUnitId": "unit-B"}}}
+
+
+def test_a_local_grab_is_not_undone_by_slave_mode_on_the_next_tick():
+    """The ping-pong. PlaybackTab's own copy promises "Local connections always take priority"."""
+    view = _both_modes_view()
+    r, router, delegate, _unroute = _reconciler(view, BOTH_MODES, peers={"unit-B": FakePeer("unit-B")})
+    r._prev_active = set()  # our own spotify-1 just went active
+
+    _run(r)
+    assert router.calls == [("player-A", "spotify-1")]  # localActivity grabbed it locally
+
+    # The view catches up: our player is now on our own source.
+    view.units[0].sources[0].player_ids = ["player-A"]
+    view.units[0].local_player = {"attached": True, "group_id": "gA", "server_id": "unit-A"}
+    for _ in range(4):
+        _run(r)
+
+    # Nothing delegated: slave mode must NOT pull it back to the master. Before the fix this
+    # produced a route on the very next tick, and every hop is a discontinuity for every listener.
+    assert delegate.calls == []
+    assert router.calls == [("player-A", "spotify-1")]  # and no repeat locally either
+
+
+def test_slave_still_follows_when_local_activity_has_not_fired():
+    """The fix must not disable slave mode — only stop it undoing a local grab."""
+    view = _both_modes_view()
+    view.units[0].sources[0].active = False  # nothing local going on
+    r, router, delegate, _unroute = _reconciler(view, BOTH_MODES, peers={"unit-B": FakePeer("unit-B")})
+    r._prev_active = set()
+
+    _run(r)
+    assert delegate.calls == [("unit-B", "spotify-1", "player-A")]
+    assert router.calls == []
+
+
+def test_the_local_override_still_clears_when_both_go_idle():
+    """Otherwise a unit that once grabbed locally would never follow its master again."""
+    view = _both_modes_view()
+    r, _router, delegate, _unroute = _reconciler(view, BOTH_MODES, peers={"unit-B": FakePeer("unit-B")})
+    r._prev_active = set()
+    _run(r)
+    assert r._overridden is True
+
+    # Both go quiet — the documented reset point.
+    view.units[0].sources[0].active = False
+    view.units[0].local_player = None
+    view.units[1].sources[0].active = False
+    view.units[1].local_player = None
+    _run(r)
+
+    assert r._overridden is False
+    assert r._last_auto_target is None
