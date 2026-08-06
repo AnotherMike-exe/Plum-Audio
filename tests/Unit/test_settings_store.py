@@ -145,6 +145,22 @@ def test_a_hostile_PLUM_UNIT_NAME_is_scrubbed_before_it_reaches_the_defaults(mon
         importlib.reload(settings_api)
 
 
+def test_a_fresh_unit_defaults_the_visualizer_and_localActivity_ON(manager):
+    """Both are deliberate product defaults, so pin them: they are one word from being flipped back.
+
+    `visualizer` must stay the bare `True`, not a partial object — Visualizer.tsx's object branch
+    spreads what it is given and fills only nine fields, so `{"enabled": true}` would leave
+    theme/type/barCount/idleState undefined, while the boolean is expanded against the full defaults by
+    both consumers.
+
+    `slave` stays off on purpose: it mirrors `masterUnitId`, and there is no id that could be defaulted.
+    """
+    s = manager.get_settings()
+    assert s["integrations"]["visualizer"] is True
+    assert s["autoSwitch"]["localActivity"] is True
+    assert s["autoSwitch"]["slave"] == {"enabled": False, "masterUnitId": None}
+
+
 def test_the_host_token_prefers_the_SoC_serial_and_is_stable(monkeypatch, tmp_path):
     """The token must not move, or it renames the unit — the thing it exists to prevent.
 

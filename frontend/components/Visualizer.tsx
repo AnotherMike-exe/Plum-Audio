@@ -71,7 +71,13 @@ export const Visualizer: React.FC<VisualizerProps> = ({
         }
         : {
             enabled: typeof settings.integrations.visualizer === 'boolean' ? settings.integrations.visualizer : false,
-            theme: 'smart',
+            // 'user', to agree with types.ts DEFAULT_VISUALIZER_SETTINGS — which is what
+            // VisualizerTab.getVisualizerSettings() expands the same legacy boolean against. This said
+            // 'smart', so a unit on the boolean shape RENDERED album-art colours while the Settings tab
+            // showed "user" selected: the tab reported a value that was not in effect. Latent while the
+            // boolean only came from legacy files; live on every unit now that the backend defaults the
+            // visualizer ON as a bare `true`.
+            theme: 'user',
             type: 'circular',
             barCount: 128,
             sensitivity: 50,

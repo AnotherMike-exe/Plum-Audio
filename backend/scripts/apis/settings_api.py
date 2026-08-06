@@ -140,7 +140,15 @@ DEFAULT_SETTINGS = {
             "sourceName": "Plexamp",
         },
         "snapcast": False,  # inert; the mesh replaces Snapcast, but the frontend type still declares it
-        "visualizer": False,  # boolean | VisualizerSettings; the VisualizerTab populates the object
+        # ON by default. `boolean | VisualizerSettings` — the bare `True` is the LEGACY shape, and it is
+        # the right one to default to: both consumers expand it against the full defaults
+        # (VisualizerTab's getVisualizerSettings, Visualizer.tsx's non-object branch), whereas a
+        # PARTIAL object would take Visualizer.tsx's object branch, which spreads what it is given and
+        # only fills nine specific fields — leaving theme/type/barCount/idleState undefined. Writing the
+        # whole object here instead would put a second copy of frontend types.ts's
+        # DEFAULT_VISUALIZER_SETTINGS in the backend, i.e. ~20 fields to drift. The VisualizerTab
+        # replaces this with the object the moment anything is tweaked.
+        "visualizer": True,
     },
     "federation": {
         # Kept to satisfy the frontend Settings type; the mesh discovers peers automatically, so
@@ -152,7 +160,17 @@ DEFAULT_SETTINGS = {
         # Ported from Plum-Snapcast, live here (unlike "federation" above): auto-route this unit's
         # player onto its own source when idle and that source goes active, and/or have it follow
         # another unit's player while idle. See mesh/follow.py.
-        "localActivity": False,
+        #
+        # localActivity ON by default — it is what makes "just AirPlay to the kitchen speaker" play
+        # without anyone routing it by hand, which is the behaviour a fresh unit should have. Safe to
+        # default because follow.tick() fires it on a RISING EDGE only: a source that was already
+        # streaming when the player went idle is not re-grabbed, so selecting None still sticks.
+        #
+        # slave stays OFF, and not out of caution: it mirrors `masterUnitId`, and there is no unit id
+        # that could sensibly be defaulted — enabling it with masterUnitId=None would just be a
+        # disabled follower wearing an enabled flag. It is also the half with the open defect (a
+        # follower stops following when its leader switches source — CLAUDE.md Open #13).
+        "localActivity": True,
         "slave": {"enabled": False, "masterUnitId": None},
     },
     "audio": {
