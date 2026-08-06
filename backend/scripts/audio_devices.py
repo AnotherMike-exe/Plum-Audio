@@ -396,7 +396,7 @@ def configured_output_spec(fallback: str | None = None) -> str | None:
 
 
 async def watch_output_device(
-    on_change: Callable[[str | None], Awaitable[None]],
+    on_change: Callable[[str | None], Awaitable[bool | None]],
     *,
     interval: float = WATCH_INTERVAL_S,
 ) -> None:
@@ -404,21 +404,50 @@ async def watch_output_device(
 
     Polling for the same reason unit_identity does: settings.json is a cross-process contract
     written by the config API, and a device switch is a deliberate user action, not something that
-    needs sub-second latency. A failing callback is logged and the loop continues — a device that
-    would not open must not also stop us noticing the user picking a different one.
+    needs sub-second latency.
+
+    RETRIES until the change actually lands. `on_change` returning False — or raising — leaves the
+    baseline where it was, so the next tick tries the same target again. This matters because the
+    single most likely reason a switch fails is the card not being ready YET: an I2S HAT registers
+    asynchronously, which is the same race that makes card numbers move on these units. Advancing
+    the baseline before the callback succeeded (the old behaviour) meant one unlucky moment left the
+    unit on the wrong output — or silent — until a human toggled the setting, because nothing ever
+    looked again.
+
+    Returning None counts as success, so a callback that just does the work and returns nothing
+    keeps working.
     """
     current = configured_output_spec()
+    pending: str | None = None  # the target we are still trying to reach, if a previous try failed
+    failures = 0
     while True:
         await asyncio.sleep(interval)
         latest = configured_output_spec()
-        if latest == current:
+        if latest == current and pending is None:
             continue
-        logger.info("output device changed: %r -> %r", current, latest)
-        current = latest
+        # A NEW choice supersedes whatever we were retrying — the user has moved on.
+        if latest != current:
+            logger.info("output device changed: %r -> %r", current, latest)
+            failures = 0
         try:
-            await on_change(latest)
+            applied = await on_change(latest)
         except Exception:  # noqa: BLE001
-            logger.warning("applying the new output device failed; will retry on the next change", exc_info=True)
+            applied = False
+            logger.warning("applying output %r raised; retrying in %.0fs", latest, interval, exc_info=True)
+
+        if applied is False:
+            pending = latest
+            failures += 1
+            # Quiet after the first few: a card that is never coming back must not fill the log at
+            # one line per interval forever, but the retry itself continues.
+            if failures <= 3 or failures % 12 == 0:
+                logger.warning("output %r did not apply (attempt %d); still retrying", latest, failures)
+        else:
+            if pending is not None:
+                logger.info("output %r applied after %d failed attempt(s)", latest, failures)
+            pending = None
+            failures = 0
+        current = latest
 
 
 def list_output_devices(active_spec: str | None = None, *, force_refresh: bool = False) -> list[AudioDevice]:

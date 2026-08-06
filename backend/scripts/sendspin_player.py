@@ -160,7 +160,8 @@ class AlsaRenderer:
         self.rate = rate
         self.channels = channels
         self.bits = bits
-        self.device = device
+        self.device = device            # what we were ASKED for (settings/env spec)
+        self.open_device: str | None = None  # what we actually OPENED, as a stable card id
         self._bpf = channels * (bits // 8)
         self._target_bytes = self._bpf * rate * target_buffer_ms // 1000
         self._max_bytes = self._bpf * rate * MAX_BUFFER_MS // 1000
@@ -212,6 +213,7 @@ class AlsaRenderer:
             raise ValueError("this unit is configured for no output; there is no device to open")
 
         device_arg: str | int | None = spec
+        resolved = None
         if spec:
             index, resolved = audio_devices.resolve_portaudio_index(spec)
             if index is not None:
@@ -230,6 +232,13 @@ class AlsaRenderer:
         )
         self._stream.start()
         self.device = spec
+        # What we actually OPENED, as the stable <card_name>:<device> identity — distinct from the
+        # spec we were ASKED for. `pending` upstream is "choice vs echo"; echoing the request back
+        # compares a string to itself and is structurally unable to notice that resolution landed on
+        # a different card than intended (a stale hw:C,D after a renumber does exactly that). None
+        # when resolution found nothing and PortAudio name-matched the raw spec — in which case we
+        # genuinely do not know which card we are on, and saying so beats inventing an answer.
+        self.open_device = resolved.id if (spec and resolved is not None) else None
         logger.info(
             "DAC open: device=%s %d:%d:%d block=%d target=%dms",
             spec or "default",
@@ -277,6 +286,7 @@ class AlsaRenderer:
         except Exception:  # noqa: BLE001
             logger.error("restoring output %r ALSO failed — this unit is now silent", previous, exc_info=True)
             self.device = None
+            self.open_device = None
         return False
 
     def stop(self) -> None:
@@ -1098,7 +1108,7 @@ async def main() -> int | None:
     # Follow an output change from Settings. The swap runs in a worker thread: PortAudio teardown
     # and the `aplay -l` behind device resolution both block, and stalling the event loop would
     # stall the feed from the server as well as the switch.
-    async def _apply_output(spec: str | None) -> None:
+    async def _apply_output(spec: str | None) -> bool:
         if audio_devices.is_no_output(spec):
             # Return without touching the renderer OR the echo. "No output" is applied by the gate at
             # the next container start, not here — this unit has a player precisely because it did
@@ -1106,16 +1116,19 @@ async def main() -> int | None:
             # the API report restart_required instead of claiming the change already took effect, and
             # it keeps the room playing in the meantime, which is what the GUI banner promises.
             logger.info("output 'none' selected — applies at the next restart; still on %r", renderer.device)
-            return
+            return True  # nothing to retry: this one genuinely waits for a container restart
 
         applied = await asyncio.get_running_loop().run_in_executor(None, renderer.reopen, spec)
         # Echo what we ACTUALLY have open, not what was asked for — the config API reports this back
         # to the GUI, which is the only way a switch that failed can be told from one that worked.
-        save_active_output(state_file, renderer.device)
+        # open_device is the RESOLVED card id, so this also catches "opened, but the spec resolved to
+        # a different card than intended" — which echoing the request back could never detect.
+        save_active_output(state_file, renderer.open_device or renderer.device)
         if not applied:
             logger.error("output stayed on %r; %r could not be opened", renderer.device, spec)
+        return applied  # False keeps watch_output_device retrying this target
 
-    save_active_output(state_file, renderer.device)
+    save_active_output(state_file, renderer.open_device or renderer.device)
     output_watch = asyncio.ensure_future(audio_devices.watch_output_device(_apply_output))
 
     stop = install_shutdown_handlers()

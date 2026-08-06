@@ -125,6 +125,14 @@ export function currentPositionMs(np: NowPlaying, serverClockOffsetUs: number, n
 const ARTWORK_CHANNEL_0 = 8; // binary message types 8..11 = artwork channels 0..3
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
+// How long a socket must SURVIVE before its attempt counter is forgiven. Resetting on `open`
+// instead — which is what this did — means a connection that dies shortly after connecting resets
+// the counter every cycle, so the backoff is pinned at RECONNECT_BASE_MS forever and the
+// exponential growth can never engage. Measured on the rig 2026-08-06: six controller sockets
+// opening and closing every ~3 s indefinitely, which reads in the GUI as the visualizer dropping to
+// zero and recovering on a fixed cadence. Comfortably longer than a healthy roam reconnect
+// (sub-second) and than the handshake, so a genuinely good connection still clears it promptly.
+const RECONNECT_STABLE_MS = 10000;
 
 export class SendspinControllerClient {
   readonly unitId: string;
@@ -146,6 +154,8 @@ export class SendspinControllerClient {
   private closed = false;
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // Fires RECONNECT_STABLE_MS after a socket opens; only then is the attempt counter forgiven.
+  private stableTimer: ReturnType<typeof setTimeout> | null = null;
   // Commands issued while the WS is mid-reconnect: queue and flush once (re)connected + grouped, so
   // a click during a brief socket blip isn't silently lost. Each carries a timestamp for TTL expiry.
   private pendingCommands: Array<{ msg: string; at: number }> = [];
@@ -195,8 +205,9 @@ export class SendspinControllerClient {
   close(): void {
     this.closed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.stableTimer) clearTimeout(this.stableTimer);
     if (this.timeTimer) clearTimeout(this.timeTimer);
-    this.reconnectTimer = this.timeTimer = null;
+    this.reconnectTimer = this.timeTimer = this.stableTimer = null;
     this.viz = null;
     this.onViz = null;
     this.revokeArtwork();
@@ -308,7 +319,10 @@ export class SendspinControllerClient {
     ws.binaryType = 'arraybuffer';
     this.ws = ws;
     ws.onopen = () => {
-      this.reconnectAttempts = 0;
+      // NOT reset here — see RECONNECT_STABLE_MS. A socket that opens and immediately dies would
+      // otherwise retry at a flat 1s forever.
+      if (this.stableTimer) clearTimeout(this.stableTimer);
+      this.stableTimer = setTimeout(() => { this.reconnectAttempts = 0; }, RECONNECT_STABLE_MS);
       this.clock = new TimeFilter(); // a new socket is a new clock relationship
       this.stateSent = false;
       this.helloSeen = false;
@@ -360,6 +374,7 @@ export class SendspinControllerClient {
   }
 
   private scheduleReconnect(): void {
+    if (this.stableTimer) { clearTimeout(this.stableTimer); this.stableTimer = null; }
     if (this.closed) return;
     // Keep the last-known now-playing through brief blips — a healthy reconnect (server restart,
     // roam) is sub-second and the reconnected socket re-emits full state, so blanking immediately
