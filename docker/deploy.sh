@@ -5,6 +5,17 @@
 #   ./deploy.sh 192.0.2.10                   # one unit
 #   ./deploy.sh all --tarball dist/x.tar.gz  # a specific build (default: newest in dist/)
 #   ./deploy.sh all --no-migrate             # skip importing the ~/plum-test state
+#   ./deploy.sh all --image ghcr.io/anothermike-exe/plum-audio:1.0.0   # pull a published release
+#   ./deploy.sh all --pull                   # shorthand for the default registry at :latest
+#
+# TWO WAYS TO GET THE IMAGE ONTO A UNIT, and they are a real trade, not a preference:
+#   tarball (default) — build.sh + scp + `docker load`. Works with no internet on the unit and no
+#                       registry auth, and deploys exactly the tree you have in front of you,
+#                       including uncommitted work. ~200 MB over the LAN per unit.
+#   --image / --pull  — the unit pulls from a registry. Deploys a BUILT, TESTED, TAGGED artifact
+#                       rather than whatever is on this laptop, and four units pull in parallel
+#                       instead of taking four sequential scp copies. Needs the unit to reach the
+#                       internet, and the image must be public or the unit must be logged in.
 #
 # What it does per unit, in order: preflight -> ensure Docker -> STOP the pre-container dev stack
 # and any old containers -> create /opt/plum-audio -> import existing rig state on first deploy ->
@@ -44,24 +55,53 @@ UNITS_FILE="${HERE}/units.conf"
 
 MIGRATE=1
 TARBALL=""
+IMAGE_REF=""
+DEFAULT_REGISTRY="ghcr.io/anothermike-exe/plum-audio"
 HOSTS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         all)          HOSTS+=("all"); shift ;;
         --tarball)    TARBALL="$2"; shift 2 ;;
+        --image)      IMAGE_REF="$2"; shift 2 ;;
+        --pull)       IMAGE_REF="${DEFAULT_REGISTRY}:latest"; shift ;;
         --no-migrate) MIGRATE=0; shift ;;
-        -h|--help)    sed -n '2,20p' "$0"; exit 0 ;;
+        -h|--help)    sed -n '2,32p' "$0"; exit 0 ;;
         -*)           echo "unknown flag $1" >&2; exit 2 ;;
         *)            HOSTS+=("$1"); shift ;;
     esac
 done
-[[ ${#HOSTS[@]} -gt 0 ]] || { echo "usage: deploy.sh <all|host...> [--tarball f] [--no-migrate]" >&2; exit 2; }
+[[ ${#HOSTS[@]} -gt 0 ]] || {
+    echo "usage: deploy.sh <all|host...> [--tarball f | --image ref | --pull] [--no-migrate]" >&2
+    exit 2
+}
+[[ -z "$IMAGE_REF" || -z "$TARBALL" ]] || {
+    echo "--tarball and --image/--pull are mutually exclusive: pick where the image comes from" >&2
+    exit 2
+}
+
+# Split the ref once, here, rather than in the per-host function: compose interpolates PLUM_IMAGE and
+# PLUM_TAG separately, and a ref with a port (registry:5000/x:tag) makes the naive rsplit wrong.
+if [[ -n "$IMAGE_REF" ]]; then
+    if [[ "${IMAGE_REF##*/}" == *:* ]]; then
+        PLUM_IMAGE_NAME="${IMAGE_REF%:*}"
+        PLUM_IMAGE_TAG="${IMAGE_REF##*:}"
+    else
+        PLUM_IMAGE_NAME="$IMAGE_REF"
+        PLUM_IMAGE_TAG="latest"
+    fi
+else
+    PLUM_IMAGE_NAME="plum-audio"
+    PLUM_IMAGE_TAG="latest"
+fi
 
 command -v sshpass >/dev/null || { echo "sshpass required (brew install sshpass)" >&2; exit 1; }
 
-# Newest tarball wins when none was named — the common case is "I just ran build.sh".
-if [[ -z "$TARBALL" ]]; then
+# Newest tarball wins when none was named — the common case is "I just ran build.sh". Skipped
+# entirely in registry mode, where there is no tarball to find and demanding one would be absurd.
+if [[ -n "$IMAGE_REF" ]]; then
+    TARBALL=""
+elif [[ -z "$TARBALL" ]]; then
     TARBALL="$(ls -t ../dist/plum-audio-*.tar.gz 2>/dev/null | head -1 || true)"
 elif [[ "$TARBALL" != /* ]]; then
     # A relative --tarball has to be resolved against the caller's cwd, not this script's. We have
@@ -72,8 +112,10 @@ elif [[ "$TARBALL" != /* ]]; then
         [[ -f "$cand" ]] && { TARBALL="$cand"; break; }
     done
 fi
-[[ -f "$TARBALL" ]] || { echo "no image tarball at '${TARBALL:-<none>}' (run docker/build.sh first)" >&2; exit 1; }
-TARBALL="$(cd "$(dirname "$TARBALL")" && pwd)/$(basename "$TARBALL")"
+if [[ -z "$IMAGE_REF" ]]; then
+    [[ -f "$TARBALL" ]] || { echo "no image tarball at '${TARBALL:-<none>}' (run docker/build.sh first)" >&2; exit 1; }
+    TARBALL="$(cd "$(dirname "$TARBALL")" && pwd)/$(basename "$TARBALL")"
+fi
 
 # A deploy opens a dozen authenticated connections per unit in quick succession, and sshd will
 # occasionally refuse one ("Permission denied" on a password that is demonstrably correct). Retry
@@ -382,25 +424,39 @@ else
 fi
 EOS
 
-    # 5. Image.
-    say "$host — loading $(basename "$TARBALL")"
-    scp_ "$TARBALL" "$host" "/tmp/plum-audio-image.tar.gz" || return 1
-    ssh_ "$host" "bash -s -- '$PW'" <<'EOS' || return 1
+    # 5. Image — either scp+load a local build, or have the unit pull a published one.
+    if [[ -n "$IMAGE_REF" ]]; then
+        say "$host — pulling ${IMAGE_REF}"
+        ssh_ "$host" "bash -s -- '$PW' '$IMAGE_REF'" <<'EOS' || return 1
+set -euo pipefail
+PW="$1"; REF="$2"
+s() { echo "$PW" | sudo -S -p '' "$@"; }
+# Pull explicitly rather than letting `compose up` do it implicitly. A registry failure here is
+# reported against the unit that had it, before anything is torn down — whereas compose pulling
+# mid-`up` fails after the old container is already gone.
+s docker pull "$REF" 2>&1 | sed 's/^/    /'
+s docker image inspect "$REF" --format '    {{.Id}}  {{.Architecture}}  {{index .RepoDigests 0}}'
+EOS
+    else
+        say "$host — loading $(basename "$TARBALL")"
+        scp_ "$TARBALL" "$host" "/tmp/plum-audio-image.tar.gz" || return 1
+        ssh_ "$host" "bash -s -- '$PW'" <<'EOS' || return 1
 set -euo pipefail
 PW="$1"
 s() { echo "$PW" | sudo -S -p '' "$@"; }
 s docker load -i /tmp/plum-audio-image.tar.gz | sed 's/^/    /'
 rm -f /tmp/plum-audio-image.tar.gz
 EOS
+    fi
 
     # 6. compose + per-unit env. TZ and PUID/PGID are read from the unit itself so files under
     #    /opt/plum-audio stay owned by the account that administers it.
     say "$host — config"
     put_ "$host" "${HERE}/docker-compose.yml" "/tmp/plum-audio-compose.yml" || return 1
-    ssh_ "$host" "bash -s -- '$PW' '$REMOTE_ROOT' '$unit_id' '$unit_name' '$player_id' '$player_name' '$dac' '$profile' '$player_enabled'" <<'EOS' || return 1
+    ssh_ "$host" "bash -s -- '$PW' '$REMOTE_ROOT' '$unit_id' '$unit_name' '$player_id' '$player_name' '$dac' '$profile' '$player_enabled' '$PLUM_IMAGE_NAME' '$PLUM_IMAGE_TAG'" <<'EOS' || return 1
 set -euo pipefail
 PW="$1"; ROOT="$2"; UNIT_ID="$3"; UNIT_NAME="$4"; PLAYER_ID="$5"; PLAYER_NAME="$6"; DAC="$7"
-PROFILE="$8"; PLAYER_ENABLED="$9"
+PROFILE="$8"; PLAYER_ENABLED="$9"; IMAGE_NAME="${10}"; IMAGE_TAG="${11}"
 s() { echo "$PW" | sudo -S -p '' "$@"; }
 mv /tmp/plum-audio-compose.yml "$ROOT/docker-compose.yml"
 TZ_HOST="$(timedatectl show -p Timezone --value 2>/dev/null || echo UTC)"
@@ -427,19 +483,27 @@ ENV
 # COMPOSE_PROFILES has to be here, not in plum-audio.env: env_file is container environment, while
 # this is compose INTERPOLATION. Written beside the compose file so a bare `docker compose up -d` or
 # `restart` run by hand in this directory selects the same service deploy.sh does.
+#
+# PLUM_IMAGE/PLUM_TAG ride here for the same reason: which image compose resolves is interpolation,
+# decided before the container exists. Pinning both means a hand-run `docker compose up -d` in this
+# directory starts the image this deploy chose, not whatever `latest` has drifted to since.
 cat > "$ROOT/.env" <<COMPOSEENV
-# Generated by docker/deploy.sh — selects which service in docker-compose.yml applies to this host.
+# Generated by docker/deploy.sh — selects which service in docker-compose.yml applies to this host,
+# and which image it runs.
 COMPOSE_PROFILES=${PROFILE}
+PLUM_IMAGE=${IMAGE_NAME}
+PLUM_TAG=${IMAGE_TAG}
 COMPOSEENV
 echo "    $ROOT/plum-audio.env  (tz=${TZ_HOST}, uid=$(id -u):$(id -g), profile=${PROFILE})"
+echo "    $ROOT/.env            (image=${IMAGE_NAME}:${IMAGE_TAG})"
 EOS
 
     # 7 + 8. Up, then prove it actually serves — a running container says nothing about whether
     # supervisord's tree came up.
     say "$host — up"
-    ssh_ "$host" "bash -s -- '$PW' '$REMOTE_ROOT' '$expected_programs' '$profile'" <<'EOS'
+    ssh_ "$host" "bash -s -- '$PW' '$REMOTE_ROOT' '$expected_programs' '$profile' '$PLUM_IMAGE_NAME' '$PLUM_IMAGE_TAG'" <<'EOS'
 set -euo pipefail
-PW="$1"; ROOT="$2"; WANT="$3"; PROFILE="$4"
+PW="$1"; ROOT="$2"; WANT="$3"; PROFILE="$4"; IMAGE_NAME="$5"; IMAGE_TAG="$6"
 # Belt and braces alongside $ROOT/.env: compose v1 (the Debian units) and v2 (the Docker-CE one)
 # differ in how they pick .env up, and selecting no profile silently starts NOTHING rather than
 # failing — a deploy that looks like it worked and left the unit down.
@@ -450,7 +514,9 @@ cd "$ROOT"
 if s docker compose version >/dev/null 2>&1; then DC="docker compose"; else DC="docker-compose"; fi
 # Through `env`, not an export: s() shells out via sudo, which strips the environment, so an exported
 # COMPOSE_PROFILES would never reach compose — and an unset profile starts NOTHING while exiting 0.
-s env COMPOSE_PROFILES="$PROFILE" $DC up -d 2>&1 | sed 's/^/    /'
+# PLUM_IMAGE/PLUM_TAG come along for the same reason. They are also in $ROOT/.env, but compose v1 and
+# v2 disagree about when that file is read, and an unresolved image name is a confusing failure.
+s env COMPOSE_PROFILES="$PROFILE" PLUM_IMAGE="$IMAGE_NAME" PLUM_TAG="$IMAGE_TAG" $DC up -d 2>&1 | sed 's/^/    /'
 
 # Wait on OUR process tree, not on a port. Under host networking a port can be answered by
 # something that is not this container (that is exactly how a stale host nginx passed a GUI check),
