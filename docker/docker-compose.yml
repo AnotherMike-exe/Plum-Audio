@@ -18,12 +18,18 @@
 # Both declare the same container_name, so only one can run on a host — which is the intent.
 #
 # Build locally from the repo root:  docker compose -f docker/docker-compose.yml build
-# Deploy to the rig:                 docker/build.sh && docker/deploy.sh all
+# Deploy a local build to the rig:   docker/build.sh && docker/deploy.sh all
+# Deploy a published release:        docker/deploy.sh all --image ghcr.io/anothermike-exe/plum-audio:1.0.0
+#
+# PLUM_IMAGE defaults to the bare local name that build.sh tags and deploy.sh `docker load`s. Point
+# it at a registry path to run a published image instead. Both are compose INTERPOLATION variables,
+# so they belong in the .env beside this file, never in plum-audio.env (that one is the container's
+# environment, which is a different thing — see the note on COMPOSE_PROFILES in deploy.sh).
 x-plum-common: &plum-common
   build:
     context: ..
     dockerfile: backend/Dockerfile
-  image: plum-audio:${PLUM_TAG:-latest}
+  image: ${PLUM_IMAGE:-plum-audio}:${PLUM_TAG:-latest}
   container_name: plum-audio
   restart: unless-stopped
   # Host networking, non-negotiable: Sendspin WS (8927/8928), the mesh beacon (8929), mDNS/Avahi
