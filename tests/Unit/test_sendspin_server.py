@@ -12,6 +12,7 @@ no aiosendspin server is started. Run: `pytest tests/Unit`.
 """
 
 import asyncio
+import contextlib
 import sys
 from pathlib import Path
 
@@ -74,32 +75,114 @@ class FakeGroup:
         return self._roles.get(family)
 
 
+class FakeCleanupHandle:
+    """Stands in for the asyncio.TimerHandle behind SendspinClient._cleanup_handle."""
+
+    def __init__(self):
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+
 class FakeClient:
     def __init__(self, client_id, group=None, connected=True, roles=()):
         self.client_id = client_id
         self.group = group
         self.is_connected = connected
         self.negotiated_roles = list(roles)
+        self._cleanup_handle = None  # armed by the library on every connection teardown
 
     def roles_by_family(self, family):
         return [r for r in self.negotiated_roles if str(r).startswith(family)]
 
+    def arm_cleanup(self):
+        self._cleanup_handle = FakeCleanupHandle()
+        return self._cleanup_handle
+
+
+def make_dial_task(swallows=1):
+    """A real task standing in for a server-initiated dial, swallowing its first N cancels.
+
+    That is what 6.0.5 does: `SendspinConnection._handle_client` awaits the message loop as a
+    SEPARATE task and `_run_message_loop` catches CancelledError, so the cancel is consumed and the
+    dialer simply reconnects. Only a cancel landing outside the message loop kills it. Must be
+    created inside a running loop.
+    """
+
+    async def dial():
+        swallowed = 0
+        while True:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                swallowed += 1
+                if swallowed > swallows:
+                    raise
+
+    return asyncio.ensure_future(dial())
+
+
+def run_scenario(scenario):
+    """Run an async test body, then hard-cancel any dial tasks it left behind.
+
+    asyncio.run's own shutdown cancels leftovers exactly ONCE, which a swallowing dial task
+    survives — so without this the test hangs rather than fails.
+    """
+
+    async def wrapper():
+        try:
+            await scenario()
+        finally:
+            for task in [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]:
+                while not task.done():
+                    task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await asyncio.wait({task}, timeout=0.05)
+
+    asyncio.run(wrapper())
+
 
 class FakeServer:
     def __init__(self):
-        self.clients = {}
+        self._by_id = {}
+        self._urls = {}
+        self._connection_tasks = {}
+        self.dialed = []  # (url, reason) in call order
+        self.disconnected = []  # urls passed to disconnect_from_client, in call order
 
-    def add(self, client):
-        self.clients[client.client_id] = client
+    @property
+    def clients(self):
+        return list(self._by_id.values())
+
+    def add(self, client, url=None):
+        self._by_id[client.client_id] = client
+        if url is not None:
+            self._urls[client.client_id] = url
+            self._connection_tasks[url] = make_dial_task()
         return client
 
     def get_client(self, client_id):
-        return self.clients.get(client_id)
+        return self._by_id.get(client_id)
 
     def get_or_create_client(self, client_id):
-        if client_id not in self.clients:
-            self.clients[client_id] = FakeClient(client_id)
-        return self.clients[client_id]
+        if client_id not in self._by_id:
+            self._by_id[client_id] = FakeClient(client_id)
+        return self._by_id[client_id]
+
+    def register_client_url(self, client_id, url):
+        self._urls[client_id] = url
+
+    def get_client_url(self, client_id):
+        return self._urls.get(client_id)
+
+    def disconnect_from_client(self, url):
+        self.disconnected.append(url)
+        self._connection_tasks.pop(url, None)
+
+    def connect_to_client(self, url, *, connection_reason=None, retry_initial_connection=False):
+        self.dialed.append((url, connection_reason))
+        self._connection_tasks.setdefault(url, make_dial_task())
 
 
 def make_feeder(group=None, ps=None):
@@ -169,8 +252,15 @@ def test_is_active_mirrors_what_is_announced_on_the_wire():
 # --- attach_player: the caller that must not lose the refresh ---------------
 
 
-def test_attach_player_refreshes_the_stream_after_adding():
-    """add_client alone leaves an already-connected player in the group but out of the stream."""
+def test_attach_player_stops_the_stream_around_the_add_then_re_acquires_it():
+    """The order is the whole point: stop, THEN add, THEN start.
+
+    add_client alone leaves an already-connected player in the group but out of the stream, so the
+    re-acquire is what makes it audible. Doing it the other way round — add first, refresh second —
+    hands the joining client the outgoing stream and puts `stream/start`, `stream/end`,
+    `stream/start` on the wire inside ~110 ms, which permanently wedges an ESP32 client. See
+    SourceFeeder.membership_change.
+    """
     unit = make_unit("airplay-1")
     handle = unit.sources["airplay-1"]
     handle.feeder.ps = FakePushStream()  # a stream is live
@@ -178,7 +268,7 @@ def test_attach_player_refreshes_the_stream_after_adding():
 
     asyncio.run(unit.attach_player("airplay-1", "player-1"))
 
-    assert handle.group.calls == [("add", "player-1"), "start_stream"]
+    assert handle.group.calls == ["stop_stream", ("add", "player-1"), "start_stream"]
 
 
 def test_attach_player_removes_from_the_old_group_before_adding():
@@ -192,7 +282,7 @@ def test_attach_player_removes_from_the_old_group_before_adding():
     asyncio.run(unit.attach_player("airplay-1", "player-1"))
 
     assert old.calls == [("remove", "player-1")]
-    assert dest.group.calls == [("add", "player-1"), "start_stream"]
+    assert dest.group.calls == ["stop_stream", ("add", "player-1"), "start_stream"]
     assert player.group is dest.group
 
 
@@ -231,6 +321,180 @@ def test_detach_player_removes_without_touching_the_stream():
 def test_detach_player_on_an_unknown_source_is_silent():
     unit = make_unit("airplay-1")
     asyncio.run(unit.detach_player("nope-9", "player-1"))  # must not raise
+
+
+# --- adopting a foreign speaker --------------------------------------------
+#
+# The 2026-08-10 failure: routing a source at a third-party speaker (an Esparagus HiFi board, a
+# FutureProof Homes Satellite1) played for a few seconds and then dropped back to idle, every time.
+# adopt_foreign_client redialled unconditionally, and in 6.0.5 a cancelled dial task does not die —
+# it backs off ~1s and reconnects, while connect_to_client has already installed a second one. Six
+# adopts measured six concurrent websockets to one speaker fighting over the single connection a
+# Sendspin client allows. These pin both halves of the fix.
+
+SPEAKER_URL = "ws://192.168.7.201:8928/sendspin"
+
+
+def test_adopting_a_speaker_we_already_hold_does_not_redial_it():
+    """The headline guard: a repeat adopt of a working speaker must not touch the connection."""
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        handle = unit.sources["airplay-1"]
+        handle.feeder.ps = FakePushStream()
+        unit.server.add(FakeClient("08:B6:1F:B7:AF:5C", roles=("player@v1",)), url=SPEAKER_URL)
+
+        ok = await unit.adopt_foreign_client("airplay-1", SPEAKER_URL, player_id="esparagus-hifi-1")
+
+        assert ok is True
+        assert unit.server.dialed == []  # no redial
+        assert unit.server.disconnected == []  # and nothing torn down
+        assert handle.group.calls == ["stop_stream", ("add", "08:B6:1F:B7:AF:5C"), "start_stream"]
+
+    run_scenario(scenario)
+
+
+def test_re_adopting_a_speaker_already_on_that_source_leaves_the_whole_group_alone():
+    """refresh_stream is a WHOLE-GROUP event, so a redundant adopt must not reach it."""
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        handle = unit.sources["airplay-1"]
+        handle.feeder.ps = FakePushStream()
+        speaker = unit.server.add(FakeClient("08:B6:1F:B7:AF:5C", roles=("player@v1",)), url=SPEAKER_URL)
+        speaker.group = handle.group
+        handle.group.members.append(speaker)
+
+        ok = await unit.adopt_foreign_client("airplay-1", SPEAKER_URL)
+
+        assert ok is True
+        assert unit.server.dialed == []
+        assert handle.group.calls == []  # no remove/add, and above all no start_stream
+
+    run_scenario(scenario)
+
+
+def test_adopting_a_speaker_we_do_not_hold_still_dials_it():
+    """The stale/never-seen case the redial exists for: a disconnected client must be re-dialled."""
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        unit.server.add(FakeClient("08:B6:1F:B7:AF:5C", connected=False, roles=("player@v1",)), url=SPEAKER_URL)
+
+        ok = await unit.adopt_foreign_client("airplay-1", SPEAKER_URL, timeout_s=0.3)
+
+        assert ok is False  # nothing ever connected within the timeout
+        assert [url for url, _ in unit.server.dialed] == [SPEAKER_URL]
+
+    run_scenario(scenario)
+
+
+def test_a_redial_waits_for_the_old_dial_task_to_actually_die():
+    """One cancel is swallowed by 6.0.5's message loop; dialing again before it dies leaks a dialer."""
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        unit.server.add(FakeClient("08:B6:1F:B7:AF:5C", connected=False, roles=("player@v1",)), url=SPEAKER_URL)
+        old = unit.server._connection_tasks[SPEAKER_URL]
+
+        await unit.adopt_foreign_client("airplay-1", SPEAKER_URL, timeout_s=0.3)
+
+        assert old.done()  # gone before the new dial went out, not left redialing beside it
+
+    run_scenario(scenario)
+
+
+def test_routing_a_player_defuses_the_eviction_timer_a_teardown_left_behind():
+    """The 30s registry cleanup must not survive to evict a speaker that is routed and playing.
+
+    Pinned on attach_player, not on adopt, so it covers every routing path — adopt (both the fast
+    path and the redial), a plain route, and a cross-server reclaim.
+    """
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        source = unit.sources["airplay-1"]
+        source.feeder.ps = FakePushStream()
+        speaker = unit.server.add(FakeClient("08:B6:1F:B7:AF:5C", roles=("player@v1",)), url=SPEAKER_URL)
+        timer = speaker.arm_cleanup()  # what a connection teardown leaves behind
+
+        await unit.attach_player("airplay-1", "08:B6:1F:B7:AF:5C")
+
+        assert timer.cancelled is True
+        assert speaker._cleanup_handle is None
+        assert source.group.calls == ["stop_stream", ("add", "08:B6:1F:B7:AF:5C"), "start_stream"]
+
+    run_scenario(scenario)
+
+
+def test_an_idempotent_re_attach_still_defuses_the_eviction_timer():
+    """The early return must not skip it — a re-adopt of an already-routed speaker is the case
+    that was dropping to idle 30 s later."""
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        source = unit.sources["airplay-1"]
+        source.feeder.ps = FakePushStream()
+        speaker = unit.server.add(FakeClient("08:B6:1F:B7:AF:5C", roles=("player@v1",)), url=SPEAKER_URL)
+        speaker.group = source.group
+        timer = speaker.arm_cleanup()
+
+        await unit.attach_player("airplay-1", "08:B6:1F:B7:AF:5C")
+
+        assert timer.cancelled is True
+        assert source.group.calls == []  # still idempotent: no re-group, no stream churn
+
+    run_scenario(scenario)
+
+
+def test_releasing_defuses_the_pending_cleanup_before_arming_the_goodbye_one():
+    """Two schedules orphan the first: _schedule_cleanup overwrites the handle without cancelling."""
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        handle = unit.sources["airplay-1"]
+        speaker = unit.server.add(FakeClient("08:B6:1F:B7:AF:5C", roles=("player@v1",)), url=SPEAKER_URL)
+        speaker.group = handle.group
+        handle.group.members.append(speaker)
+        pending = speaker.arm_cleanup()  # armed by the dial teardown, reason=None -> 30s
+
+        await unit.release_foreign_client("airplay-1", "08:B6:1F:B7:AF:5C")
+
+        assert pending.cancelled is True  # or it fires 30s later and evicts whoever holds this id
+
+    run_scenario(scenario)
+
+
+def test_cancelling_a_cleanup_is_harmless_when_there_is_none_or_no_such_client():
+    """Best-effort by design: it reaches into a private attribute and must never break routing."""
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        unit.server.add(FakeClient("08:B6:1F:B7:AF:5C", roles=("player@v1",)))
+        unit._cancel_pending_cleanup("08:B6:1F:B7:AF:5C")  # no handle armed
+        unit._cancel_pending_cleanup("nobody-by-that-name")  # not in the registry
+
+    run_scenario(scenario)
+
+
+def test_releasing_a_speaker_stops_the_dial_instead_of_letting_it_reconnect():
+    """disconnect_from_client does not stop the dialer, so a release that used it took the speaker
+    straight back about a second later — a release that silently did nothing."""
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        handle = unit.sources["airplay-1"]
+        speaker = unit.server.add(FakeClient("08:B6:1F:B7:AF:5C", roles=("player@v1",)), url=SPEAKER_URL)
+        speaker.group = handle.group
+        handle.group.members.append(speaker)
+        dial = unit.server._connection_tasks[SPEAKER_URL]
+
+        await unit.release_foreign_client("airplay-1", "08:B6:1F:B7:AF:5C")
+
+        assert dial.done()
+        assert handle.group.calls == [("remove", "08:B6:1F:B7:AF:5C")]
+
+    run_scenario(scenario)
 
 
 # --- source lifecycle -------------------------------------------------------

@@ -46,6 +46,7 @@ import logging
 import os
 import socket
 import time
+from collections.abc import AsyncIterator
 
 import unit_identity
 from aiosendspin.models.types import GoodbyeReason, MediaCommand, has_role_family
@@ -93,6 +94,7 @@ ANCHOR_PREFIX = "src:"  # server-side group anchor client id namespace
 SOURCE_IDLE_TIMEOUT_S = float(os.environ.get("PLUM_SOURCE_IDLE_TIMEOUT", "300"))
 CONTROLLER_PREFIX = "ctrl:"  # GUI controller client id namespace: "ctrl:<source_id>:<nonce>"
 REACQUIRE_BACKOFF_S = 0.1  # pause before re-acquiring a stopped stream (avoid hot-looping)
+CANCEL_POLL_S = 0.25  # how long to wait between cancels of a dial task — see _stop_dialing
 
 
 def _bytes_per_frame(fmt: AudioFormat) -> int:
@@ -135,6 +137,9 @@ class SourceFeeder:
         self._task: asyncio.Task | None = None
         self._stop_evt = asyncio.Event()
         self._last_data_at: float | None = None  # monotonic; None = idle (announced as stopped)
+        # Held across a group membership change so the pump cannot re-acquire the stream underneath
+        # it — see membership_change().
+        self._change_lock = asyncio.Lock()
 
     @property
     def is_active(self) -> bool:
@@ -189,6 +194,52 @@ class SourceFeeder:
             return  # nothing playing: the next chunk starts a stream that includes everyone
         self._acquire_stream()
         logger.info("[%s] stream re-acquired to include a new group member", self.source_id)
+
+    @contextlib.asynccontextmanager
+    async def membership_change(self) -> AsyncIterator[None]:
+        """Stop the stream for the duration of an add/remove, then re-acquire it once.
+
+        Without this a client joining a live group is handed the stream we are about to replace, and
+        the sequence on the wire is `stream/start` -> `stream/end` -> `stream/start` inside ~110 ms:
+        `add_client` runs the library's late-join (`PushStream.on_role_join`) for every role with
+        audio requirements, and `refresh_stream` then stops that stream and starts another.
+
+        Measured on unit-7204 2026-08-10 with DEBUG on, for both an Esparagus HiFi board and a
+        FutureProof Homes Satellite1 (both ESPHome / sendspin-cpp 0.7.0):
+
+            20:53:32,567  StreamStartMessage   <- add_client's late-join
+            20:53:32,570  StreamEndMessage     <- 3 ms later, refresh_stream replaces the stream
+            20:53:32,664  StreamStartMessage   <- the stream it actually gets
+
+        sendspin-cpp does not survive that. The first start sets `pending_start_` and requests
+        play_uri; the end arrives mid-spin-up, and its STOP is explicitly ignored while a start is
+        pending. `pending_start_` is only cleared inside `play_uri()`, which is never reached, so the
+        PLAY_URI sits at the head of an `xQueuePeek`ed command queue and blocks every command behind
+        it. That state survives re-routing — only a power cycle clears it, which matches the rig
+        exactly: the Esparagus could not be recovered by any number of unroute/reroute cycles.
+
+        Stopping first gives: `stream/end` to the members already listening, then a membership change
+        against a group with no live stream (so no late-join, no spurious start), then ONE
+        `stream/start` for everyone. Existing listeners see the same end/start pair they already saw;
+        the joining client sees one start instead of three messages.
+
+        This does NOT optimise `refresh_stream` away — membership is still fixed at `start_stream()`
+        and the re-acquire still happens, it just no longer straddles the change. The lock is what
+        stops `_pump` seeing a stopped stream mid-change and re-acquiring one that excludes the
+        client being added.
+        """
+        async with self._change_lock:
+            was_streaming = self.ps is not None and not self.ps.is_stopped
+            if was_streaming:
+                with contextlib.suppress(Exception):
+                    self.group.stop_stream()  # transport only: clients stay logically PLAYING
+                self.ps = None
+            try:
+                yield
+            finally:
+                if was_streaming:
+                    self._acquire_stream()
+                    logger.info("[%s] stream re-acquired to include a new group member", self.source_id)
 
     def _ensure_fifo(self) -> None:
         """Create the FIFO if the source service hasn't yet, so we can open the read end and
@@ -255,26 +306,37 @@ class SourceFeeder:
                 continue
 
             if data:
-                if self.ps is None or self.ps.is_stopped:
-                    self._acquire_stream()  # first audio of a session → playback_state=playing
-                    logger.info("[%s] active: sender feeding us (playback_state=playing)", self.source_id)
-                self._last_data_at = time.monotonic()
-                assert self.ps is not None
-                self.ps.prepare_audio(data, self.fmt)
-                try:
-                    await self.ps.commit_audio()
-                except StreamStoppedError:
-                    # Routing/membership churn stopped our stream — re-acquire and re-push
-                    # this same chunk so no audio is dropped.
-                    logger.info("[%s] stream stopped under feeder; re-acquiring", self.source_id)
-                    await asyncio.sleep(REACQUIRE_BACKOFF_S)
-                    self._acquire_stream()
-                    with contextlib.suppress(StreamStoppedError):
-                        self.ps.prepare_audio(data, self.fmt)
+                # Serialised against membership_change so we never re-acquire a stream that would
+                # exclude the client currently being added. Waiting costs a few ms; guessing costs
+                # a silent endpoint. The pacing sleep below is deliberately OUTSIDE the lock.
+                async with self._change_lock:
+                    if self.ps is None or self.ps.is_stopped:
+                        self._acquire_stream()  # first audio of a session → playback_state=playing
+                        logger.info("[%s] active: sender feeding us (playback_state=playing)", self.source_id)
+                    self._last_data_at = time.monotonic()
+                    assert self.ps is not None
+                    self.ps.prepare_audio(data, self.fmt)
+                    committed = False
+                    try:
                         await self.ps.commit_audio()
-                else:
+                        committed = True
+                    except StreamStoppedError:
+                        pass
+                if committed:
                     # Yield until we're back under the buffer target: real-time pacing.
                     await self.ps.sleep_to_limit_buffer(TARGET_BUFFER_US)
+                else:
+                    # Routing/membership churn stopped our stream — re-acquire and re-push this
+                    # same chunk so no audio is dropped. Under the lock again, so a membership
+                    # change that is still in flight finishes first and we re-push into ITS stream.
+                    logger.info("[%s] stream stopped under feeder; re-acquiring", self.source_id)
+                    await asyncio.sleep(REACQUIRE_BACKOFF_S)
+                    async with self._change_lock:
+                        if self.ps is None or self.ps.is_stopped:
+                            self._acquire_stream()
+                        with contextlib.suppress(StreamStoppedError):
+                            self.ps.prepare_audio(data, self.fmt)
+                            await self.ps.commit_audio()
 
             if eof:
                 await self._go_idle("FIFO writer closed (session end)")
@@ -449,15 +511,19 @@ class PlumSendspinServer:
         if handle is None:
             raise KeyError(f"unknown source {source_id!r}")
         player = self.server.get_or_create_client(player_id)
+        # A player we are routing is a player that must not be evicted from the registry thirty
+        # seconds from now by a timer some earlier teardown armed. See _cancel_pending_cleanup.
+        self._cancel_pending_cleanup(player_id)
         if player.group is handle.group:
             return  # already on this source — idempotent, avoids a redundant re-group
-        if player.group is not None:
-            await player.group.remove_client(player)
-        await handle.group.add_client(player)
-        # add_client alone does not put an already-connected player into a stream that is already
-        # running — see SourceFeeder.refresh_stream. Without this the player joins the group and
-        # stays silent.
-        handle.feeder.refresh_stream()
+        # The stream is stopped for the duration of the move and re-acquired once afterwards, so the
+        # joining player is never handed the outgoing stream. add_client alone does not put an
+        # already-connected player into a running stream either way — membership is fixed at
+        # start_stream() — so the re-acquire is still what makes it audible.
+        async with handle.feeder.membership_change():
+            if player.group is not None:
+                await player.group.remove_client(player)
+            await handle.group.add_client(player)
         logger.info("[%s] attached player %s", source_id, player_id)
 
     async def detach_player(self, source_id: str, player_id: str) -> None:
@@ -641,16 +707,22 @@ class PlumSendspinServer:
         before = {c.client_id for c in self.server.clients}
         if player_id:
             self.server.register_client_url(player_id, url)
-        # Drop any dial we are already holding for this URL before opening a new one. Without this a
-        # second adopt is a NO-OP: connect_to_client sees a live registration for the URL and does
-        # nothing, so if the speaker went away in the meantime (unplugged, rebooted, or taken back by
-        # its own server) nothing ever re-dials and we time out blaming it — "never connected" about
-        # a speaker whose port is plainly open. Only release_foreign_client cancelled the dial, which
-        # is why releasing first was the accidental workaround.
-        # Measured on .100.21 against a Home Assistant Voice PE, seconds apart on the same URL:
-        # adopt alone -> ok:false; release (whose only extra step is this) then adopt -> ok:true.
-        with contextlib.suppress(Exception):
-            self.server.disconnect_from_client(url)
+        # Already dialled, connected and answering? Then there is nothing to dial. Re-routing it is
+        # attach_player's job, and attach_player is idempotent when the group is already right.
+        # Redialing here instead would drop a working speaker mid-track for no reason — see
+        # _stop_dialing for why a redial is never free.
+        existing = self._connected_player_at(url)
+        if existing is not None:
+            await self.attach_player(source_id, existing)
+            logger.info("[%s] foreign speaker %s (%s) already connected; kept the dial", source_id, existing, url)
+            return True
+        # Otherwise the registration is stale, and a stale one must be torn down before we redial:
+        # connect_to_client is a NO-OP while a dial task for the URL exists, so without this a second
+        # adopt does nothing and then times out blaming the speaker — "never connected" about a
+        # device whose port is plainly open. Measured on .100.21 against a Home Assistant Voice PE,
+        # seconds apart on the same URL: adopt alone -> ok:false; release (whose only extra step is
+        # this teardown) then adopt -> ok:true.
+        await self._stop_dialing(url)
         self.server.connect_to_client(url, connection_reason=ConnectionReason.PLAYBACK, retry_initial_connection=True)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
@@ -669,28 +741,129 @@ class PlumSendspinServer:
                 registered = self.server.get_client_url(client.client_id)
                 if registered == url or client.client_id == player_id or client.client_id not in before:
                     self.server.register_client_url(client.client_id, url)
-                    await self.attach_player(source_id, client.client_id)
+                    await self.attach_player(source_id, client.client_id)  # defuses the eviction timer
                     logger.info("[%s] adopted foreign speaker %s (%s)", source_id, client.client_id, url)
                     return True
             await asyncio.sleep(0.1)
         logger.warning("[%s] foreign speaker at %s never connected", source_id, url)
         return False
 
+    def _connected_player_at(self, url: str) -> str | None:
+        """The client id of the render endpoint we already hold a live connection to at `url`.
+
+        The registered URL is the only reliable identity: a speaker adopted once keeps its entry in
+        server.clients forever, its handshake id is a MAC where mDNS named it by instance, and both
+        differ from whatever the GUI passed as player_id. Controllers are skipped — only something
+        that negotiated a player role is a speaker.
+        """
+        assert self.server is not None
+        for client in self.server.clients:
+            if not client.is_connected:
+                continue
+            if not has_role_family("player", client.negotiated_roles):
+                continue
+            if self.server.get_client_url(client.client_id) == url:
+                return client.client_id
+        return None
+
+    def _cancel_pending_cleanup(self, client_id: str) -> None:
+        """Defuse the library's registry-eviction timer for a client we are about to keep or drop.
+
+        `SendspinClient._schedule_cleanup` assigns `_cleanup_handle` WITHOUT cancelling whatever was
+        already there, so scheduling twice orphans the first timer: nothing holds a reference to it,
+        so `attach_connection`'s "cancel pending cleanup on reconnect" can never reach it, and it
+        fires anyway. `_do_cleanup` then calls `remove_client(self._client_id)` — which evicts
+        whichever client currently holds that id, not the object the timer belonged to.
+
+        Two schedules is the normal shape of a release: tearing the connection down has no goodbye
+        reason, which arms a 30 s DELAYED cleanup, and the `USER_REQUEST` goodbye ~250 ms later arms
+        an IMMEDIATE one on top of it. Measured on unit-7204 2026-08-10 with DEBUG on:
+
+            20:53:32,209  Scheduling delayed cleanup in 30s (reason: None)
+            20:53:32,507  Received client/hello          <- rerouted, reconnected
+            20:53:32,571  attached player 98:A3:...      <- playing
+            20:54:02,210  Cleaning up client from registry
+            20:54:02,211  removing 98:A3:... from group  <- evicted mid-playback, 30 s after the UNROUTE
+
+        That is the "reroute it, it plays for a few seconds, then drops back to idle" failure: the
+        countdown starts when the speaker is unrouted and expires while it is happily streaming
+        again. Across that session the library cancelled 3 pending cleanups and ran 13.
+
+        So we cancel the handle ourselves at both points where we would otherwise leave one armed:
+        before adding a second schedule (release), and once an adopt has confirmed the client is
+        connected — a connected client must never have an eviction pending. Best-effort by design:
+        this reaches into a private attribute, and a version that no longer has it should not break
+        routing. See UPSTREAM §5.
+        """
+        if self.server is None:
+            return
+        client = self.server.get_client(client_id)
+        handle = getattr(client, "_cleanup_handle", None)
+        if handle is None:
+            return
+        with contextlib.suppress(Exception):
+            handle.cancel()
+            client._cleanup_handle = None  # noqa: SLF001
+            logger.debug("cancelled a pending registry cleanup for %s", client_id)
+
+    async def _stop_dialing(self, url: str, timeout_s: float = 2.0) -> bool:
+        """Tear down a server-initiated dial and WAIT until the task is actually gone.
+
+        `disconnect_from_client()` alone does not stop it. It cancels the dial task, but the task
+        survives its own cancellation: `SendspinConnection._handle_client` awaits the message loop
+        as a SEPARATE task, and `_run_message_loop` catches CancelledError and returns normally, so
+        the cancel is consumed. The dialer sees a clean session end, backs off ~1 s and redials —
+        and because a session that lasted 10 s resets the backoff, a real speaker keeps it alive
+        forever. Worse, the doomed task's `finally` pops `_connection_tasks[url]` AFTER the caller's
+        next `connect_to_client` has already put its own task there, so the new dial is unregistered
+        and the adopt after that opens a THIRD dialer, and so on.
+
+        Measured against 6.0.5 with a fake speaker counting sockets: six disconnect+reconnect pairs
+        left six concurrent websockets to one speaker and six live dial tasks, with the server's
+        registry claiming one. A Sendspin client holds exactly ONE websocket, so those dialers fight
+        over it — audio starts, plays a few seconds, and dies with close_code=1006, repeatedly. That
+        is the "route it to a foreign speaker and it drops back to idle" failure of 2026-08-10.
+
+        So: cancel until it is genuinely done. The swallow only happens inside the message loop; a
+        cancel that lands during connect or during the backoff sleep propagates normally, which is
+        why re-cancelling terminates. Returns False if it outlived the timeout anyway — the caller
+        still redials, because a stale registration that never dies is worse than a duplicate.
+        """
+        assert self.server is not None
+        task = getattr(self.server, "_connection_tasks", {}).get(url)
+        with contextlib.suppress(Exception):
+            self.server.disconnect_from_client(url)  # public half: options, reason, registry entry
+        if task is None:
+            return True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while not task.done() and loop.time() < deadline:
+            task.cancel()
+            with contextlib.suppress(Exception):
+                await asyncio.wait({task}, timeout=CANCEL_POLL_S)
+        if not task.done():
+            logger.warning("dial task for %s outlived %.1fs of cancellation; redialing anyway", url, timeout_s)
+            return False
+        return True
+
     async def release_foreign_client(self, source_id: str, player_id: str, url: str | None = None) -> None:
         """Hand a foreign speaker back: leave the group, cancel our dial, and drop the connection.
 
-        Three steps, all needed. detach leaves our group; disconnect_from_client only cancels the
-        server-initiated connection task for that URL, which by itself leaves the speaker sitting
-        connected to us and unavailable to its own server; remove_client is what actually closes it
-        out and forgets it. Verified on a real third-party speaker — without the last step it stayed
-        connected and Music Assistant could not take it back.
+        Three steps, all needed. detach leaves our group; stopping the dial is what stops us taking
+        it straight back, which by itself would leave the speaker sitting connected to us and
+        unavailable to its own server; remove_client is what actually closes it out and forgets it.
+        Verified on a real third-party speaker — without the last step it stayed connected and Music
+        Assistant could not take it back.
+
+        The dial teardown goes through `_stop_dialing`, not `disconnect_from_client`: the latter
+        does not actually stop the dialer, so a release would hand the speaker back and then redial
+        it about a second later, which reads as a release that silently did nothing.
         """
         await self.detach_player(source_id, player_id)
         if self.server is not None:
             target = url or self.server.get_client_url(player_id)
             if target:
-                with contextlib.suppress(Exception):
-                    self.server.disconnect_from_client(target)  # cancel OUR dial, so we don't re-take it
+                await self._stop_dialing(target)  # stop OUR dial, so we don't re-take it
             client = self.server.get_client(player_id)
             if client is not None:
                 # Actually hang up. Neither disconnect_from_client (which only cancels our dial's
@@ -703,6 +876,11 @@ class PlumSendspinServer:
                 if conn is not None:
                     with contextlib.suppress(Exception):
                         await conn.disconnect(retry_connection=False)
+                # Both steps above schedule a registry cleanup, and the second ORPHANS the first
+                # rather than replacing it — an unreachable 30 s timer that later evicts whatever
+                # client holds this id, including a re-routed speaker mid-playback. Defuse the
+                # pending one so the USER_REQUEST goodbye leaves exactly one. See _cancel_pending_cleanup.
+                self._cancel_pending_cleanup(player_id)
                 with contextlib.suppress(Exception):
                     client.detach_connection(GoodbyeReason.USER_REQUEST)
             with contextlib.suppress(Exception):
