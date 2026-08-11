@@ -158,6 +158,128 @@ goodbye and closes the live socket in one call.
 
 ---
 
+## 4. `disconnect_from_client()` does not stop the dialer — **a library bug**
+
+**Conformance impact: NONE — but it is the worst interop bug found so far.**
+
+Found 2026-08-10 bringing up two third-party speakers (an Esparagus HiFi board, a FutureProof Homes
+Satellite1) on unit-7204. Routing a source at one played for a few seconds and dropped back to idle,
+every time, and retrying made it worse.
+
+`disconnect_from_client(url)` cancels the server-initiated dial task and returns. The task does not
+die. `SendspinConnection._handle_client` awaits the message loop as a **separate task**, and
+`_run_message_loop` catches `asyncio.CancelledError` and returns normally — so `await
+self._message_loop_task` consumes the cancel. The dialer sees a clean session end, backs off ~1 s
+and **reconnects**; a session that lasted ≥ `STABLE_SERVER_INITIATED_SESSION_S` (10 s) resets the
+backoff, so against a real speaker it never reaches the ceiling that would end it. Meanwhile the
+caller's next `connect_to_client(url)` has already installed its own task, and the doomed task's
+`finally` then pops `_connection_tasks[url]` — **the new task's entry** — so the next call does not
+hit the "already dialling" guard and opens a third dialer, and so on.
+
+Measured against 6.0.5 with a fake speaker counting sockets, driving the disconnect+reconnect pair
+six times 3 s apart:
+
+```
+after adopt #1: speaker holds 1 websocket(s), 1 dial task(s) alive, registry knows 1
+after adopt #2: speaker holds 2 websocket(s), 2 dial task(s) alive, registry knows 1
+...
+after adopt #6: speaker holds 6 websocket(s), 6 dial task(s) alive, registry knows 1
+```
+
+A Sendspin client holds exactly ONE websocket, so those dialers fight over it: audio starts, plays
+a few seconds, and dies with `close_code=1006`, repeatedly — which is exactly what
+`/config/logs/sendspin_server.log` on unit-7204 shows across the 19:05–19:39 test window.
+
+**Current workaround** (`sendspin_server.py`, `_stop_dialing`): cancel in a loop until the task is
+genuinely `done()`. The swallow only happens *inside* the message loop; a cancel landing during
+connect or during the backoff sleep propagates normally, so re-cancelling terminates. Everything
+that tears a dial down (`adopt_foreign_client`'s stale path, `release_foreign_client`) goes through
+it, and `adopt_foreign_client` no longer redials at all when it already holds a live connection to
+that URL.
+
+**Ask:** make `disconnect_from_client(url)` actually stop the dial — either have
+`_run_message_loop` re-raise `CancelledError`, or have `_handle_client_connection` track its own
+"cancelled" flag and skip the retry. Awaitable would be better still
+(`await server.disconnect_from_client(url)`), so a caller can redial safely. Related: the `finally`
+block should only clear `_connection_tasks[url]` when the entry is still *its own* task.
+
+**Refs:** `sendspin_server.py` `_stop_dialing` / `adopt_foreign_client` / `release_foreign_client`;
+guards in `tests/Unit/test_sendspin_server.py`; `aiosendspin/server/server.py:593`
+`_handle_client_connection`, `aiosendspin/server/connection.py:618` `_run_message_loop`.
+
+---
+
+## 5. `_schedule_cleanup` orphans its previous timer, which later evicts a LIVE client — **a library bug**
+
+**Conformance impact: NONE — but it silently unroutes a playing speaker.**
+
+Found 2026-08-10 on unit-7204 with DEBUG on, chasing "reroute a speaker, it plays for a few seconds,
+then drops back to idle".
+
+`SendspinClient._schedule_cleanup` assigns `self._cleanup_handle = ...` **without cancelling
+whatever handle was already there**. Schedule twice and the first timer is orphaned: nothing
+references it, so `attach_connection`'s "Cancel pending cleanup if client reconnected before cleanup
+fired" can never reach it, and it fires regardless. `_do_cleanup`'s only other guard is
+`if self._connected` on the object that owns the timer — which does not protect a connection that
+came back on a different object — and it then calls `remove_client(self._client_id)`, evicting
+**whichever client currently holds that id**.
+
+Two schedules is the normal shape of a release: the connection teardown carries no goodbye reason
+(→ 30 s DELAYED cleanup) and the `USER_REQUEST` goodbye ~250 ms later adds an IMMEDIATE one on top.
+
+```
+20:53:32,209  Scheduling delayed cleanup in 30s (reason: None)
+20:53:32,507  Received client/hello           <- rerouted, reconnected
+20:53:32,571  attached player 98:A3:16:D0:9E:E8   <- playing
+20:54:02,210  Cleaning up client from registry
+20:54:02,211  removing 98:A3:16:D0:9E:E8 from group   <- evicted mid-playback
+```
+
+Exactly 30 s after the **unroute**, not the reroute — which is why the symptom reads as a random
+15–60 s dropout scaling with how quickly the speaker was re-routed. Over that session the library
+logged 3 cancelled cleanups and 13 executed ones, against two ESP32 speakers and a browser client.
+
+**Current workaround** (`sendspin_server.py`, `_cancel_pending_cleanup`): cancel the pending handle
+ourselves at both points that would otherwise leave one armed — in `attach_player` (a routed player
+must never have an eviction pending, which covers adopt, route and reclaim) and in
+`release_foreign_client` before the goodbye adds the second schedule. Best-effort: it touches a
+private attribute and must not break routing on a version that no longer has it.
+
+**Ask:** cancel the existing handle at the top of `_schedule_cleanup`, and make `_do_cleanup` verify
+the registry still maps `client_id` to `self` before removing it. Either alone fixes this.
+
+**Refs:** `sendspin_server.py` `_cancel_pending_cleanup`; guards in `tests/Unit/test_sendspin_server.py`;
+`aiosendspin/server/client.py:555` `_schedule_cleanup`, `:584` `_do_cleanup`, `:388` `attach_connection`.
+
+---
+
+## 6. Encryption is opt-in-by-omission today — will become opt-out on the next big pin bump
+
+**Conformance impact: NONE today — a forward-looking trap, not a current bug.**
+
+Discovered 2026-08-10 researching third-party ESP32 (ESPHome/Sendspin) client hardware. Our pinned
+`SendspinServer.__init__` (6.0.5) has no psk/pairing/noise/encryption parameter at all — the entire
+`aiosendspin/noise/` package (Noise Protocol `KKpsk2` handshake, PSK pairing) doesn't exist until
+upstream **8.0.0** (2026-08-07) and **9.0.0** (2026-08-10). The current spec page now describes
+encryption as mandatory for standard-discovery connections, which is the 8.0.0+ shape, not what we
+run. Post-8.0.0 `SendspinServer` carries an `allow_unencrypted: bool = False` escape hatch.
+
+**Why this matters for a pin bump, not just new clients:** every client we currently interoperate
+with — our own units, and any third-party ESP32 board running `sendspin-cpp` (ESPHome's Sendspin
+client, no noise/psk code as of the version checked) — is cleartext-only. If `aiosendspin` is ever
+bumped past 8.0.0 without also passing `allow_unencrypted=True` in `sendspin_server.py`, every
+existing client fails the handshake silently the day the pin moves, with nothing in the logs
+pointing at encryption as the cause.
+
+**Ask:** none — this is us, not upstream. Just a checklist item: when bumping past 8.0.0, either
+pass `allow_unencrypted=True` deliberately, or scope out what pairing/PSK distribution to our own
+players and any adopted third-party clients would require before flipping it off.
+
+**Refs:** `_resources/Research/Esparagus/Sendspin-Conversion-Plan.md` (where this was found);
+`sendspin_server.py:347`.
+
+---
+
 ## Revisit checklist (per pin bump)
 
 Run `_resources/spike/mesh_smoke.py` first (per `CLAUDE.md`), then check each ask above against the

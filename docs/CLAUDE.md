@@ -6,9 +6,13 @@
 > hardware-validated on four units. Remaining: DLNA + Plexamp (no backend yet) and the gaps in
 > `docs/SPEC-CONFORMANCE.md`. What landed when → `docs/PHASE-HISTORY.md`.
 >
-> **Not ours, do not re-investigate:** a Home Assistant Voice PE joins a group, ACKs our
-> `stream/start` codec header, reports PLAYING — and renders nothing. It does the same from **Music
-> Assistant**, under FLAC and PCM. Device-side. Play from MA first before blaming us.
+> **A Home Assistant Voice PE joining, ACKing our codec header, reporting PLAYING and rendering
+> nothing was long recorded here as device-side** (it did the same from **Music Assistant**, under
+> FLAC and PCM). **PARTLY OVERTURNED 2026-08-10:** on the leaked-dialer fix a Voice PE rendered
+> audio, cross-routed as a 4th endpoint mid-stream. Every earlier test ran on a build that leaked an
+> immortal dialer per adopt, so "renders nothing" was measured under contamination. The MA half was
+> not re-tested (MA was shut down). Still play from MA first before blaming us — but do not treat
+> silence from an ESP32 client as settled.
 
 ## What this is
 
@@ -139,10 +143,35 @@ The *reasoning* behind these, and the failures that produced them, is in
   `SourceFeeder.refresh_stream()` after `add_client`. The cost is a brief discontinuity for everyone
   already listening; that is the deliberate trade. **Roaming hides this** (a reconnect gets the
   stream free), so do not "optimise" the refresh away because a roam test passes.
-- **Re-dial before adopting a foreign speaker.** `connect_to_client(url)` is a NO-OP when a dial
-  registration for that URL already exists, so a second `adopt` silently does nothing and then times
-  out reporting "never connected" about a device whose port is plainly open. Identify a speaker by
-  its **registered URL**, never by "a client id that was not in the set before".
+- **Never re-dial a foreign speaker you already hold — and when you must, wait for the old dial to
+  DIE.** Both halves are load-bearing. `connect_to_client(url)` is a NO-OP while a dial registration
+  for that URL exists, so a *stale* one must be torn down or the adopt does nothing and times out
+  "never connected" about a device whose port is plainly open. But `disconnect_from_client` does not
+  actually stop the dialer (UPSTREAM §4) — it backs off ~1 s and reconnects beside the new one — so
+  redialing unconditionally leaks one immortal dialer per adopt, all fighting over the single
+  websocket a client allows: audio plays a few seconds, then `close_code=1006`, forever. Go through
+  `_stop_dialing`, and take the fast path when `_connected_player_at(url)` already answers. Identify
+  a speaker by its **registered URL**, never by "a client id that was not in the set before".
+- **Never hand a joining client the stream you are about to replace.** `attach_player` stops the
+  stream, changes membership, then re-acquires — `SourceFeeder.membership_change`, serialised
+  against the feeder pump by a lock. Doing it the other way round (add, then refresh) puts
+  `stream/start` → `stream/end` → `stream/start` on the wire inside ~110 ms, because `add_client`
+  runs the library's late-join and `refresh_stream` then replaces that stream. The single start is
+  strictly less churn and costs nothing, so keep it — but it is **belt-and-braces, not a proven
+  fix**: a sendspin-cpp read says that sequence can jam `pending_start_` permanently, yet a Voice PE
+  cross-routed mid-stream on the OLD ordering (2026-08-10 ~20:45) did not wedge. The Esparagus wedge
+  it was written for is at least as well explained by the leaked dialers and the eviction timer,
+  which were live at the time. Not isolated — do not cite this as the cause without the A/B.
+  Separately and firmly: **an ESP32 client that does wedge is unrecoverable over the protocol.** The
+  full ladder (detach / detach+settle / release / release+settle,
+  `_resources/spike/unwedge_probe.py`) was run on hardware and none of it worked; only a power cycle
+  clears it. This does NOT remove the refresh — membership is still fixed at `start_stream()`.
+- **A routed player must never have a registry eviction pending.** `_schedule_cleanup` overwrites
+  `_cleanup_handle` without cancelling it, so a release (teardown → 30 s delayed, then the goodbye →
+  immediate) orphans a timer nothing can reach. It fires 30 s after the **unroute** and evicts
+  whichever client holds that id — typically a speaker that was re-routed seconds later and is
+  playing. Reads as a random 15–60 s dropout. `attach_player` and `release_foreign_client` defuse it
+  via `_cancel_pending_cleanup`; see UPSTREAM §5.
 - **Codec choice belongs to the CLIENT.** `supported_formats` is in priority order and the server
   takes the first match it implements. A player that cannot sustain its own choice renegotiates with
   `stream/request-format`. Do not add a server-side override without a live, proven case — one was
