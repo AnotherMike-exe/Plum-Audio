@@ -178,8 +178,14 @@ The *reasoning* behind these, and the failures that produced them, is in
   written and reverted (`0d7c6ab`). A heterogeneous group is normal, not a problem.
 - **Announce idle, don't imply it.** On EOF or `PLUM_SOURCE_IDLE_TIMEOUT` silence call
   `group.stop()` (playback_state=**stopped**), never `stop_stream()` (which keeps clients logically
-  PLAYING). The spec has no distinct idle state — `stopped` is it. Groups/anchors persist, so
-  routing survives.
+  PLAYING). The spec has no distinct idle state — `stopped` is it. The group and its anchor persist,
+  so the **source** stays routable — but every attached **player** does not. "None" is a true none
+  (`docs/ROUTING-MODEL.md` rule 1, implemented 2026-08-12): going idle detaches every player-role
+  client uniformly (own player, a roamed peer, an adopted foreign speaker — no exceptions), and
+  nothing auto-resumes one except `autoSwitch.localActivity` (this unit's own player, rising-edge)
+  or `follow`. This is a **reversal** from earlier — the group/anchor persisting used to mean players
+  stayed attached and silently resumed too; that auto-resume was the bug (`unit-7204`, 2026-08-10:
+  both endpoints stayed attached, sender returned 2 minutes later, audio resumed with no re-route).
 - **Three volumes, and only two are the protocol's.** *Per-player* and *group* are Sendspin, and the
   library already does the delta-preserving group redistribution — do not fan out per client.
   *Source volume* is the level on the **sending** device (the phone's slider, Spotify Connect); the
@@ -348,7 +354,9 @@ are in **`docs/OPERATIONS.md`**; commissioning in **`docs/HOST-PROVISIONING.md`*
     the new source. Distinguishing "went idle because the source stopped" from "was deliberately
     moved" needs a real decision, so it was pinned by a parity test
     (`test_a_playerless_leader_switching_source_behaves_like_any_other_leader`) rather than
-    quietly changed under a feature branch.
+    quietly changed under a feature branch. `docs/ROUTING-MODEL.md`'s true-none rule 1 landed
+    2026-08-12 and speculated this ambiguity might dissolve under it — not re-examined yet; still
+    open.
 14. **A playerless leader cannot nominate which source it leads with.** With several concurrent
     active sources, `follow._leader_status` picks the one with the most endpoints attached,
     tie-broken by `source_id`. Deterministic and self-reinforcing — the first follower to join raises

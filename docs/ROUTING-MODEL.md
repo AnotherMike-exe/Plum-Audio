@@ -1,9 +1,14 @@
 # Routing model — proposed
 
-> **Status: PROPOSAL, not implemented.** Written 2026-08-10 after an evening of connection-lifecycle
-> bugs (see `UPSTREAM-AIOSENDSPIN.md` §4/§5 and commit `2d3f548`) exposed that the routing API has
-> two overlapping vocabularies and one undefined state. Nothing here has been built or rig-tested.
-> The rule in *"None" is a true none* is Michael's call, made explicitly; the rest is a
+> **Status: rule 1 implemented 2026-08-12** (`SourceFeeder._go_idle`, `sendspin_server.py`) —
+> unit-tested, hardware verification pending (see this file's own staging step 3). Implemented
+> directly against the existing `detach_player`/`group.remove_client` primitives, **not** through
+> the `attach`/`detach(mode=hold|release)` vocabulary in rules 3-4 below, which remain an
+> unimplemented recommendation — the minimal version was the deliberate choice, not a first slice of
+> the full rollout. Rules 2 and 4 are otherwise unchanged from when this was written 2026-08-10,
+> after an evening of connection-lifecycle bugs (see `UPSTREAM-AIOSENDSPIN.md` §4/§5 and commit
+> `2d3f548`) exposed that the routing API has two overlapping vocabularies and one undefined state.
+> The rule in *"None" is a true none* was Michael's call, made explicitly; the rest is still just a
 > recommendation.
 
 ## Why now
@@ -43,12 +48,16 @@ implicit attachment that survives idle. Turning `localActivity` off is how a use
 ingests but does not render its own source", which today can only be expressed as
 absence-of-attachment and therefore cannot survive a restart.
 
-**This is a change from today.** `SourceFeeder._go_idle` currently announces `playback_state=stopped`
-and deliberately leaves the group intact — `CLAUDE.md` says *"Groups/anchors persist, so routing
-survives"*. Measured on `unit-7204` 2026-08-10 21:36–21:38: source died, both endpoints stayed
-attached, sender returned 2 minutes later, audio resumed with no re-route. Under this rule that
-resume must not happen: `_go_idle` detaches every player, and only `localActivity` brings the local
-one back.
+**Was a change from today; now built.** `SourceFeeder._go_idle` used to announce
+`playback_state=stopped` and deliberately leave the group intact — `CLAUDE.md` used to say
+*"Groups/anchors persist, so routing survives"*. Measured on `unit-7204` 2026-08-10 21:36–21:38:
+source died, both endpoints stayed attached, sender returned 2 minutes later, audio resumed with no
+re-route. **Implemented 2026-08-12**: `_go_idle` now detaches every player-role client via
+`group.remove_client()` (the same primitive `detach_player` already used for a manual "set to
+none"), and only `localActivity` brings the local one back automatically. Unit-tested
+(`tests/Unit/test_sendspin_server.py`, the `_go_idle` section); hardware verification of the
+cross-unit "stays down" case and the local rising-edge re-attach is the remaining open step (see
+Staging below).
 
 ### 2. Pauses and disconnects stay distinct — as built
 
@@ -110,16 +119,28 @@ checking against `follow.py` properly before it is claimed as a free win.
 
 ## Staging
 
-1. Add `attach`/`detach` as the real implementation; make the four existing routes thin aliases.
-2. Change `_go_idle` to detach, and rewrite the idle-contract rule in `CLAUDE.md` (it currently says
-   the opposite, deliberately — this is a reversal, not an extension).
-3. Verify `localActivity` covers the local-player case end-to-end on hardware, including its
-   rising-edge behaviour after a true-none.
-4. Migrate the GUI to the new pair; default "set to none" to `detach(hold)`.
-5. Retire the aliases.
+**Taken 2026-08-12: a minimal path, not this list.** Steps 1 and 2 below were deliberately NOT done
+as originally sequenced — `_go_idle` was changed to detach directly against the existing
+`detach_player`/`group.remove_client` primitives, skipping the `attach`/`detach` vocabulary
+introduction entirely (see the status header). That was a scope decision, not a discovery that the
+vocabulary work is unnecessary — it's still a reasonable recommendation, just not decided on. Steps
+3-5 below are unchanged and still open if the vocabulary unification is ever picked up:
 
-Each step is rig-testable on its own. Do not do 1 and 2 in one deploy — 2 is a behaviour change users
-will feel, and it wants to be isolatable if it turns out to be wrong.
+1. ~~Add `attach`/`detach` as the real implementation; make the four existing routes thin
+   aliases.~~ — not done; skipped in favour of the direct route.
+2. ~~Change `_go_idle` to detach, and rewrite the idle-contract rule in `CLAUDE.md`~~ — **done
+   2026-08-12**, directly, without step 1.
+3. Verify `localActivity` covers the local-player case end-to-end on hardware, including its
+   rising-edge behaviour after a true-none. **Still open** — reading the code says it already
+   handles this (`follow.py:287`, `router.py:126-140`), but it hasn't been run on the rig against
+   this specific transition yet.
+4. Migrate the GUI to the new pair; default "set to none" to `detach(hold)`. Blocked on 1, which
+   wasn't done.
+5. Retire the aliases. Blocked on 1 and 4.
+
+Each step is rig-testable on its own. The original warning — do not do 1 and 2 in one deploy, since 2
+is a behaviour change users will feel and wants to be isolatable if it turns out to be wrong — still
+applied even without step 1 existing: 2 shipped alone.
 
 ## Related
 

@@ -34,7 +34,10 @@ Design notes (the *why*, learned from the lifecycle audit + handoff probe):
     PLUM_SOURCE_IDLE_TIMEOUT. We announce it the way the spec does — `group.stop()` sets
     playback_state=stopped and pushes a group/update to every client — then loop back to wait
     for the next writer. A stream exists ONLY while a sender is feeding us; the group and its
-    anchor persist regardless, so routing survives across source sessions.
+    anchor persist regardless, so the SOURCE stays routable across sessions. Every attached
+    PLAYER does not: "none" is a true none (docs/ROUTING-MODEL.md rule 1) — going idle detaches
+    every player-role client uniformly, and nothing auto-resumes it except autoSwitch.localActivity
+    (this unit's own player) or follow.
 """
 
 from __future__ import annotations
@@ -125,7 +128,9 @@ class SourceFeeder:
     it announces playback_state=stopped in a group/update to every client and freezes the metadata
     progress anchor. (`stop_stream()` deliberately does NOT — it keeps clients logically PLAYING for
     a stream-to-stream transition, which is not our case.) The group and its anchor persist through
-    all of this, so routing survives an idle source and the next session just starts a new stream.
+    all of this, so the source stays routable and the next session just starts a new stream — but
+    every attached player is detached at the same time (docs/ROUTING-MODEL.md rule 1, "true none"):
+    membership does not survive an idle source, only the source itself does.
     """
 
     def __init__(self, source_id: str, fifo_path: str, group: SendspinGroup, fmt: AudioFormat = DEFAULT_FORMAT) -> None:
@@ -343,12 +348,26 @@ class SourceFeeder:
                 return
 
     async def _go_idle(self, why: str) -> None:
-        """Announce that nothing is playing on this source, per the spec.
+        """Announce that nothing is playing on this source, per the spec, and detach every player.
 
         group.stop() sets playback_state=stopped and pushes a group/update to every client (and
         freezes the metadata progress anchor). Deliberately NOT stop_stream(), which keeps clients
-        logically PLAYING for a stream-to-stream handover. The group survives — its anchor client
-        holds it — so players stay routed here and the next session just starts a new stream.
+        logically PLAYING for a stream-to-stream handover.
+
+        "None" is a true none (docs/ROUTING-MODEL.md rule 1): a dead source holds no players,
+        uniformly — this unit's own player, a roamed peer, or an adopted foreign speaker are all
+        just endpoints and none of them auto-resume. group.remove_client() drops each one into its
+        own solo group (aiosendspin never leaves client.group as None) — the same state a manual
+        "set to none" already produces via PlumSendspinServer.detach_player, so the GUI already
+        renders it correctly. Locked against _change_lock because this is now a membership change
+        like any other, and can race attach_player's own membership_change() for the same source.
+        The group and its anchor persist regardless — only player membership changes — so the
+        source stays routable and the next session just starts a new stream that includes whoever
+        is attached at the time.
+
+        Nothing here auto-resumes anything: only autoSwitch.localActivity (this unit's own player,
+        rising-edge — follow.py:159) or follow bring a player back, and both already treat "no
+        group at all" as the normal idle precondition (follow.py:287, router.py:126-140).
         """
         if self._last_data_at is None and (self.ps is None or self.ps.is_stopped):
             return  # already idle
@@ -356,7 +375,19 @@ class SourceFeeder:
         self.ps = None
         with contextlib.suppress(Exception):
             await self.group.stop()
-        logger.info("[%s] idle: %s (announced playback_state=stopped)", self.source_id, why)
+        async with self._change_lock:
+            players = [
+                client
+                for client in self.group.clients
+                if not client.client_id.startswith(ANCHOR_PREFIX) and has_role_family("player", client.negotiated_roles)
+            ]
+            for player in players:
+                with contextlib.suppress(Exception):
+                    await self.group.remove_client(player)
+        logger.info(
+            "[%s] idle: %s (announced playback_state=stopped, detached %d player(s))",
+            self.source_id, why, len(players),
+        )
 
 
 class SourceHandle:
