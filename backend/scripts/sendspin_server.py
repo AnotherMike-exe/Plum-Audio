@@ -544,12 +544,16 @@ class PlumSendspinServer:
             asyncio.ensure_future(self._maybe_group_controller(event.client_id))
 
     async def _maybe_group_controller(self, client_id: str) -> None:
-        """Join a controller-only client to the source group it asked for (or the primary source).
+        """Join a controller-only client to the source group it asked for, or the best active one.
 
         A client holds exactly one websocket and therefore sits in exactly one group, so a single
         controller can only ever see ONE source's now-playing. The GUI opens one controller per
-        source and names it "ctrl:<source_id>:<nonce>"; we honour that request here. Without the
-        hint (any other client id) it lands on the primary source, preserving the Phase-1 behaviour.
+        source and names it "ctrl:<source_id>:<nonce>"; we honour that request here, even for an
+        idle source — an explicit ask gets what it asked for. Without the hint (any other client
+        id — i.e. a third-party Sendspin controller, since only our own GUI ever sends one) it
+        falls back through _default_controller_source rather than blindly grouping into whatever
+        _primary_source is: that used to hand a foreign controller a group with nothing playing and
+        nothing in the protocol to tell it apart from a live one.
         """
         if self.server is None or self._primary_source is None:
             return
@@ -560,7 +564,12 @@ class PlumSendspinServer:
             return
         if has_role_family("player", client.negotiated_roles):
             return  # a player — the mesh orchestrator owns its routing, never regroup it here
-        source_id = self._requested_source(client_id) or self._primary_source
+        source_id = self._requested_source(client_id)
+        if source_id is None:
+            source_id = self._default_controller_source()
+        if source_id is None:
+            logger.debug("controller %s connected with nothing active; leaving it ungrouped", client_id)
+            return
         handle = self.sources.get(source_id)
         if handle is None or client.group is handle.group:
             return  # unknown source, or already grouped — idempotent
@@ -588,6 +597,22 @@ class PlumSendspinServer:
             return None
         requested = client_id[len(CONTROLLER_PREFIX) :].split(":", 1)[0]
         return requested if requested in self.sources else None
+
+    def _default_controller_source(self) -> str | None:
+        """Fallback source for a controller with no "ctrl:<source_id>:" hint.
+
+        Only reached by a THIRD-PARTY Sendspin controller — our own GUI always sends the hint (see
+        _requested_source), so an unhinted client here is someone else's controller (e.g. Music
+        Assistant) with no way to name a source. Defaulting it into an idle source used to hand a
+        foreign controller a group with nothing playing and nothing to tell it apart from a live
+        one — prefer the primary source while it is actually active, else the first active source,
+        else leave the client in its own solo group.
+        """
+        if self._primary_source is not None:
+            primary = self.sources.get(self._primary_source)
+            if primary is not None and primary.feeder.is_active:
+                return self._primary_source
+        return next((source_id for source_id, handle in self.sources.items() if handle.feeder.is_active), None)
 
     def set_player_volume(self, player_id: str, volume: int, muted: bool) -> None:
         """Set one player's volume (0-100) and mute — per-client, independent of its group.
