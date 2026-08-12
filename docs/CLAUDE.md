@@ -431,6 +431,19 @@ are in **`docs/OPERATIONS.md`**; commissioning in **`docs/HOST-PROVISIONING.md`*
     Bluetooth were collision-bound the same way once enabled. Both env-derived defaults are
     `sanitize_device_name`'d **at import**, because `_sanitize_device_names` runs on the write path
     only — a default otherwise reaches disk, and the config renderers, unscrubbed.
+20. ~~An unhinted third-party Sendspin controller was silently grouped into `_primary_source`
+    whether or not it was actually playing~~ — **fixed 2026-08-12.** Only our own GUI ever sends
+    the `"ctrl:<source_id>:"` naming hint `_maybe_group_controller` uses to pick a source; anything
+    else (Music Assistant, any conformant third-party Sendspin controller) fell straight through to
+    `_primary_source` regardless of state, so a controller connecting while everything was idle
+    could land in a `playback_state=stopped` group with nothing in the protocol to mark it as dead —
+    "picking up a stream that isn't live." `_default_controller_source` now prefers the primary
+    source only while `feeder.is_active`, else the first active source, else leaves the client
+    ungrouped. An explicit hint still always wins, idle or not — this only changes the ambiguous
+    default. Does not touch player routing or the audio path.
+    Related but explicitly out of scope: `docs/ROUTING-MODEL.md` rule 1 ("true none") is a separate,
+    larger, already-staged proposal about *players* staying attached to a dead source and
+    auto-resuming — not implemented, not part of this fix.
 
 ## Resources
 - Sendspin spec: <https://www.sendspin-audio.com/spec/> · Org: <https://github.com/Sendspin>

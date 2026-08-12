@@ -579,8 +579,9 @@ def test_controller_grouping_honours_the_source_hint():
     assert unit.sources["airplay-1"].group.calls == []
 
 
-def test_controller_grouping_falls_back_to_the_primary_source():
+def test_controller_grouping_falls_back_to_the_primary_source_when_active():
     unit = make_unit("airplay-1", "spotify-1")
+    unit.sources["airplay-1"].feeder._last_data_at = 1.0
     unit.server.add(FakeClient("some-other-client"))
 
     asyncio.run(unit._maybe_group_controller("some-other-client"))
@@ -592,10 +593,33 @@ def test_controller_grouping_follows_the_primary_after_it_moves():
     """The pairing that item 9 of the backlog was about: stop the first source, keep grouping."""
     unit = make_unit("airplay-1", "spotify-1")
     asyncio.run(unit.stop_source("airplay-1"))
+    unit.sources["spotify-1"].feeder._last_data_at = 1.0
     unit.server.add(FakeClient("some-other-client"))
 
     asyncio.run(unit._maybe_group_controller("some-other-client"))
 
+    assert unit.sources["spotify-1"].group.calls == [("add", "some-other-client")]
+
+
+def test_controller_grouping_does_not_default_into_an_idle_primary_source():
+    """A third-party controller with no ctrl: hint must not be handed a dead group."""
+    unit = make_unit("airplay-1", "spotify-1")
+    unit.server.add(FakeClient("some-other-client"))
+
+    asyncio.run(unit._maybe_group_controller("some-other-client"))
+
+    assert unit.sources["airplay-1"].group.calls == []
+    assert unit.sources["spotify-1"].group.calls == []
+
+
+def test_controller_grouping_falls_back_to_any_active_source_when_primary_is_idle():
+    unit = make_unit("airplay-1", "spotify-1")
+    unit.sources["spotify-1"].feeder._last_data_at = 1.0
+    unit.server.add(FakeClient("some-other-client"))
+
+    asyncio.run(unit._maybe_group_controller("some-other-client"))
+
+    assert unit.sources["airplay-1"].group.calls == []
     assert unit.sources["spotify-1"].group.calls == [("add", "some-other-client")]
 
 
