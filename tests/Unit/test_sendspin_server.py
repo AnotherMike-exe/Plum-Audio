@@ -60,6 +60,9 @@ class FakeGroup:
     def stop_stream(self):
         self.calls.append("stop_stream")
 
+    async def stop(self):
+        self.calls.append("stop")
+
     async def add_client(self, client):
         self.calls.append(("add", client.client_id))
         self.members.append(client)
@@ -247,6 +250,50 @@ def test_is_active_mirrors_what_is_announced_on_the_wire():
     assert feeder.is_active is False  # idle == announced stopped
     feeder._last_data_at = 1.0
     assert feeder.is_active is True
+
+
+# --- SourceFeeder._go_idle: true none (ROUTING-MODEL.md rule 1) ------------
+
+
+def test_go_idle_detaches_player_role_clients_but_not_controllers_or_the_anchor():
+    group = FakeGroup()
+    player1 = FakeClient("player-1", group=group, roles=["player@v1"])
+    player2 = FakeClient("player-2", group=group, roles=["player@v1"])
+    controller = FakeClient("ctrl:src1:n1", group=group, roles=["controller@v1"])
+    anchor = FakeClient(ss.ANCHOR_PREFIX + "src1", group=group)  # transport-less: no roles
+    group.members = [player1, player2, controller, anchor]
+    feeder = make_feeder(group=group, ps=FakePushStream())
+    feeder._last_data_at = 1.0  # was active, so _go_idle won't early-return
+
+    asyncio.run(feeder._go_idle("test"))
+
+    assert ("remove", "player-1") in group.calls
+    assert ("remove", "player-2") in group.calls
+    assert [c.client_id for c in group.members] == ["ctrl:src1:n1", ss.ANCHOR_PREFIX + "src1"]
+
+
+def test_go_idle_is_a_noop_when_already_idle():
+    group = FakeGroup()
+    player = FakeClient("player-1", group=group, roles=["player@v1"])
+    group.members = [player]
+    feeder = make_feeder(group=group, ps=FakePushStream())
+    feeder._last_data_at = 1.0
+
+    asyncio.run(feeder._go_idle("first"))
+    calls_after_first = list(group.calls)
+    asyncio.run(feeder._go_idle("second"))
+
+    assert group.calls == calls_after_first
+
+
+def test_go_idle_announces_stopped():
+    group = FakeGroup()
+    feeder = make_feeder(group=group, ps=FakePushStream())
+    feeder._last_data_at = 1.0
+
+    asyncio.run(feeder._go_idle("test"))
+
+    assert "stop" in group.calls
 
 
 # --- attach_player: the caller that must not lose the refresh ---------------

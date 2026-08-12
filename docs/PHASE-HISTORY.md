@@ -43,6 +43,54 @@ image compares as different across units.
 
 ## Phase 3 — remaining sources, GUI, container (`feature/phase3-sources-gui`, in progress)
 
+### True none: idle players stop silently auto-resuming — 2026-08-12
+
+**`docs/ROUTING-MODEL.md` rule 1 ("None is a true none"), decided 2026-08-10 after the connection-
+lifecycle bug hunt, implemented and hardware-verified on `unit-7204`/`unit-7122` on `.7.122`/`.7.204`.**
+The bug it closes: `SourceFeeder._go_idle` used to announce `playback_state=stopped` and leave every
+attached player in the group — measured on `unit-7204` 2026-08-10 21:36–21:38, a source died, both
+endpoints stayed attached, the sender returned two minutes later, and audio resumed on both with no
+re-route. `_go_idle` now detaches every player-role client (own player, a roamed peer, an adopted
+foreign speaker — uniformly, no exceptions) via the same `group.remove_client()` primitive a manual
+"set to none" already used; only `autoSwitch.localActivity` (this unit's own player, rising-edge) or
+`follow` bring one back automatically.
+
+Investigated before writing any code, not assumed: three research passes confirmed the "true none"
+state already existed (a manual unroute already produces exactly this — a fresh solo group via
+aiosendspin's real `remove_client`, which the GUI already renders correctly), that `follow.py`'s
+`localActivity` already treated "no group at all" as its normal idle precondition rather than a
+special case, and that `router.py` already had a reclaim-from-self-report fallback for a fully
+unattached player (commit `61cc219`). So the change ended up scoped to `SourceFeeder._go_idle` alone
+— no `follow.py`, `router.py`, or frontend changes were needed.
+
+Hardware-verified on the VLAN-7 pair with two probes rather than a real AirPlay sender (nothing was
+live on either unit at the time, so nothing was disrupted): a throwaway fake Sendspin player role
+client attached to `airplay-1` confirmed the real `aiosendspin` library detaches on idle exactly like
+the unit tests predicted (`detached 1 player(s)` in the server log); then the real local players were
+briefly routed to prove the end-to-end story, producing this log timeline on `unit-7204`:
+
+```
+10:52:58  [airplay-1] active               (session #1: player-7204 AND player-7122 both attached)
+10:52:59  [airplay-1] idle ... detached 2 player(s)     <- uniform: both detached
+10:53:20  [airplay-1] active               (session #2)
+10:53:20  attached player player-7204      <- localActivity fired automatically, same second
+10:53:24  [airplay-1] idle ... detached 1 player(s)     <- only player-7204, the one re-attached
+```
+
+`player-7122` (the cross-routed, foreign-to-this-unit endpoint) never got an "attached" line after
+the reset and stayed true-none for the rest of the test — the exact scenario the 2026-08-10 bug
+report measured, now proven fixed on the same unit it was found on.
+
+Pinned in `tests/Unit/test_sendspin_server.py` (the `_go_idle` section: detaches players, leaves
+controllers/anchor, idempotent on a second call) and, since the hardware proof above is a one-off
+manual test with no automated guard, in a new `tests/Unit/test_true_none_reattach.py` that wires the
+real `_go_idle` output into a real `FollowReconciler.tick()` to pin the handoff itself, not just each
+half in isolation.
+
+Deliberately did NOT implement the rest of `ROUTING-MODEL.md` (the `attach`/`detach(mode=hold|release)`
+vocabulary unification in rules 3-4) — a separate, larger, still-undecided recommendation; see that
+doc's status header.
+
 ### Alpha deployment onto bare Raspberry Pi OS Lite — 2026-08-06 (`dd13071`)
 
 **The first deploy onto units carrying nothing but a stock image.** `.2.10` and `.2.11` were
