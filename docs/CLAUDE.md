@@ -343,8 +343,14 @@ are in **`docs/OPERATIONS.md`**; commissioning in **`docs/HOST-PROVISIONING.md`*
    opt-in: Settings → Theme → *Album Art Colors*, off by default, per-browser. Left OFF as found.
    Two real defects were found and fixed: the About tab was unported from Plum-Snapcast wholesale,
    and the DLNA console errors in item 1. Console is otherwise clean.
-6. **Multi-server arbitration** is a spec MUST we only half-implement — we persist the last playing
-   `server_id` but cannot yet decide, pending UPSTREAM §1.
+6. ~~**Multi-server arbitration** is a spec MUST we only half-implement~~ — **CLOSED 2026-08-13 by
+   the 9.1.0 bump.** The library now arbitrates internally: `attach_websocket` brings a connection up
+   provisionally, handshakes, then admits or rejects by `Activity` rank with a persisted
+   `last_playback_server_id` as the tiebreak. Our yield-to-newest workaround is deleted. No policy
+   hook, and it keys on `Activity` rather than the `connection_reason` we drive.
+   **Replaced by a new standing deviation: we implement NO pairing method** (a spec MUST for
+   servers) and run on the unpaired/sentinel path plus `PLUM_ALLOW_UNENCRYPTED=1`. Deliberate —
+   `docs/SENDSPIN-PAIRING.md` has the reasoning, the API, and what real pairing would cost.
 7. **amd64 has never been built.**
 8. **The APIs are unauthenticated with blanket CORS** (`CORS(app)`, `Access-Control-Allow-Origin: *`,
    both bound to `0.0.0.0`). The injection chain behind it is closed at three layers, but any page on

@@ -2,6 +2,8 @@
 
 > Audited 2026-07-21 against <https://www.sendspin-audio.com/spec/> and `aiosendspin` 6.0.5, with
 > live evidence from the interop rig (Music Assistant 2.9.9 + a Home Assistant Voice PE).
+> **Re-audited 2026-08-13 for the 9.1.0 bump** — the encryption/pairing chapter below is new, the
+> multi-server gap is CLOSED, and the rig evidence was re-taken on `.7.122`/`.7.204`.
 > Interop is the reason we build on this protocol, so this file tracks conformance as a first-class
 > property, not a footnote. See ARCHITECTURE §8 for the design behind each item.
 
@@ -44,24 +46,22 @@ instead — same wire result, one responder per host.
 | `client/hello` → `server/hello` handshake | ✅ all three speakers |
 | `client/goodbye` reason `another_server` when switching servers | ✅ `sendspin_player.py` |
 | Server dials clients with `connection_reason` | ✅ always `playback` (we removed the DISCOVERY tier — ARCHITECTURE §2) |
-| **Multi-server arbitration on the client** | ❌ **GAP** |
+| **Multi-server arbitration on the client** | ✅ **CLOSED 2026-08-13** — upstream, in the 9.1.0 bump |
 
-**The gap:** the spec has the client accept the new handshake, then choose by `connection_reason`
-(`playback` beats `discovery`), tie-breaking on the persisted `server_id` of the last server with
-`playback_state: playing`. Our player implements only the first branch — it always yields to the
-newest dialer — but it now persists the `server_id` of the server that most recently had it
-playing, which is the storage the third branch needs. Plum-to-Plum this is indistinguishable from conformant, since
-we only ever dial `playback`. Against a foreign server running a discovery sweep it is wrong: we
-would hand over a playing speaker.
+**The gap, and how it closed.** The spec has the client accept the new handshake, then choose:
+`playback` beats `discovery`, tie-broken on the persisted `server_id` of the last server that had it
+playing. On 6.0.5 we could implement only the first branch — always yield to the newest dialer —
+because `server_info` was populated only *after* `attach_websocket`, which refused a second socket.
+"Accept both, then decide" was not expressible on one client. Observed live at the time: our unit's
+boot-time dial took a speaker back off Music Assistant about a minute after MA claimed it.
 
-Not *cleanly* locally fixable. `SendspinClient.server_info` exposes `connection_reason` only *after*
-`attach_websocket`, which refuses a second socket — so "accept both, then decide" cannot be expressed
-on the one client. A throwaway second client could peek at `server/hello` and arbitrate before
-committing, but it's racy and ugly; not worth shipping over a clean library fix. **Tracked as
-upstream ask #1 in [docs/UPSTREAM-AIOSENDSPIN.md](UPSTREAM-AIOSENDSPIN.md).**
-
-Observed live: our unit's boot-time dial took a speaker back off Music Assistant about a minute
-after MA claimed it. This is the gap, not a theory.
+9.1.0 implements it in the library. `attach_websocket` now brings the incoming connection up
+**provisionally**, completes the handshake, and only then admits or rejects it — ranking by the new
+`Activity` enum (management > playback > pairing > none) and tie-breaking on a
+`last_playback_server_id` the pairing store persists. Our yield-to-newest workaround and our own
+persistence of that id are both deleted (`cc936df`). **Caveat:** there is no policy hook, so the
+decision is the library's; and arbitration now keys on `Activity` rather than the `connection_reason`
+we drive, which is worth remembering if a foreign server's ranking ever surprises us.
 
 ## Playback state — conformant (fixed 2026-07-21)
 
@@ -169,6 +169,32 @@ number.
   is MA's library/browse/queue surface (its own Home Assistant API) — the protocol has no such
   concept, as expected.
 - Discovers players by mDNS `_sendspin._tcp`, with manual IP entry as a fallback.
+
+## Encryption and pairing — the one standing deviation (added 2026-08-13)
+
+The spec makes encryption mandatory for connections established through standard discovery, and
+makes **all three pairing methods mandatory for servers**. Full treatment, including the API and what
+building it would cost: **[docs/SENDSPIN-PAIRING.md](SENDSPIN-PAIRING.md)**.
+
+| Requirement | Status |
+|---|---|
+| Noise `KKpsk2`, server as initiator, client as responder | ✅ `aiosendspin` owns it end to end |
+| Both cipher suites on the server, ≥1 on the client | ✅ library |
+| Encryption on standard-discovery connections | ⚠️ **deviation** — `PLUM_ALLOW_UNENCRYPTED=1` accepts the non-spec transition path |
+| Server implements all three pairing methods | ❌ **GAP** — we implement none |
+| Client implements Pairing PSK | ➖ the library does; we neither configure nor exercise it |
+| Unpaired access at trust level `none` | ✅ and this is the path we actually run on |
+
+**Why the deviation stands.** Cleartext is not a convenience here, it is the only way the fleet talks
+to anything: `sendspin-cpp` — every ESP32 speaker on the segment — has no Noise in any release, and
+our own web GUI is a hand-rolled cleartext WebSocket client with no proxy in front of :8927. Turning
+it off drops all of them at once. The spec sanctions the *unpaired* path we use for our own encrypted
+players (sentinel PSK, trust level `none`) while warning plainly that such sessions are open to
+man-in-the-middle; it does not sanction the legacy cleartext frame we accept beside it.
+
+**What it costs today, measured:** Music Assistant 2.9.x pins `aiosendspin==6.0.5` and hangs up on
+our `client/init`, so it can no longer claim a Plum speaker. MA 2.10.0-beta pins 9.0.0, so this
+resolves on their side. See `docs/PHASE-HISTORY.md`.
 
 ## Deliberate deviations (not gaps)
 
