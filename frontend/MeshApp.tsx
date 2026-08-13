@@ -33,6 +33,7 @@ import { Client, Settings as SettingsType, Stream } from './types';
 import { Model, SendspinDataService, FOREIGN_PREFIX, parseStreamId } from './services/sendspinDataService';
 import type { ControllerCommand } from './services/sendspinControllerClient';
 import { settingsService } from './services/settingsService';
+import { aboutService } from './services/aboutService';
 import { useThemeSettings } from './hooks/useThemeSettings';
 import { useBrowserPlayer } from './hooks/useBrowserPlayer';
 
@@ -109,6 +110,7 @@ export default function MeshApp(): React.ReactElement {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [visualizerOpen, setVisualizerOpen] = useState(false);
   const [settings, setSettings] = useState<SettingsType>(settingsService.getMergedSettings());
+  const [appVersion, setAppVersion] = useState<string | null>(null);
   const browser = useBrowserPlayer();
 
   useEffect(() => {
@@ -118,6 +120,10 @@ export default function MeshApp(): React.ReactElement {
       unsub();
       service.stop();
     };
+  }, []);
+
+  useEffect(() => {
+    aboutService.getVersions().then((v) => setAppVersion(v.app.version)).catch(() => setAppVersion(null));
   }, []);
 
   // Settings: fetch from the config API on mount, then track changes.
@@ -615,7 +621,9 @@ export default function MeshApp(): React.ReactElement {
 
       <footer className="w-full max-w-7xl mx-auto grid grid-cols-3 items-center text-[var(--text-muted)] mt-12 text-sm">
         <div />
-        <p className="text-center">Plum Audio — Mesh</p>
+        <p className="text-center">
+          Plum Audio — Mesh{appVersion && <span className="opacity-60"> · v{appVersion}</span>}
+        </p>
         <div className="flex justify-end gap-2">
           <button
             onClick={() => setVisualizerOpen(true)}

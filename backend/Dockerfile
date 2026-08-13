@@ -31,6 +31,17 @@ ENV PUID=99 \
     PYTHONUNBUFFERED=1 \
     PLUM_PROC_ASOUND=/host/asound
 
+# Baked in at build time by docker/build.sh (git describe against the nearest tag) — this is the ONLY
+# way the running container can know "its own" version; apis/about_api.py serves it as-is. Everything
+# else that endpoint reports (aiosendspin, shairport-sync, bluez-alsa) is queried live instead, so
+# only the app's own identity needs this rebuild-to-update path.
+ARG PLUM_APP_VERSION=0.0.0-dev
+ARG PLUM_BUILD_TYPE=dev
+ARG PLUM_GIT_DESCRIBE=unknown
+ENV PLUM_APP_VERSION=${PLUM_APP_VERSION} \
+    PLUM_BUILD_TYPE=${PLUM_BUILD_TYPE} \
+    PLUM_GIT_DESCRIBE=${PLUM_GIT_DESCRIBE}
+
 # Runtime, by consumer:
 #   libportaudio2      sendspin_player -> onboard DAC
 #   alsa-utils         arecord (the Bluetooth capture path) + aplay -l for debugging
@@ -68,6 +79,10 @@ RUN shairport-sync -V | grep -q -- '-mpris' \
 # go-librespot (Spotify Connect): one process per endpoint, spawned by sources/spotify_manager.py —
 # deliberately NOT a supervisord program, so endpoint edits apply live. Native binary, no runtime.
 ARG GO_LIBRESPOT_VERSION=0.7.4
+# Fallback only: about_api.py tries `go-librespot --version` first and falls back to this baked ARG
+# only if the binary doesn't answer. Unlike aiosendspin/shairport-sync there's no package metadata to
+# query, so without this the About page would have no way to say what got downloaded.
+ENV PLUM_GO_LIBRESPOT_VERSION=${GO_LIBRESPOT_VERSION}
 RUN set -eux; \
     case "$(dpkg --print-architecture)" in \
         arm64) GLR_ARCH=arm64 ;; \
