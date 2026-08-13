@@ -20,6 +20,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "backend" / "scripts"))
 
+import sendspin_identity  # noqa: E402
 import sendspin_server as ss  # noqa: E402
 
 
@@ -1135,3 +1136,44 @@ def test_turning_unpaired_access_off_revokes_every_existing_approval():
         assert {c[1] for c in unit.server.calls if isinstance(c, tuple) and c[0] == "untrust"} == {"a", "b"}
 
     run_scenario(scenario)
+
+
+# --- auto-pairing must never touch a cleartext client -----------------------
+
+
+def test_a_cleartext_speaker_is_never_offered_the_shared_psk(monkeypatch):
+    """The ESP32 regression, pinned.
+
+    Pairing mixes a PSK into a Noise handshake, so there is nothing to pair over the legacy
+    cleartext path and `initiate_pairing` refuses it. Every ESP32 speaker is cleartext, so with a
+    fleet PSK configured each one that connected earned a doomed pairing attempt — and that broke
+    `adopt_foreign_client` on hardware: the speaker connected, the pairing ran and failed, and the
+    adopt's 15 s wait expired reporting "never connected" about a device whose MAC had just been
+    logged. The NEXT adopt of the same speaker succeeded, because by then it was already connected.
+
+    Measured on .7.122 against three boards (Voice PE, Esparagus, Satellite1), 2026-08-13.
+    """
+    unit = make_unit("airplay-1")
+    monkeypatch.setattr(sendspin_identity, "fleet_psk", lambda: "fleet-secret")
+    monkeypatch.setattr(sendspin_identity, "peer_id_of", lambda role: "our-own-player")
+    unit.server.add(FakeClient("ESP32-MAC", roles=["player@v1"], security=None))
+
+    asyncio.run(unit._maybe_pair_via_shared_psk("ESP32-MAC"))
+
+    assert not [c for c in unit.server.calls if c[0] == "initiate_pairing"], (
+        "a cleartext speaker must not be asked to pair — the library refuses and the adopt breaks"
+    )
+
+
+def test_an_encrypted_unpaired_speaker_still_pairs_via_the_fleet_psk(monkeypatch):
+    """The other half: the gate must not swallow the case it exists to serve. A peer unit's player
+    arrives over Noise on the sentinel PSK, and the fleet secret is what pairs it with no operator."""
+    unit = make_unit("airplay-1")
+    monkeypatch.setattr(sendspin_identity, "fleet_psk", lambda: "fleet-secret")
+    monkeypatch.setattr(sendspin_identity, "peer_id_of", lambda role: "our-own-player")
+    monkeypatch.setattr(sendspin_identity, "local_pairing_psk", lambda: b"x" * 32)
+    unit.server.add(FakeClient("peer-player", roles=["player@v1"], security="sentinel"))
+
+    asyncio.run(unit._maybe_pair_via_shared_psk("peer-player"))
+
+    assert ("initiate_pairing", "peer-player", "pairing_psk") in unit.server.calls
