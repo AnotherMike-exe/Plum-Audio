@@ -135,6 +135,17 @@ The *reasoning* behind these, and the failures that produced them, is in
   a GUI act. `pairing_psk` needs NO window; the window (300 s, ONE attempt) is for PIN methods and
   later-added units, opened via the `management` role — which is why a unit pairs with its own player
   at startup. `docs/SENDSPIN-PAIRING.md`.
+- **Pair by STAGING before the dial, never by `initiate_pairing` after it — and never at all over
+  cleartext.** Both halves cost a working rig on 2026-08-13. `initiate_pairing` on a connected client
+  whose PSK is the sentinel forces a mid-connection Noise re-handshake; a peer's player is contended
+  (its own server dials it too, and it holds ONE websocket) so the re-handshake finds the socket gone
+  — `expected Noise message 2 (TEXT), got CLOSE`, then that player's reclaim times out forever.
+  `stage_shared_psk` puts the PSK in front of the handshake (`_psk_provider` reads it while
+  *choosing*), so the connection arrives already paired and nothing renegotiates. Stage only ids we
+  already share a secret with — our own player, and a peer's from a snapshot. A pairing handshake
+  against a **cleartext** client is aborted outright by the library, so staging or pairing an ESP32
+  takes it offline: it connects, the doomed attempt runs, and adopt reports "never connected" about a
+  device whose MAC is in the log one line up. Signature: the NEXT adopt succeeds.
 - **Cleartext clients skip the trust gate entirely, and our own player can never be one.** A legacy
   `client/hello` is activated straight from the negotiated set, so ESP32 speakers, Music Assistant
   and our hand-rolled GUI controller need no pairing — that is what `PLUM_ALLOW_UNENCRYPTED=1` buys.
