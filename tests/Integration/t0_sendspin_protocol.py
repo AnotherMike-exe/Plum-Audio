@@ -15,6 +15,8 @@ Steps (each prints PASS/FAIL):
      but NOT activated — the three silent-dud combinations.
   7. ADMISSION: client unpaired_access_enabled AND server trust_unpaired -> role ACTIVATED.
      This is the mechanism our own mesh depends on.
+  9. PAIRING (a-c): an unpaired client is negotiated but NOT active; pairing it over the Pairing
+     PSK method ACTIVATES its roles on the live connection, as a real long-term record.
   8. LEGACY CLEARTEXT (a-e): a raw websocket sending a 6.0.5-shaped client/hello — our GUI
      controller's exact payload, and an ESP32-shaped player — must be admitted, KEEP ITS OWN
      client id, and get ACTIVE roles with no pairing and no trust. Plus the inverse: with
@@ -153,6 +155,9 @@ async def main():
 
     # 8. LEGACY CLEARTEXT — the premise of the whole 9.x bump for this product.
     passed &= await legacy_checks(loop)
+
+    # 9. PAIRING — the way an encrypted client is SUPPOSED to become playable.
+    passed &= await pairing_checks(loop)
 
     await asyncio.sleep(0.3)  # let background tasks spin
     for s in (srvA, srvB):
@@ -373,6 +378,98 @@ async def legacy_checks(loop):
             await s.stop_server(); await s.close()
         except Exception:
             pass
+    return passed
+
+
+
+# -- step 9: pairing turns an unplayable client into a playable one -------------------------------
+
+
+async def pairing_checks(loop):
+    """A real pairing round, asserting the transition that the whole feature rests on.
+
+    Steps 6-7 measured the *unpaired* truth table — a client admitted and activated for nothing.
+    This is the other half: pairing is what fixes that, and it must flip `active_role_ids` from
+    empty to populated on a LIVE connection, without the client reconnecting and without unpaired
+    access being involved anywhere.
+
+    Uses the Pairing PSK method because it needs no operator: the point here is the state
+    transition, not the human ceremony. The PIN methods run the same `initiate_pairing` path with a
+    PAKE round in front of it.
+    """
+    from aiosendspin.noise import PSKPairingToken, PairingPsk, encode_token, generate_psk, psk_id_for
+    from aiosendspin.noise.pairing import PairingAttempt
+    from aiosendspin.noise.trust_store import PairMethod
+
+    port = 8975
+    srv = make_server(loop, "Pairing Probe")
+    await srv.start_server(port=port, advertise_addresses=[], discover_clients=False)
+    passed = True
+
+    # A client with unpaired access OFF: it can only ever play by being paired.
+    identity = Identity.generate()
+    psk = generate_psk()
+    store = InMemoryClientPairingStore()
+    await store.store_pairing_config(
+        ClientPairingConfig(unpaired_access_enabled=False, record_mode_psk_id="pair-probe")
+    )
+    await store.set_pairing_psk(PairingPsk(psk_id=psk_id_for(psk), psk=psk))
+    client = SendspinClient(
+        identity=identity,
+        client_name="Pairing Probe",
+        roles=[Roles.PLAYER],
+        pairing_store=store,
+        player_support=ClientHelloPlayerSupport(
+            supported_formats=[
+                SupportedAudioFormat(codec=AudioCodec.PCM, sample_rate=RATE, channels=CH, bit_depth=BITS)
+            ],
+            buffer_capacity=1 << 20,
+            supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
+        ),
+    )
+    task = asyncio.ensure_future(client.connect(f"ws://127.0.0.1:{port}/sendspin"))
+    await asyncio.sleep(1.2)
+
+    server_client = srv.get_client(identity.peer_id)
+    before = sorted(server_client.active_role_ids) if server_client else None
+    passed &= ok(
+        "9a unpaired + no unpaired-access -> negotiated, NOT active",
+        server_client is not None and not before,
+        f"negotiated={sorted(server_client.negotiated_role_ids) if server_client else None} active={before}",
+    )
+
+    # The token an operator would paste. Round-tripped rather than passed raw, because that encoding
+    # is what a device actually shows and a decode bug here would only surface on a real device.
+    token = encode_token(PSKPairingToken(client_id=identity.peer_id, pairing_psk=psk))
+    from aiosendspin.noise import decode_token
+
+    await srv.initiate_pairing(
+        identity.peer_id,
+        PairingAttempt(method=PairMethod.PAIRING_PSK, pairing_psk=decode_token(token).pairing_psk),
+    )
+    await asyncio.sleep(0.8)
+
+    server_client = srv.get_client(identity.peer_id)
+    after = sorted(server_client.active_role_ids) if server_client else []
+    passed &= ok(
+        "9b pairing ACTIVATES the roles on the live connection",
+        bool(after) and any(r.startswith("player") for r in after),
+        f"active={after}",
+    )
+    passed &= ok(
+        "9c and it is a real long-term record, not the sentinel path",
+        bool(server_client and server_client.is_paired),
+        f"paired={server_client.is_paired if server_client else None} "
+        f"psk={getattr(getattr(server_client, 'connection_security', None), 'psk_category', None)}",
+    )
+
+    for shutdown in (client.disconnect(), srv.stop_server()):
+        try:
+            await shutdown
+        except Exception:
+            pass
+    task.cancel()
+    await srv.close()
     return passed
 
 

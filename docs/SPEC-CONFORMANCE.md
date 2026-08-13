@@ -181,16 +181,18 @@ building it would cost: **[docs/SENDSPIN-PAIRING.md](SENDSPIN-PAIRING.md)**.
 | Noise `KKpsk2`, server as initiator, client as responder | ✅ `aiosendspin` owns it end to end |
 | Both cipher suites on the server, ≥1 on the client | ✅ library |
 | Encryption on standard-discovery connections | ⚠️ **deviation** — `PLUM_ALLOW_UNENCRYPTED=1` accepts the non-spec transition path |
-| Server implements all three pairing methods | ❌ **GAP** — we implement none |
-| Client implements Pairing PSK | ➖ the library does; we neither configure nor exercise it |
-| Unpaired access at trust level `none` | ✅ and this is the path we actually run on |
+| Server implements all three pairing methods | ✅ **CLOSED 2026-08-13** — all three, driven from the GUI |
+| Client implements Pairing PSK | ✅ configured and exercised; it is how a unit pairs with its own speaker |
+| Unpaired access at trust level `none` | ✅ implemented, and **off by default** |
 
-**Why the deviation stands.** Cleartext is not a convenience here, it is the only way the fleet talks
-to anything: `sendspin-cpp` — every ESP32 speaker on the segment — has no Noise in any release, and
-our own web GUI is a hand-rolled cleartext WebSocket client with no proxy in front of :8927. Turning
-it off drops all of them at once. The spec sanctions the *unpaired* path we use for our own encrypted
-players (sentinel PSK, trust level `none`) while warning plainly that such sessions are open to
-man-in-the-middle; it does not sanction the legacy cleartext frame we accept beside it.
+**What closed, and what did not.** The pairing MUST is met: all three methods are implemented and
+reachable from the GUI, and encrypted clients now pair rather than riding the sentinel PSK, which is
+off by default. What remains is the **cleartext transition path**, and it is not a convenience — it
+is the only way the fleet talks to anything. `sendspin-cpp` (every ESP32 speaker on the segment) has
+no Noise in any release, and our own web GUI is a hand-rolled cleartext client with no proxy in front
+of :8927. Turning `PLUM_ALLOW_UNENCRYPTED` off drops all of them at once; those are one change, not
+three. The spec sanctions the unpaired path (sentinel PSK, trust `none`) while warning that such
+sessions are open to man-in-the-middle; it does not sanction the legacy frame we accept beside it.
 
 **What it costs today, measured:** Music Assistant 2.9.x pins `aiosendspin==6.0.5` and hangs up on
 our `client/init`, so it can no longer claim a Plum speaker. MA 2.10.0-beta pins 9.0.0, so this

@@ -1,11 +1,15 @@
-# Sendspin pairing — what it is, what we do instead, and what it costs
+# Sendspin pairing — how it works here
 
-> **Read this before changing `PLUM_ALLOW_UNENCRYPTED`, before adding a pairing UI, and before
-> anyone asks "why can't Music Assistant see our speaker".**
+> **Read this before changing `PLUM_ALLOW_UNENCRYPTED` or `PLUM_FLEET_PSK`, before touching the
+> pairing UI, and before anyone asks "why can't Music Assistant see our speaker".**
 >
 > Written 2026-08-13 against the spec (<https://www.sendspin-audio.com/spec/>) and `aiosendspin`
-> 9.1.0 as installed. Plum currently implements **none** of the three pairing methods and relies on
-> the unpaired path instead — a deliberate, spec-sanctioned choice with real limits, set out below.
+> 9.1.0 as installed. §1-3 are the protocol; §4 onward is what Plum does with it.
+>
+> **Plum implements all three pairing methods, and unpaired access is off by default.** A unit pairs
+> with its own speaker automatically, peers pair automatically when they share a fleet secret, and
+> anything else is a deliberate act in the GUI. This document previously argued for the opposite —
+> see §4 for what changed and why.
 
 ## 1. What actually changed
 
@@ -55,7 +59,7 @@ an active one.
 3. **Static PIN** — a fixed 8-digit device PIN. Every attempt is gesture-gated: the operator must
    physically confirm on the device.
 
-The API surface, for when we do implement it:
+The API surface, as we drive it:
 
 ```python
 # server side — pairing rides a dial, as an "operator intent"
@@ -71,96 +75,131 @@ client.open_pairing_window(); client.pairing_window_open; client.consume_pairing
 
 `PairMethod` is `dynamic_pin | pairing_psk | static_pin`; `TrustLevel` is `none | user`.
 
-## 4. What Plum does instead: trust-on-deploy
+Two properties of these that are easy to assume wrong, and both were found by testing rather than
+reading: **`pairing_psk` needs no pairing window** — possession of the token is the authorisation, so
+a shared secret pairs with no gesture at all. And **`PairingAttempt` refuses `PAIRING_PSK` without a
+`pairing_psk`**, so the token is not optional garnish; it is the method.
 
-**We implement no pairing method.** Every Plum connection uses the sentinel PSK, and we make it work
-with the spec's unpaired-access provision, which requires **both** halves:
+The window itself is `_PAIRING_WINDOW_LIFETIME_S = 300` and admits exactly **one** attempt, claimed
+by the first device to pair — not "open for five minutes to anything that shows up".
 
-- **client:** `ClientPairingConfig(unpaired_access_enabled=True)` — our player sets this in
-  `sendspin_identity.client_pairing_store()`;
-- **server:** `await server.trust_unpaired(peer_id)` — `sendspin_server._trust_player()`, called for
-  our own player at startup and for a peer's player in `reclaim_remote_player` before it dials.
+## 4. What Plum does: real pairing, with the sentinel path off by default
 
-Miss either and the client is admitted, negotiated, grouped, at the right volume — and activated for
-**no roles**. Silent, both logs clean. The measured truth table is in
-`tests/Integration/t0_sendspin_protocol.py` steps 6–7.
+**Implemented 2026-08-13.** An earlier version of this document argued for skipping pairing and
+running everything on the sentinel PSK. Two of its reasons did not survive review — "our player has
+no display" is false, because every unit serves a web GUI and Sendspin needs a network anyway; and
+"the operator is `deploy.sh`" stops applying once fleet deploy is a testing convenience rather than
+how units are commissioned. It is kept in git history rather than here.
 
-**Trust is per-server AND per-peer.** A unit trusting its own player says nothing about a peer's.
-That is why the trust call sits on the routing path rather than only at boot.
+All three methods are offered. The wiring is one object, and its *presence* is what enables them:
 
-**Why this and not real pairing.** A pairing UI is an interactive, per-device operator flow; a Plum
-mesh is a fleet provisioned from a workstation, where "the operator" is `deploy.sh`. Trust-on-deploy
-matches how the units are actually commissioned, and costs nothing at run time. The security
-difference is real but bounded: on the LAN these units already run unauthenticated HTTP APIs with
-blanket CORS (`docs/CLAUDE.md` Open #8), so sentinel-PSK sessions are not the weakest link.
-
-**And it does not apply to most of the traffic anyway.** Cleartext clients — every ESP32 speaker,
-Music Assistant as a client, our own web GUI — skip the trust gate entirely: a legacy `client/hello`
-is activated straight from the negotiated role set. That is what `PLUM_ALLOW_UNENCRYPTED=1` buys.
-
-## 5. Doing it on our units, today
-
-There is **no pairing to perform**. What exists is trust, and it is automatic:
-
-```bash
-# what identities this unit holds (its "device certificate")
-docker exec plum-audio ls -la /config/identity
-# server.key, player.key, server-pairing.json, player-pairing.json — all 0600, root-owned
-
-# did the trust take? this is the only field that distinguishes audio from silence
-curl -s localhost:5001/api/mesh/view |
-  python3 -c 'import json,sys; [print(p["player_id"][:16], p.get("active_roles")) for u in json.load(sys.stdin)["units"] for p in u["players"]]'
-
-# what the server decided, and about whom
-docker exec plum-audio grep -E 'identity|trusted|unpaired' /config/logs/sendspin_server.log
+```python
+PairingSupport(
+    gesture_prompt = ...,   # enables static PIN
+    pin_display    = ...,   # either out-channel enables dynamic PIN
+    offer_static_pin = True,
+    secret_locations = ("this unit's web GUI, under Settings",),
+)
 ```
 
-A peer's player is trusted lazily, at the first cross-route to it, so "no trust line for unit B" is
-normal until you route to B.
+Both callbacks route to the GUI over the consume relay as a `t: "pair"` frame — loopback-only, so a
+PIN never leaves the unit, and immediate rather than waiting on the 3 s state poll.
 
-## 6. Doing it in the Music Assistant beta
+### Who pairs with whom, and how
 
-MA 2.9.x pins `aiosendspin==6.0.5` and cannot speak Noise at all. **2.10.0-beta pins 9.0.0** and is
-where their pairing work landed (#4846 encryption, #5472 pairing, #5591 auto-pair the built-in web
-player, plus "use expanded_options for sendspin pairing method").
+| Pair | Method | Operator? |
+|---|---|---|
+| a unit ↔ **its own** speaker | Pairing PSK, from `/config/identity/local-pair.psk` | none — one device, one `/config` |
+| unit ↔ **peer** unit's speaker | Pairing PSK, from the fleet secret | none, when `PLUM_FLEET_PSK` is set |
+| unit ↔ **third-party** speaker | dynamic PIN, static PIN, or a pasted token | yes, in the GUI |
 
-Their public docs do **not** document pairing yet — the player-support page still just says players
-"appear automatically when clients connect" — so treat the following as the shape to expect rather
-than a procedure to follow:
+**The fleet secret** (`PLUM_FLEET_PSK`) is one Pairing PSK every unit accepts, minted once by
+`deploy.sh` into the gitignored `docker/.deploy.env` and written identically to every unit. Without
+it, four units mean twelve directed pairings, repeated whenever one is re-imaged — a new identity is
+a new device to every peer. It is a **shared secret**: anyone holding it can pair with any unit.
+Weaker than a per-pair record, stronger than the sentinel PSK, which is *published*. Leaving it
+unset is a supported, stricter posture — units then pair only with their own speaker automatically.
+Rotating it unpairs the fleet, so redeploy every unit together afterwards.
 
-- MA becomes a **server that must trust or pair our player**. Our player advertises
-  `unpaired_access_enabled`, so if MA offers unpaired access it should just work, exactly as our own
-  server does for it.
-- If MA instead insists on a pairing method, our player supports what `aiosendspin` implements —
-  Pairing PSK by default. Expect a token or a PIN prompt in MA's player settings.
-- Our player has **no display and no speaker**, so dynamic PIN (which requires the *client* to emit
-  the PIN) is awkward for us; `pin_display` is None. Pairing PSK is the method that fits a headless
-  Plum unit.
+### Unpaired access is now OFF
 
-**Expect a step, not silence.** If MA 2.10 sees the speaker and it plays nothing, read
-`active_roles` on our side first — that distinguishes "MA never trusted us" from anything else.
+`unpaired_access_enabled` + `trust_unpaired()` remain, gated by a setting whose precedence is
+**settings.json > `PLUM_UNPAIRED_ACCESS` > off** — the `audio.output.device` shape, with a **null**
+sentinel in `DEFAULT_SETTINGS` because `false` is a real user choice and a literal there would
+outrank the env permanently.
 
-## 7. How this changes workflows and deployment
+It is the sentinel path: encrypted but unauthenticated, which the spec calls MITM-vulnerable. With
+it off, an encrypted client that has not paired is admitted, negotiated, grouped — and activated for
+nothing. That state is what the GUI's Pair button keys on.
 
-| | |
-|---|---|
-| **Commissioning** | One new artefact per unit: `/config/identity`. Created automatically on first boot, `0700`/`0600`, root-owned, excluded from the entrypoint's chown. Nothing to type. |
-| **Deploy** | Unchanged in shape. `deploy.sh` now fails a unit whose player has no active `player@` role, so the silent-failure mode cannot ship quietly. |
-| **Re-imaging a Pi** | **A new identity = a new device to every peer.** Trust is re-established automatically between Plum units (it is derived, not typed), but any *third-party* server that had paired with that unit must re-pair. |
-| **Backups** | `/config/identity` is the one directory worth keeping. It survives `down`, `down -v`, `rm -f` and redeploys (bind mount at `/opt/plum-audio/config`). It does **not** survive a re-image or running the image without the compose mounts. |
-| **Turning encryption on properly** | Blocked on `sendspin-cpp`, which has no Noise in any release. The day it ships, `PLUM_ALLOW_UNENCRYPTED=0` becomes testable — and that is also the day the web GUI's hand-rolled cleartext controller and the 3.2.1 browser player both stop working. Those are one change, not three. |
+Turning it off applies live on the server side (`untrust_unpaired` revokes every existing approval).
+The client half rides in `client/hello` and so is fixed for a connection's life, taking effect on
+the player's next restart — the same deliberate trade as a device rename.
 
-## 8. What we would have to build for real pairing
+## 5. What the GUI shows, and why
 
-Not planned, recorded so the size is known:
+A device that cannot play must not offer controls that would silently do nothing. So **Pair replaces
+Join Stream and the stream picker** on a device's row, rather than sitting beside them.
 
-1. a **server-side operator flow** — a pairing mode, a PIN entry field, a token scanner/paster, and
-   the API to drive `initiate_pairing` / `end_pairing` / `unpair`;
-2. **all three methods**, because the spec makes them mandatory for servers;
-3. **persistence and revocation UX** on top of the pairing store we already carry;
-4. a decision about the **web GUI**, which is a hand-rolled cleartext client today and would need a
-   Noise implementation in TypeScript, or to move to `@sendspin/sendspin-js` 5.x (which is Noise-only
-   and drops the caller-chosen `playerId` our browser-route reconciler joins on).
+Four states, and telling them apart is the whole feature:
 
-Item 4 is the expensive one and is the real reason `PLUM_ALLOW_UNENCRYPTED` is a standing setting
-rather than a transitional one.
+| State | Means | Button? |
+|---|---|---|
+| `cleartext` | `security: null` on a connected client — the legacy path | **no** — can never pair |
+| `unpaired` | encrypted, no record, activated for nothing | **yes** — the only one |
+| `trusted` | encrypted, playing, but on the sentinel PSK | no |
+| `unknown` | an older peer, or a speaker nobody has connected to — **the default** | no |
+
+`unknown` rendering nothing is the same rule as `has_player` defaulting true. Guessing `unpaired`
+would put a Pair button on every mDNS speaker on the segment, most of them cleartext, every one a
+dead end.
+
+`trusted` is deliberately not folded into `paired`: it is not paired, and it is exactly the state
+that disappears when unpaired access is turned off.
+
+**Settings → Pairing** carries the fleet-wide action: open every unit for five minutes to accept one
+new device each. That is the protocol's `management` role — a server already paired with a device may
+stand in for its physical gesture — which is *why* a unit pairs with its own speaker at startup. The
+fan-out goes from the GUI, not unit-to-unit: each unit opens only its own speaker, so the mesh call
+is a nudge and never a transfer of trust over an API that has no authentication.
+
+## 6. Doing it on a unit
+
+```bash
+# identities and secrets — a device certificate, not runtime state
+docker exec plum-audio ls -la /config/identity
+#   server.key  player.key  local-pair.psk  server-pairing.json  player-pairing.json   (all 0600)
+
+# ACTIVATED vs negotiated: the only field that separates audio from silence
+curl -s localhost:5001/api/mesh/view | python3 -c 'import json,sys; [print(p["player_id"][:16], p.get("security"), p.get("paired"), p.get("active_roles")) for u in json.load(sys.stdin)["units"] for p in u["players"]]'
+
+# what pairing has been attempted here, and how it went
+curl -s localhost:5001/api/mesh/pairing
+
+# what the server decided at startup, and about whom
+docker exec plum-audio grep -E 'identity|paired|pairing|unpaired' /config/logs/sendspin_server.log
+```
+
+Env: `PLUM_FLEET_PSK` (shared, base64url 32 bytes) · `PLUM_UNPAIRED_ACCESS` (deploy-time default
+only; the GUI wins and persists) · `PLUM_STATIC_PIN` (exactly 8 digits, refused otherwise).
+
+## 7. Music Assistant
+
+MA 2.9.x pins `aiosendspin==6.0.5` and cannot speak Noise, so it can no longer claim a Plum speaker —
+measured, see `docs/PHASE-HISTORY.md`. MA 2.10.0-beta pins 9.0.0 and dev pins 9.1.0, so this closes
+on their side. Until then, route MA to a Plum **AirPlay** endpoint.
+
+When MA does move, it becomes a server that must pair with our player. Our player offers all three
+methods and displays a PIN in the GUI, so expect a step rather than silence — and if a speaker
+appears in MA and plays nothing, read `active_roles` on our side first.
+
+## 8. What is deliberately not built
+
+- **`management/add-record`** — a paired server can *install* a peer's credential directly, skipping
+  the PAKE. It would make fleet provisioning a push rather than a shared secret. Powerful, and a
+  bigger security surface; not needed while `PLUM_FLEET_PSK` exists.
+- **Turning `PLUM_ALLOW_UNENCRYPTED` off.** Blocked on two things we do not control: `sendspin-cpp`
+  has no Noise in any release, and our own web GUI is a hand-rolled cleartext client on `:8927` with
+  no proxy in front of it. Those are one change, not three — see `docs/SPEC-CONFORMANCE.md`.
+- **Pairing the browser player.** It rides `@sendspin/sendspin-js` 3.2.1, which is cleartext, so it
+  needs none. 5.0.0 is Noise-only and would need a per-browser trust flow.

@@ -123,13 +123,18 @@ The *reasoning* behind these, and the failures that produced them, is in
 - **Pin `aiosendspin`** (9.1.0). On any bump run `tests/Integration/t0_sendspin_protocol.py` first
   (tier 0 — real protocol, no rig; needs a venv on the candidate version), and re-check
   `docs/UPSTREAM-AIOSENDSPIN.md`. Port notes: `docs/AIOSENDSPIN-BUMP-SCOPE.md`.
-- **A role is ALWAYS negotiated but only ACTIVATED when the client sets `unpaired_access_enabled`
-  AND the server calls `trust_unpaired()`** for that peer id. Miss either and the endpoint connects,
-  negotiates, joins the group at the right volume and renders **nothing**, with no error at either
-  end — `negotiated_role_ids` vs `active_role_ids` is the only tell, and it is published as
-  `PlayerState.active_roles`. **Trust is per-server AND per-peer**: trusting our own player at
-  startup says nothing about a peer's, so `reclaim_remote_player` trusts before it dials. This gate
-  applies to ENCRYPTED clients only — see the next rule.
+- **A role is ALWAYS negotiated but only ACTIVATED when the client is PAIRED** (or, with unpaired
+  access on, when the client sets `unpaired_access_enabled` AND the server calls `trust_unpaired()`).
+  Miss it and the endpoint connects, negotiates, joins the group at the right volume and renders
+  **nothing**, with no error at either end — `active_roles` vs `negotiated_role_ids` is the only tell,
+  and it is published on `PlayerState` alongside `security`/`paired`. **`security is None` means
+  CLEARTEXT**, which is how the GUI tells "needs pairing" from "can never pair". Trust and pairing are
+  both per-server AND per-peer. Applies to ENCRYPTED clients only — see the next rule.
+- **Pairing is implemented; unpaired access defaults OFF.** A unit pairs with its own speaker via
+  `/config/identity/local-pair.psk`, peers pair via `PLUM_FLEET_PSK` when set, and everything else is
+  a GUI act. `pairing_psk` needs NO window; the window (300 s, ONE attempt) is for PIN methods and
+  later-added units, opened via the `management` role — which is why a unit pairs with its own player
+  at startup. `docs/SENDSPIN-PAIRING.md`.
 - **Cleartext clients skip the trust gate entirely, and our own player can never be one.** A legacy
   `client/hello` is activated straight from the negotiated set, so ESP32 speakers, Music Assistant
   and our hand-rolled GUI controller need no pairing — that is what `PLUM_ALLOW_UNENCRYPTED=1` buys.
