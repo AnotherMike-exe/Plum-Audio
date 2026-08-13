@@ -56,6 +56,15 @@
    cleartext path open, because `sendspin-cpp` has no Noise in any release and our own web GUI is a
    hand-rolled cleartext client on :8927. Those are one change, not three.
    `docs/SENDSPIN-PAIRING.md`.
+   **Still open under this heading: the FIRST roam to a never-paired peer is slow, and Music Assistant
+   contends for the player.** Measured on `.7.204`'s player, 2026-08-13. `reclaim_remote_player` gives
+   up at 10 s and reports failure; the player actually lands ~30 s later and the route completes, so
+   the GUI shows an error for a roam that then works. B's player log across that window shows `.122`
+   dialling five times with 1/2/4/8/12 s backoff, each attach dropping — interleaved with **two dials
+   from Music Assistant on `.7.226`**, which is a third server legitimately competing for the same
+   single websocket. Every subsequent roam is 3/3 in ~13 s, so this is a cold-start cost, not a
+   steady-state one. Not yet separated: how much is first-pairing and how much is MA contention. The
+   obvious next step is to re-measure with MA stopped before touching any timeout.
 7. **amd64 has never been built.**
 8. **The APIs are unauthenticated with blanket CORS** (`CORS(app)`, `Access-Control-Allow-Origin: *`,
    both bound to `0.0.0.0`). The injection chain behind it is closed at three layers, but any page on

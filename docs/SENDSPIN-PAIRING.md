@@ -121,6 +121,28 @@ PIN never leaves the unit, and immediate rather than waiting on the 3 s state po
 | unit ↔ **peer** unit's speaker | Pairing PSK, from the fleet secret | none, when `PLUM_FLEET_PSK` is set |
 | unit ↔ **third-party** speaker | dynamic PIN, static PIN, or a pasted token | yes, in the GUI |
 
+### How, mechanically: stage before the dial
+
+Both automatic pairings above are **staged**, not initiated. `StagedPairingPsk` — the library's own
+"operator-staged Pairing PSK awaiting a client" — is written into the server's pairing store *before*
+the client is dialled, and `_psk_provider` consults it while **choosing** the handshake PSK. So the
+connection comes up already in `PskCategory.PAIRING` and finalizes immediately. Two call sites:
+`start()` for our own player (before the player process exists), and `reclaim_remote_player` for a
+peer's, before the dial.
+
+The alternative — `initiate_pairing` on an already-connected client — is what shipped first and it
+does not survive a real mesh. Its PSK is the sentinel, so `_rehandshake_for_pairing_if_needed` tears
+the Noise session down and rebuilds it mid-connection. A peer's player is contended (its own server
+is dialling it too, and it holds exactly ONE websocket), so the re-handshake finds the socket gone:
+
+```
+could not pair player G2UChhEv…: expected Noise message 2 (TEXT), got CLOSE
+[airplay-1] reclaim of remote player G2UChhEv… timed out          ← then, forever
+```
+
+Never stage or initiate against a **cleartext** client. A pairing handshake over the legacy path is
+aborted by the library outright, so every ESP32 would go offline — see §5.
+
 **The fleet secret** (`PLUM_FLEET_PSK`) is one Pairing PSK every unit accepts, minted once by
 `deploy.sh` into the gitignored `docker/.deploy.env` and written identically to every unit. Without
 it, four units mean twelve directed pairings, repeated whenever one is re-imaged — a new identity is
