@@ -25,14 +25,22 @@ active_of() { ssh_json "$UNIT" /api/mesh/snapshot \
 assert_eq "$(active_of)" "False" "source starts idle (active=False)"
 
 # Feed ~4s of silence into the FIFO in the background; feeder should flip to active.
-ssh_ "$UNIT" "setsid sh -c 'dd if=/dev/zero of=$FIFO bs=17640 count=40 2>/dev/null' </dev/null >/dev/null 2>&1 &" || true
-defer "ssh_ \"$UNIT\" \"pkill -f 'dd if=/dev/zero of=$FIFO' 2>/dev/null; true\""
+# Inside the CONTAINER — the FIFO is not on the host's filesystem. See dexec_/feed_fifo_ in lib.sh.
+feed_fifo_ "$UNIT" "$FIFO" 40 || true
+defer "stop_feed_ \"$UNIT\" \"$FIFO\""
 
 got="$(wait_for "True" 8 active_of)"
 assert_eq "$got" "True" "source goes active while a sender feeds it"
 
 # Also reflected as streaming (has_active_stream / playback_state=playing).
-streaming="$(ssh_json "$UNIT" /api/mesh/snapshot "next((s[\"streaming\"] for s in d[\"sources\"] if s[\"source_id\"]==\"$SOURCE\"), None)")"
+#
+# POLLED, not read once: `streaming` legitimately lags `active`. Since the true-none rule a player is
+# DETACHED while its source is idle, so the order on a feed is source-goes-active -> localActivity
+# re-attaches the player -> the group acquires a stream. A single immediate read here raced that and
+# reported a hard FAIL on a unit that was about to stream perfectly well.
+streaming_of() { ssh_json "$UNIT" /api/mesh/snapshot \
+    "next((s[\"streaming\"] for s in d[\"sources\"] if s[\"source_id\"]==\"$SOURCE\"), None)"; }
+streaming="$(wait_for "True" 8 streaming_of)"
 assert_eq "$streaming" "True" "source reports streaming while active"
 
 # After the writer closes (EOF), it must return to idle — the group.stop() path.

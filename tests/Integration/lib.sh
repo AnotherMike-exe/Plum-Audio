@@ -55,6 +55,34 @@ ssh_json() {
     printf '%s' "$raw" | ssh_ "$host" "python3 -c 'import json,sys; d=json.load(sys.stdin); print($expr)'"
 }
 
+# dexec_ <host> <command...> — run a command INSIDE the plum-audio container.
+#
+# The source FIFOs live in the CONTAINER's /tmp, which is not bind-mounted, so a plain `ssh_` writes
+# to a different filesystem entirely: `dd of=/tmp/airplay-1-fifo` on the host silently creates a
+# regular file, the feeder never sees a byte, and the source never goes active. These tests were
+# written against the pre-container dev stack (`~/plum-test`) where host /tmp WAS the right place,
+# and have been quietly failing their feed-driven assertions ever since the cutover to a container —
+# on 6.0.5 as well as 9.x, verified against a control unit 2026-08-13.
+dexec_() {
+    local host="$1"; shift
+    ssh_ "$host" "echo '$PW' | sudo -S -p '' docker exec plum-audio $*"
+}
+
+# feed_fifo_ <host> <fifo> [chunks] — push silence into a source FIFO from inside the container.
+# Backgrounded and detached so the caller can poll while it runs; returns immediately.
+feed_fifo_() {
+    local host="$1" fifo="$2" chunks="${3:-40}"
+    ssh_ "$host" "echo '$PW' | sudo -S -p '' docker exec -d plum-audio \
+        sh -c 'dd if=/dev/zero of=$fifo bs=17640 count=$chunks 2>/dev/null'"
+}
+
+# stop_feed_ <host> <fifo> — kill a feed started by feed_fifo_ (for `defer`).
+stop_feed_() {
+    local host="$1" fifo="$2"
+    ssh_ "$host" "echo '$PW' | sudo -S -p '' docker exec plum-audio \
+        pkill -f 'dd if=/dev/zero of=$fifo' 2>/dev/null; true"
+}
+
 # --- assertions -------------------------------------------------------------------------------
 
 _ok()   { _PASS=$((_PASS+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
