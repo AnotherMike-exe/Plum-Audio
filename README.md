@@ -157,6 +157,7 @@ is never bridged between servers. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.m
 | [HOST-PROVISIONING.md](docs/HOST-PROVISIONING.md) | Commissioning a new Pi, step by step |
 | [HARD-WON-LESSONS.md](docs/HARD-WON-LESSONS.md) | Why the code is shaped this way. Read before "simplifying" |
 | [SPEC-CONFORMANCE.md](docs/SPEC-CONFORMANCE.md) | Where we stand against the Sendspin spec |
+| [SENDSPIN-PAIRING.md](docs/SENDSPIN-PAIRING.md) | Encryption/pairing: what we do instead, and what it costs |
 | [ROUTING-MODEL.md](docs/ROUTING-MODEL.md) | **Proposal** — unified attach/detach and the true-none rule |
 | [UPSTREAM-AIOSENDSPIN.md](docs/UPSTREAM-AIOSENDSPIN.md) | Workarounds to delete when the pin bumps |
 | [AIOSENDSPIN-BUMP-SCOPE.md](docs/AIOSENDSPIN-BUMP-SCOPE.md) | 6.0.5 → 9.1.0 scoped, and why the pin is on hold |
