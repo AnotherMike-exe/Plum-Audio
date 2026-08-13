@@ -399,3 +399,65 @@ describe('a speaker is foreign only when its SERVER id belongs to nobody', () =>
     expect(c.foreignServer).toBeUndefined();
   });
 });
+
+describe('pairingState — who gets a Pair button', () => {
+  // The button appears only where pairing is both NEEDED and POSSIBLE. Two ways to get this wrong,
+  // and both are worse than not shipping the feature: offering it to a cleartext ESP32 that can
+  // never pair, or withholding it from an encrypted device that is silent until you do.
+  const view = (p: Partial<Record<string, unknown>>): MeshView => ({
+    local_unit_id: 'unit-210',
+    units: [
+      {
+        unit_id: 'unit-210', name: 'Pi4-02', host: '192.0.2.10', server_id: 'peer-unit-210',
+        sources: [],
+        players: [{
+          player_id: 'spk', name: 'Speaker', connected: true, group_id: null,
+          url: 'ws://192.0.2.10:8928/sendspin', ...p,
+        } as never],
+      },
+    ],
+  });
+
+  const stateOf = (v: MeshView) => mapViewToModel(v, new Map(), new Map()).clients[0].pairingState;
+
+  it('says CLEARTEXT for a legacy device, which can never pair', () => {
+    // security null on a connected client == the legacy path. Every ESP32 speaker on the segment.
+    expect(stateOf(view({ security: null, active_roles: ['player@v1'], paired: false }))).toBe('cleartext');
+  });
+
+  it('says UNPAIRED only when encrypted AND activated for nothing', () => {
+    expect(stateOf(view({ security: 'sentinel', active_roles: [], paired: false }))).toBe('unpaired');
+  });
+
+  it('says PAIRED when a long-term record exists', () => {
+    expect(stateOf(view({ security: 'long_term', active_roles: ['player@v1'], paired: true }))).toBe('paired');
+  });
+
+  it('distinguishes TRUSTED from paired', () => {
+    // Encrypted, playing, but on the sentinel PSK via unpaired access — not a pairing record.
+    // Folding this into 'paired' would have the GUI assert something untrue, and this is exactly
+    // the state that vanishes the moment unpaired access is turned off.
+    expect(stateOf(view({ security: 'sentinel', active_roles: ['player@v1'], paired: false }))).toBe('trusted');
+  });
+
+  it('says UNKNOWN when the peer sends no roles at all', () => {
+    // An older image. Guessing 'unpaired' here would put a Pair button on every device in a
+    // mixed-version mesh — the mirror of the has_player defaulting rule.
+    expect(stateOf(view({}))).toBe('unknown');
+  });
+
+  it('says UNKNOWN rather than cleartext for a device that reported nothing and is disconnected', () => {
+    expect(stateOf(view({ connected: false, security: null }))).toBe('unknown');
+  });
+
+  it('leaves an mDNS-only speaker UNKNOWN, so it never sprouts a Pair button', () => {
+    // The neighbourhood row for an ESP32 nobody has connected to. Most such devices are cleartext
+    // and would fail a pairing attempt outright.
+    const model = mapViewToModel(
+      { local_unit_id: 'unit-210', units: [{ unit_id: 'unit-210', name: 'A', host: '192.0.2.10', sources: [], players: [] }] },
+      new Map(), new Map(), Date.now(),
+      { players: [{ name: 'esparagus', friendly_name: 'Esparagus', url: 'ws://192.0.2.99:8928/sendspin', host: '192.0.2.99', port: 8928, is_own: false }], servers: [] },
+    );
+    expect(model.clients.find((c) => c.url?.includes('192.0.2.99'))!.pairingState).toBe('unknown');
+  });
+});
