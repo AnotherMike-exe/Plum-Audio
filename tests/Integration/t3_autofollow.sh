@@ -35,13 +35,14 @@ defer "curl_ \"$B\" POST /api/settings \"{\\\"autoSwitch\\\":{\\\"localActivity\
 defer "curl_ \"$B\" POST /api/mesh/unroute \"{\\\"player_id\\\":\\\"$PLAYER_B\\\",\\\"source_id\\\":\\\"$HOME_B\\\"}\" >/dev/null 2>&1; true"
 defer "curl_ \"$B\" POST /api/mesh/route \"{\\\"player_id\\\":\\\"$PLAYER_B\\\",\\\"source_id\\\":\\\"$HOME_B\\\"}\" >/dev/null 2>&1; sleep 2; true"
 defer "curl_ \"$A\" POST /api/mesh/unroute \"{\\\"player_id\\\":\\\"$PLAYER_A\\\",\\\"source_id\\\":\\\"$SRC_A\\\"}\" >/dev/null 2>&1; true"
-defer "ssh_ \"$A\" \"pkill -f 'dd if=/dev/zero of=$FIFO_A' 2>/dev/null; true\""
+defer "stop_feed_ \"$A\" \"$FIFO_A\""
 
 in_group() {  # in_group <player-id> -> is it in SRC_A's player_ids, per A's aggregated view?
     ssh_json "$A" /api/mesh/view \
         "\"$1\" in next((s[\"player_ids\"] for u in d[\"units\"] if u[\"host\"]==\"$A\" for s in u[\"sources\"] if s[\"source_id\"]==\"$SRC_A\"), [])"
 }
-feed_a() { ssh_ "$A" "setsid sh -c 'dd if=/dev/zero of=$FIFO_A bs=17640 count=$1 2>/dev/null' </dev/null >/dev/null 2>&1 &" || true; }
+# Inside the CONTAINER: the FIFO is not on the host filesystem (see lib.sh feed_fifo_).
+feed_a() { feed_fifo_ "$A" "$FIFO_A" "$1" || true; }
 a_active() { ssh_json "$A" /api/mesh/snapshot "next((s[\"active\"] for s in d[\"sources\"] if s[\"source_id\"]==\"$SRC_A\"), None)"; }
 
 # -- make A "play": feed its source and route A's own player onto it ------------------------------
@@ -64,7 +65,7 @@ sleep 6  # >2 reconciler ticks
 assert_eq "$(in_group "$PLAYER_B")" "False" "None on B holds — not re-followed while A still plays"
 
 # -- 3. master-idle reset: A goes idle while B idle -> next A stream is followed again ------------
-ssh_ "$A" "pkill -f 'dd if=/dev/zero of=$FIFO_A' 2>/dev/null; true"          # stop A's feed
+stop_feed_ "$A" "$FIFO_A"                                                    # stop A's feed
 curl_ "$A" POST /api/mesh/unroute "{\"player_id\":\"$PLAYER_A\",\"source_id\":\"$SRC_A\"}" >/dev/null  # A player idle
 assert_eq "$(wait_for "False" 12 a_active)" "False" "A went idle"
 sleep 4  # let B's reconciler observe the master-idle reset while B is idle
