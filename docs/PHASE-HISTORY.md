@@ -86,8 +86,26 @@ What still works: MA as a **client of our server** — the legacy path — so MA
 us, poll the mesh API and drive us as a controller. What is lost is MA treating a Plum speaker as one
 of *its own* sync endpoints. The fallback is to send MA → a Plum **AirPlay** endpoint, which keeps
 audio flowing and keeps multi-room *within* Plum, at the cost of the speaker no longer being a member
-of MA's sync group. Restoring the Sendspin path needs MA to ship a 7.0+ aiosendspin; nothing on our
-side can bridge it short of hand-rolling a cleartext client.
+of MA's sync group.
+
+**This is temporary, and closer to resolved than it looks.** MA's own pins, read from their repo:
+
+| MA version | `aiosendspin` pin | Interops with our 9.1.0? |
+|---|---|---|
+| **2.9.11** (the rig's, HA add-on) | — | no |
+| **2.9.13** (current stable) | `6.0.5` | no — *the exact version we just left* |
+| **2.10.0b14** (beta) | `9.0.0` | **yes** — same major, Noise both ends |
+| `dev` | `9.1.0` | yes — identical to ours |
+
+So MA and Plum were pinned to the *same* 6.0.5 by coincidence, and our bump broke a lockstep neither
+project knew it was in. MA added encryption in PR #4846 (2026-07-19) and has been iterating on
+pairing since (#5472, #5591). The interop returns when 2.10 goes stable, or immediately by moving MA
+to the beta channel — with the caveat that 9.x pairing then applies in *that* direction too: MA
+becomes a server that must trust our player's peer id, which is what their pairing work is about.
+
+Nothing on our side can bridge a 6.0.5 MA: `SendspinClient` has no cleartext mode (verified — no
+`allow_unencrypted` equivalent anywhere under `client/`), so short of hand-rolling a cleartext
+Sendspin client there is no fix that does not involve moving one end or the other.
 
 **Four bugs the rig found that reading did not**, all the same shape — an id comparison that worked
 only because two namespaces used to hold the same string:
