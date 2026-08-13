@@ -65,6 +65,16 @@
    single websocket. Every subsequent roam is 3/3 in ~13 s, so this is a cold-start cost, not a
    steady-state one. Not yet separated: how much is first-pairing and how much is MA contention. The
    obvious next step is to re-measure with MA stopped before touching any timeout.
+   **Refined 2026-08-13, same evening:** first-pairing is NOT the cost. Under live audio A's player
+   was dialled at 15:21:57.879 and paired at 15:21:58.047 — **170 ms, inside the handshake**, on a
+   pairing it had never done before. So the 30 s belongs to contention (or to the pre-staging build),
+   not to pairing. Measure with MA stopped.
+   **Also found: "Open the mesh for pairing" skips any unit whose player has roamed away.** The
+   `management` activity is a property of a live connection between a server and a client, so a unit
+   whose own player is currently attached to a PEER's source has no connection to open a window on:
+   `POST /api/mesh/pairing-window` returns `ok:false`, and returns `ok:true` the moment the player is
+   routed home. Verified both ways on `.7.122`. The GUI degrades visibly ("N of M opened") but names
+   no reason, and "route your speakers home before adding a unit" is not a rule anyone would guess.
 7. **amd64 has never been built.**
 8. **The APIs are unauthenticated with blanket CORS** (`CORS(app)`, `Access-Control-Allow-Origin: *`,
    both bound to `0.0.0.0`). The injection chain behind it is closed at three layers, but any page on
