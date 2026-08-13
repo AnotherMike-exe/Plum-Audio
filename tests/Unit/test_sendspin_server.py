@@ -180,8 +180,26 @@ class _FakeManagementConnection:
         return type("R", (), {"value": "ok"})()
 
 
+class FakePairingStore:
+    """Stands in for aiosendspin's ServerPairingStore. Only the three calls staging touches."""
+
+    def __init__(self):
+        self.records = {}   # client_id -> record (a real pairing)
+        self.staged = {}    # client_id -> StagedPairingPsk (a pairing pre-authorised for the handshake)
+
+    async def record_by_client_id(self, client_id):
+        return self.records.get(client_id)
+
+    async def staged_pairing_psk(self, client_id):
+        return self.staged.get(client_id)
+
+    async def stage_pairing_psk(self, client_id, staged):
+        self.staged[client_id] = staged
+
+
 class FakeServer:
     def __init__(self):
+        self.pairing_store = FakePairingStore()
         self._by_id = {}
         self._urls = {}
         self._connection_tasks = {}
@@ -1165,15 +1183,29 @@ def test_a_cleartext_speaker_is_never_offered_the_shared_psk(monkeypatch):
     )
 
 
-def test_an_encrypted_unpaired_speaker_still_pairs_via_the_fleet_psk(monkeypatch):
-    """The other half: the gate must not swallow the case it exists to serve. A peer unit's player
-    arrives over Noise on the sentinel PSK, and the fleet secret is what pairs it with no operator."""
+def test_a_peer_player_is_staged_before_the_dial_not_paired_after_it(monkeypatch):
+    """The other half, and the reason the peer branch moved out of the connect handler.
+
+    `initiate_pairing` on a client that is already connected on the sentinel PSK forces a
+    mid-connection Noise re-handshake. A peer's player is contended — its own server is dialling it
+    too and it holds only ONE websocket — so the re-handshake finds the socket gone:
+
+        could not pair player G2UChhEv...: expected Noise message 2 (TEXT), got CLOSE
+        [airplay-1] reclaim of remote player G2UChhEv... timed out    (then, forever)
+
+    Staging puts the same PSK in front of the handshake instead, so the reclaim's own connection
+    comes up already paired. Measured on .7.122 taking .7.204's player, 2026-08-13.
+    """
     unit = make_unit("airplay-1")
-    monkeypatch.setattr(sendspin_identity, "fleet_psk", lambda: "fleet-secret")
+    monkeypatch.setattr(sendspin_identity, "fleet_psk", lambda: b"f" * 32)
     monkeypatch.setattr(sendspin_identity, "peer_id_of", lambda role: "our-own-player")
-    monkeypatch.setattr(sendspin_identity, "local_pairing_psk", lambda: b"x" * 32)
+    monkeypatch.setattr(sendspin_identity, "local_pairing_psk", lambda: b"f" * 32)
     unit.server.add(FakeClient("peer-player", roles=["player@v1"], security="sentinel"))
 
+    # The connect handler must leave a peer alone...
     asyncio.run(unit._maybe_pair_via_shared_psk("peer-player"))
+    assert not [c for c in unit.server.calls if c[0] == "initiate_pairing"]
 
-    assert ("initiate_pairing", "peer-player", "pairing_psk") in unit.server.calls
+    # ...and the roam path must stage it instead.
+    assert asyncio.run(unit.stage_shared_psk("peer-player")) is True
+    assert "peer-player" in unit.server.pairing_store.staged
