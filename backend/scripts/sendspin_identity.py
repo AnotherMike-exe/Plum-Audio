@@ -68,6 +68,71 @@ def pairing_store_path(role: str) -> str:
     return os.path.join(identity_dir(), f"{role}-pairing.json")
 
 
+def local_pair_psk_path() -> str:
+    return os.path.join(identity_dir(), "local-pair.psk")
+
+
+def local_pairing_psk() -> bytes:
+    """The Pairing PSK this unit's server and its own player share, minted once and persisted.
+
+    A unit's server and its player are two processes on one device, in one container, behind one
+    `/config`. They are the same trust domain by construction, so making an operator pair a unit
+    with *itself* would be ceremony with no security content — and it would mean a fresh unit's own
+    speaker stays silent until a human intervened, on a box that may have no screen attached.
+    Music Assistant reached the same conclusion for its built-in web player (their #5591).
+
+    So they pair over the **Pairing PSK** method, which needs no interaction: both ends must simply
+    know one secret. This file IS that secret. The player installs it as the PSK it will accept; the
+    server presents it in a `PairingAttempt`. The result is a real long-term pairing record with
+    trust level `user` — not a sentinel bypass — which is also what earns the server the `management`
+    activity on its own player, and that is what makes the provisioning window possible at all.
+
+    Same create-once-or-lose-the-race shape as `load_or_create`, for the same reason: two processes
+    minting different secrets would leave a unit unable to pair with itself, silently.
+    """
+    path = local_pair_psk_path()
+    existing = _read_psk(path)
+    if existing is not None:
+        return existing
+
+    from aiosendspin.noise import generate_psk
+
+    psk = generate_psk()
+    os.makedirs(identity_dir(), mode=0o700, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raced = _read_psk(path)
+        if raced is None:
+            raise
+        logger.info("local pairing psk: lost the create race, using the stored secret")
+        return raced
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(_b64(psk))
+    logger.info("local pairing psk: minted %s", path)
+    return psk
+
+
+def _read_psk(path: str) -> bytes | None:
+    """The stored local Pairing PSK, or None. A damaged one is fatal, like a damaged key."""
+    from aiosendspin.noise import b64url_decode
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            stored = f.read().strip()
+    except FileNotFoundError:
+        return None
+    if not stored:
+        raise ValueError(f"{path} is empty — refusing to mint a replacement over it")
+    return b64url_decode(stored)
+
+
+def _b64(raw: bytes) -> str:
+    from aiosendspin.noise import b64url_encode
+
+    return b64url_encode(raw)
+
+
 def load_or_create(role: str) -> Identity:
     """This role's persistent identity, minting one on first call.
 
@@ -138,20 +203,39 @@ async def server_pairing_store() -> FileServerPairingStore:
     return await FileServerPairingStore.open(pairing_store_path(SERVER_ROLE))
 
 
-async def client_pairing_store(role: str = PLAYER_ROLE) -> FileClientPairingStore:
-    """A client store with unpaired access ENABLED — half of the trust-on-deploy contract.
+async def client_pairing_store(role: str = PLAYER_ROLE, *, unpaired_access: bool | None = None) -> FileClientPairingStore:
+    """This client's pairing store, with its policy applied.
 
-    Without this the server's `trust_unpaired()` is inert: `_playback_capable` requires the client to
-    have advertised `unpaired_access.enabled` in its hello AND the server to have trusted the peer id.
-    Setting it here, once, means every client we construct carries it.
+    Two things are configured here, and they are independent:
+
+    **The Pairing PSK** this client will accept, so its own unit's server can pair with it without an
+    operator — see `local_pairing_psk`. Installed unconditionally: it is what makes a fresh unit's
+    own speaker work out of the box.
+
+    **Unpaired access**, which is the sentinel-PSK escape hatch. `_playback_capable` requires BOTH
+    this flag on the client AND `trust_unpaired(peer_id)` on the server, so with it off an
+    unpaired encrypted client is admitted and activated for nothing. It defaults OFF now that real
+    pairing exists; `unpaired_access=None` leaves whatever is stored alone.
+
+    Note this does NOT touch cleartext clients — ESP32 speakers, Music Assistant, our own web GUI.
+    They never reach the trust gate at all.
     """
+    from aiosendspin.noise import PairingPsk, psk_id_for
+
     os.makedirs(identity_dir(), mode=0o700, exist_ok=True)
     store = await FileClientPairingStore.open(pairing_store_path(role))
+
+    psk = local_pairing_psk()
+    stored = await store.pairing_psk()
+    if stored is None or stored.psk != psk:
+        await store.set_pairing_psk(PairingPsk(psk_id=psk_id_for(psk), psk=psk))
+        logger.info("pairing store %s: installed the local Pairing PSK", role)
+
     config = await store.get_pairing_config()
-    if not config.unpaired_access_enabled:
+    if unpaired_access is not None and config.unpaired_access_enabled != unpaired_access:
         await store.store_pairing_config(
             ClientPairingConfig(
-                unpaired_access_enabled=True,
+                unpaired_access_enabled=unpaired_access,
                 record_mode_psk_id=config.record_mode_psk_id,
                 pairing_psk_enabled=config.pairing_psk_enabled,
                 dynamic_pin_enabled=config.dynamic_pin_enabled,
@@ -159,7 +243,7 @@ async def client_pairing_store(role: str = PLAYER_ROLE) -> FileClientPairingStor
                 dynamic_pin_min_length=config.dynamic_pin_min_length,
             )
         )
-        logger.info("pairing store %s: enabled unpaired access", role)
+        logger.info("pairing store %s: unpaired access -> %s", role, "on" if unpaired_access else "off")
     return store
 
 

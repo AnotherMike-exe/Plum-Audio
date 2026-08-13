@@ -101,6 +101,22 @@ REACQUIRE_BACKOFF_S = 0.1  # pause before re-acquiring a stopped stream (avoid h
 CANCEL_POLL_S = 0.25  # how long to wait between cancels of a dial task — see _stop_dialing
 
 
+def _security_of(client) -> str | None:
+    """How a connected client's transport is secured: None (CLEARTEXT), "sentinel", or "long_term".
+
+    `connection_security` is None both when the client is disconnected AND when it is connected over
+    the legacy cleartext path — the legacy branch never resolves a PSK. Only connected clients reach
+    the snapshot, so within it None means cleartext, and that is exactly the distinction the GUI
+    needs: a cleartext device can never be paired and must never be offered a Pair button.
+
+    Defensive against the library moving: a missing attribute reads as None (unknown/cleartext)
+    rather than raising inside the snapshot, which every peer polls.
+    """
+    security = getattr(client, "connection_security", None)
+    category = getattr(security, "psk_category", None)
+    return getattr(category, "value", None)
+
+
 def _bytes_per_frame(fmt: AudioFormat) -> int:
     return fmt.channels * (fmt.bit_depth // 8)
 
@@ -490,10 +506,9 @@ class PlumSendspinServer:
     async def _trust_own_player(self) -> None:
         """Trust this unit's own player, so its player role is ACTIVATED and not merely negotiated.
 
-        Half of the trust-on-deploy contract; the other half is `unpaired_access_enabled` on the
-        player's own pairing store. Neither alone is enough, and the failure when one is missing is
-        silent — the player connects, negotiates player@v1, joins the group at the right volume, and
-        renders nothing, logging nothing. See sendspin_identity for the measured truth table.
+        This is the *unpaired* half — the sentinel escape hatch — and it only matters while unpaired
+        access is on. Real pairing is `pair_own_player`, which runs when the player connects; once a
+        pairing record exists this call is redundant but harmless.
 
         Best-effort: a unit whose player key does not exist yet is a playerless unit (headless mode
         never mints one), and a trust store that will not open must not stop the server from serving
@@ -505,6 +520,44 @@ class PlumSendspinServer:
             return
         if await self._trust_player(player_peer):
             logger.info("trusted local player %s", player_peer)
+
+    async def pair_own_player(self, client_id: str) -> bool:
+        """Pair this unit's server with its OWN player, over the Pairing PSK method. Idempotent.
+
+        Runs when the local player connects, not at start(): pairing needs a live connection, and
+        the player process comes up after us (supervisord priority 20 against our 10).
+
+        No operator, deliberately. The two processes are one device behind one `/config`, so the
+        shared secret in `sendspin_identity.local_pairing_psk()` is not a credential to distribute —
+        it is a value both halves already have. What this buys is a real long-term record at trust
+        level `user`, which is what a conformant deployment looks like, and what grants this server
+        the `management` activity on its own player. Without that there is no way to open the
+        player's pairing window remotely, and the provisioning window has nothing to stand on.
+
+        Never raises. A unit whose own pairing fails still serves cleartext clients perfectly well,
+        and it will retry on the player's next connection.
+        """
+        assert self.server is not None
+        client = self.server.get_client(client_id)
+        if client is not None and getattr(client, "is_paired", False):
+            return True  # already has a long-term record
+        try:
+            from aiosendspin.noise.pairing import PairingAttempt
+            from aiosendspin.noise.trust_store import PairMethod
+
+            await self.server.initiate_pairing(
+                client_id,
+                PairingAttempt(
+                    method=PairMethod.PAIRING_PSK,
+                    pairing_psk=sendspin_identity.local_pairing_psk(),
+                    owner="plum-local",
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            logger.warning("could not pair the local player %s: %s", client_id, exc)
+            return False
+        logger.info("paired the local player %s", client_id)
+        return True
 
     async def stop(self) -> None:
         self._stop_evt.set()
@@ -630,9 +683,25 @@ class PlumSendspinServer:
     def _on_server_event(self, _server: SendspinServer, event: object) -> None:
         """React to client lifecycle events. A controller-only client (the GUI's now-playing WS)
         connects into its own solo group by default, where it sees no source metadata — join it to
-        the primary source group so its metadata/artwork/playback-state roles receive live state."""
+        the primary source group so its metadata/artwork/playback-state roles receive live state.
+
+        This is also where our own player gets paired, because pairing needs a live connection and
+        the player process starts after us."""
         if isinstance(event, (ClientAddedEvent, ClientUpdatedEvent)):
             asyncio.ensure_future(self._maybe_group_controller(event.client_id))
+            asyncio.ensure_future(self._maybe_pair_own_player(event.client_id))
+
+    async def _maybe_pair_own_player(self, client_id: str) -> None:
+        """Pair the connecting client if it is this unit's own player. No-op for anything else.
+
+        Matched on the peer id read off our own `/config/identity`, never on a name or a URL: this
+        must not fire for a peer unit's player that happens to be roaming here, and the peer id is
+        the only identifier that cannot be spoofed into looking local.
+        """
+        own = sendspin_identity.peer_id_of(sendspin_identity.PLAYER_ROLE)
+        if not own or client_id != own:
+            return
+        await self.pair_own_player(client_id)
 
     async def _maybe_group_controller(self, client_id: str) -> None:
         """Join a controller-only client to the source group it asked for, or the best active one.
@@ -1086,6 +1155,10 @@ class PlumSendspinServer:
                         # grouped, and silent — publishing it is what makes that visible outside the
                         # audio process (the mesh API, the GUI, deploy.sh's verify).
                         active_roles=sorted(client.active_role_ids),
+                        # None for a CLEARTEXT connection, which is how the GUI tells "needs
+                        # pairing" from "never will" — see PlayerState.security.
+                        security=_security_of(client),
+                        paired=bool(client.is_paired),
                     )
                 )
 

@@ -88,11 +88,25 @@ class FakeCleanupHandle:
         self.cancelled = True
 
 
+class _FakeSecurity:
+    """Stands in for aiosendspin's ConnectionSecurity: what the snapshot reads is `.psk_category.value`."""
+
+    def __init__(self, category):
+        self.psk_category = type("Cat", (), {"value": category})()
+
+
 class FakeClient:
-    def __init__(self, client_id, group=None, connected=True, roles=(), active=None, name=None):
+    def __init__(
+        self, client_id, group=None, connected=True, roles=(), active=None, name=None, security=None, paired=False
+    ):
         self.client_id = client_id
         self.group = group
         self.is_connected = connected
+        # How the transport is secured. `security=None` models a CLEARTEXT client — an ESP32
+        # speaker, Music Assistant, the web GUI — which is the default here because it is the
+        # majority case and the one that must never be asked to pair.
+        self.connection_security = None if security is None else _FakeSecurity(security)
+        self.is_paired = paired
         # The handshake name. Only the snapshot path reads it, which is why it was absent until
         # that path got its first test.
         self.name = name or client_id
@@ -879,3 +893,56 @@ def test_a_failed_trust_does_not_abort_the_route():
         await unit.reclaim_remote_player("airplay-1", "p", "ws://10.0.0.9:8928/sendspin", timeout_s=0.2)
 
     run_scenario(scenario)
+
+
+# -- the snapshot must say whether pairing is even a question ---------------------------------------
+
+
+def _row(**kw):
+    unit = make_unit("airplay-1")
+    unit.server.add(FakeClient("p", group=unit.sources["airplay-1"].group, roles=["player@v1"], **kw))
+    return unit.snapshot().players[0]
+
+
+def test_a_cleartext_client_reports_no_security_at_all():
+    """The load-bearing case. Every ESP32 speaker, Music Assistant and our own web GUI connect over
+    the legacy cleartext path, which never resolves a PSK — so `security` is None, and that is how
+    the GUI knows never to offer them a Pair button. Getting this wrong would put a Pair button on
+    devices that cannot pair, which is worse than not shipping pairing at all."""
+    row = _row(security=None)
+    assert row.security is None
+    assert row.paired is False
+    assert row.active_roles == ["player@v1"], "cleartext clients are activated without pairing"
+
+
+def test_an_encrypted_unpaired_client_is_distinguishable_from_a_cleartext_one():
+    """Both are `paired=False`; only `security` separates them. This is the pair the Pair button
+    keys on: sentinel + no active roles means pairing is required and possible."""
+    row = _row(security="sentinel", active=[])
+    assert row.security == "sentinel"
+    assert row.paired is False
+    assert row.active_roles == []
+
+
+def test_a_paired_client_says_so():
+    row = _row(security="long_term", paired=True)
+    assert (row.security, row.paired) == ("long_term", True)
+
+
+def test_security_and_paired_survive_the_wire_round_trip():
+    """They cross the mesh REST API, so a peer's GUI must see them too."""
+    from mesh.model import PlayerState
+
+    back = PlayerState.from_dict(_row(security="sentinel", active=[]).to_dict())
+    assert (back.security, back.paired, back.active_roles) == ("sentinel", False, [])
+
+
+def test_a_peer_on_an_older_image_reads_as_unknown_not_as_cleartext():
+    """`security` absent from the wire is indistinguishable from cleartext at the type level, so the
+    GUI must gate on active_roles being present too — this pins the wire shape it relies on."""
+    from mesh.model import PlayerState
+
+    legacy = {"player_id": "p", "name": "p", "connected": True, "group_id": None}
+    row = PlayerState.from_dict(legacy)
+    assert row.security is None and row.paired is False
+    assert row.active_roles is None, "None here is what marks the whole row unknown"
