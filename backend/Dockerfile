@@ -84,7 +84,18 @@ WORKDIR /app
 
 # Dependencies before code (layer caching)
 COPY backend/requirements.txt ./requirements.txt
-RUN pip install -r requirements.txt
+# --only-binary=:all: because this image has no compiler — the apt list above installs no
+# build-essential, gcc, rustc or -dev headers, deliberately. aiosendspin 9.x pulled in
+# `cryptography`, which builds from an sdist against Rust + OpenSSL headers if pip cannot find a
+# wheel for the platform. Without this flag that fallback is silent right up until it fails deep in
+# a compiler log; with it, a missing aarch64 wheel says so immediately and legibly.
+RUN pip install --only-binary=:all: -r requirements.txt
+
+# Same reasoning as the apt assertions above, one layer down. 9.x made encryption load-bearing:
+# `noise/` is what every client handshake goes through, and `cpace` (a single-release package) backs
+# PIN pairing. A missing or broken one of these does not fail the build — it fails at the first
+# client connection, on the rig, as a handshake that never completes.
+RUN python3 -c "import aiosendspin.noise, cryptography, cpace, noiseprotocol; print('noise stack OK')"
 
 # Application code (scripts/, config/, nginx/, supervisord/, entrypoint.sh)
 COPY backend/ /app/
