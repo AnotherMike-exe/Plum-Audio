@@ -134,7 +134,7 @@ Compose is reached two ways and that is deliberate: `.100.20` runs Docker CE fro
 `docker-compose` 2.26. Same compose file; `deploy.sh` detects the invocation. Trixie has no
 `docker-compose-v2` package — the name is `docker-compose` and it *is* v2.
 
-### The two conflicts that fail deceptively
+### The three failures that look like success
 
 1. **The host's nginx.** It served the pre-container GUI from `/var/www/plum-audio` with the same
    proxy config the image now ships. Under host networking the container's nginx crash-loops on
@@ -145,10 +145,25 @@ Compose is reached two ways and that is deliberate: `.100.20` runs Docker CE fro
    SIGTERM and hangs in shutdown: `pkill` reports success, the process survives, and it still holds
    RAOP 5050. Endpoint ports are configurable so the port sweep cannot enumerate them — the deploy
    escalates every dev-stack pattern to `SIGKILL` unconditionally, then treats a survivor as fatal.
+3. **A player that is negotiated but not ACTIVATED.** Since aiosendspin 9.x a client can complete
+   the handshake, negotiate `player@v1`, join the group and sit at the right volume while the server
+   has activated **no roles** for it. Everything you would check is green: supervisord reports all
+   four programs RUNNING, 8927 and 8928 are listening, all three APIs answer, the GUI shows the
+   speaker attached to the right stream — and the room is silent, with nothing in either log.
+
+   Two causes, both silent: the client did not set `unpaired_access_enabled`, or this server never
+   called `trust_unpaired()` for that peer id. Trust is **per-server and per-peer**, so a unit
+   trusting its own player says nothing about a peer's. Cleartext clients (ESP32 speakers, Music
+   Assistant, the web GUI) skip this gate entirely and are never affected.
+
+   The signature is `negotiated_role_ids` diverging from `active_role_ids`, published as
+   `players[].active_roles` in `/api/mesh/view`. `deploy.sh` now fails a deploy that cannot see a
+   `player@` entry there, so this should never reach you silently again — but if you are debugging by
+   hand, that field is the first thing to read, not the logs.
 
 Readiness is checked on **supervisord's own view**, not on a port: under host networking a port can
 be answered by something that is not this container, which is exactly how a stale host nginx passed
-a GUI check.
+a GUI check. Since 9.x that is necessary but no longer sufficient — see failure 3.
 
 ## Debugging cookbook
 
@@ -162,6 +177,25 @@ docker exec plum-audio tail -f /config/logs/nginx.log
 docker exec plum-audio aplay -l
 docker exec plum-audio python3 /app/scripts/audio_devices.py   # id / hw_id / availability / active
 ```
+
+**Identity and trust** — the first three things to run when a speaker is attached and silent:
+
+```bash
+# 1. Does this unit have an identity at all? Expect server.key, player.key and two pairing JSONs,
+#    all 0600 and root-owned. A missing player.key on a unit that HAS a speaker is the fault.
+docker exec plum-audio ls -la /config/identity
+
+# 2. ACTIVATED vs negotiated. `active_roles: []` on a connected player is the silent-failure
+#    signature; `["player@v1"]` means the trust chain is intact and the fault is elsewhere.
+curl -s localhost:5001/api/mesh/view |
+  python3 -c 'import json,sys; [print(p["player_id"][:16], p["connected"], p.get("active_roles")) for u in json.load(sys.stdin)["units"] for p in u["players"]]'
+
+# 3. What the server decided at startup, and about whom.
+docker exec plum-audio grep -E 'identity|trusted|unpaired' /config/logs/sendspin_server.log
+```
+
+A peer's player is trusted lazily, at the moment we decide to take it (`reclaim_remote_player`), so
+"no trust line for unit B's player" is normal until the first cross-route to it.
 
 `/config/supervisord.log` is supervisord's own log and the first place to look when a program will
 not stay up. Per-endpoint daemon logs live under `/data`, one directory per endpoint id:
@@ -200,6 +234,26 @@ A device-to-device switch is unaffected and still applies live.
 **Deploy the image to EVERY unit before making any unit playerless.** A peer running an older image
 sends no `has_player` in its snapshot, which defaults to True — it would read the playerless leader as
 idle and unroute its own followers, which is precisely the bug this feature fixes.
+
+**A mesh migrates across an aiosendspin major as a WHOLE, or it splits into two meshes.** A 9.x
+client sends `client/init` and a 6.0.5 server rejects it as an unexpected first frame; a 6.0.5 client
+sends `client/hello`, which a 9.x server accepts only in transition mode. Broken in both directions,
+so there is no rolling upgrade. `deploy.sh` is strictly serial — one unit fully up and verified
+before the next is contacted — so a `deploy.sh all` across this boundary leaves the rig mixed for
+several minutes. Expect, and do not report as regressions: peers reading each other's speakers as
+foreign (the 6.0.5 side publishes no `server_id`), failed roams, and `follow` unrouting. It is
+self-healing once every unit is on the same major. To migrate a subset deliberately, give the units
+you are NOT moving a different `PLUM_BEACON_PORT` so they form their own mesh rather than a broken
+shared one.
+
+**A rebuild is not a re-pairing.** `/config/identity/` holds this unit's X25519 keypairs and its
+pairing/trust store — treat it as a device certificate. Lose `server.key` and the unit is a stranger
+to every peer; lose `player.key` and its speaker is untrusted by every server, including its own.
+Both `/config` and `/data` are bind mounts under `/opt/plum-audio/`, so `docker compose down`,
+`down -v`, `rm -f` and every redeploy preserve them. The three ways to actually lose one: re-imaging
+the Pi, a manual `rm`, or running the image **without** the compose bind mounts, where the
+Dockerfile's `VOLUME` declaration makes `/config` an anonymous volume that `docker volume prune`
+will collect.
 
 **The source daemons are NOT supervisord programs.** shairport-sync, go-librespot, bluealsa, obexd
 and their private `dbus-daemon`s are spawned and reconciled by the source managers
