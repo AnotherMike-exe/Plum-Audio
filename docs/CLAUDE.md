@@ -141,7 +141,9 @@ The *reasoning* behind these, and the failures that produced them, is in
   and no trust — that is what `PLUM_ALLOW_UNENCRYPTED=1` buys, and why it is permanent rather than
   transitional. But there is **no client-side legacy mode**: `SendspinClient` always speaks Noise,
   so a foreign server dialing OUR player (Music Assistant claiming a speaker) must speak Noise too.
-  `allow_unencrypted` does not help that direction.
+  `allow_unencrypted` does not help that direction. **Measured 2026-08-13: MA is pre-7.0 and hangs
+  up on our `client/init`, so MA can no longer claim a Plum speaker.** Route MA to a Plum AirPlay
+  endpoint instead; the Sendspin path needs MA to ship a 7.0+ aiosendspin.
 - **A Sendspin id is a public key, and a unit now has THREE ids.** `unit_id` keys the mesh;
   `server_id`/`player_id` are X25519 peer ids from `/config/identity` and are what the protocol
   uses; the player also keeps a **listener id** (`PLUM_PLAYER_ID`) for mDNS and for a server to dial.

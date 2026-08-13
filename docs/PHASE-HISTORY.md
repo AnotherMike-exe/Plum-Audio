@@ -66,10 +66,28 @@ this is what the rig actually proved.
 
 **Cleartext interop is confirmed on real firmware.** This was the gating unknown — the whole bump
 rests on `allow_unencrypted=True` being sufficient for devices that will never speak Noise. Two
-ESP32 boards adopted, joined a group and released cleanly. **Still unproven: Music Assistant
-*claiming* our speaker**, which is the one direction `allow_unencrypted` does NOT cover — our player
-is an aiosendspin client and always speaks Noise, so MA must too. That check SKIPs unless MA is
-actively playing.
+ESP32 boards adopted, joined a group and released cleanly.
+
+**MA can no longer claim our speakers — measured 2026-08-13, and it is a real functional loss.**
+This is the one direction `allow_unencrypted` does not cover, and it is now settled rather than
+suspected. Probed from the workstation with a real aiosendspin 9.1.0 client against MA's server at
+`192.168.7.226:8927` — the identical handshake our player performs:
+
+| Probe | Result |
+|---|---|
+| 9.1.0 client → MA (sends `client/init`) | `HandshakeAbortedError: expected server/init (TEXT), got CLOSE` |
+| 6.0.5-style cleartext `client/hello` → MA | **accepted**, `server/hello` core version 1, `server_id=1d95425e…`, `connection_reason=discovery` |
+
+So **MA is a pre-7.0 cleartext-only Sendspin server**. Our player is an aiosendspin client with no
+legacy mode, so it opens with `client/init` and MA hangs up. `allow_unencrypted` is a SERVER-side
+concession and cannot help here.
+
+What still works: MA as a **client of our server** — the legacy path — so MA continues to discover
+us, poll the mesh API and drive us as a controller. What is lost is MA treating a Plum speaker as one
+of *its own* sync endpoints. The fallback is to send MA → a Plum **AirPlay** endpoint, which keeps
+audio flowing and keeps multi-room *within* Plum, at the cost of the speaker no longer being a member
+of MA's sync group. Restoring the Sendspin path needs MA to ship a 7.0+ aiosendspin; nothing on our
+side can bridge it short of hand-rolling a cleartext client.
 
 **Four bugs the rig found that reading did not**, all the same shape — an id comparison that worked
 only because two namespaces used to hold the same string:
