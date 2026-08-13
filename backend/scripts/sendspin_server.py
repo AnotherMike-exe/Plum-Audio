@@ -55,8 +55,9 @@ import sendspin_identity
 import unit_identity
 from aiosendspin.models.types import GoodbyeReason, MediaCommand, has_role_family
 from aiosendspin.noise import decode_token
+from aiosendspin.noise.keys import psk_id_for
 from aiosendspin.noise.pairing import PairingAttempt
-from aiosendspin.noise.trust_store import PairMethod
+from aiosendspin.noise.trust_store import PairMethod, StagedPairingPsk
 from aiosendspin.server.audio import AudioFormat
 from aiosendspin.server.group import SendspinGroup
 from aiosendspin.server.push_stream import PushStream, StreamStoppedError
@@ -486,6 +487,9 @@ class PlumSendspinServer:
         # mDNS OFF: SendspinServer always constructs AsyncZeroconf; keep it from advertising
         # (5353 collides with our Avahi). We connect players by explicit URL via the orchestrator.
         await self.server.start_server(port=self.port, advertise_addresses=[], discover_clients=False)
+        # Before the player process comes up (supervisord priority 20 against our 10), so its very
+        # first handshake is already a pairing one and no re-handshake is ever needed here either.
+        await self.stage_shared_psk(sendspin_identity.peer_id_of(sendspin_identity.PLAYER_ROLE))
         await self._trust_own_player()
         # Join controller-only clients (the GUI's metadata/artwork/controller WS) to a source group
         # so they receive its now-playing state — the server otherwise leaves them in a solo group.
@@ -700,6 +704,56 @@ class PlumSendspinServer:
                 await self.server.untrust_unpaired(client.client_id)
         logger.info("unpaired access off — revoked every sentinel-PSK approval")
 
+    async def stage_shared_psk(self, client_id: str) -> bool:
+        """Pre-authorise `client_id` to pair with us IN ITS NEXT HANDSHAKE, over the PSK we share.
+
+        This is the library's own fleet-provisioning primitive — `StagedPairingPsk`, "an
+        operator-staged Pairing PSK awaiting a client" — and it is strictly better than pairing a
+        client after it connects, because of where the work lands. `_psk_provider` consults the
+        staged PSK while choosing the handshake PSK, so the connection comes up already in
+        `PskCategory.PAIRING` and `client/pair-finalize` follows immediately. Nothing is
+        renegotiated.
+
+        `initiate_pairing` on an already-connected client cannot do that. Its PSK is the sentinel,
+        so `_rehandshake_for_pairing_if_needed` tears the Noise session down and rebuilds it
+        mid-connection, redoing the hellos. That works in a quiet lab and loses the race on a real
+        mesh: a peer's player is contended — its own server is dialling it too, and it may hold only
+        ONE websocket — so the re-handshake finds the socket gone. Measured on .7.122 taking .7.204's
+        player, both by roam and by adopt:
+
+            could not pair player G2UChhEv…: expected Noise message 2 (TEXT), got CLOSE
+            [airplay-1] reclaim of remote player G2UChhEv… timed out          (then, forever)
+
+        Staged only for clients we ALREADY share a secret with — our own player, and a peer's player
+        whose id came out of a mesh snapshot. Never for a speaker off the neighbourhood: staging is
+        what turns the next handshake into a pairing one, and a pairing handshake against a cleartext
+        client is aborted outright by the library ("pairing requires an encrypted connection"), which
+        would take every ESP32 offline. Their ids are unknown here, so they resolve to the sentinel
+        and are untouched — but the rule is the reason, not the accident.
+
+        Never raises, and idempotent: an existing record or an existing staging is success.
+        """
+        assert self.server is not None
+        if not client_id:
+            return False
+        store = self.server.pairing_store
+        try:
+            # Inside the try: this reads (and on first use mints) a file under /config, and staging
+            # sits on the routing path — a store we cannot read must cost us a pairing, not a route.
+            psk = sendspin_identity.local_pairing_psk()
+            if psk is None:
+                return False
+            if await store.record_by_client_id(client_id) is not None:
+                return True  # already paired for real; staging would be noise
+            if await store.staged_pairing_psk(client_id) is not None:
+                return True
+            await store.stage_pairing_psk(client_id, StagedPairingPsk(psk_id_for(psk), psk))
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            logger.warning("could not stage the shared PSK for %s: %s", client_id, exc)
+            return False
+        logger.info("staged the shared PSK for %s — it pairs on its next handshake", client_id)
+        return True
+
     async def pair_via_shared_psk(self, client_id: str) -> bool:
         """Pair with a connected player over a Pairing PSK we already share. Idempotent, no operator.
 
@@ -878,14 +932,6 @@ class PlumSendspinServer:
         **Our own player** — matched on the peer id read off our own `/config/identity`, never on a
         name or URL, so it cannot fire for a peer's player roaming here.
 
-        **Any player, when a FLEET PSK is configured** — every unit accepts the same Pairing PSK, so
-        a peer's speaker arriving here pairs with no operator step. This is what makes a multi-unit
-        mesh usable: without it, four units would need twelve manual pairings, repeated whenever one
-        is re-imaged. Skipped entirely when no fleet PSK is set, which is the stricter posture — then
-        a peer's player is simply unpaired and the GUI offers a Pair button for it.
-
-        Only for clients that actually render. A controller (the GUI's own WS) has nothing to pair.
-
         **And only ENCRYPTED ones.** Pairing mixes a PSK into a Noise handshake, so there is nothing
         to pair over a legacy cleartext connection and `initiate_pairing` refuses it outright. Every
         ESP32 speaker on the segment is cleartext, so without this gate each one that connects earns
@@ -894,20 +940,22 @@ class PlumSendspinServer:
         then expired reporting "never connected" about a device whose MAC we had just logged. The
         following adopt of the same speaker succeeded, because by then it was already connected. That
         off-by-one is the signature. Measured on .7.122 against three boards, 2026-08-13.
+
+        **A PEER's player is deliberately NOT handled here.** It used to be, on the same fleet PSK,
+        and it was the wrong place: pairing a client that is already connected on the sentinel PSK
+        forces a mid-connection re-handshake, and a peer's player is contended, so the re-handshake
+        loses the race and takes the connection down with it. Peers are staged instead — see
+        `stage_shared_psk`, called before the dial in `reclaim_remote_player` — so they pair inside
+        the handshake and never renegotiate.
         """
         own = sendspin_identity.peer_id_of(sendspin_identity.PLAYER_ROLE)
+        if not own or client_id != own:
+            return
         client = self.server.get_client(client_id) if self.server else None
         if client is not None and _security_of(client) is None:
             return  # cleartext: activated straight from its negotiated roles, nothing to pair
-        if own and client_id == own:
-            await self.pair_via_shared_psk(client_id)
-            return
-        if sendspin_identity.fleet_psk() is None:
-            return
-        if client is None or getattr(client, "is_paired", False):
-            return
-        if not has_role_family("player", getattr(client, "negotiated_role_ids", [])):
-            return
+        # Normally a no-op: start() stages this same PSK before the player process comes up, so it
+        # arrives already paired. Kept for a unit whose store predates staging.
         await self.pair_via_shared_psk(client_id)
 
     async def _maybe_group_controller(self, client_id: str) -> None:
@@ -1072,6 +1120,12 @@ class PlumSendspinServer:
         if handle is None:
             raise KeyError(f"unknown source {source_id!r}")
         self.server.register_client_url(player_id, player_url)
+        # A peer's player is a client we already share a secret with (the fleet PSK), it just has no
+        # record here yet. Stage it BEFORE the dial so the reclaim's own handshake pairs it — doing
+        # it after it lands would need a re-handshake, which loses the race against the server it is
+        # roaming away from. `player_id` came from a peer snapshot, so this only ever names a Plum
+        # player; see stage_shared_psk for why that restriction is load-bearing.
+        await self.stage_shared_psk(player_id)
         # A PEER's player is an encrypted-but-unpaired client of ours, and trust is per-server:
         # trusting our own player at startup says nothing about anyone else's. Without this the
         # roam completes — the player detaches from its old server, reconnects here, joins the
