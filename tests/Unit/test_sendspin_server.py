@@ -93,11 +93,11 @@ class FakeClient:
         self.client_id = client_id
         self.group = group
         self.is_connected = connected
-        self.negotiated_roles = list(roles)
+        self.negotiated_role_ids = list(roles)
         self._cleanup_handle = None  # armed by the library on every connection teardown
 
     def roles_by_family(self, family):
-        return [r for r in self.negotiated_roles if str(r).startswith(family)]
+        return [r for r in self.negotiated_role_ids if str(r).startswith(family)]
 
     def arm_cleanup(self):
         self._cleanup_handle = FakeCleanupHandle()

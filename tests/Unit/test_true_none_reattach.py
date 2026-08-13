@@ -30,6 +30,7 @@ from mesh.follow import FollowReconciler  # noqa: E402
 from mesh.model import MeshView, SourceState, UnitSnapshot  # noqa: E402
 
 UNIT_ID = "unit-7204"
+SERVER_ID = "peer-unit-7204"  # the Sendspin id; a pubkey in production, never equal to UNIT_ID
 PLAYER_ID = "player-7204"
 SOURCE_ID = "airplay-1"
 
@@ -63,7 +64,7 @@ class FakeClient:
         self.client_id = client_id
         self.group = group
         self.is_connected = True
-        self.negotiated_roles = list(roles)
+        self.negotiated_role_ids = list(roles)
 
 
 # -- mesh.follow side: same shape as test_follow_reconciler.py's fakes ----------------------------
@@ -124,9 +125,12 @@ def _source_state(handle):
 def _snapshot(handle):
     # Post-detach, aiosendspin hands the player a fresh solo group_id -- never the source's. See
     # sendspin_server.py's _go_idle docstring for why that's the real library behavior, not a guess.
-    local_player = {"attached": True, "group_id": "solo-after-detach", "server_id": UNIT_ID}
+    # server_id is the SENDSPIN id (an X25519 pubkey under 9.x), deliberately not UNIT_ID here — the
+    # two were the same string until the 9.x bump and follow silently stopped working when they
+    # diverged, so a fixture that conflates them cannot catch that regression again.
+    local_player = {"attached": True, "group_id": "solo-after-detach", "server_id": SERVER_ID}
     return UnitSnapshot(unit_id=UNIT_ID, name=UNIT_ID, host="10.0.0.1",
-                        sources=[_source_state(handle)], local_player=local_player)
+                        sources=[_source_state(handle)], local_player=local_player, server_id=SERVER_ID)
 
 
 def test_a_player_detached_by_go_idle_reads_as_idle_to_follow():
