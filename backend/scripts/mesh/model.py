@@ -31,6 +31,17 @@ class PlayerState:
     # the player is the source of truth for its own gain, and it persists it across restarts.
     volume: int = 100
     muted: bool = False
+    # The roles the server has ACTIVATED for this client, which is not the same as the roles it
+    # negotiated. Under aiosendspin 9.x an encrypted-but-unpaired client negotiates its full role
+    # set and is activated for none of it, so it appears here, in the group, at the right volume —
+    # and renders nothing, with no error at either end. `negotiated` vs `active` is the only signal
+    # that separates a working endpoint from a silent one, so it is published rather than left
+    # inside the audio process. Empty on a client that is connected but not cleared to play.
+    #
+    # DEFAULTS to None (not []), so "a peer on an older image that never sends this" is
+    # distinguishable from "a peer saying this client is activated for nothing" — the same reason
+    # has_player defaults True.
+    active_roles: list[str] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -41,6 +52,7 @@ class PlayerState:
             "url": self.url,
             "volume": self.volume,
             "muted": self.muted,
+            "active_roles": self.active_roles,
         }
 
     @classmethod
@@ -53,6 +65,7 @@ class PlayerState:
             url=d.get("url"),
             volume=int(d.get("volume", 100)),
             muted=bool(d.get("muted", False)),
+            active_roles=d.get("active_roles"),
         )
 
 

@@ -639,7 +639,18 @@ class SendspinPlayer:
         info = self.client.server_info
         attached = self.client.connected and info is not None
         state = {
-            "player_id": self.player_id,
+            # The PEER id, not the listener id. This self-report is joined against
+            # `UnitSnapshot.players[]`, which the server keys on `client.client_id` — the id a
+            # client presents at the handshake, and under 9.x that is the X25519 public key.
+            # Reporting the listener id here instead splits one speaker across two namespaces:
+            # the GUI synthesises a SECOND row for it (sendspinDataService's `clients.find`
+            # misses), and `router._idle_player_url` hands the listener id to a reclaim that
+            # resolves clients by peer id — so an idle speaker dials fine and then times out at
+            # 10 s, every time. They were the same string before the 9.x bump.
+            "player_id": self.client.identity.peer_id,
+            # Kept alongside for display and debugging: this is what we advertise over mDNS and
+            # what a server dials. See the note on `player_id` in __init__.
+            "listener_id": self.player_id,
             "name": self.player_name,
             "url": f"ws://{self._host_hint()}:{self.port}/sendspin",
             "attached": bool(attached),
