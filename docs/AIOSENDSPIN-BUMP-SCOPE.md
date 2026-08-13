@@ -57,10 +57,19 @@ def __init__(self, loop, identity: Identity, server_name, client_session=None, *
   `server_id=self.unit_id`. Under 9.1.0 every unit's own player reads as attached to a *foreign*
   server — follow stops working, and `sendspinDataService.ts:226` flags local peers as
   `claimedByOutsider`.
-- **The `ctrl:<source_id>:<nonce>` convention dies.** The GUI names its target source through the
-  client id (`sendspin_server._requested_source`, `sendspinControllerClient.ts:333`). A client id is
-  now a 43-char key digest carrying no hint. This is the code touched by Open #20 (2026-08-12) and
-  needs a different channel entirely — this is the single largest design hole in the port.
+- ~~**The `ctrl:<source_id>:<nonce>` convention dies.**~~ **LARGELY RETRACTED 2026-08-12 — it
+  probably survives.** The claim was that a client id is now a 43-char key digest carrying no hint,
+  so the GUI could no longer name its target source through it
+  (`sendspin_server._requested_source`, `sendspinControllerClient.ts:333`). That is true only of
+  clients that handshake with Noise. **Our GUI controller is a hand-rolled cleartext WebSocket
+  client**, so it takes the legacy `client/hello` path — and on that path the server keeps the id the
+  client claims: `self._client_id = client_id` (`server/connection.py:1016`, gated by
+  `_admit_legacy_client_id`). So the hint keeps working for exactly the client that uses it.
+  **Caveats, both untested:** it dies the day `allow_unencrypted` goes off or the controller moves to
+  Noise, so the hint is now coupled to transition mode; and `_admit_legacy_client_id` *rejects* a
+  cleartext hello claiming an id that is paired or trusted-unpaired, which `ctrl:` ids never are
+  today but would be if the controller were ever trusted. Whether our hand-rolled hello is accepted
+  by a 9.x server at all is a separate question and needs the real GUI against a real unit.
 - Everything keyed on `player_id` (`register_client_url`, `reclaim_client_for_playback`,
   `attach_player`, GUI routing) migrates to the pubkey. 9.1.0's new
   `SendspinServer.get_client_id_for_url(url)` helps, and is consistent with the existing rule that
