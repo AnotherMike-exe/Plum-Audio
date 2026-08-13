@@ -43,6 +43,57 @@ image compares as different across units.
 
 ## Phase 3 — remaining sources, GUI, container (`feature/phase3-sources-gui`, in progress)
 
+### aiosendspin 6.0.5 → 9.1.0, proven on the `.7` pair — 2026-08-13
+
+**Three majors, ported on `feature/aiosendspin-9x` and validated on hardware.** The scoping (why the
+first recommendation was to hold, and what overturned it) is in `docs/AIOSENDSPIN-BUMP-SCOPE.md`;
+this is what the rig actually proved.
+
+**Deployed:** `192.168.7.122` (Plum RackPi) and `192.168.7.204` (Plum Amp100) on `163fa35`.
+`.201.133` deliberately left on 6.0.5 as a control — used twice below, and worth keeping until the
+`.201` pair is moved. `.201.113` was down throughout, which is why the `.7` pair was cut instead.
+
+**Measured:**
+
+| | |
+|---|---|
+| tier 0 (`t0_sendspin_protocol.py`) | ALL PASS — incl. a raw cleartext `client/hello` admitted with ACTIVE roles, and refused with `allow_unencrypted=False` |
+| `run.sh mesh .7.122 .7.204` | **16/16**, incl. `t3_mesh_roam` 3/3 and `t3_autofollow` 7/7 |
+| `run.sh interop .7.122` | **ALL PASS**, 1 SKIP (MA-claims-our-speaker needs MA playing) |
+| ESP32 adopt/release | 5/5 against two different boards (`20:F8:3B:09:47:2D`, `08:B6:1F:B7:AF:5C`), socket closed cleanly |
+| Music Assistant | discovered as a foreign server; our server AND player both advertise correctly |
+| unit tests | 467 backend, 133 frontend |
+
+**Cleartext interop is confirmed on real firmware.** This was the gating unknown — the whole bump
+rests on `allow_unencrypted=True` being sufficient for devices that will never speak Noise. Two
+ESP32 boards adopted, joined a group and released cleanly. **Still unproven: Music Assistant
+*claiming* our speaker**, which is the one direction `allow_unencrypted` does NOT cover — our player
+is an aiosendspin client and always speaks Noise, so MA must too. That check SKIPs unless MA is
+actively playing.
+
+**Four bugs the rig found that reading did not**, all the same shape — an id comparison that worked
+only because two namespaces used to hold the same string:
+
+1. the player's self-report published its LISTENER id while the server keys players by PEER id, so
+   the GUI grew a duplicate row per speaker and routing an idle speaker timed out at 10 s;
+2. a peer's player was never trusted, so a cross-unit roam would have completed and rendered
+   silence — trust is per-server AND per-peer;
+3. `Neighbourhood` matched its own mDNS record by id, so a unit stopped recognising its own speaker
+   and offered to route it to itself. Found by `t4_interop_ma` reporting "our player is not
+   advertising" about a player that plainly was;
+4. `deploy.sh`'s new activation check read the sudo password as its own program (`s()` pipes it to
+   stdin) and failed a healthy unit on its first run.
+
+**Two pre-existing harness bugs**, confirmed against the 6.0.5 control before touching anything:
+the integration tests fed FIFOs on the HOST while the feeder's FIFOs are inside the container — so
+every feed-driven assertion, including all of `t3_autofollow`, had been silently failing since
+containerisation — and the `streaming` assertion read once where it now must poll, because under
+true-none a player detaches while idle and re-attaches on the feed, so `streaming` legitimately lags
+`active`.
+
+**Not yet done:** the `.201` pair, and `@sendspin/sendspin-js` stays on 3.2.1 deliberately (5.0.0
+makes encryption mandatory and removes the caller-chosen `playerId` the browser reconciler joins on).
+
 ### True none: idle players stop silently auto-resuming — 2026-08-12
 
 **`docs/ROUTING-MODEL.md` rule 1 ("None is a true none"), decided 2026-08-10 after the connection-
