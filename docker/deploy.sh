@@ -477,10 +477,15 @@ EOS
     #    /opt/plum-audio stay owned by the account that administers it.
     say "$host — config"
     put_ "$host" "${HERE}/docker-compose.yml" "/tmp/plum-audio-compose.yml" || return 1
-    ssh_ "$host" "bash -s -- '$PW' '$REMOTE_ROOT' '$unit_id' '$unit_name' '$player_id' '$player_name' '$dac' '$profile' '$player_enabled' '$PLUM_IMAGE_NAME' '$PLUM_IMAGE_TAG'" <<'EOS' || return 1
+    ssh_ "$host" "bash -s -- '$PW' '$REMOTE_ROOT' '$unit_id' '$unit_name' '$player_id' '$player_name' '$dac' '$profile' '$player_enabled' '$PLUM_IMAGE_NAME' '$PLUM_IMAGE_TAG' '${PLUM_FLEET_PSK:-}'" <<'EOS' || return 1
 set -euo pipefail
 PW="$1"; ROOT="$2"; UNIT_ID="$3"; UNIT_NAME="$4"; PLAYER_ID="$5"; PLAYER_NAME="$6"; DAC="$7"
 PROFILE="$8"; PLAYER_ENABLED="$9"; IMAGE_NAME="${10}"; IMAGE_TAG="${11}"
+# Passed as an ARG, not referenced in the heredoc below. The heredoc is expanded on the REMOTE host,
+# where a local-only variable is unbound — and under `set -u` that aborts AFTER `cat >` has already
+# truncated the file, leaving a unit with an EMPTY plum-audio.env. It then boots on entrypoint
+# defaults with no DAC device and no unit id, which reads as a broken image rather than a bad deploy.
+FLEET_PSK="${12:-}"
 s() { echo "$PW" | sudo -S -p '' "$@"; }
 mv /tmp/plum-audio-compose.yml "$ROOT/docker-compose.yml"
 TZ_HOST="$(timedatectl show -p Timezone --value 2>/dev/null || echo UTC)"
@@ -520,7 +525,7 @@ PLUM_UNPAIRED_ACCESS=0
 
 # The fleet's shared Pairing PSK — identical on every unit, which is what lets a unit's server pair
 # with any unit's speaker with no operator step. Generated once into docker/.deploy.env.
-PLUM_FLEET_PSK=${PLUM_FLEET_PSK}
+PLUM_FLEET_PSK=${FLEET_PSK}
 
 # Optional 8-digit static pairing PIN, offered as a pairing method for this unit's speaker. Must be
 # EXACTLY 8 digits or it is refused with a log line. The spec gesture-gates every static-PIN attempt,

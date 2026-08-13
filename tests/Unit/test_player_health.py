@@ -202,3 +202,25 @@ def test_the_listener_id_is_still_reported_separately():
     """It is what we advertise over mDNS and what a server dials, so it stays visible for display
     and debugging — just not as the join key."""
     assert FakeReportingPlayer().snapshot()["listener_id"] == "player-133"
+
+
+def test_the_pairing_secret_locations_are_from_the_librarys_closed_vocabulary():
+    """A canary for a whole class of crash that no other test could reach.
+
+    `PairingSupport.secret_locations` looks like prose and is not: it is validated in
+    `__post_init__` against `aiosendspin.client.models.SECRET_LOCATIONS`, a frozenset of exactly
+    {device, leaflet, operator}. A descriptive string there raises ValueError *at construction*, in
+    `SendspinPlayer.__init__`, before the renderer opens a card and before anything is logged beyond
+    a traceback — so the unit deploys clean, `sendspin_server` runs, and `sendspin_player` sits in
+    supervisord's STARTING forever with no player in the mesh view.
+
+    That is exactly what shipped to .7.122 on 2026-08-13, and it reached hardware because the local
+    protocol probes construct `SendspinClient` directly and nothing in tests/Unit ever constructs a
+    real `SendspinPlayer`. This asserts the constant against the library's own vocabulary, so a
+    future edit to either side fails here instead of on the rig.
+    """
+    from aiosendspin.client.models import SECRET_LOCATIONS, PairingSupport
+
+    assert set(sendspin_player.PAIR_SECRET_LOCATIONS) <= SECRET_LOCATIONS
+    # And prove the value is actually accepted, not merely a subset of a set we mis-read.
+    PairingSupport(secret_locations=sendspin_player.PAIR_SECRET_LOCATIONS)
