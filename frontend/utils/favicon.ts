@@ -1,18 +1,22 @@
 /**
  * Favicon Utility
- * Generates dynamic favicons using the Snapcast icon with custom accent colors
+ * Generates dynamic favicons using the Sendspin icon with custom accent colors
  */
 
 import { getTextColorForBackground } from './colorContrast';
 
-const SNAPCAST_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1000" viewBox="0 0 937.5 937.5">
-  <g transform="translate(0 -114.862)">
-    <circle cx="-739.798" cy="114.143" r="431.25" style="fill:ACCENT_COLOR;fill-opacity:1;stroke-width:10.48156548" transform="rotate(-120)"/>
-    <path fill="none" d="M-427.771-63.976a360.3 360.3 0 0 1 0 360.297M-472.58-20.016a299.98 299.98 0 0 1 0 272.378m-47.884-233.873a240.17 240.17 0 0 1 0 195.368" style="fill:#000;fill-opacity:0;fill-rule:evenodd;stroke:STROKE_COLOR;stroke-width:34.99999619;stroke-linecap:round;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-opacity:1" transform="rotate(-120)"/>
-    <path d="m580.047 420.343-114.36 98.912H357.453v127.287h106.594l116 100.34z" style="fill:STROKE_COLOR;fill-opacity:1;fill-rule:evenodd;stroke:STROKE_COLOR;stroke-width:33.33299637;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:4;stroke-dasharray:none;stroke-opacity:1"/>
-    <path fill="none" d="M780.777 405.493a360.3 360.3 0 0 1 0 360.297m-44.741-316.337a299.98 299.98 0 0 1 0 272.378m-47.884-233.873a240.17 240.17 0 0 1 0 195.368" style="fill:#000;fill-opacity:0;fill-rule:evenodd;stroke:STROKE_COLOR;stroke-width:34.99999619;stroke-linecap:round;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-opacity:1"/>
-    <path fill="none" d="M583.007-875.875a360.3 360.3 0 0 1 0 360.297m-44.741-316.337a299.98 299.98 0 0 1 0 272.378M490.383-793.41a240.17 240.17 0 0 1 0 195.368" style="fill:#000;fill-opacity:0;fill-rule:evenodd;stroke:STROKE_COLOR;stroke-width:34.99999619;stroke-linecap:round;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-opacity:1" transform="rotate(120)"/>
-  </g>
+// Based on the official Sendspin logo (_resources/Assets/sendspin-favicon.svg).
+// The outer disc + center dot carry the accent/theme color; the rings and inner
+// disc carry the contrast-toggled color (same role STROKE_COLOR played on the
+// old Snapcast-derived icon).
+const SENDSPIN_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1000" viewBox="0 0 64 64">
+  <circle cx="32" cy="32" r="32" fill="ACCENT_COLOR"/>
+  <circle cx="32" cy="32" r="27" fill="none" stroke="STROKE_COLOR" stroke-width="0.6"/>
+  <circle cx="32" cy="32" r="23" fill="none" stroke="STROKE_COLOR" stroke-width="0.6"/>
+  <circle cx="32" cy="32" r="19" fill="none" stroke="STROKE_COLOR" stroke-width="0.6"/>
+  <circle cx="32" cy="32" r="15" fill="none" stroke="STROKE_COLOR" stroke-width="0.6"/>
+  <circle cx="32" cy="32" r="10" fill="STROKE_COLOR"/>
+  <circle cx="32" cy="32" r="1.4" fill="ACCENT_COLOR"/>
 </svg>`;
 
 /**
@@ -28,7 +32,7 @@ const ACCENT_COLORS: Record<string, string> = {
 };
 
 /**
- * Update the browser favicon with the Snapcast icon in the specified accent color
+ * Update the browser favicon with the Sendspin icon in the specified accent color
  */
 export function updateFavicon(accentColor: string, customColor?: string, themeMode?: string): void {
   let color: string;
@@ -54,7 +58,7 @@ export function updateFavicon(accentColor: string, customColor?: string, themeMo
   }
 
   // Replace placeholders with actual colors
-  const svg = SNAPCAST_ICON
+  const svg = SENDSPIN_ICON
     .replace(/ACCENT_COLOR/g, color)
     .replace(/STROKE_COLOR/g, strokeColor);
 
