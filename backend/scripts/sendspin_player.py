@@ -84,6 +84,12 @@ DEFAULT_PORT = 8928
 # Advertised to servers/controllers in client/hello device_info, so a foreign controller (Music
 # Assistant) shows a real identity for this speaker rather than a bare id.
 PLUM_SOFTWARE_VERSION = os.environ.get("PLUM_VERSION", "phase3-dev")
+
+# Where an operator finds our static PIN, from aiosendspin's CLOSED vocabulary
+# (client.models.SECRET_LOCATIONS = device | leaflet | operator), enforced in PairingSupport's
+# __post_init__. A module constant so the canary test can assert the real value rather than a copy.
+PAIR_SECRET_LOCATIONS = ("device", "operator")
+
 DEFAULT_RATE = 44100  # AirPlay-native; the server resamples other sources to this
 DEFAULT_CHANNELS = 2
 DEFAULT_BITS = 16
@@ -440,7 +446,9 @@ class SendspinPlayer:
                 gesture_prompt=self._pair_gesture_prompt,
                 pin_display=self._pair_show_pin,
                 offer_static_pin=True,
-                secret_locations=("this unit's web GUI, under Settings",),
+                # NOT free text — see PAIR_SECRET_LOCATIONS. A descriptive string raises here, at
+                # construction, and the player crash-loops before it ever opens a card.
+                secret_locations=PAIR_SECRET_LOCATIONS,
             ),
             device_info=DeviceInfo(
                 product_name="Plum Audio",

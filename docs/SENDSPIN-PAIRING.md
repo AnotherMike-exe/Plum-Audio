@@ -98,9 +98,17 @@ PairingSupport(
     gesture_prompt = ...,   # enables static PIN
     pin_display    = ...,   # either out-channel enables dynamic PIN
     offer_static_pin = True,
-    secret_locations = ("this unit's web GUI, under Settings",),
+    secret_locations = ("device", "operator"),   # a CLOSED vocabulary — see below
 )
 ```
+
+`secret_locations` reads like prose and is not. It is validated in `__post_init__` against
+`SECRET_LOCATIONS = {device, leaflet, operator}`, so a descriptive string raises **in
+`SendspinPlayer.__init__`** — before the renderer opens a card, before the listener binds. The unit
+deploys clean, `sendspin_server` runs, and `sendspin_player` sits in supervisord's `STARTING` with no
+player in the mesh view. It shipped to `.7.122` that way on 2026-08-13, because the local probes
+build `SendspinClient` directly and nothing constructed a real `SendspinPlayer`. Pinned now by
+`test_the_pairing_secret_locations_are_from_the_librarys_closed_vocabulary`.
 
 Both callbacks route to the GUI over the consume relay as a `t: "pair"` frame — loopback-only, so a
 PIN never leaves the unit, and immediate rather than waiting on the 3 s state poll.
