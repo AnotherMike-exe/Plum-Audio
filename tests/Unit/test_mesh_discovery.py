@@ -105,3 +105,53 @@ def test_a_known_peer_refreshes_rather_than_competing_for_a_slot():
 
     d._on_datagram(beacon(unit_id="u0"), ("192.168.1.9", 8929))
     assert d._peers["u0"].last_seen >= first - 1
+
+
+# -- recognising our OWN player in the mDNS view ----------------------------------------------------
+
+
+class _Svc:
+    """The fields Neighbourhood.is_own_player reads off a DiscoveredService."""
+
+    def __init__(self, name, ws_url):
+        self.name = name
+        self.ws_url = ws_url
+
+
+def _nbhd(**kw):
+    from mesh.neighbourhood import Neighbourhood
+
+    return Neighbourhood("unit-7122", "Plum RackPi", server_port=8927, **kw)
+
+
+def test_our_own_player_is_recognised_by_url_not_id():
+    """The 9.x regression.
+
+    An mDNS record carries the LISTENER id; the id a server knows a speaker by is now its X25519
+    public key. `own_client_ids` holds the latter, so matching on name alone stopped recognising our
+    own speaker — it showed as foreign in the neighbourhood and the GUI offered to route it to
+    itself. The listener URL is the identifier both views share.
+    """
+    n = _nbhd(own_client_ids={"PEERKEY-x25519"}, own_player_url="ws://192.168.7.122:8928/sendspin")
+    mine = _Svc("player-7122", "ws://192.168.7.122:8928/sendspin")
+    assert n.is_own_player(mine) is True
+    assert n.foreign_players() == []
+
+
+def test_a_peers_player_on_the_same_port_is_still_foreign():
+    """Host matters, not just port — every unit's player listens on 8928."""
+    n = _nbhd(own_client_ids=set(), own_player_url="ws://192.168.7.122:8928/sendspin")
+    assert n.is_own_player(_Svc("player-7204", "ws://192.168.7.204:8928/sendspin")) is False
+
+
+def test_the_id_match_still_works_without_a_url():
+    """Fallback for a unit whose advertised URL could not be derived."""
+    n = _nbhd(own_client_ids={"player-7122"}, own_player_url=None)
+    assert n.is_own_player(_Svc("player-7122", "ws://192.168.7.122:8928/sendspin")) is True
+
+
+def test_a_trailing_path_difference_does_not_make_it_foreign():
+    """Compared on (host, port): what a device advertises and what we derived need not match byte
+    for byte."""
+    n = _nbhd(own_client_ids=set(), own_player_url="ws://192.168.7.122:8928")
+    assert n.is_own_player(_Svc("player-7122", "ws://192.168.7.122:8928/sendspin")) is True

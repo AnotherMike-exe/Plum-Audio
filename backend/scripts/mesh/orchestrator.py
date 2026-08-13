@@ -44,6 +44,7 @@ class MeshOrchestrator:
         beacon_port: int = 8929,
         api_port: int = 5001,
         local_player_id: str | None = None,
+        local_player_url: str | None = None,
     ) -> None:
         self.unit_id = server.unit_id
         self.engine = SendspinEngine(server)
@@ -71,6 +72,9 @@ class MeshOrchestrator:
             server.unit_name,
             server_port=server.port,
             own_client_ids={local_player_id} if local_player_id else set(),
+            # The URL is the join between the mDNS view and the handshake view — since 9.x the
+            # id in an mDNS record (the listener id) is not the id a server knows us by.
+            own_player_url=local_player_url,
         )
         self.api = MeshApi(self.engine, self.aggregator, self.router, port=api_port, neighbourhood=self.neighbourhood)
 
