@@ -116,6 +116,25 @@ That is verbatim the failure signature `CLAUDE.md` already documents for the str
 **Anyone who bumps the pin and tests "does it connect?" will conclude it worked.** Write that into
 the test plan before touching the pin.
 
+**MEASURED 2026-08-12** against a real 9.1.0 server and client (`_resources/spike/mesh_smoke.py`
+steps 6-7, run locally — no hardware needed). This was a source read when first written; it is now a
+truth table:
+
+| client `unpaired_access_enabled` | server `trust_unpaired()` | `negotiated_role_ids` | `active_role_ids` |
+|---|---|---|---|
+| no | no | `player@v1` | — |
+| **yes** | no | `player@v1` | — |
+| no | **yes** | `player@v1` | — |
+| **yes** | **yes** | `player@v1` | **`player@v1`** |
+
+Two things this pins down that the code read did not. **The role is always negotiated**, in every
+combination — so a failed endpoint is indistinguishable from a healthy one by connection state,
+client list, or negotiated roles. And **both opt-ins are required**; either alone is a silent dud, so
+this is not a single flag anyone can forget once. The observable signature is `negotiated_role_ids`
+diverging from `active_role_ids`, and `client.activities` is **not** it — that reports what the
+server declares in `server/activate`, and is legitimately empty on a healthy client-dialled
+connection. Anything we build to health-check endpoints must read `active_role_ids` server-side.
+
 Fix per endpoint, including our own: either pair it (long-term PSK), or set
 `unpaired_access_enabled=True` on the client config **and** call `await server.trust_unpaired(client_id)`.
 The second is the pragmatic route since we own both ends — but it requires the persisted `Identity`
