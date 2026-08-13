@@ -49,7 +49,6 @@ from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFo
 from aiosendspin.models.types import (
     ArtworkSource,
     AudioCodec,
-    GoodbyeReason,
     MediaCommand,
     PictureFormat,
     PlayerCommand,
@@ -646,7 +645,11 @@ class SendspinPlayer:
             "attached": bool(attached),
         }
         if attached and info is not None:
-            reason = getattr(info.connection_reason, "value", info.connection_reason)
+            # 9.x trimmed ServerInfo to (server_id, name) — `connection_reason` and `version` are
+            # gone. Its successor is the connection's ACTIVITIES, which is also what the library's
+            # new multi-server arbiter ranks on, so it is the more useful thing to surface anyway.
+            # Nothing consumed the old field; this is telemetry for the mesh view and the GUI.
+            activities = sorted(getattr(a, "value", a) for a in (self.client.activities or []))
             # Only advertise a current track while audio is actually flowing. A foreign server (MA)
             # holds our player as a group member even when idle, and its last metadata title lingers
             # in _state — reporting it while stopped makes the "Idle Devices" chip claim a track is
@@ -655,7 +658,7 @@ class SendspinPlayer:
             state.update(
                 server_id=info.server_id,
                 server_name=info.name,
-                connection_reason=reason,
+                activities=activities,
                 group_id=self._state.get("group_id"),
                 group_name=self._state.get("group_name"),
                 playback_state=("playing" if playing else "stopped"),
@@ -804,40 +807,33 @@ class SendspinPlayer:
         self.renderer.start()
 
         async def on_connection(ws) -> None:
-            # attach_websocket raises if we're already attached to another server — that means a
-            # reclaim handoff: release the old connection (goodbye ANOTHER_SERVER) then attach
-            # the new one. This is the player half of cross-server roaming.
-            try:
-                await self.client.attach_websocket(ws)
-            except RuntimeError:
-                with contextlib.suppress(Exception):
-                    await self.client.send_goodbye(GoodbyeReason.ANOTHER_SERVER)
-                with contextlib.suppress(Exception):
-                    await self.client.disconnect()
-                try:
-                    await self.client.attach_websocket(ws)
-                except Exception:  # noqa: BLE001 - transient during rapid reclaim; server retries
-                    logger.debug("attach race during reclaim", exc_info=True)
-                    return
-            disc = asyncio.Event()
-            self.client.add_disconnect_listener(disc.set)
-            logger.info("attached to a server %s", self.renderer.stats())
-            # Re-send client/state immediately, conformantly.
-            #
-            # attach_websocket's handshake already sent one — through the library's own
-            # send_player_state(), which omits the spec's REQUIRED top-level `state` (UPSTREAM §0).
-            # That is the message the spec singles out ("must be sent immediately after receiving
-            # server/hello"), so overriding only the states WE initiate left the mandatory one
-            # non-conformant. Confirmed on the wire 2026-08-05: our own frames carry the field, the
-            # library's connect-time frame does not.
-            #
-            # A duplicate client/state is harmless — it is a full state report, not a delta — so
-            # following the library's with a correct one is the cheapest way to be conformant
-            # without patching it. Delete when the pin bumps past the fix.
-            self._last_starved_frames = self.renderer.starved_frames  # don't charge pre-attach idle
-            with contextlib.suppress(Exception):
-                await self._send_client_state(PlayerHealth.SYNCHRONIZED)
-            await disc.wait()
+            """Serve one incoming server connection for its whole life.
+
+            **Both workarounds this used to carry are gone**, and it is worth being explicit about
+            why, because between them they were the player half of cross-server roaming:
+
+            1. *The reclaim dance.* 6.0.5's `attach_websocket` raised RuntimeError if we already held
+               a server, so we caught it, sent `goodbye: ANOTHER_SERVER`, disconnected, and re-attached
+               — yielding to the newest dialer unconditionally. That was UPSTREAM §1, and it was wrong
+               against a foreign server running a discovery sweep: it handed over a *playing* speaker.
+               9.x brings the incoming connection up provisionally, completes the handshake, and then
+               arbitrates by activity rank with the persisted last-playback server as the tiebreak —
+               the "accept both, then decide" the spec asks for and we could not express. Displacing
+               a holder emits ANOTHER_SERVER itself.
+            2. *The conformant re-send.* We followed the library's connect-time `client/state` with
+               our own because its was missing the spec's REQUIRED top-level field (UPSTREAM §0). 9.x
+               replaced that field with `available` and sets it itself, so the duplicate is now pure
+               noise on the mandatory message.
+
+            `attach_websocket` blocks until the connection closes, which is what drives this handler,
+            so the old disconnect-listener/Event pair is redundant too.
+            """
+            # Don't charge pre-attach idle padding to this session's health. Deliberately before the
+            # attach: everything up to now is idle by definition, and the attach does not return
+            # until the connection is over.
+            self._last_starved_frames = self.renderer.starved_frames
+            logger.info("server dialed us %s", self.renderer.stats())
+            await self.client.attach_websocket(ws)
             logger.info("detached from server %s", self.renderer.stats())
 
         self._listener = ClientListener(
