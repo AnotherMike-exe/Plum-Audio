@@ -70,7 +70,15 @@ from aiosendspin.server.roles.controller.events import (
     ControllerShuffleEvent,
 )
 from aiosendspin.server.roles.player import PlayerV1Role
-from aiosendspin.server.server import ClientAddedEvent, ClientUpdatedEvent, ConnectionReason, SendspinServer
+from aiosendspin.server.server import (
+    ClientAddedEvent,
+    ClientConnectedEvent,
+    ClientDisconnectedEvent,
+    ClientRemovedEvent,
+    ClientUpdatedEvent,
+    ConnectionReason,
+    SendspinServer,
+)
 from lifecycle import install_shutdown_handlers
 from mesh.model import PlayerState, SourceState, UnitSnapshot
 from sources import airplay_config, bluetooth_config, spotify_config
@@ -920,6 +928,24 @@ class PlumSendspinServer:
 
         This is also where our own player gets paired, because pairing needs a live connection and
         the player process starts after us."""
+        # Client lifecycle is otherwise INVISIBLE: the library logs nothing when a client connects or
+        # goes away, so a roam that dies between "the player left its old server" and "the new server
+        # has it" leaves a hole in the record with a timeout at the end and nothing before it. That is
+        # exactly the shape of the .122 -> .204 failure, and it cost hours of guessing. One line each.
+        if isinstance(event, (ClientAddedEvent, ClientConnectedEvent)):
+            client = self.server.get_client(event.client_id) if self.server else None
+            logger.info(
+                "client %s %s (security=%s paired=%s roles=%s)",
+                event.client_id,
+                "added" if isinstance(event, ClientAddedEvent) else "connected",
+                _security_of(client) if client else "?",
+                getattr(client, "is_paired", "?"),
+                ",".join(getattr(client, "active_role_ids", []) or []) or "-",
+            )
+        elif isinstance(event, (ClientRemovedEvent, ClientDisconnectedEvent)):
+            logger.info(
+                "client %s %s", event.client_id, "removed" if isinstance(event, ClientRemovedEvent) else "disconnected"
+            )
         if isinstance(event, (ClientAddedEvent, ClientUpdatedEvent)):
             asyncio.ensure_future(self._maybe_group_controller(event.client_id))
             asyncio.ensure_future(self._maybe_pair_via_shared_psk(event.client_id))
@@ -1349,6 +1375,15 @@ class PlumSendspinServer:
             if client is not None and client.is_connected:
                 return True
             await asyncio.sleep(0.05)
+        # Name who we DO hold. A reclaim that times out is either "the player never arrived" or "it
+        # arrived under an id we did not look up", and those need opposite fixes — this is the line
+        # that tells them apart, and its absence is why the .122 -> .204 failure stayed opaque.
+        logger.warning(
+            "waited %.0fs for player %s; clients held: %s",
+            timeout_s,
+            player_id,
+            ", ".join(f"{c.client_id}{'' if c.is_connected else '(disconnected)'}" for c in self.server.clients) or "none",
+        )
         return False
 
     def snapshot(self) -> UnitSnapshot:
