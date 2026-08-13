@@ -69,6 +69,16 @@
    was dialled at 15:21:57.879 and paired at 15:21:58.047 — **170 ms, inside the handshake**, on a
    pairing it had never done before. So the 30 s belongs to contention (or to the pre-staging build),
    not to pairing. Measure with MA stopped.
+   **Cause identified, same evening: Music Assistant is continuously stealing our players' sockets.**
+   `.7.226` (MA 2.9.11) accounts for **16 of the last 20 handshakes** on `.7.122`'s player, arriving
+   every ~40-60 s, and each one makes the player log `server dialed us` → `detached from server`. A
+   client holds exactly ONE websocket, so every MA dial evicts whichever Plum server currently holds
+   that player. This is what makes cross-server roam intermittent on VLAN 7: the same route that
+   paired in 170 ms at 15:21:57 returned `ok:false` at 15:26, with MA dialling in between. It is not
+   a pairing bug and not a regression — MA is a third-party server legitimately claiming a speaker it
+   has configured. **Test cross-server roam with the Plum speakers removed from MA, or MA stopped**,
+   and treat any roam measurement taken on VLAN 7 with MA running as contaminated. The real fix is
+   the arbitration policy hook this item already notes we do not have.
    **Also found: "Open the mesh for pairing" skips any unit whose player has roamed away.** The
    `management` activity is a property of a live connection between a server and a client, so a unit
    whose own player is currently attached to a PEER's source has no connection to open a window on:
