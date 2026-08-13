@@ -885,14 +885,25 @@ class PlumSendspinServer:
         a peer's player is simply unpaired and the GUI offers a Pair button for it.
 
         Only for clients that actually render. A controller (the GUI's own WS) has nothing to pair.
+
+        **And only ENCRYPTED ones.** Pairing mixes a PSK into a Noise handshake, so there is nothing
+        to pair over a legacy cleartext connection and `initiate_pairing` refuses it outright. Every
+        ESP32 speaker on the segment is cleartext, so without this gate each one that connects earns
+        a pairing attempt that can only fail — and on the rig that broke `adopt_foreign_client`
+        outright: the speaker connected, the doomed pairing ran against it, and the adopt's 15 s wait
+        then expired reporting "never connected" about a device whose MAC we had just logged. The
+        following adopt of the same speaker succeeded, because by then it was already connected. That
+        off-by-one is the signature. Measured on .7.122 against three boards, 2026-08-13.
         """
         own = sendspin_identity.peer_id_of(sendspin_identity.PLAYER_ROLE)
+        client = self.server.get_client(client_id) if self.server else None
+        if client is not None and _security_of(client) is None:
+            return  # cleartext: activated straight from its negotiated roles, nothing to pair
         if own and client_id == own:
             await self.pair_via_shared_psk(client_id)
             return
         if sendspin_identity.fleet_psk() is None:
             return
-        client = self.server.get_client(client_id) if self.server else None
         if client is None or getattr(client, "is_paired", False):
             return
         if not has_role_family("player", getattr(client, "negotiated_role_ids", [])):
