@@ -344,3 +344,58 @@ describe('a live unit rename reaches its PEERS', () => {
     expect(nameOf(reloaded)).toBe('Pi4-02-Renamed');
   });
 });
+
+describe('a speaker is foreign only when its SERVER id belongs to nobody', () => {
+  // The 9.x regression guard. `local_player.server_id` is a SENDSPIN id — an X25519 public key
+  // under aiosendspin 9.x — while `unit_id` is the mesh's own key. They were the same string until
+  // the bump, because we passed `server_id=unit_id` to SendspinServer, and this comparison joined
+  // them directly. Once ids became keypairs it missed every time: every unit's OWN speaker was
+  // flagged as claimed by an outsider, given a bogus `foreignServer` label, and grown a phantom
+  // `foreign::` stream. Nothing failed; the GUI just quietly lied about who owned every speaker.
+  const URL = 'ws://192.0.2.10:8928/sendspin';
+
+  const view = (unitServerId: string | undefined, reportedServerId: string | undefined): MeshView => ({
+    local_unit_id: 'unit-210',
+    units: [
+      {
+        unit_id: 'unit-210',
+        name: 'Pi4-02',
+        host: '192.0.2.10',
+        server_id: unitServerId,
+        sources: [],
+        players: [],
+        local_player: { player_id: 'player-210', name: 'Player-210', url: URL, attached: true, server_id: reportedServerId },
+      },
+    ],
+  });
+
+  const speaker = (v: MeshView) =>
+    mapViewToModel(v, new Map(), new Map()).clients.find((c) => c.id === 'player-210')!;
+
+  it('is NOT foreign when the reported server id matches a unit', () => {
+    // The everyday case: our own player, attached to our own server, under the new namespace.
+    const c = speaker(view('peer-unit-210', 'peer-unit-210'));
+    expect(c.foreignServer).toBeUndefined();
+    expect(c.isForeign).toBeFalsy();
+  });
+
+  it('IS foreign when the reported server id matches no unit', () => {
+    // Music Assistant, or any third-party Sendspin server, holding our speaker.
+    const c = speaker(view('peer-unit-210', 'music-assistant'));
+    expect(c.foreignServer).toBeDefined();
+    expect(c.foreignServer!.name).toBe('music-assistant');
+  });
+
+  it('does NOT accept a unit_id as a server id', () => {
+    // Guards against "fixing" this by comparing against unit_ids again, which would resurrect the
+    // bug — and would let a foreign server whose id resembled one of our unit ids read as ours.
+    expect(speaker(view('peer-unit-210', 'unit-210')).foreignServer).toBeDefined();
+  });
+
+  it('flags NOTHING when no unit publishes a server id', () => {
+    // A peer mid-start, or one on an older image, publishes no server_id. With an empty set the
+    // naive check calls every speaker foreign — the mirror of the has_player defaults-true rule.
+    const c = speaker(view(undefined, 'peer-unit-210'));
+    expect(c.foreignServer).toBeUndefined();
+  });
+});
