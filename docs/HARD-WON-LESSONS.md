@@ -335,3 +335,80 @@ registers** and a loopback default advertises an endpoint no peer can reach.
 **The metadata role stores ONE progress anchor and clients extrapolate from its timestamp.** A bare
 `playback_speed` flip re-stamps a *stale* anchor and the timeline jumps, so play/pause must re-anchor
 to the daemon's real position. Latent since Phase 2; a second source exposed it.
+
+## Connection lifecycle & identity (2026-08)
+
+Moved here from `docs/CLAUDE.md` on 2026-08-13 when that file was trimmed back toward its own
+~280-line budget. The rules these produced are still stated there; the evidence is here.
+
+**The immortal dialer: `disconnect_from_client()` does not stop the dial.** Found 2026-08-10 bringing
+up an Esparagus HiFi board and a FutureProof Satellite1 on unit-7204 — routing a source at either
+played for a few seconds, dropped back to idle, and got *worse* on retry. The cancel is swallowed:
+`SendspinConnection._handle_client` awaited the message loop as a separate task and
+`_run_message_loop` caught `CancelledError` and returned normally, so the dialer saw a clean session
+end, backed off ~1 s and reconnected. A session lasting ≥10 s reset the backoff, so against a real
+speaker it never reached the ceiling that would end it. Meanwhile the caller's next
+`connect_to_client(url)` had already installed its own task, and the doomed task's `finally` popped
+**the new task's** registry entry — so the next call missed the "already dialling" guard and opened a
+third. Measured with a fake speaker counting sockets, six disconnect/reconnect pairs 3 s apart:
+1, 2, 3, 4, 5, 6 live websockets, registry still reporting one client. A Sendspin client holds
+exactly ONE websocket, so they fought over it: audio for a few seconds, then `close_code=1006`,
+forever. That is the whole 19:05–19:39 window in that unit's server log.
+**9.1.0 fixes the swallow** (the message loop's cancel now propagates via `_connection_done`), but
+`disconnect_from_client` is still synchronous and still clobbers `_connection_tasks[url]`, so
+`_stop_dialing` stays.
+
+**The orphaned eviction timer.** Found the same night, with DEBUG on, chasing "reroute a speaker, it
+plays for a few seconds, then drops back to idle". `SendspinClient._schedule_cleanup` assigns
+`_cleanup_handle` **without cancelling whatever was already there**, so scheduling twice orphans the
+first timer — nothing references it, `attach_connection`'s "cancel pending cleanup" can never reach
+it, and it fires anyway. `_do_cleanup`'s only other guard is `if self._connected` on the object that
+owns the timer, which does not protect a connection that came back on a *different* object, and it
+then evicts whichever client currently holds that id. Two schedules is the normal shape of a release:
+the teardown carries no goodbye reason (→ 30 s delayed) and the `USER_REQUEST` goodbye ~250 ms later
+adds an immediate one on top.
+
+```
+20:53:32,209  Scheduling delayed cleanup in 30s (reason: None)
+20:53:32,507  Received client/hello           <- rerouted, reconnected
+20:53:32,571  attached player 98:A3:16:D0:9E:E8   <- playing
+20:54:02,210  Cleaning up client from registry
+20:54:02,211  removing 98:A3:16:D0:9E:E8 from group   <- evicted mid-playback
+```
+
+Exactly 30 s after the **unroute**, not the reroute — which is why it read as a random 15–60 s
+dropout that scaled with how quickly the speaker was re-routed. That session logged 3 cancelled
+cleanups against 13 executed ones. **Still unfixed in 9.1.0, and the window is now 180 s**, so an
+orphan has six times longer to outlive a re-route.
+
+**Stop the stream before changing membership, not after — but know what that is and is not.**
+`attach_player` stops the stream, changes membership, then re-acquires. The other order (add, then
+refresh) puts `stream/start` → `stream/end` → `stream/start` on the wire inside ~110 ms, because
+`add_client` runs the library's late-join and `refresh_stream` then replaces that stream. The single
+start is strictly less churn and costs nothing, so it stays — but it is **belt-and-braces, not a
+proven fix**. A sendspin-cpp read says that sequence can jam `pending_start_` permanently, yet a
+Voice PE cross-routed mid-stream on the OLD ordering (2026-08-10 ~20:45) did not wedge, and the
+Esparagus wedge it was written for is at least as well explained by the two bugs above, which were
+live at the time. **Do not cite it as the cause without the A/B.** Separately and firmly: an ESP32
+client that *does* wedge is unrecoverable over the protocol — the full ladder (detach, detach+settle,
+release, release+settle; `_resources/spike/unwedge_probe.py`) was run on hardware and none of it
+worked. Only a power cycle clears it.
+
+**"None" became a true none, reversing an earlier design.** The group and its anchor persist when a
+source goes idle, which used to mean attached players stayed attached and silently resumed when the
+sender came back. That auto-resume was the bug: on unit-7204, 2026-08-10, both endpoints stayed
+attached, the sender returned two minutes later, and audio resumed with no re-route — a room playing
+because of something a user did before lunch. Going idle now detaches every player-role client
+uniformly, with no exceptions for our own player, a roamed peer, or an adopted foreign speaker, and
+nothing auto-resumes one except `autoSwitch.localActivity` (own player, rising edge) or `follow`.
+
+**Every default name must be unique per unit, and a clash must never block a deploy.**
+`DEFAULT_SETTINGS` is written to `settings.json` on the first read, so any literal in it outranks the
+environment permanently *and identically on every unit* — which is how two freshly imaged units both
+came up as "Plum Sendspin" offering a "Plum Audio" AirPlay receiver, with nothing on the LAN to tell
+them apart. Unit name and all three endpoint names now derive from `PLUM_UNIT_NAME`, falling back to
+`unit_identity.default_device_name()`, which appends a stable per-unit token. The token is the Pi's
+**SoC serial**, not a default-route MAC: a MAC moves when a unit is put on `wlan0` instead of `eth0`,
+silently renaming it. No token readable → bare name, because unknown beats invented. `deploy.sh`
+appends the same token to whatever `units.conf` duplicates and **warns rather than refuses** — a
+cosmetic slip must not become a rig that will not deploy.
