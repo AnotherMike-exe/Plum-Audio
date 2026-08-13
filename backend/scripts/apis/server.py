@@ -21,6 +21,7 @@ from flask import Flask, request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/ on path
 import cors_policy  # noqa: E402
+from about_api import create_about_blueprint  # noqa: E402
 from audio_api import create_audio_blueprint  # noqa: E402
 from integrations_api import create_integrations_blueprint  # noqa: E402
 from settings_api import SettingsManager, create_settings_blueprint  # noqa: E402
@@ -35,6 +36,7 @@ def create_app() -> Flask:
     app.register_blueprint(create_settings_blueprint(settings_manager))
     app.register_blueprint(create_integrations_blueprint(settings_manager))
     app.register_blueprint(create_audio_blueprint(settings_manager))
+    app.register_blueprint(create_about_blueprint())
 
     @app.after_request
     def _cors(response):

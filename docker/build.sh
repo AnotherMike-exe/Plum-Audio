@@ -28,10 +28,26 @@ OUT_DIR="${ROOT}/dist"
 ARCH_SUFFIX="${PLATFORM##*/}"
 TARBALL="${OUT_DIR}/plum-audio-${PLUM_TAG}-${ARCH_SUFFIX}.tar.gz"
 
-echo "==> building ${IMAGE} for ${PLATFORM}"
+# The app version shown on the About page and the main-page footer. Nearest tag, "-dev" appended
+# unless the tree is exactly at that tag with nothing uncommitted — so "0.4.2" only ever means the
+# 0.4.2 release, and any other build reads "0.4.2-dev" rather than silently claiming to be the release.
+GIT_DESCRIBE="$(git describe --tags --always --dirty 2>/dev/null || echo unknown)"
+LAST_TAG="$(git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)"
+if git describe --tags --exact-match >/dev/null 2>&1 && [[ -z "$(git status --porcelain 2>/dev/null)" ]]; then
+    PLUM_APP_VERSION="${LAST_TAG#v}"
+    PLUM_BUILD_TYPE="release"
+else
+    PLUM_APP_VERSION="${LAST_TAG#v}-dev"
+    PLUM_BUILD_TYPE="dev"
+fi
+
+echo "==> building ${IMAGE} for ${PLATFORM} (app version ${PLUM_APP_VERSION}, ${PLUM_BUILD_TYPE})"
 docker build \
     --platform "$PLATFORM" \
     -f backend/Dockerfile \
+    --build-arg "PLUM_APP_VERSION=${PLUM_APP_VERSION}" \
+    --build-arg "PLUM_BUILD_TYPE=${PLUM_BUILD_TYPE}" \
+    --build-arg "PLUM_GIT_DESCRIBE=${GIT_DESCRIBE}" \
     -t "$IMAGE" \
     -t "plum-audio:latest" \
     "$ROOT"
