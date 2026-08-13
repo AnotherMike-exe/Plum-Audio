@@ -49,9 +49,13 @@
    provisionally, handshakes, then admits or rejects by `Activity` rank with a persisted
    `last_playback_server_id` as the tiebreak. Our yield-to-newest workaround is deleted. No policy
    hook, and it keys on `Activity` rather than the `connection_reason` we drive.
-   **Replaced by a new standing deviation: we implement NO pairing method** (a spec MUST for
-   servers) and run on the unpaired/sentinel path plus `PLUM_ALLOW_UNENCRYPTED=1`. Deliberate —
-   `docs/SENDSPIN-PAIRING.md` has the reasoning, the API, and what real pairing would cost.
+   ~~**Replaced by a new standing deviation: we implement NO pairing method**~~ — **that deviation is
+   CLOSED too, 2026-08-13.** All three methods are implemented and reachable from the GUI, a unit
+   pairs with its own speaker automatically, peers pair via `PLUM_FLEET_PSK`, and unpaired access
+   defaults off. What remains is narrower and external: `PLUM_ALLOW_UNENCRYPTED=1` keeps the non-spec
+   cleartext path open, because `sendspin-cpp` has no Noise in any release and our own web GUI is a
+   hand-rolled cleartext client on :8927. Those are one change, not three.
+   `docs/SENDSPIN-PAIRING.md`.
 7. **amd64 has never been built.**
 8. **The APIs are unauthenticated with blanket CORS** (`CORS(app)`, `Access-Control-Allow-Origin: *`,
    both bound to `0.0.0.0`). The injection chain behind it is closed at three layers, but any page on
