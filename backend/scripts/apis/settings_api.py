@@ -174,6 +174,18 @@ DEFAULT_SETTINGS = {
         "localActivity": True,
         "slave": {"enabled": False, "masterUnitId": None},
     },
+    "pairing": {
+        # Deliberately NULL, exactly like `audio.output.device` below and for the same reason: a
+        # concrete literal here reaches settings.json on the first read and then outranks
+        # PLUM_UNPAIRED_ACCESS permanently, on every unit at once. Null means "whatever the env
+        # says", which keeps the deploy-time knob meaningful until a human makes a choice in the
+        # GUI — and `False` is a real choice, so the sentinel MUST be None rather than False.
+        #
+        # What it gates: whether an ENCRYPTED-but-unpaired client may play (the sentinel-PSK path).
+        # It has no bearing on cleartext clients — ESP32 speakers, Music Assistant, the web GUI —
+        # which never reach the trust gate. See docs/SENDSPIN-PAIRING.md.
+        "unpairedAccess": None,
+    },
     "audio": {
         # Deliberately EMPTY. An empty device means "whatever PLUM_DAC_DEVICE says", which is how a
         # unit that has never been near the GUI keeps the output it booted with. A concrete-looking

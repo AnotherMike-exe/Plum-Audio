@@ -518,6 +518,12 @@ class PlumSendspinServer:
         if not player_peer:
             logger.info("no local player identity — playerless unit, nothing to trust")
             return
+        if not sendspin_identity.unpaired_access_enabled():
+            # Off is the default now: our own player is PAIRED (pair_own_player), so it does not
+            # need the sentinel path, and trusting it anyway would leave an unused approval sitting
+            # in the store looking like policy.
+            logger.info("unpaired access off — the local player relies on its pairing record")
+            return
         if await self._trust_player(player_peer):
             logger.info("trusted local player %s", player_peer)
 

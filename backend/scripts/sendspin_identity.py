@@ -15,10 +15,15 @@ client_id at all. So the ids are now:
   - **not derivable**, so they must be PERSISTED — a regenerated keypair is a brand-new device that
     every peer has forgotten, which is why these files matter more than they look.
 
-**Trust model: trust-on-deploy** (decided 2026-08-12, see docs/AIOSENDSPIN-BUMP-SCOPE.md). We do not
-run PIN/PSK pairing. Instead each of our clients sets `unpaired_access_enabled` and each of our
-servers calls `trust_unpaired(peer_id)` for the peers it should serve. **Both halves are required and
-neither is sufficient** — measured, see `tests/Integration/t0_sendspin_protocol.py`:
+**Trust model: real pairing, with a sentinel fallback that is OFF by default.** A unit pairs with its
+own player automatically over the Pairing PSK method (`local_pairing_psk`), because the two are one
+device behind one `/config` and an operator pairing a unit with itself would be ceremony. Everything
+else — a peer unit, a third-party speaker — is a genuine pairing, driven from the GUI.
+
+`unpaired_access_enabled` + `trust_unpaired(peer_id)` remain as the sentinel-PSK escape hatch, now
+gated by `unpaired_access_enabled()` (settings.json > env > **off**). Encrypted but unauthenticated,
+and the spec is explicit that such sessions are open to man-in-the-middle. **Both halves are required
+and neither is sufficient** — measured, see `tests/Integration/t0_sendspin_protocol.py`:
 
     client unpaired_access | server trust_unpaired | negotiated | ACTIVATED
     -----------------------+-----------------------+------------+-----------
@@ -40,9 +45,11 @@ ignoring umask by construction, so `UMASK=002` does not apply to either.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 
+import unit_identity
 from aiosendspin.noise import FileClientPairingStore, FileServerPairingStore, Identity
 from aiosendspin.noise.trust_store import ClientPairingConfig
 
@@ -231,20 +238,115 @@ async def client_pairing_store(role: str = PLAYER_ROLE, *, unpaired_access: bool
         await store.set_pairing_psk(PairingPsk(psk_id=psk_id_for(psk), psk=psk))
         logger.info("pairing store %s: installed the local Pairing PSK", role)
 
+    await _apply_static_pin(store, role)
+
+    # One reconcile for both policy flags. static_pin_enabled is a SECOND gate beside the PIN value
+    # itself — a stored PIN with the method disabled is advertised to nobody, which is the sort of
+    # half-configured state that produces "I set the PIN and no dialog appeared".
     config = await store.get_pairing_config()
-    if unpaired_access is not None and config.unpaired_access_enabled != unpaired_access:
+    want_static = await store.static_pin() is not None
+    want_unpaired = config.unpaired_access_enabled if unpaired_access is None else unpaired_access
+    if (config.static_pin_enabled, config.unpaired_access_enabled) != (want_static, want_unpaired):
         await store.store_pairing_config(
             ClientPairingConfig(
-                unpaired_access_enabled=unpaired_access,
+                unpaired_access_enabled=want_unpaired,
                 record_mode_psk_id=config.record_mode_psk_id,
                 pairing_psk_enabled=config.pairing_psk_enabled,
                 dynamic_pin_enabled=config.dynamic_pin_enabled,
-                static_pin_enabled=config.static_pin_enabled,
+                static_pin_enabled=want_static,
                 dynamic_pin_min_length=config.dynamic_pin_min_length,
             )
         )
-        logger.info("pairing store %s: unpaired access -> %s", role, "on" if unpaired_access else "off")
+        logger.info(
+            "pairing store %s: unpaired access %s, static PIN %s",
+            role,
+            "on" if want_unpaired else "off",
+            "on" if want_static else "off",
+        )
     return store
+
+
+UNPAIRED_ACCESS_ENV = "PLUM_UNPAIRED_ACCESS"
+
+
+def unpaired_access_enabled() -> bool:
+    """Whether an encrypted-but-unpaired client may play: settings.json > env > **False**.
+
+    One definition of the precedence, read by both audio processes — the player configures its
+    pairing store from it, the server decides whether to `trust_unpaired`. Neither imports
+    `settings_api`, which is why this lives here beside `allow_unencrypted()` rather than there.
+
+    Defaults **off** now that real pairing exists. It is the sentinel-PSK escape hatch: encrypted
+    but unauthenticated, and the spec is explicit that such sessions are open to man-in-the-middle.
+    Leaving it on would mean shipping the deviation we just removed.
+
+    It does **nothing** to cleartext clients. ESP32 speakers, Music Assistant and our own web GUI are
+    activated straight from their negotiated role set and never reach this gate — turning this off
+    cannot break them, which is the property that lets us default it off at all.
+
+    Same never-raise contract as `audio_devices.configured_output_spec`: the audio processes call it
+    unwrapped at boot, so a damaged settings.json must degrade to the env rather than kill the unit.
+    """
+    try:
+        with open(unit_identity.settings_path(), encoding="utf-8") as f:
+            configured = (json.load(f).get("pairing") or {}).get("unpairedAccess")
+        # `is not None`, not truthiness: False is a real choice and must beat the env, which is the
+        # whole reason the stored default is null rather than false.
+        if configured is not None:
+            return bool(configured)
+    except FileNotFoundError:
+        # A unit that has never been near the GUI has no settings.json yet. That is the ordinary
+        # first-boot state, not a fault — logging a traceback for it would put an alarming stack
+        # trace in every fresh unit's log for a condition the env tier exists to handle.
+        pass
+    except (OSError, ValueError, AttributeError, TypeError):
+        logger.warning("could not read the pairing settings; falling back to the environment", exc_info=True)
+    return (os.environ.get(UNPAIRED_ACCESS_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+STATIC_PIN_ENV = "PLUM_STATIC_PIN"
+
+
+def static_pin() -> str | None:
+    """The operator-configured static pairing PIN, or None. Exactly 8 digits or it is REFUSED.
+
+    The spec fixes static PINs at 8 digits, so a 6-digit value is not "a shorter PIN", it is a value
+    the protocol cannot carry. We reject it loudly and continue without one rather than silently
+    padding, truncating, or leaving a half-configured method advertised: an operator who set this and
+    got no PIN dialog would have nothing to look at to find out why.
+
+    A static PIN is convenience, not unattended pairing — the spec gesture-gates EVERY static-PIN
+    attempt, so someone still confirms in the GUI each time.
+    """
+    raw = (os.environ.get(STATIC_PIN_ENV) or "").strip()
+    if not raw:
+        return None
+    if len(raw) != 8 or not raw.isdigit():
+        logger.error(
+            "%s must be exactly 8 digits (the spec's static-PIN length); got %d character(s) — ignoring it",
+            STATIC_PIN_ENV,
+            len(raw),
+        )
+        return None
+    return raw
+
+
+async def _apply_static_pin(store: FileClientPairingStore, role: str) -> None:
+    """Install or clear the static PIN to match the environment.
+
+    Clearing matters as much as setting: unsetting the env var must actually retire the PIN, or a
+    value someone removed from a compose file would keep working from the persisted store forever.
+    """
+    desired = static_pin()
+    current = await store.static_pin()
+    if desired == current:
+        return
+    if desired is None:
+        await store.clear_static_pin()
+        logger.info("pairing store %s: cleared the static PIN (%s unset)", role, STATIC_PIN_ENV)
+    else:
+        await store.set_static_pin(desired)
+        logger.info("pairing store %s: installed a static PIN from %s", role, STATIC_PIN_ENV)
 
 
 def allow_unencrypted() -> bool:
