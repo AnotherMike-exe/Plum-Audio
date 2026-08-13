@@ -89,39 +89,67 @@ switch. Two clients, a hand-off dance, and racy. Not worth shipping over a clean
 
 ---
 
-## 2. Fresh-stamp metadata progress + compute the join snapshot from the live position
+## 2. Fresh-stamp metadata progress on re-emit
 
 **Conformance impact: LOW (correct today) — this is a complexity/robustness ask.**
+
+> **Corrected 2026-08-12.** This entry used to carry a second half — "the join snapshot carries the
+> stale anchor too" — and an ask to build it from the live position. **That half was never true, not
+> even on 6.0.5.** It was written from the wire symptom, not from the library source. See the struck
+> point 2 below. Re-verified against both 6.0.5 and 9.1.0 while scoping the bump
+> (`docs/AIOSENDSPIN-BUMP-SCOPE.md`); the whole file is a 2-line unrelated diff between them.
 
 The Sendspin metadata model is built for **sparse** progress updates: emit `(track_progress,
 track_duration, playback_speed)` with a `timestamp`, and every client extrapolates the live position
 from there. A source like shairport-sync that only emits progress every few seconds *should* need
 nothing more.
 
-Two library behaviours break that assumption:
+Two library behaviours were recorded here as breaking that assumption. **Only the first is real:**
 
 1. `MetadataGroupRole.update()` / `set_metadata()` **inherit the previous metadata's
    `timestamp_us`** (`replace()` copies it; `set_metadata` only stamps a fresh timestamp when it is
    `None`). A re-emit that doesn't explicitly clear the timestamp leaves clients extrapolating from
    an ever-older anchor — the position runs past the end and clamps to 100%.
-2. The per-client **join snapshot** a late-joining client receives carries that same stale anchor, so
-   a client that connects mid-track reads a clamped 100% until the next source update.
+2. ~~The per-client **join snapshot** a late-joining client receives carries that same stale anchor,
+   so a client that connects mid-track reads a clamped 100% until the next source update.~~
+   **FALSE — the library already does this correctly, and did on 6.0.5.**
+   `MetadataGroupRole._send_state_to_role` (`server/roles/metadata/group.py:42`, reached from
+   `on_member_join`) stamps a fresh `timestamp` and then *overwrites* the snapshot's progress with
+   the live value:
+   ```python
+   metadata_update = self._current_metadata.snapshot_update(timestamp)
+   current_progress = self._get_current_track_progress()
+   if current_progress is not None and ...track_duration is not None and ...playback_speed is not None:
+       metadata_update.progress = Progress(track_progress=current_progress, ...)
+   ```
+   and `_get_current_track_progress` (`:66`) genuinely extrapolates —
+   `elapsed_us = now - _track_progress_timestamp_us`, scaled by `playback_speed`, clamped to
+   `track_duration`. A stale anchor therefore still yields a **correct** live position at join.
+   (It extrapolates only while `has_active_stream`; with no stream it returns the stored value, which
+   is the right behaviour for a paused/stopped join.) When any of the three progress fields is unset,
+   `snapshot_update`'s own guard drops `progress` entirely — so no stale anchor reaches the client on
+   that path either.
 
 **Current workaround** (`backend/scripts/sources/airplay_metadata.py`):
 - every `_emit_progress` passes `timestamp_us=None` to force a fresh stamp; **and**
-- a **1 Hz `_progress_ticker`** re-emits the extrapolated position while playing, purely to keep the
-  server's anchor (and thus the join snapshot) from going stale.
+- a **1 Hz `_progress_ticker`** re-emits the extrapolated position while playing, ~~purely to keep
+  the server's anchor (and thus the join snapshot) from going stale~~ — **that justification is
+  void** given the correction above. The `timestamp_us=None` stamp alone covers the real defect
+  (point 1). **The ticker is now a deletion candidate, not a documented necessity** — but it has not
+  been removed, because nobody has checked on hardware whether anything else came to depend on a
+  1 Hz metadata cadence (our own GUI extrapolates client-side and should not care; a third-party
+  controller that does not extrapolate would). Test before deleting.
 
 The ticker is compensating for the library, not for the wire protocol. If the library did the right
 thing, the AirPlay reader could just forward shairport's sparse `prgr` frames verbatim.
 
-**Ask:**
-- `set_metadata`/`update` should **re-stamp `timestamp_us` by default** whenever a progress field
-  changes (or take an explicit `restamp: bool`); and
-- the server's join snapshot should be built from the **live extrapolated** position at join time —
-  the group role already has `_get_current_track_progress()`; call it when composing the snapshot.
+**Ask:** `set_metadata`/`update` should **re-stamp `timestamp_us` by default** whenever a progress
+field changes (or take an explicit `restamp: bool`). With that, the `timestamp_us=None` dance can be
+deleted.
 
-With both, `_progress_ticker` and the `timestamp_us=None` dance can be deleted.
+**Status against 9.1.0: UNCHANGED.** `set_metadata` (`:110`) still stamps only when the caller left
+it `None`, and `update()` (`:196`) still does `replace(current, **kwargs)` off an already-stamped
+`_current_metadata`. No `restamp` parameter was added. Keep the workaround.
 
 **Refs:** `airplay_metadata.py` `_emit_progress` / `_progress_ticker`; aiosendspin
 `server/roles/metadata/group.py` `set_metadata` / `_get_current_track_progress`.
@@ -275,6 +303,23 @@ pointing at encryption as the cause.
 pass `allow_unencrypted=True` deliberately, or scope out what pairing/PSK distribution to our own
 players and any adopted third-party clients would require before flipping it off.
 
+**VERIFIED against 9.1.0, 2026-08-12 — the entry was right but understates it.** `allow_unencrypted:
+bool = False` is real (`server/server.py:155`). It is **necessary but not sufficient**, and it is not
+the expensive part:
+
+- `SendspinServer(server_id: str)` became `identity: Identity` with `self._id = identity.peer_id`
+  (an X25519 pubkey), plus a **required** `pairing_store`. Client ids stop being ours to choose,
+  which breaks the `follow.py` `server_id`↔`unit_id` join and the GUI's `ctrl:<source_id>:` hint.
+- With the flag on, our **own** player still connects, handshakes, joins the group at the right
+  volume — and gets **zero roles**, because an unpaired sentinel-PSK client fails `_playback_capable`
+  unless `unpaired_access_enabled` **and** `trust_unpaired(client_id)` are both set. Silent on both
+  sides. "Does it connect?" is not a valid test.
+- `sendspin-cpp` has no encryption as of v0.7.2, so the flag is **permanent, not transitional**, for
+  as long as we want ESP32 interop.
+
+Full port scope, breakage list and the recommendation to hold the pin:
+**`docs/AIOSENDSPIN-BUMP-SCOPE.md`**.
+
 **Refs:** `_resources/Research/Esparagus/Sendspin-Conversion-Plan.md` (where this was found);
 `sendspin_server.py:347`.
 
@@ -285,3 +330,18 @@ players and any adopted third-party clients would require before flipping it off
 Run `_resources/spike/mesh_smoke.py` first (per `CLAUDE.md`), then check each ask above against the
 new release's changelog/API. For any that's resolved: remove the workaround, update
 `docs/SPEC-CONFORMANCE.md`, and delete the entry here.
+
+**Note that `mesh_smoke.py` itself does not survive the 9.x constructor changes** — it has 5 broken
+constructor sites, so the mandated gate must be ported before it can gate anything.
+
+**Status as of 2026-08-12** (all six read against 9.1.0 — see `docs/AIOSENDSPIN-BUMP-SCOPE.md`):
+
+| § | 9.1.0 |
+|---|---|
+| 0 | **Fixed**, by replacing `state` with `available: bool` — our workaround becomes the non-conformance |
+| 1 | **Fixed** — real arbitration in `attach_websocket`; closes `CLAUDE.md` Open #6 |
+| 2 | Unchanged (and half the original ask was never true — see the correction above) |
+| 3 | Unchanged |
+| 4 | **Partially fixed** — the dial task now dies on cancel; still sync, still clobbers `_connection_tasks[url]` |
+| 5 | Unchanged, and **worse**: `CLIENT_CLEANUP_DELAY` 30 s → 180 s widens the orphaned-eviction window 6× |
+| 6 | Confirmed and understated — see the block in that section |
