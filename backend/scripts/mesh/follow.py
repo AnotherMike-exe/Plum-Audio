@@ -286,7 +286,12 @@ class FollowReconciler:
         lp = unit.local_player if unit else None
         if not lp or not lp.get("attached") or not lp.get("group_id"):
             return True, None
-        server_unit = view.unit(lp.get("server_id"))
+        # `server_id` here is a SENDSPIN id, which under 9.x is an X25519 public key — not a unit_id.
+        # This was `view.unit(...)` and worked only because we used to pass `server_id=unit_id` to
+        # SendspinServer; once ids became keypairs that lookup missed every time, so every unit's own
+        # player read as attached to a foreign server and follow stopped following. It failed
+        # silently, which is why the lookup is now named for the namespace it searches.
+        server_unit = view.unit_by_server_id(lp.get("server_id"))
         if server_unit is None:
             # Attached to a server outside our mesh (Music Assistant, any foreign Sendspin server):
             # busy, but nothing we can route onto.

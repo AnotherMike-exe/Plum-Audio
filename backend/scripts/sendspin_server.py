@@ -380,7 +380,7 @@ class SourceFeeder:
             players = [
                 client
                 for client in self.group.clients
-                if not client.client_id.startswith(ANCHOR_PREFIX) and has_role_family("player", client.negotiated_roles)
+                if not client.client_id.startswith(ANCHOR_PREFIX) and has_role_family("player", client.negotiated_role_ids)
             ]
             for player in players:
                 with contextlib.suppress(Exception):
@@ -636,7 +636,7 @@ class PlumSendspinServer:
         client = self.server.get_client(client_id)
         if client is None or not client.is_connected:
             return
-        if has_role_family("player", client.negotiated_roles):
+        if has_role_family("player", client.negotiated_role_ids):
             return  # a player — the mesh orchestrator owns its routing, never regroup it here
         source_id = self._requested_source(client_id)
         if source_id is None:
@@ -829,7 +829,7 @@ class PlumSendspinServer:
             for client in self.server.clients:
                 if not client.is_connected:
                     continue
-                if not has_role_family("player", client.negotiated_roles):
+                if not has_role_family("player", client.negotiated_role_ids):
                     continue  # not a render endpoint (a controller connecting for its own reasons)
                 # Identify the speaker we just dialled. The URL is the reliable test and has to come
                 # first: a speaker adopted ONCE stays in self.server.clients, so on every later
@@ -859,7 +859,7 @@ class PlumSendspinServer:
         for client in self.server.clients:
             if not client.is_connected:
                 continue
-            if not has_role_family("player", client.negotiated_roles):
+            if not has_role_family("player", client.negotiated_role_ids):
                 continue
             if self.server.get_client_url(client.client_id) == url:
                 return client.client_id
@@ -1010,7 +1010,7 @@ class PlumSendspinServer:
             player_ids = [
                 c.client_id
                 for c in group.clients
-                if not c.client_id.startswith(ANCHOR_PREFIX) and has_role_family("player", c.negotiated_roles)
+                if not c.client_id.startswith(ANCHOR_PREFIX) and has_role_family("player", c.negotiated_role_ids)
             ]
             src_vol = self._source_volumes.get(source_id, {})
             sources.append(
@@ -1037,7 +1037,7 @@ class PlumSendspinServer:
                     continue  # a disconnected client isn't a live endpoint here — e.g. a player
                     # that roamed to a peer leaves a stub; reporting it would make the mesh view
                     # (and the router's find_player) think the player is still on this unit.
-                if not has_role_family("player", client.negotiated_roles):
+                if not has_role_family("player", client.negotiated_role_ids):
                     continue  # controller/display clients (the GUI WS) are grouped for metadata, not players
                 # The level the PLAYER reported (client/state), which is what the role object holds —
                 # set_volume() alone does not move it, so this is the endpoint's real gain, not our
@@ -1069,6 +1069,10 @@ class PlumSendspinServer:
             players=players,
             has_player=self.has_player,
             hostname=socket.gethostname(),
+            # Our Sendspin id (an X25519 pubkey under 9.x), so peers can map the server a roamed
+            # player reports itself attached to back onto a unit. Without this `follow` cannot tell
+            # one of our servers from Music Assistant. None until start() has run.
+            server_id=self.server_id,
         )
 
     def start_airplay_metadata(self, source_id: str, metadata_fifo: str) -> None:

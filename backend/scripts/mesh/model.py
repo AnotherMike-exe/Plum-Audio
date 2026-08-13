@@ -142,6 +142,13 @@ class UnitSnapshot:
     # this a peer cannot recognise a page served BY this unit as a legitimate origin. See
     # cors_policy.known_hosts.
     hostname: str | None = None
+    # This unit's SENDSPIN server id, which under aiosendspin 9.x is its X25519 public key and is
+    # NOT `unit_id`. They used to be the same string — we passed `server_id=unit_id` — and a good
+    # deal of the mesh quietly relied on that, most importantly `follow`, which joins the server a
+    # player reports itself attached to against this table. Publishing it is what makes that join
+    # possible again; `MeshView.unit_by_server_id` is the lookup. None for a peer that has not
+    # started its server yet.
+    server_id: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -153,6 +160,7 @@ class UnitSnapshot:
             "local_player": self.local_player,
             "has_player": self.has_player,
             "hostname": self.hostname,
+            "server_id": self.server_id,
         }
 
     @classmethod
@@ -166,6 +174,7 @@ class UnitSnapshot:
             local_player=d.get("local_player"),
             has_player=bool(d.get("has_player", True)),
             hostname=d.get("hostname"),
+            server_id=d.get("server_id"),
         )
 
 
@@ -180,6 +189,20 @@ class MeshView:
 
     def unit(self, unit_id: str) -> UnitSnapshot | None:
         return next((u for u in self.units if u.unit_id == unit_id), None)
+
+    def unit_by_server_id(self, server_id: str | None) -> UnitSnapshot | None:
+        """The unit whose SENDSPIN server has this id, or None if it is not one of ours.
+
+        Under 9.x a server id is an X25519 public key, so it is a different namespace from `unit_id`
+        and this is the only way back. Deliberately strict — no fall-through to `unit()` — because
+        the answer "not one of our units" is meaningful here rather than an error: it is how a player
+        attached to Music Assistant or any other foreign Sendspin server is recognised as busy but
+        unroutable. Matching a peer id against the unit table by accident would read a foreign server
+        as one of ours and hand its speaker away.
+        """
+        if not server_id:
+            return None
+        return next((u for u in self.units if u.server_id == server_id), None)
 
     def find_source(self, source_id: str) -> tuple[UnitSnapshot, SourceState] | None:
         """Locate which unit ingests a given source (audio stays on its ingesting unit)."""
