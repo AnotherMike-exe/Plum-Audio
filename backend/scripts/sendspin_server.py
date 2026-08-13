@@ -5,7 +5,7 @@ Plum-Audio — in-process Sendspin server + per-source PushStream feeders.
 Phase 1: AirPlay FIFO → in-process SendspinServer → local player, end-to-end.
 
 Grounded in the verified aiosendspin 6.0.5 API (audited signatures; the ingest/re-route/
-reclaim control plane is exercised on hardware by _resources/spike/mesh_smoke.py, and the
+reclaim control plane is exercised on hardware by tests/Integration/t0_sendspin_protocol.py, and the
 full render + handoff path — including the group/stream lifecycle rules this module relies
 on — by _resources/spike/handoff_probe.py).
 

@@ -1,5 +1,6 @@
 # Plum-Audio backend — Python 3.13
-# Sync engine: pin aiosendspin (fast-moving). On bump, run _resources/spike/mesh_smoke.py first.
+# Sync engine: pin aiosendspin (fast-moving). On bump run tests/Integration/t0_sendspin_protocol.py
+# first, against a venv holding the candidate version. 9.1.0 is scoped: docs/AIOSENDSPIN-BUMP-SCOPE.md
 aiosendspin==6.0.5
 av>=18,<19            # PyAV — audio encode/resample (glibc wheels on Debian base)
 numpy>=2,<3

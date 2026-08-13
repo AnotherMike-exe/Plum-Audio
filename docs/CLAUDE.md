@@ -125,12 +125,15 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
 The *reasoning* behind these, and the failures that produced them, is in
 **`docs/HARD-WON-LESSONS.md`**. Do not re-litigate them from first principles.
 
-- **Pin `aiosendspin`** (6.0.5). On any bump run `_resources/spike/mesh_smoke.py` first (it needs
-  porting itself), and re-check `docs/UPSTREAM-AIOSENDSPIN.md`. **9.1.0 is scoped and deliberately
-  NOT taken** — client ids become X25519 pubkeys (breaking `follow`'s `server_id`↔`unit_id` join and
-  the GUI's `ctrl:<source_id>:` hint), every endpoint must be paired or it plays silently, and a
-  9.x client cannot reach a 6.0.5 server so all four units cut over at once. Reasoning and the
-  revisit triggers: `docs/AIOSENDSPIN-BUMP-SCOPE.md`. Do not re-derive this.
+- **Pin `aiosendspin`** (6.0.5). On any bump run `tests/Integration/t0_sendspin_protocol.py` first
+  (tier 0 — real protocol, no rig; needs a venv on the candidate version), and re-check
+  `docs/UPSTREAM-AIOSENDSPIN.md`. **9.1.0 is scoped** — client ids become X25519 pubkeys (breaking
+  `follow`'s `server_id`↔`unit_id` join and the GUI's `ctrl:<source_id>:` hint), and a 9.x client
+  cannot reach a 6.0.5 server so all four units cut over at once. **A role is ALWAYS negotiated but
+  only ACTIVATED when the client sets `unpaired_access_enabled` AND the server calls
+  `trust_unpaired()`** — miss either and the endpoint sits in the group at the right volume
+  rendering nothing, and `negotiated_role_ids` vs `active_role_ids` is the only tell.
+  `docs/AIOSENDSPIN-BUMP-SCOPE.md`. Do not re-derive this.
 - **`SendspinServer` always binds mDNS (5353)** → collides with the host Avahi. Start with
   `start_server(advertise_addresses=[], discover_clients=False)` and drive connections by URL.
 - **Sendspin mDNS goes through the system Avahi** (`mesh/avahi.py`, D-Bus), never our own responder.

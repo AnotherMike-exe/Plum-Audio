@@ -327,12 +327,13 @@ Full port scope, breakage list and the recommendation to hold the pin:
 
 ## Revisit checklist (per pin bump)
 
-Run `_resources/spike/mesh_smoke.py` first (per `CLAUDE.md`), then check each ask above against the
-new release's changelog/API. For any that's resolved: remove the workaround, update
-`docs/SPEC-CONFORMANCE.md`, and delete the entry here.
+Run `tests/Integration/t0_sendspin_protocol.py` first (per `CLAUDE.md`), against a venv holding the
+candidate version, then check each ask above against the new release's changelog/API. For any that's
+resolved: remove the workaround, update `docs/SPEC-CONFORMANCE.md`, and delete the entry here.
 
-**Note that `mesh_smoke.py` itself does not survive the 9.x constructor changes** — it has 5 broken
-constructor sites, so the mandated gate must be ported before it can gate anything.
+That gate was `_resources/spike/mesh_smoke.py` until 2026-08-12, when porting it to 9.1.0 showed it
+did not survive the constructor changes it was supposed to gate — and that being gitignored, the
+port would be lost. It now also asserts role **activation**, not just connection.
 
 **Status as of 2026-08-12** (all six read against 9.1.0 — see `docs/AIOSENDSPIN-BUMP-SCOPE.md`):
 

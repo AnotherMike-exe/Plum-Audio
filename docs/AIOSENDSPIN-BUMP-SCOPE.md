@@ -1,13 +1,23 @@
 # Scoping the `aiosendspin` bump — 6.0.5 → 9.1.0
 
-> **Status: HOLD the pin.** Scoped 2026-08-12 by source-reading both trees. This is a protocol
-> migration, not a version edit: ~30 call sites break, three of them architectural, and the blocking
-> problem has no clean answer while `sendspin-cpp` lacks encryption.
+> **Status: PORT IN PROGRESS** on `feature/aiosendspin-9x`. Scoped 2026-08-12 by source-reading both
+> trees. This is a protocol migration, not a version edit: ~30 call sites break, three of them
+> architectural.
 >
-> This document is the evidence behind that call. Re-read it before bumping, and re-check
-> `docs/UPSTREAM-AIOSENDSPIN.md` alongside it — that file tracks the workarounds, this one tracks the
-> port. Nothing here has been tested on hardware; every claim is a source read of the two trees, and
-> the items under *Needs a rig test* are explicitly not settled.
+> **The original recommendation was to HOLD, and Michael called it the other way the same day.** That
+> recommendation is preserved verbatim below rather than rewritten, because its reasoning is what the
+> port has to survive: `sendspin-cpp` still has no encryption, so `allow_unencrypted=True` is a
+> standing requirement rather than a transitional one, and we are building toward a server that runs
+> permanently in what upstream calls *"non-spec transition mode"*. Build it as an explicit flag, never
+> an assumption.
+>
+> **Trust model decided 2026-08-12: trust-on-deploy** — `unpaired_access_enabled` on our players plus
+> `trust_unpaired()` driven from provisioning, not PSK/PIN pairing. See the truth table under break #3
+> for why both halves are load-bearing.
+>
+> Re-read this before each phase, and re-check `docs/UPSTREAM-AIOSENDSPIN.md` alongside it — that file
+> tracks the workarounds, this one tracks the port. Claims here are source reads of the two trees
+> **except** where marked MEASURED; the items under *Needs a rig test* remain unsettled.
 
 ## Where we are
 
@@ -116,7 +126,7 @@ That is verbatim the failure signature `CLAUDE.md` already documents for the str
 **Anyone who bumps the pin and tests "does it connect?" will conclude it worked.** Write that into
 the test plan before touching the pin.
 
-**MEASURED 2026-08-12** against a real 9.1.0 server and client (`_resources/spike/mesh_smoke.py`
+**MEASURED 2026-08-12** against a real 9.1.0 server and client (`tests/Integration/t0_sendspin_protocol.py`
 steps 6-7, run locally — no hardware needed). This was a source read when first written; it is now a
 truth table:
 
@@ -169,7 +179,7 @@ keys are *not* in the trust store; `Identity` persistence is entirely ours.
 | `sendspin_player.py:654` | `ServerInfo.connection_reason` | `ServerInfo` is now `client/models.py` with only `server_id`, `name` — `AttributeError` |
 | `sendspin_server.py:382,596,789,819,970,997` | `client.negotiated_roles` | renamed `negotiated_role_ids` (6 sites + fakes) |
 | `server/client.py` | `attach_connection` | gained a required `negotiated_roles=` kwarg |
-| `_resources/spike/*.py` | constructors | 5 sites — **`mesh_smoke.py` is the mandated pre-bump gate, so it must be fixed first** |
+| ~~`_resources/spike/*.py`~~ | constructors | **DONE 2026-08-12** — ported and promoted to `tests/Integration/t0_sendspin_protocol.py`; now also asserts role activation |
 | `backend/requirements.txt` | deps | +`cryptography>=42`, +`noiseprotocol>=0.3.1`, +`cpace>=0.1.0` |
 | `tests/Unit/` | `test_client_state_conformance.py`, `test_player_health.py` (+13 assertions), `test_sendspin_server.py:96`, `test_true_none_reattach.py:66` | fakes and canaries |
 
@@ -273,8 +283,8 @@ Add that 9.x shipped **three majors in five days** (8.0.0 Aug 7, 9.0.0 Aug 10, 9
 - we want **seek** in the GUI;
 - the 9.x line goes a month without a major.
 
-**Port order when we do go**, since the dependencies are strict: `mesh_smoke.py` first (it is the
-mandated gate and is itself broken), then identity + pairing, then `client/state`, then the ~20
+**Port order when we do go**, since the dependencies are strict: the tier-0 gate first (**done** —
+`tests/Integration/t0_sendspin_protocol.py`), then identity + pairing, then `client/state`, then the ~20
 mechanical renames, then the frontend's two streams.
 
 ## Explicitly not a reason to bump: the source role

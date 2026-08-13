@@ -20,6 +20,7 @@ tier 4, which runs against live third-party devices in someone's home.
 
 | Script | Rig | Run |
 |---|---|---|
+| `t0_sendspin_protocol.py` | **none** — localhost only | `<venv>/bin/python t0_sendspin_protocol.py` |
 | `t2_source_lifecycle.sh` | any one unit | `./t2_source_lifecycle.sh <host> [source-id]` |
 | `t2_endpoint_crud.sh` | any one unit (config API on :5002) | `./t2_endpoint_crud.sh <host> [spotify\|airplay]` |
 | `t3_mesh_roam.sh` | **two** Plum units on one segment | `./t3_mesh_roam.sh <unit-a> <unit-b>` |
@@ -38,6 +39,27 @@ Run everything for one rig via `./run.sh`:
 ./run.sh mesh    192.0.2.10 192.0.2.11   # tier 2 + tier 3
 ./run.sh interop 198.51.100.20            # tier 2 + tier 4
 ```
+
+## Tier 0 — the aiosendspin version gate
+
+`t0_sendspin_protocol.py` is the odd one out: **Python, no host argument, no rig.** It stands two
+servers up on localhost and drives the ingest / group / stream / mesh-control path plus a real
+client handshake, so it answers "does this aiosendspin version still do what the product needs"
+without touching hardware. It is the gate `CLAUDE.md` mandates before any pin bump.
+
+It deliberately does **not** run against the repo's pinned version — point it at a venv holding the
+candidate:
+
+```
+python3.13 -m venv /tmp/venv91
+/tmp/venv91/bin/pip install 'aiosendspin[server]==9.1.0'
+/tmp/venv91/bin/python t0_sendspin_protocol.py
+```
+
+Steps 6-7 assert **role activation**, not connection. Under 9.x a role is always negotiated and only
+activated when the client sets `unpaired_access_enabled` *and* the server calls `trust_unpaired()` —
+so "it connected" is not evidence of anything. Do not weaken those assertions; see
+`docs/AIOSENDSPIN-BUMP-SCOPE.md` break #3 for the truth table.
 
 ## Notes
 
