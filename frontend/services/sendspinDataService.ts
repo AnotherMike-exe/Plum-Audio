@@ -74,6 +74,10 @@ interface WireUnit {
   } | null;
   /** Absent from a peer running an older image — treat that as "has one", never as playerless. */
   has_player?: boolean;
+  /** This unit's SENDSPIN server id — an X25519 public key under aiosendspin 9.x, and NOT `unit_id`.
+   *  The two were the same string until the 9.x bump, which is why `local_player.server_id` used to
+   *  join straight against `unit_id`. It does not any more; see `claimedByOutsider` below. */
+  server_id?: string;
 }
 /** GET /api/mesh/neighbourhood — every Sendspin service mDNS can see on this segment. */
 export interface Neighbourhood {
@@ -219,11 +223,20 @@ export function mapViewToModel(
 
   // Fold in each unit's self-reported speaker. Two jobs: keep a speaker visible when the server
   // it left can no longer see it, and name the server that took it.
-  const unitIds = new Set(view.units.map((u) => u.unit_id));
+  // `local_player.server_id` is a SENDSPIN id. Under aiosendspin 9.x that is an X25519 public key,
+  // a different namespace from `unit_id` — so this matches it against the units' own `server_id`s.
+  // It was `unit_id` before the bump, and worked only because we used to pass `server_id=unit_id`
+  // to SendspinServer; once ids became keypairs it missed every time, flagging every unit's OWN
+  // speaker as foreign and growing a phantom `foreign::` stream for it.
+  const serverIds = new Set(view.units.map((u) => u.server_id).filter(Boolean) as string[]);
   for (const unit of view.units) {
     const lp = unit.local_player;
     if (!lp?.player_id) continue;
-    const claimedByOutsider = !!lp.attached && !!lp.server_id && !unitIds.has(lp.server_id);
+    // If NO unit publishes a server_id, we cannot tell ours from anyone else's — so flag nothing
+    // rather than everything. Same reasoning as `has_player` defaulting true: a peer that has not
+    // finished starting its server, or one on an older image, must not turn the mesh foreign.
+    const claimedByOutsider =
+      !!lp.attached && !!lp.server_id && serverIds.size > 0 && !serverIds.has(lp.server_id);
     const foreignServer = claimedByOutsider
       ? { name: lp.server_name || lp.server_id!, title: lp.title, artist: lp.artist }
       : undefined;
