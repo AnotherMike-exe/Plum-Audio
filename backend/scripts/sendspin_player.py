@@ -43,6 +43,7 @@ from enum import StrEnum
 import numpy as np
 from aiosendspin.client.client import SendspinClient
 from aiosendspin.client.listener import ClientListener
+from aiosendspin.client.models import PairingSupport
 from aiosendspin.models.artwork import ArtworkChannel, ClientHelloArtworkSupport
 from aiosendspin.models.core import DeviceInfo
 from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
@@ -427,10 +428,20 @@ class SendspinPlayer:
         self.client = SendspinClient(
             identity=identity or sendspin_identity.load_or_create(sendspin_identity.PLAYER_ROLE),
             client_name=player_name,
-            # Required in 9.x. Carries unpaired_access_enabled (set in sendspin_identity), which is
-            # half of what makes our player's role ACTIVATE rather than merely negotiate; the server
-            # trusting this peer id is the other half. Miss either and we play nothing, silently.
+            # Required in 9.x. Carries the Pairing PSK this unit's own server pairs with, and the
+            # unpaired_access flag (both set in sendspin_identity).
             pairing_store=pairing_store,
+            # What makes this speaker pairable BY A HUMAN, and it is the presence of the wiring that
+            # decides which methods we can offer at all: a gesture_prompt enables static PIN, and
+            # either PIN out-channel enables dynamic PIN. A headless Pi has no screen, but every
+            # unit serves a web GUI and Sendspin needs a network regardless — so the GUI IS the
+            # display and the button, and both channels route to it over the consume relay.
+            pairing_support=PairingSupport(
+                gesture_prompt=self._pair_gesture_prompt,
+                pin_display=self._pair_show_pin,
+                offer_static_pin=True,
+                secret_locations=("this unit's web GUI, under Settings",),
+            ),
             device_info=DeviceInfo(
                 product_name="Plum Audio",
                 manufacturer="Plum Solutions",
@@ -481,6 +492,11 @@ class SendspinPlayer:
         self._last_audio_mono = 0.0
         self._audio_flowing = False
         self._relay_task: asyncio.Task | None = None
+        # Pairing frame for the relay (a live PIN and/or a pending gesture request), latest-wins
+        # like ctrl. Not part of the 3 s state POST: a PIN must reach the operator immediately, and
+        # the relay is loopback-only so it never leaves the unit.
+        self._relay_pair: dict | None = None
+        self._relay_pair_dirty = False
         self.relay_url = os.environ.get("PLUM_PLAYER_RELAY_URL", "ws://127.0.0.1:5001/api/mesh/consume?role=player")
         self.client.add_group_update_listener(self._on_group_update)
         self.client.add_metadata_listener(self._on_metadata)
@@ -732,6 +748,10 @@ class SendspinPlayer:
                 self._relay_ctrl_dirty = False
                 with contextlib.suppress(Exception):
                     await ws.send_json(self._relay_ctrl)
+            if self._relay_pair_dirty and self._relay_pair is not None:
+                self._relay_pair_dirty = False
+                with contextlib.suppress(Exception):
+                    await ws.send_json(self._relay_pair)
             if self._relay_art_dirty and self._relay_art is not None:
                 self._relay_art_dirty = False
                 with contextlib.suppress(Exception):
@@ -741,6 +761,43 @@ class SendspinPlayer:
                 with contextlib.suppress(Exception):
                     await ws.send_json(frame)
             await asyncio.sleep(1 / 30)
+
+    # -- pairing: the GUI is this speaker's display and its button ------------
+
+    async def _pair_show_pin(self, pin: str | None) -> None:
+        """`pin_display`: surface a derived dynamic PIN, or clear it when the exchange ends.
+
+        Called with the PIN when one is derived and with None on success OR failure, so the GUI can
+        take the dialog down either way. Pushed over the consume relay rather than ridden along on
+        the 3 s player-state POST: a PIN the operator is waiting to read must appear immediately,
+        and the relay is loopback-only, so the PIN never leaves the unit.
+        """
+        self._emit_pair(pin=pin)
+        logger.info("pairing: %s", "PIN displayed" if pin else "PIN cleared")
+
+    async def _pair_gesture_prompt(self, needed: bool) -> None:
+        """`gesture_prompt`: ask the operator to confirm, or withdraw the ask.
+
+        Its mere presence is what lets us offer static-PIN pairing, which the spec gesture-gates on
+        EVERY attempt — so this is not a one-off confirmation, it is the thing that makes a static
+        PIN safe to have. The GUI answers it by calling `open_pairing_window()` through the mesh API.
+        """
+        self._emit_pair(gesture=needed)
+        logger.info("pairing: gesture %s", "requested" if needed else "withdrawn")
+
+    def _emit_pair(self, *, pin: str | None = None, gesture: bool | None = None) -> None:
+        """Latest-wins pairing frame for the relay, in the same `t`-tagged shape as ctrl/viz/art.
+
+        Merges rather than replaces: a PIN and a gesture request can be live at once (static-PIN
+        pairing asks for both), and each callback only knows about its own half.
+        """
+        frame = dict(self._relay_pair or {"t": "pair"})
+        if pin is not None or "pin" in frame:
+            frame["pin"] = pin
+        if gesture is not None:
+            frame["gesture"] = gesture
+        self._relay_pair = frame
+        self._relay_pair_dirty = True
 
     async def _relay_command(self, data: dict) -> None:
         """A transport command from the GUI → send it to the server we are a member of."""
@@ -1078,7 +1135,12 @@ async def main() -> int | None:
     # supervisord priority. load_or_create rather than a plain read so a hand-run player on the dev
     # rig (no supervisord) still works, and so the two can never disagree about which key is ours.
     identity = sendspin_identity.load_or_create(sendspin_identity.PLAYER_ROLE)
-    pairing_store = await sendspin_identity.client_pairing_store()
+    # settings.json > PLUM_UNPAIRED_ACCESS > off. Applied at construction because the flag rides in
+    # `client/hello`, so it is fixed for the life of a connection — a change takes effect on the
+    # player's next restart, the same deliberate trade as a device rename.
+    pairing_store = await sendspin_identity.client_pairing_store(
+        unpaired_access=sendspin_identity.unpaired_access_enabled()
+    )
     logger.info("player identity: peer_id=%s (listener id %s)", identity.peer_id, player_id)
     player = SendspinPlayer(
         player_id,

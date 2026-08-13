@@ -455,3 +455,94 @@ def test_the_legacy_headphones_placeholder_still_takes_its_own_path(manager):
     """It is also `hw:`-prefixed; the two clauses must not fight over it."""
     manager.update_settings({"audio": {"output": {"device": "hw:Headphones"}}})
     assert manager.get_settings()["audio"]["output"]["device"] is None
+
+
+# -- unpaired access: settings.json > env > OFF ------------------------------------------------------
+
+
+def _unpaired(tmp_path, monkeypatch, *, stored=..., env=None):
+    """Resolve unpaired access with a given stored value and environment."""
+    import importlib
+    import json as _json
+
+    import sendspin_identity
+
+    path = tmp_path / "settings.json"
+    if stored is not ...:
+        path.write_text(_json.dumps({"pairing": {"unpairedAccess": stored}}))
+    monkeypatch.setenv("PLUM_SETTINGS_FILE", str(path))
+    if env is None:
+        monkeypatch.delenv("PLUM_UNPAIRED_ACCESS", raising=False)
+    else:
+        monkeypatch.setenv("PLUM_UNPAIRED_ACCESS", env)
+    importlib.reload(sendspin_identity)
+    return sendspin_identity.unpaired_access_enabled()
+
+
+def test_unpaired_access_defaults_off(tmp_path, monkeypatch):
+    """The product default, and the whole point of implementing pairing. On would mean shipping the
+    deviation we removed: encrypted but unauthenticated, which the spec calls MITM-vulnerable."""
+    assert _unpaired(tmp_path, monkeypatch) is False
+
+
+def test_the_env_supplies_the_deploy_time_default(tmp_path, monkeypatch):
+    """Meaningful only while nobody has chosen in the GUI — the same tier PLUM_DAC_DEVICE occupies."""
+    assert _unpaired(tmp_path, monkeypatch, env="1") is True
+    assert _unpaired(tmp_path, monkeypatch, env="0") is False
+
+
+def test_settings_beat_the_env_in_both_directions(tmp_path, monkeypatch):
+    assert _unpaired(tmp_path, monkeypatch, stored=True, env="0") is True
+    assert _unpaired(tmp_path, monkeypatch, stored=False, env="1") is False
+
+
+def test_a_stored_false_is_a_real_choice_not_an_absent_one(tmp_path, monkeypatch):
+    """The reason the stored default is null rather than false. If `False` were read as "unset", a
+    user who turned this OFF in the GUI would have it silently turned back on by the env on the next
+    deploy — the failure mode `audio.output.device` was redesigned to avoid."""
+    assert _unpaired(tmp_path, monkeypatch, stored=False, env="1") is False
+
+
+def test_a_damaged_settings_file_falls_back_rather_than_raising(tmp_path, monkeypatch):
+    """Both audio processes call this unwrapped at boot; a raise here would kill the unit."""
+    import importlib
+
+    import sendspin_identity
+
+    path = tmp_path / "settings.json"
+    path.write_text("{ this is not json")
+    monkeypatch.setenv("PLUM_SETTINGS_FILE", str(path))
+    monkeypatch.setenv("PLUM_UNPAIRED_ACCESS", "1")
+    importlib.reload(sendspin_identity)
+    assert sendspin_identity.unpaired_access_enabled() is True
+
+
+def test_a_settings_file_whose_pairing_key_is_not_a_dict_does_not_raise(tmp_path, monkeypatch):
+    """A hand-edit can put anything there; the chained .get() walk must not explode on it."""
+    import importlib
+    import json as _json
+
+    import sendspin_identity
+
+    path = tmp_path / "settings.json"
+    path.write_text(_json.dumps({"pairing": "nonsense"}))
+    monkeypatch.setenv("PLUM_SETTINGS_FILE", str(path))
+    monkeypatch.delenv("PLUM_UNPAIRED_ACCESS", raising=False)
+    importlib.reload(sendspin_identity)
+    assert sendspin_identity.unpaired_access_enabled() is False
+
+
+def test_a_missing_settings_file_is_silent_not_a_traceback(tmp_path, monkeypatch, caplog):
+    """First boot has no settings.json — the env tier exists precisely for that state. Logging a
+    stack trace for it would put an alarming traceback in every fresh unit's log."""
+    import importlib
+    import logging
+
+    import sendspin_identity
+
+    monkeypatch.setenv("PLUM_SETTINGS_FILE", str(tmp_path / "does-not-exist.json"))
+    monkeypatch.delenv("PLUM_UNPAIRED_ACCESS", raising=False)
+    importlib.reload(sendspin_identity)
+    with caplog.at_level(logging.WARNING):
+        assert sendspin_identity.unpaired_access_enabled() is False
+    assert not caplog.records, f"a missing settings file logged: {[r.message for r in caplog.records]}"

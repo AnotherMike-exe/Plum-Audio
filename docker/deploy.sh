@@ -486,6 +486,18 @@ PLEXAMP_ENABLED=0
 # no Noise support in any release, and our own GUI controller is a hand-rolled cleartext WebSocket.
 # Setting this to 0 drops every third-party speaker on the LAN, Music Assistant, AND the web GUI.
 PLUM_ALLOW_UNENCRYPTED=1
+
+# Whether an ENCRYPTED-but-unpaired client may play (the sentinel-PSK path). Off by default now that
+# real pairing exists — it is encrypted but UNAUTHENTICATED, which the spec calls MITM-vulnerable.
+# This is only the deploy-time default: a choice made in the GUI is stored in settings.json and wins
+# from then on, including across upgrades. It does NOT affect cleartext clients (ESP32 speakers,
+# Music Assistant, the web GUI) — they never reach this gate.
+PLUM_UNPAIRED_ACCESS=0
+
+# Optional 8-digit static pairing PIN, offered as a pairing method for this unit's speaker. Must be
+# EXACTLY 8 digits or it is refused with a log line. The spec gesture-gates every static-PIN attempt,
+# so this is convenience, not unattended pairing — someone still confirms in the GUI.
+#PLUM_STATIC_PIN=
 ENV
 # COMPOSE_PROFILES has to be here, not in plum-audio.env: env_file is container environment, while
 # this is compose INTERPOLATION. Written beside the compose file so a bare `docker compose up -d` or
