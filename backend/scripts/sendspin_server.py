@@ -51,6 +51,7 @@ import socket
 import time
 from collections.abc import AsyncIterator
 
+import sendspin_identity
 import unit_identity
 from aiosendspin.models.types import GoodbyeReason, MediaCommand, has_role_family
 from aiosendspin.server.audio import AudioFormat
@@ -408,6 +409,9 @@ class PlumSendspinServer:
         self.unit_id = unit_id
         self.unit_name = unit_name
         self.port = port
+        # Our Sendspin-level id (identity.peer_id), filled in start(). Distinct from unit_id, which
+        # is the mesh's key — 9.x derives this from a keypair, so they are separate namespaces now.
+        self.server_id: str | None = None
         # False on an ingest/routing-only unit: no player process, no local speaker, and nothing for
         # a peer to route audio onto. Travels in the snapshot so peers can tell "no speaker here,
         # ever" from "no speaker connected right now" — see UnitSnapshot.has_player.
@@ -437,14 +441,53 @@ class PlumSendspinServer:
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
-        self.server = SendspinServer(loop=loop, server_id=self.unit_id, server_name=self.unit_name)
+        # 9.x: the server id is not ours to choose — it is identity.peer_id, the X25519 public key.
+        # `unit_id` stays the MESH key (discovery, topology, the API); the two are now different
+        # namespaces and anything joining them has to do it explicitly. See mesh/follow.py.
+        identity = sendspin_identity.load_or_create(sendspin_identity.SERVER_ROLE)
+        self.server = SendspinServer(
+            loop=loop,
+            identity=identity,
+            server_name=self.unit_name,
+            pairing_store=await sendspin_identity.server_pairing_store(),
+            # Cleartext clients. Permanent, not transitional — sendspin-cpp has no encryption in any
+            # release, so this is what keeps every ESP32 speaker and Music Assistant able to connect.
+            allow_unencrypted=sendspin_identity.allow_unencrypted(),
+        )
+        self.server_id = identity.peer_id
         # mDNS OFF: SendspinServer always constructs AsyncZeroconf; keep it from advertising
         # (5353 collides with our Avahi). We connect players by explicit URL via the orchestrator.
         await self.server.start_server(port=self.port, advertise_addresses=[], discover_clients=False)
+        await self._trust_own_player()
         # Join controller-only clients (the GUI's metadata/artwork/controller WS) to a source group
         # so they receive its now-playing state — the server otherwise leaves them in a solo group.
         self.server.add_event_listener(self._on_server_event)
-        logger.info("Sendspin server up: %s (%s) :%d", self.unit_name, self.unit_id, self.port)
+        logger.info(
+            "Sendspin server up: %s (unit %s, peer %s) :%d", self.unit_name, self.unit_id, self.server_id, self.port
+        )
+
+    async def _trust_own_player(self) -> None:
+        """Trust this unit's own player, so its player role is ACTIVATED and not merely negotiated.
+
+        Half of the trust-on-deploy contract; the other half is `unpaired_access_enabled` on the
+        player's own pairing store. Neither alone is enough, and the failure when one is missing is
+        silent — the player connects, negotiates player@v1, joins the group at the right volume, and
+        renders nothing, logging nothing. See sendspin_identity for the measured truth table.
+
+        Best-effort: a unit whose player key does not exist yet is a playerless unit (headless mode
+        never mints one), and a trust store that will not open must not stop the server from serving
+        foreign speakers. Both are logged rather than raised.
+        """
+        player_peer = sendspin_identity.peer_id_of(sendspin_identity.PLAYER_ROLE)
+        if not player_peer:
+            logger.info("no local player identity — playerless unit, nothing to trust")
+            return
+        try:
+            await self.server.trust_unpaired(player_peer)
+        except Exception:  # noqa: BLE001 - never let trust bookkeeping stop the audio process
+            logger.warning("could not trust the local player %s; it will connect but stay silent", player_peer)
+        else:
+            logger.info("trusted local player %s", player_peer)
 
     async def stop(self) -> None:
         self._stop_evt.set()
@@ -1397,8 +1440,8 @@ class PlumSendspinServer:
             await asyncio.sleep(1.0)
 
 
-def local_player_config(env: dict, unit_id: str) -> tuple[str | None, str | None]:
-    """(player id, player URL) for this unit's own speaker — (None, None) if it has none.
+def local_player_config(env: dict) -> str | None:
+    """This unit's own speaker's listener URL, or None if it has none.
 
     Extracted from main() because it is the hinge of headless mode and main() cannot be unit-tested.
     A unit with no audio output has no player process at all (output_gate.py decided that before
@@ -1408,13 +1451,15 @@ def local_player_config(env: dict, unit_id: str) -> tuple[str | None, str | None
     PLUM_PLAYER_ENABLED is the container-level answer, written by deploy.sh from the units.conf row,
     and the entrypoint sets it from the gate. The empty-URL check stays as a second way to say the
     same thing — it predates the flag and the dev rig still uses it.
+
+    **This used to also return the player's ID, derived from PLUM_LOCAL_PLAYER_ID or `<unit>-player`.**
+    Under aiosendspin 9.x a client id is the peer's X25519 public key, so it is no longer ours to
+    name: main() reads it from the persisted keypair instead. What is left here is purely "is there a
+    player, and where does it listen" — which is what every test on this function was really about.
     """
     if env.get("PLUM_PLAYER_ENABLED", "1") == "0":
-        return None, None
-    url = env.get("PLUM_LOCAL_PLAYER_URL", "ws://127.0.0.1:8928/sendspin")
-    if not url:
-        return None, None
-    return env.get("PLUM_LOCAL_PLAYER_ID", f"{unit_id}-player"), url
+        return None
+    return env.get("PLUM_LOCAL_PLAYER_URL", "ws://127.0.0.1:8928/sendspin") or None
 
 
 async def main() -> None:
@@ -1429,7 +1474,15 @@ async def main() -> None:
     # Single-unit glue: auto-attach our own player to this source once it comes up. Empty URL
     # disables it (Phase 2: the mesh orchestrator drives routing instead).
     home_source = os.environ.get("PLUM_LOCAL_PLAYER_SOURCE", "airplay-1")
-    local_player_id, local_player_url = local_player_config(os.environ, unit_id)
+    local_player_url = local_player_config(os.environ)
+    # The player's Sendspin id is its PUBLIC KEY under 9.x, so the server derives it from the stored
+    # keypair rather than naming it. Minting here (not just reading) is deliberate: the server has
+    # the lower supervisord priority and therefore starts first, so it is what creates both
+    # identities on a fresh unit — and it needs the player's id before the player has ever connected,
+    # to register its URL and to trust it. Both processes share /config inside one container.
+    local_player_id = (
+        sendspin_identity.load_or_create(sendspin_identity.PLAYER_ROLE).peer_id if local_player_url else None
+    )
 
     mesh_enabled = os.environ.get("PLUM_MESH_ENABLED", "1") != "0"
 

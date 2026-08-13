@@ -63,6 +63,7 @@ except Exception:  # noqa: BLE001 - allows --probe-config / import without PortA
     sd = None
 
 import audio_devices
+import sendspin_identity
 import unit_identity
 from lifecycle import install_shutdown_handlers
 from mesh.avahi import CLIENT_SERVICE, AvahiClient
@@ -382,7 +383,13 @@ class SendspinPlayer:
         initial_volume: int,
         initial_muted: bool = False,
         state_file: str | None = None,
+        identity=None,
+        pairing_store=None,
     ) -> None:
+        # `player_id` is the LISTENER id — what we advertise over mDNS and what a server dials. It is
+        # NOT the id a server knows us by after the handshake: 9.x derives that from `identity`
+        # (identity.peer_id, the X25519 public key) and the client hello no longer carries a chosen
+        # id at all. Two ids, and as with the two NAMES, the listener URL is the join between them.
         self.player_id = player_id
         self.player_name = player_name  # friendly name; also the mDNS TXT `name`
         self.port = port
@@ -419,8 +426,12 @@ class SendspinPlayer:
             ],
         )
         self.client = SendspinClient(
-            client_id=player_id,
+            identity=identity or sendspin_identity.load_or_create(sendspin_identity.PLAYER_ROLE),
             client_name=player_name,
+            # Required in 9.x. Carries unpaired_access_enabled (set in sendspin_identity), which is
+            # half of what makes our player's role ACTIVATE rather than merely negotiate; the server
+            # trusting this peer id is the other half. Miss either and we play nothing, silently.
+            pairing_store=pairing_store,
             device_info=DeviceInfo(
                 product_name="Plum Audio",
                 manufacturer="Plum Solutions",
@@ -1056,9 +1067,17 @@ async def main() -> int | None:
     )
 
     renderer = AlsaRenderer(rate, channels, bits, device=device, target_buffer_ms=target_buffer_ms)
+    # Normally already on disk — the server mints both identities at startup and it has the lower
+    # supervisord priority. load_or_create rather than a plain read so a hand-run player on the dev
+    # rig (no supervisord) still works, and so the two can never disagree about which key is ours.
+    identity = sendspin_identity.load_or_create(sendspin_identity.PLAYER_ROLE)
+    pairing_store = await sendspin_identity.client_pairing_store()
+    logger.info("player identity: peer_id=%s (listener id %s)", identity.peer_id, player_id)
     player = SendspinPlayer(
         player_id,
         player_name,
+        identity=identity,
+        pairing_store=pairing_store,
         port=port,
         renderer=renderer,
         rate=rate,

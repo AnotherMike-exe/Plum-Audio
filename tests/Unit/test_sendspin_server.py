@@ -718,31 +718,38 @@ def test_controller_grouping_is_a_noop_with_no_sources():
 # -- headless: the unit that has no speaker ----------------------------------------------------------
 
 
-def test_local_player_config_derives_the_pair_by_default():
-    player_id, url = ss.local_player_config({}, "unit-210")
-    assert player_id == "unit-210-player"
-    assert url == "ws://127.0.0.1:8928/sendspin"
+def test_local_player_config_defaults_to_the_loopback_listener():
+    assert ss.local_player_config({}) == "ws://127.0.0.1:8928/sendspin"
 
 
-def test_local_player_config_honours_explicit_values():
-    env = {"PLUM_LOCAL_PLAYER_ID": "player-210", "PLUM_LOCAL_PLAYER_URL": "ws://10.0.0.9:8928/sendspin"}
-    assert ss.local_player_config(env, "unit-210") == ("player-210", "ws://10.0.0.9:8928/sendspin")
+def test_local_player_config_honours_an_explicit_url():
+    env = {"PLUM_LOCAL_PLAYER_URL": "ws://10.0.0.9:8928/sendspin"}
+    assert ss.local_player_config(env) == "ws://10.0.0.9:8928/sendspin"
 
 
 def test_the_operator_flag_removes_the_local_player():
     """deploy.sh writes this from a units.conf row whose DAC column is `none`."""
-    env = {"PLUM_PLAYER_ENABLED": "0", "PLUM_LOCAL_PLAYER_ID": "player-210"}
-    assert ss.local_player_config(env, "unit-210") == (None, None)
+    assert ss.local_player_config({"PLUM_PLAYER_ENABLED": "0"}) is None
 
 
 def test_an_empty_url_also_removes_the_local_player():
     """The older way of saying it, still used on the dev rig — must keep working."""
-    assert ss.local_player_config({"PLUM_LOCAL_PLAYER_URL": ""}, "unit-210") == (None, None)
+    assert ss.local_player_config({"PLUM_LOCAL_PLAYER_URL": ""}) is None
 
 
 def test_the_flag_wins_over_an_explicit_url():
     env = {"PLUM_PLAYER_ENABLED": "0", "PLUM_LOCAL_PLAYER_URL": "ws://10.0.0.9:8928/sendspin"}
-    assert ss.local_player_config(env, "unit-210") == (None, None)
+    assert ss.local_player_config(env) is None
+
+
+def test_the_player_id_no_longer_comes_from_the_environment():
+    """PLUM_LOCAL_PLAYER_ID used to name the player. Under 9.x the id IS the X25519 public key, so
+    honouring an env override would hand the server an id no handshake can ever produce — it would
+    register a URL and trust a peer that does not exist, and the real player would arrive unknown
+    and untrusted. The variable is deliberately ignored rather than removed, because a deployed
+    units.conf still sets it."""
+    env = {"PLUM_LOCAL_PLAYER_ID": "player-210"}
+    assert ss.local_player_config(env) == "ws://127.0.0.1:8928/sendspin"
 
 
 def test_a_unit_reports_whether_it_has_a_speaker_at_all():
