@@ -546,3 +546,66 @@ def test_a_missing_settings_file_is_silent_not_a_traceback(tmp_path, monkeypatch
     with caplog.at_level(logging.WARNING):
         assert sendspin_identity.unpaired_access_enabled() is False
     assert not caplog.records, f"a missing settings file logged: {[r.message for r in caplog.records]}"
+
+
+# -- the fleet pairing secret ------------------------------------------------------------------------
+
+
+def _fleet(monkeypatch, value):
+    import importlib
+
+    import sendspin_identity
+
+    if value is None:
+        monkeypatch.delenv("PLUM_FLEET_PSK", raising=False)
+    else:
+        monkeypatch.setenv("PLUM_FLEET_PSK", value)
+    importlib.reload(sendspin_identity)
+    return sendspin_identity
+
+
+def test_no_fleet_secret_is_a_valid_stricter_posture(monkeypatch):
+    """Unset means units pair only with their own speaker automatically; everything else is a
+    deliberate act in the GUI. That is a real choice, not a broken configuration."""
+    assert _fleet(monkeypatch, None).fleet_psk() is None
+
+
+def test_a_well_formed_fleet_secret_is_accepted(monkeypatch):
+    from aiosendspin.noise import b64url_encode, generate_psk
+
+    si = _fleet(monkeypatch, b64url_encode(generate_psk()))
+    assert si.fleet_psk() is not None and len(si.fleet_psk()) == 32
+
+
+def test_a_malformed_fleet_secret_is_refused_not_half_applied(monkeypatch):
+    """Refusing loudly matters more than usual here: a PSK that half-applies would leave SOME units
+    able to pair and others not, which reads as an intermittent mesh fault rather than a typo."""
+    assert _fleet(monkeypatch, "not base64 !!").fleet_psk() is None
+
+
+def test_a_correctly_encoded_secret_of_the_wrong_LENGTH_is_refused(monkeypatch):
+    """Valid base64url that decodes to 16 bytes is the plausible mistake — someone generating a
+    secret with the wrong byte count. It must not be silently padded or accepted."""
+    from aiosendspin.noise import b64url_encode
+
+    assert _fleet(monkeypatch, b64url_encode(b"\x01" * 16)).fleet_psk() is None
+
+
+def test_the_fleet_secret_takes_over_the_local_pairing_slot(monkeypatch, tmp_path):
+    """A client accepts exactly ONE Pairing PSK, so the fleet value must displace the per-unit one —
+    otherwise a unit would accept the fleet secret from peers but present its own to its own player,
+    and pair with nobody."""
+    from aiosendspin.noise import b64url_encode, generate_psk
+
+    psk = generate_psk()
+    monkeypatch.setenv("PLUM_IDENTITY_DIR", str(tmp_path))
+    si = _fleet(monkeypatch, b64url_encode(psk))
+    assert si.local_pairing_psk() == psk
+
+
+def test_without_a_fleet_secret_each_unit_mints_its_own(monkeypatch, tmp_path):
+    monkeypatch.setenv("PLUM_IDENTITY_DIR", str(tmp_path))
+    si = _fleet(monkeypatch, None)
+    first = si.local_pairing_psk()
+    assert len(first) == 32
+    assert si.local_pairing_psk() == first, "must be stable, or the unit re-pairs itself every boot"

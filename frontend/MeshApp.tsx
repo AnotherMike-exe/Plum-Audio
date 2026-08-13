@@ -692,6 +692,7 @@ export default function MeshApp(): React.ReactElement {
           settings={settings}
           onSettingsChange={onSettingsChange}
           onClose={() => setSettingsOpen(false)}
+          onOpenPairingWindows={() => service.openPairingWindowEverywhere()}
         />
       )}
 
