@@ -79,6 +79,47 @@ def local_pair_psk_path() -> str:
     return os.path.join(identity_dir(), "local-pair.psk")
 
 
+FLEET_PSK_ENV = "PLUM_FLEET_PSK"
+
+
+def fleet_psk() -> bytes | None:
+    """The Pairing PSK shared across this fleet, or None when each unit stands alone.
+
+    **What it buys.** A unit's server can pair with ANY unit's player that accepts the same secret,
+    with no operator step — which is what makes a four-unit mesh usable without twelve manual
+    pairings, and what lets a replacement unit join by being deployed rather than by being paired
+    twelve times over.
+
+    **What it costs, plainly.** It is one secret for the whole fleet. Anyone holding it can pair with
+    any unit, so it is meaningfully weaker than a per-pair record and meaningfully stronger than the
+    sentinel PSK, which is *published*. It is written by `deploy.sh` into each unit's env, so its
+    blast radius is whoever can read that env or `/opt/plum-audio` — the same people who can already
+    ssh to the units.
+
+    Unset is a valid, stricter posture: units then pair only with their own player automatically, and
+    everything else is a deliberate act in the GUI.
+    """
+    raw = (os.environ.get(FLEET_PSK_ENV) or "").strip()
+    if not raw:
+        return None
+    from aiosendspin.noise import PSK_SIZE, b64url_decode
+
+    try:
+        psk = b64url_decode(raw)
+    except Exception:  # noqa: BLE001 - operator-supplied; say what is wrong rather than crash-looping
+        logger.error("%s is not valid base64url — ignoring it; units will not auto-pair", FLEET_PSK_ENV)
+        return None
+    if len(psk) != PSK_SIZE:
+        logger.error(
+            "%s must decode to %d bytes, got %d — ignoring it; units will not auto-pair",
+            FLEET_PSK_ENV,
+            PSK_SIZE,
+            len(psk),
+        )
+        return None
+    return psk
+
+
 def local_pairing_psk() -> bytes:
     """The Pairing PSK this unit's server and its own player share, minted once and persisted.
 
@@ -96,7 +137,16 @@ def local_pairing_psk() -> bytes:
 
     Same create-once-or-lose-the-race shape as `load_or_create`, for the same reason: two processes
     minting different secrets would leave a unit unable to pair with itself, silently.
+
+    **A configured fleet PSK takes over this slot entirely**, because a client accepts exactly ONE
+    Pairing PSK — `set_pairing_psk` replaces any existing one. That is not a compromise: the local
+    server presents whatever this returns, so it keeps pairing with its own player either way, and
+    using one value means "our own player" and "a peer's player" are the same code path.
     """
+    shared = fleet_psk()
+    if shared is not None:
+        return shared
+
     path = local_pair_psk_path()
     existing = _read_psk(path)
     if existing is not None:

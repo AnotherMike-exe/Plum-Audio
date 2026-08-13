@@ -37,6 +37,30 @@ HERE="$PWD"
 [[ -f "${HERE}/.deploy.env" ]] && source "${HERE}/.deploy.env"
 USER_="${PLUM_TEST_USER:-plum-admin}"
 PW="${PLUM_TEST_PW:?not set — export it, or create docker/.deploy.env containing PLUM_TEST_PW=<rig password>}"
+
+# --- fleet pairing secret -------------------------------------------------------------------------
+# One Pairing PSK shared by every unit, so a unit's server can pair with any unit's SPEAKER without
+# an operator. Without it a four-unit mesh needs twelve manual pairings, repeated whenever a unit is
+# re-imaged (a new identity is a new device to every peer).
+#
+# Generated ONCE and kept in .deploy.env, which is gitignored, because the whole point is that every
+# unit gets the SAME value — regenerating per deploy would silently unpair the fleet on every run.
+# Losing it is recoverable: delete the line, redeploy every unit together, and they re-pair on the
+# new secret. Losing it while deploying only SOME units is not, so deploy the fleet together after
+# a rotation.
+#
+# It is a shared secret: anyone holding it can pair with any unit. That is a real step down from a
+# per-pair record and a real step up from the sentinel PSK, which is published. Unset it for the
+# stricter posture, where units pair only with their own speaker and everything else is deliberate.
+if [[ -z "${PLUM_FLEET_PSK:-}" ]]; then
+    if [[ -f "${HERE}/.deploy.env" ]] && grep -q '^PLUM_FLEET_PSK=' "${HERE}/.deploy.env"; then
+        PLUM_FLEET_PSK="$(grep '^PLUM_FLEET_PSK=' "${HERE}/.deploy.env" | tail -1 | cut -d= -f2-)"
+    else
+        PLUM_FLEET_PSK="$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')"
+        printf 'PLUM_FLEET_PSK=%s\n' "$PLUM_FLEET_PSK" >> "${HERE}/.deploy.env"
+        echo "==> minted a fleet pairing secret into docker/.deploy.env (shared by every unit)"
+    fi
+fi
 # UserKnownHostsFile=/dev/null, not just StrictHostKeyChecking=no: a REIMAGED unit presents a new
 # host key, and a conflicting known_hosts entry makes ssh refuse the connection outright — password
 # auth is disabled in that state, so the deploy fails on the very first ssh of every unit with a
@@ -493,6 +517,10 @@ PLUM_ALLOW_UNENCRYPTED=1
 # from then on, including across upgrades. It does NOT affect cleartext clients (ESP32 speakers,
 # Music Assistant, the web GUI) — they never reach this gate.
 PLUM_UNPAIRED_ACCESS=0
+
+# The fleet's shared Pairing PSK — identical on every unit, which is what lets a unit's server pair
+# with any unit's speaker with no operator step. Generated once into docker/.deploy.env.
+PLUM_FLEET_PSK=${PLUM_FLEET_PSK}
 
 # Optional 8-digit static pairing PIN, offered as a pairing method for this unit's speaker. Must be
 # EXACTLY 8 digits or it is refused with a log line. The spec gesture-gates every static-PIN attempt,

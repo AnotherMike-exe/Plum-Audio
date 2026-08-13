@@ -885,6 +885,26 @@ export class SendspinDataService {
     return this.postResult(unitId, '/pairing-window', clientId ? { client_id: clientId } : {});
   }
 
+  /** Open EVERY unit's own speaker for pairing, so an existing group admits a new unit.
+   *
+   * Fanned out from here rather than unit-to-unit, deliberately. Each unit opens only its OWN
+   * player's window, using its own server's management session over a pairing record it already
+   * holds — so this call is a nudge, never a transfer of trust, and a unit that ignores it simply
+   * stays closed. Doing it server-to-server would mean one unit acting on another's authority over
+   * an API that has none.
+   *
+   * Reports how many opened: a partial result is normal (a unit may be down) and is more useful
+   * than a bare failure, because the operator can see whether the one they care about is ready.
+   */
+  async openPairingWindowEverywhere(): Promise<{ opened: number; total: number; failed: string[] }> {
+    const units = [...this.unitHosts.keys()];
+    const results = await Promise.all(
+      units.map(async (unitId) => ({ unitId, res: await this.openPairingWindow(unitId) })),
+    );
+    const failed = results.filter((r) => !r.res.ok).map((r) => r.unitId);
+    return { opened: results.length - failed.length, total: results.length, failed };
+  }
+
   /** How a pairing attempt is going. Polled while a dialog is open — an attempt runs in the
    *  background on the unit, so its outcome arrives here rather than from the call that began it. */
   async pairingState(unitId: string, clientId?: string): Promise<Record<string, { state: string; error?: string }>> {

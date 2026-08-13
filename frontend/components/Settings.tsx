@@ -7,6 +7,7 @@ import {PlaybackTab} from './settings/PlaybackTab';
 import {ThemeTab} from './settings/ThemeTab';
 import {VisualizerTab} from './settings/VisualizerTab';
 import {AboutTab} from './settings/AboutTab';
+import {PairingTab} from './settings/PairingTab';
 import { Icon } from './Icon';
 
 interface SettingsProps {
@@ -14,6 +15,8 @@ interface SettingsProps {
     onSettingsChange: (newSettings: SettingsType) => void;
     onClose: () => void;
     initialTab?: string; // Optional initial tab to open
+    /** Fleet-wide pairing action, surfaced on the Pairing tab. */
+    onOpenPairingWindows?: () => Promise<{ opened: number; total: number; failed: string[] }>;
 }
 
 // Phase 3: Integrations is surfaced with only the sources whose backend exists (AirPlay, Spotify
@@ -29,12 +32,13 @@ const tabs: Tab[] = [
     {id: 'integrations', label: 'Integrations', icon: 'puzzle-piece'},
     {id: 'audio', label: 'Audio', icon: 'volume-high'},
     {id: 'playback', label: 'Playback', icon: 'network-wired'},
+    {id: 'pairing', label: 'Pairing', icon: 'network-wired'},
     {id: 'theme', label: 'Theme', icon: 'palette'},
     {id: 'visualizer', label: 'Visualizer', icon: 'waveform'},
     {id: 'about', label: 'About', icon: 'circle-info'},
 ];
 
-export const Settings: React.FC<SettingsProps> = ({settings, onSettingsChange, onClose, initialTab}) => {
+export const Settings: React.FC<SettingsProps> = ({settings, onSettingsChange, onClose, initialTab, onOpenPairingWindows}) => {
     const [activeTab, setActiveTab] = useState(initialTab || tabs[0].id);
 
     const renderTabContent = () => {
@@ -45,6 +49,8 @@ export const Settings: React.FC<SettingsProps> = ({settings, onSettingsChange, o
                 return <AudioTab settings={settings} onSettingsChange={onSettingsChange} />;
             case 'playback':
                 return <PlaybackTab settings={settings} onSettingsChange={onSettingsChange} />;
+            case 'pairing':
+                return <PairingTab onOpenPairingWindows={onOpenPairingWindows} />;
             case 'theme':
                 return <ThemeTab settings={settings} onSettingsChange={onSettingsChange} />;
             case 'visualizer':
