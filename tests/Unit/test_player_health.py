@@ -1,7 +1,16 @@
-"""Unit tests for the player's client/state health signal.
+"""Unit tests for the player's render-health signal.
 
-The spec asks a client that cannot maintain sync to report `state: 'error'`; that is how a server
-learns to give it more lead time. The signal is only useful if it is quiet when nothing is wrong.
+Until aiosendspin 9.x this rode the wire: the spec asked a client that could not maintain sync to
+report `state: 'error'`, and that is how a server learned to give it more lead time. 9.x deleted the
+field, and `available: bool` cannot replace it — the server ends an active stream before honouring
+`available=False`, so reporting an xrun that way would make the dropout permanent.
+
+The detection below is therefore unchanged and still load-bearing; only its destination moved, to the
+log and to player_state.json (see `sendspin_player.PlayerHealth`). Keeping these tests green matters
+MORE after that change, not less: the signal no longer has a server reacting to it, so a false
+positive is now purely noise and a false negative is now purely silence.
+
+The signal is only useful if it is quiet when nothing is wrong.
 
 `test_an_idle_player_is_not_an_error` guards the bug this file was written for. AlsaRenderer keeps
 two padded-silence counters and they are NOT interchangeable:
@@ -29,10 +38,8 @@ sys.path.insert(0, str(REPO / "backend" / "scripts"))
 pytest.importorskip("numpy", reason="sendspin_player imports numpy")
 pytest.importorskip("aiosendspin", reason="aiosendspin is a real runtime dep")
 
-from aiosendspin.models.types import ClientStateType  # noqa: E402
-
 import sendspin_player  # noqa: E402
-from sendspin_player import ERROR_STARVED_FRAMES  # noqa: E402
+from sendspin_player import ERROR_STARVED_FRAMES, PlayerHealth  # noqa: E402
 
 
 class FakeRenderer:
@@ -70,42 +77,42 @@ def player() -> FakePlayer:
 
 def test_a_quiet_player_reports_synchronized():
     p = player()
-    assert p.health() is ClientStateType.SYNCHRONIZED
+    assert p.health() is PlayerHealth.SYNCHRONIZED
 
 
 def test_an_idle_player_is_not_an_error():
     """The regression. Idle padding accrues on pad_frames only — it must not reach the signal."""
     p = player()
     p.renderer.pad_frames += ERROR_STARVED_FRAMES * 100  # ~5s of idle silence
-    assert p.health() is ClientStateType.SYNCHRONIZED, "idle padding must not read as a fault"
+    assert p.health() is PlayerHealth.SYNCHRONIZED, "idle padding must not read as a fault"
 
 
 def test_sustained_starvation_reports_error():
     p = player()
     p.renderer.starved_frames += ERROR_STARVED_FRAMES
-    assert p.health() is ClientStateType.ERROR
+    assert p.health() is PlayerHealth.ERROR
 
 
 def test_a_single_hiccup_is_tolerated():
     """Below threshold is one scheduling blip, not a client that cannot keep up."""
     p = player()
     p.renderer.starved_frames += ERROR_STARVED_FRAMES - 1
-    assert p.health() is ClientStateType.SYNCHRONIZED
+    assert p.health() is PlayerHealth.SYNCHRONIZED
 
 
 def test_recovery_returns_to_synchronized():
     """The delta must reset, or one dropout pins the player at error for the rest of its life."""
     p = player()
     p.renderer.starved_frames += ERROR_STARVED_FRAMES * 2
-    assert p.health() is ClientStateType.ERROR
-    assert p.health() is ClientStateType.SYNCHRONIZED, "a lifetime total would never recover"
+    assert p.health() is PlayerHealth.ERROR
+    assert p.health() is PlayerHealth.SYNCHRONIZED, "a lifetime total would never recover"
 
 
 def test_starvation_is_measured_per_window_not_cumulatively():
     p = player()
     for _ in range(5):
         p.renderer.starved_frames += ERROR_STARVED_FRAMES // 4  # slow drip, under threshold
-        assert p.health() is ClientStateType.SYNCHRONIZED
+        assert p.health() is PlayerHealth.SYNCHRONIZED
 
 
 def test_a_paused_source_is_not_an_error():
@@ -119,7 +126,7 @@ def test_a_paused_source_is_not_an_error():
     p = player()
     p.pause()
     p.renderer.starved_frames += ERROR_STARVED_FRAMES * 10
-    assert p.health() is ClientStateType.SYNCHRONIZED
+    assert p.health() is PlayerHealth.SYNCHRONIZED
 
 
 def test_a_pause_is_not_charged_to_the_resume():
@@ -127,10 +134,10 @@ def test_a_pause_is_not_charged_to_the_resume():
     p = player()
     p.pause()
     p.renderer.starved_frames += ERROR_STARVED_FRAMES * 10
-    assert p.health() is ClientStateType.SYNCHRONIZED
+    assert p.health() is PlayerHealth.SYNCHRONIZED
 
     p.resume()
-    assert p.health() is ClientStateType.SYNCHRONIZED, "the pause's padding must not resurface"
+    assert p.health() is PlayerHealth.SYNCHRONIZED, "the pause's padding must not resurface"
 
 
 def test_starvation_after_a_resume_still_reports():
@@ -142,4 +149,4 @@ def test_starvation_after_a_resume_still_reports():
 
     p.resume()
     p.renderer.starved_frames += ERROR_STARVED_FRAMES
-    assert p.health() is ClientStateType.ERROR
+    assert p.health() is PlayerHealth.ERROR

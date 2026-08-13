@@ -122,6 +122,28 @@ def save_last_playing_server(path: str, server_id: str | None) -> None:
     _merge_write(path, {"last_playing_server_id": server_id})
 
 
+def load_player_health(path: str) -> str | None:
+    """The renderer's last reported health ("synchronized" / "error"), or None if never reported."""
+    health = _read(path).get("player_health")
+    return str(health) if health else None
+
+
+def save_player_health(path: str, health: str) -> None:
+    """Record whether the renderer is keeping up.
+
+    This exists because aiosendspin 9.x deleted the wire field it used to ride on. The spec had
+    `client/state.state: 'error'` for a client that cannot maintain sync — buffer underrun is its own
+    example — and a server was meant to respond by granting more lead time. 9.x replaced that enum
+    with `available: bool`, which cannot carry it: the server ends an active stream before honouring
+    `available=False`, so reporting an xrun that way would turn a brief dropout into a real one.
+
+    So the signal comes here instead. It is the only remaining place a struggling speaker is visible
+    without reading logs, and unlike the log line it is queryable — the mesh API serves this file.
+    See sendspin_player.PlayerHealth for the detection, which is unchanged and hardware-tuned.
+    """
+    _merge_write(path, {"player_health": health})
+
+
 def save_active_output(path: str, spec: str | None) -> None:
     """Record which output the player actually has open.
 

@@ -1,7 +1,17 @@
 # Plum-Audio backend — Python 3.13
 # Sync engine: pin aiosendspin (fast-moving). On bump run tests/Integration/t0_sendspin_protocol.py
-# first, against a venv holding the candidate version. 9.1.0 is scoped: docs/AIOSENDSPIN-BUMP-SCOPE.md
-aiosendspin==6.0.5
+# first, against a venv holding the candidate version. Port notes: docs/AIOSENDSPIN-BUMP-SCOPE.md
+#
+# 9.x is a PROTOCOL migration, not a version edit: client ids are X25519 pubkeys, the server needs an
+# Identity + a pairing_store, and cleartext clients need allow_unencrypted=True — which is permanent,
+# not transitional, because sendspin-cpp (the ESP32 clients) has no encryption. A 9.x client CANNOT
+# reach a 6.0.5 server, so the whole rig cuts over at once; there is no rolling upgrade.
+aiosendspin==9.1.0
+# Pulled in by aiosendspin 9.x's noise/ package. Listed explicitly because they are new mandatory
+# runtime deps, they install whether or not encryption is enabled, and cpace has exactly one release.
+cryptography>=42
+noiseprotocol>=0.3.1
+cpace>=0.1.0
 av>=18,<19            # PyAV — audio encode/resample (glibc wheels on Debian base)
 numpy>=2,<3
 Pillow>=10            # REQUIRED by aiosendspin's artwork role (server won't import without it)
