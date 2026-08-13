@@ -683,11 +683,27 @@ class PlumSendspinServer:
 
         Only ever called for our own player — management requires a long-term record, so it would
         fail for anything we have not paired with anyway, but the caller should not rely on that.
+
+        **Management is a SESSION, and leaving it open makes the player unroamable.** A declared
+        activity is part of what the client's arbitration ranks when a second server dials it, so a
+        server still holding `management` outranks a peer asking for plain PLAYBACK: the peer's dial
+        is accepted provisionally, handshakes, and is then rejected — it lands in the peer's registry
+        as `(disconnected)` and its reclaim polls for a client that never comes up. Since nothing
+        expired the session, that player could not be roamed for the rest of the process's lifetime,
+        and a restart "fixed" it. Measured on `.7.122` 2026-08-13: roam worked 12/12, one
+        `pairing-window` call, then failed on the very next attempt and every one after.
+
+        So it is enabled for exactly the length of the call and always disabled again. The window
+        itself is client-side state with its own 300 s deadline — it long outlives this session, and
+        does not need us to hold management to stay open.
         """
         assert self.server is not None
         try:
             connection = self.server.enable_management(client_id)
-            result = await connection.open_pairing_window()
+            try:
+                result = await connection.open_pairing_window()
+            finally:
+                self.server.disable_management(client_id)
         except Exception as exc:  # noqa: BLE001 - a closed window is not worth a 500
             logger.warning("could not open a pairing window on %s: %s", client_id, exc)
             return False
