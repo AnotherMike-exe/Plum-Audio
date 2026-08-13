@@ -15,6 +15,10 @@ Steps (each prints PASS/FAIL):
      but NOT activated — the three silent-dud combinations.
   7. ADMISSION: client unpaired_access_enabled AND server trust_unpaired -> role ACTIVATED.
      This is the mechanism our own mesh depends on.
+  8. LEGACY CLEARTEXT (a-e): a raw websocket sending a 6.0.5-shaped client/hello — our GUI
+     controller's exact payload, and an ESP32-shaped player — must be admitted, KEEP ITS OWN
+     client id, and get ACTIVE roles with no pairing and no trust. Plus the inverse: with
+     allow_unencrypted=False the same hello must be refused.
 
 Steps 6-7 exist because the pre-9.x version of this file never constructed a client, so it
 could not have caught the failure that matters most. Measured truth table (9.1.0):
@@ -31,6 +35,16 @@ in the GUI, at the right volume, and renders nothing, with no error at either en
 signature is negotiated_role_ids diverging from active_role_ids — assert on the latter.
 See docs/AIOSENDSPIN-BUMP-SCOPE.md break #3.
 
+Step 8 is the other half, and it is the PREMISE of the whole 9.x bump for this product:
+a CLEARTEXT client skips that trust gate entirely. The server activates its negotiated
+roles straight from the legacy client/hello branch, so third-party devices need neither
+pairing nor trust_unpaired — which is what makes allow_unencrypted=True sufficient for
+sendspin-cpp speakers, Music Assistant, and our own hand-rolled GUI controller.
+
+What step 8 does NOT prove: that real sendspin-cpp firmware or Music Assistant send a
+hello we accept. It proves the shape OUR client sends is accepted, and that the flag is
+load-bearing in both directions. The firmware half is still a rig test.
+
 TIER 0 — real protocol, no hardware. Unlike its tier 2-4 neighbours this is Python, takes no
 host argument, and touches no rig: it stands two servers up on localhost. It does need an
 interpreter with the aiosendspin version under test, which is NOT the repo's pinned one:
@@ -42,7 +56,7 @@ Formerly _resources/spike/mesh_smoke.py. Promoted out of the gitignored spike ar
 2026-08-12 because it is the mandated pre-bump gate and was therefore being lost between
 sessions.
 """
-import asyncio, math, struct, sys, time, logging
+import asyncio, json, math, struct, sys, time, logging
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -137,6 +151,9 @@ async def main():
     # handshake; everything downstream keys on it.
     passed &= await admission_checks(loop, srvA)
 
+    # 8. LEGACY CLEARTEXT — the premise of the whole 9.x bump for this product.
+    passed &= await legacy_checks(loop)
+
     await asyncio.sleep(0.3)  # let background tasks spin
     for s in (srvA, srvB):
         try:
@@ -223,6 +240,139 @@ async def admission_checks(loop, _srv):
         negotiated, active = await admission_case(loop, port, unpaired_access=ua, trust=trust)
         good = bool(negotiated) and (bool(active) == want_active)
         passed &= ok(label, good, f"negotiated={negotiated} active={active}")
+    return passed
+
+
+
+# -- step 8: the legacy cleartext path ---------------------------------------------------------
+
+
+# The GUI's controller hello, copied from frontend/services/sendspinControllerClient.ts (~:329).
+# Kept verbatim rather than minimised: the point is to exercise the bytes our shipping client
+# actually sends, so a divergence here is a real signal and not a fixture drifting.
+GUI_HELLO_ROLES = ["controller@v1", "metadata@v1", "artwork@v1", "visualizer@v1"]
+GUI_HELLO_SUPPORT = {
+    "artwork@v1_support": {
+        "channels": [{"source": "album", "format": "jpeg", "media_width": 512, "media_height": 512}]
+    },
+    "visualizer@v1_support": {
+        "buffer_capacity": 65536,
+        "rate_max": 30,
+        "types": ["spectrum", "loudness"],
+        "spectrum": {"n_disp_bins": 256, "scale": "log", "f_min": 40, "f_max": 16000},
+    },
+}
+
+
+def legacy_hello(client_id, roles, extra=None):
+    payload = {
+        "client_id": client_id,
+        "name": "Plum Web GUI",
+        "version": 1,
+        "device_info": {"product_name": "Plum Web GUI", "manufacturer": "Plum Solutions"},
+        "supported_roles": list(roles),
+    }
+    payload.update(extra or {})
+    return json.dumps({"type": "client/hello", "payload": payload})
+
+
+async def legacy_probe(port, client_id, roles, extra=None, inspect=None):
+    """Connect as a 6.0.5-era CLEARTEXT client and report what came back.
+
+    Returns (hello_payload | None, inspect_result). No aiosendspin client anywhere in this path —
+    a raw websocket, because that is what our hand-rolled GUI controller and every sendspin-cpp
+    ESP32 speaker are. If this stops working, allow_unencrypted has stopped meaning anything and
+    the bump loses every third-party device plus Music Assistant.
+
+    `inspect` runs while the socket is still OPEN, which is the only time the server-side client
+    object exists to look at — a disconnected client is cleaned out of the registry.
+    """
+    import aiohttp
+
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(f"ws://127.0.0.1:{port}/sendspin") as ws:
+            await ws.send_str(legacy_hello(client_id, roles, extra))
+            hello = None
+            deadline = asyncio.get_running_loop().time() + 5
+            while asyncio.get_running_loop().time() < deadline:
+                try:
+                    msg = await asyncio.wait_for(ws.receive(), timeout=2)
+                except asyncio.TimeoutError:
+                    break
+                if msg.type is not aiohttp.WSMsgType.TEXT:
+                    continue
+                data = json.loads(msg.data)
+                if data.get("type") == "server/hello":
+                    hello = data.get("payload")
+                    break
+            await asyncio.sleep(0.4)  # let the server finish registering us
+            return hello, (inspect() if inspect else None)
+
+
+async def legacy_checks(loop):
+    """A cleartext client must be admitted, keep its OWN client id, and get ACTIVE roles.
+
+    Three separate claims, and the middle one is easy to lose sight of. Under 9.x an encrypted
+    client's id is its X25519 public key, but a legacy hello carries its own — which is what keeps
+    the GUI's `ctrl:<source_id>:<nonce>` convention working, since that hint is the only way it can
+    name the source it wants to control.
+
+    Roles here are activated straight from the negotiated set (server/connection.py, the
+    `if not self.is_encrypted` branch), bypassing the trust gate that steps 6-7 exercise. So a
+    cleartext client needs NO pairing and NO trust_unpaired — the exact opposite of our own player,
+    and the reason `allow_unencrypted=True` is sufficient for third-party devices.
+    """
+    port = 8971
+    srv = make_server(loop, "Legacy Probe", allow_unencrypted=True)
+    await srv.start_server(port=port, advertise_addresses=[], discover_clients=False)
+    passed = True
+
+    def active_of(server, client_id):
+        """The server's view of a client, read while it is still connected."""
+        client = server.get_client(client_id)
+        return None if client is None else sorted(client.active_role_ids)
+
+    # 8a. The shipping GUI controller, id and all.
+    ctrl_id = "ctrl:airplay-1:abc123"
+    hello, active = await legacy_probe(
+        port, ctrl_id, GUI_HELLO_ROLES, extra=GUI_HELLO_SUPPORT, inspect=lambda: active_of(srv, ctrl_id)
+    )
+    passed &= ok("8a legacy controller admitted", hello is not None,
+                 f"server/hello={'received' if hello else 'NONE'}")
+    passed &= ok("8b legacy client keeps its OWN id", active is not None,
+                 f"server knows {ctrl_id!r}: {active is not None}")
+    passed &= ok("8c legacy roles are ACTIVE without any trust", bool(active), f"active={active}")
+    await asyncio.sleep(0.3)
+
+    # 8d. An ESP32-shaped speaker: player role only, cleartext, never trusted. This is the case
+    # the whole allow_unencrypted decision rests on.
+    spk_id = "AA:BB:CC:DD:EE:FF"
+    _hello, spk_active = await legacy_probe(
+        port, spk_id, ["player@v1"],
+        extra={"player@v1_support": {
+            "supported_formats": [{"codec": "pcm", "sample_rate": RATE, "channels": CH, "bit_depth": BITS}],
+            "buffer_capacity": 1 << 20,
+            "supported_commands": ["volume", "mute"],
+        }},
+        inspect=lambda: active_of(srv, spk_id),
+    )
+    passed &= ok("8d legacy SPEAKER gets an active player role",
+                 bool(spk_active and any(r.startswith("player") for r in spk_active)),
+                 f"active={spk_active}")
+
+    # 8e. With the flag OFF, a cleartext client must be refused rather than silently ignored.
+    strict_port = 8972
+    strict = make_server(loop, "Strict Probe", allow_unencrypted=False)
+    await strict.start_server(port=strict_port, advertise_addresses=[], discover_clients=False)
+    refused_hello, _ = await legacy_probe(strict_port, ctrl_id, GUI_HELLO_ROLES, extra=GUI_HELLO_SUPPORT)
+    passed &= ok("8e allow_unencrypted=False refuses cleartext", refused_hello is None,
+                 "no server/hello (expected)" if refused_hello is None else "ADMITTED - flag is not doing anything")
+
+    for s in (srv, strict):
+        try:
+            await s.stop_server(); await s.close()
+        except Exception:
+            pass
     return passed
 
 
