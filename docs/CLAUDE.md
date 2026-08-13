@@ -37,7 +37,7 @@ Solo developer + AI assistance. Priority: correct mesh + audio reliability first
 
 ## Stack and ports
 
-**Backend** — Python 3.13 · `aiosendspin` **pinned 6.0.5** · PyAV · numpy · Flask (:5002) + aiohttp
+**Backend** — Python 3.13 · `aiosendspin` **pinned 9.1.0** · PyAV · numpy · Flask (:5002) + aiohttp
 (:5001) · supervisord · Avahi + D-Bus + host networking.
 Base image **`python:3.13-slim-trixie`** — glibc, not Alpine (deliberate: trivial PyAV/PortAudio/
 numpy wheels). **Trixie specifically** to match the units' Debian 13: bluez-alsa still names its
@@ -125,15 +125,30 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
 The *reasoning* behind these, and the failures that produced them, is in
 **`docs/HARD-WON-LESSONS.md`**. Do not re-litigate them from first principles.
 
-- **Pin `aiosendspin`** (6.0.5). On any bump run `tests/Integration/t0_sendspin_protocol.py` first
+- **Pin `aiosendspin`** (9.1.0). On any bump run `tests/Integration/t0_sendspin_protocol.py` first
   (tier 0 — real protocol, no rig; needs a venv on the candidate version), and re-check
-  `docs/UPSTREAM-AIOSENDSPIN.md`. **9.1.0 is scoped** — client ids become X25519 pubkeys (breaking
-  `follow`'s `server_id`↔`unit_id` join and the GUI's `ctrl:<source_id>:` hint), and a 9.x client
-  cannot reach a 6.0.5 server so all four units cut over at once. **A role is ALWAYS negotiated but
-  only ACTIVATED when the client sets `unpaired_access_enabled` AND the server calls
-  `trust_unpaired()`** — miss either and the endpoint sits in the group at the right volume
-  rendering nothing, and `negotiated_role_ids` vs `active_role_ids` is the only tell.
-  `docs/AIOSENDSPIN-BUMP-SCOPE.md`. Do not re-derive this.
+  `docs/UPSTREAM-AIOSENDSPIN.md`. Port notes: `docs/AIOSENDSPIN-BUMP-SCOPE.md`.
+- **A role is ALWAYS negotiated but only ACTIVATED when the client sets `unpaired_access_enabled`
+  AND the server calls `trust_unpaired()`** for that peer id. Miss either and the endpoint connects,
+  negotiates, joins the group at the right volume and renders **nothing**, with no error at either
+  end — `negotiated_role_ids` vs `active_role_ids` is the only tell, and it is published as
+  `PlayerState.active_roles`. **Trust is per-server AND per-peer**: trusting our own player at
+  startup says nothing about a peer's, so `reclaim_remote_player` trusts before it dials. This gate
+  applies to ENCRYPTED clients only — see the next rule.
+- **Cleartext clients skip the trust gate entirely, and our own player can never be one.** A legacy
+  `client/hello` is activated straight from the negotiated set, so ESP32 speakers (`sendspin-cpp`,
+  no Noise in any release), Music Assistant and our own hand-rolled GUI controller need no pairing
+  and no trust — that is what `PLUM_ALLOW_UNENCRYPTED=1` buys, and why it is permanent rather than
+  transitional. But there is **no client-side legacy mode**: `SendspinClient` always speaks Noise,
+  so a foreign server dialing OUR player (Music Assistant claiming a speaker) must speak Noise too.
+  `allow_unencrypted` does not help that direction.
+- **A Sendspin id is a public key, and a unit now has THREE ids.** `unit_id` keys the mesh;
+  `server_id`/`player_id` are X25519 peer ids from `/config/identity` and are what the protocol
+  uses; the player also keeps a **listener id** (`PLUM_PLAYER_ID`) for mDNS and for a server to dial.
+  Anything joining across those namespaces must be explicit — `MeshView.unit_by_server_id`, and the
+  player's self-report publishes its **peer** id (publishing the listener id instead duplicated every
+  speaker in the GUI and made idle speakers unroutable). `/config/identity` is a device certificate:
+  losing it makes a unit a stranger to every peer.
 - **`SendspinServer` always binds mDNS (5353)** → collides with the host Avahi. Start with
   `start_server(advertise_addresses=[], discover_clients=False)` and drive connections by URL.
 - **Sendspin mDNS goes through the system Avahi** (`mesh/avahi.py`, D-Bus), never our own responder.

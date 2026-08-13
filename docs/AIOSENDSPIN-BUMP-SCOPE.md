@@ -162,9 +162,18 @@ from break #1, because a regenerated identity is a brand-new untrusted device.
 **Trust store persistence:** `FileServerPairingStore` / `FileClientPairingStore`, caller-chosen path,
 no default. Holds raw PSKs, staged pairing PSKs and the trusted-unpaired list; the client side also
 holds `last_playback_server_id`. Written `0o600` via atomic replace (the 7.0.0 permissions fix).
-**Must persist** — losing it un-pairs every device on the unit — so it belongs on `/data`. Note it
-ignores `UMASK=002` by construction, so the file is root-only in the container. The X25519 private
-keys are *not* in the trust store; `Identity` persistence is entirely ours.
+**Must persist** — losing it un-pairs every device on the unit — so it belongs on ~~`/data`~~
+**`/config/identity`**, alongside the keypairs. *(Corrected 2026-08-12: `/data` was wrong. It is the
+one directory `deploy.sh` imports into on a first deploy, and this is closer to a device certificate
+than to runtime state — it must survive a `/data` wipe. Implemented at `sendspin_identity.py`.)*
+Note it ignores `UMASK=002` by construction, so the file is root-only in the container; the
+entrypoint's recursive chown skips `/config/identity` for the same reason. The X25519 private keys
+are *not* in the trust store; `Identity` persistence is entirely ours.
+
+Both are **bind** mounts (`/opt/plum-audio/{config,data}`), so `down`, `down -v`, `rm -f` and
+redeploys all preserve them. The three ways to actually lose an identity: re-imaging the Pi, a manual
+`rm`, or running the image **without** the compose bind mounts — where `Dockerfile`'s
+`VOLUME ["/config", ...]` makes it an anonymous volume that `docker volume prune` will collect.
 
 ## Breakage list
 
@@ -274,6 +283,24 @@ note, not a defect.
 3. **Fix the §2 doc claim.** Done 2026-08-12.
 
 ## Recommendation
+
+> **OVERTURNED 2026-08-12, and the port is done** (`feature/aiosendspin-9x`). The reasoning below is
+> preserved verbatim rather than rewritten, because it was correct on the evidence it had and its
+> central concern still stands: `allow_unencrypted=True` is permanent, so we run in transition mode
+> indefinitely.
+>
+> **What changed the answer** was a source read the hold did not have: the legacy cleartext path is
+> not a degraded mode for third-party *clients*, it is a full one. A cleartext connection is
+> activated straight from its negotiated role set, bypassing the trust gate entirely
+> (`server/connection.py:1043-1045`), and its `server/hello` is byte-compatible with 6.0.5. So ESP32
+> speakers, Music Assistant-as-a-client and our own GUI need no pairing, no trust, and no changes.
+> That removed the interop objection the hold rested on. Measured, not just read:
+> `tests/Integration/t0_sendspin_protocol.py` step 8.
+>
+> **The asymmetry that survives, and is the real remaining risk:** there is **no client-side legacy
+> mode**. `SendspinClient` always speaks Noise, so a foreign server dialing OUR player — Music
+> Assistant claiming a speaker — must speak Noise too. `allow_unencrypted` does nothing for that
+> direction. It is the one interop case a code read cannot settle.
 
 **Hold the pin.** The blocker is not effort, it is that `sendspin-cpp` has no encryption as of v0.7.2
 — so `allow_unencrypted=True` is **permanent, not transitional**. We would pay the full identity,

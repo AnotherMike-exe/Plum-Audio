@@ -20,8 +20,9 @@ weights integration and interop over breadth of unit coverage.
 
 | Suite | Runs | Covers |
 |---|---|---|
-| `tests/Unit/**` (pytest, **217**) | `PYTHONPATH=backend/scripts pytest tests/Unit` | see the breakdown below |
-| `frontend/tests/unit/**` (vitest, **112**) | `cd frontend && npx vitest run` | view→model mapping, local-player-by-host, progress extrapolation, `TimeFilter` clock sync, audio + settings + integrations services |
+| `tests/Integration/t0_sendspin_protocol.py` (**tier 0**) | `<venv>/bin/python tests/Integration/t0_sendspin_protocol.py` | the aiosendspin VERSION GATE — real protocol, no rig; run before any pin bump |
+| `tests/Unit/**` (pytest, **463**) | `PYTHONPATH=backend/scripts pytest tests/Unit` | see the breakdown below |
+| `frontend/tests/unit/**` (vitest, **133**) | `cd frontend && npx vitest run` | view→model mapping, local-player-by-host, progress extrapolation, `TimeFilter` clock sync, audio + settings + integrations services |
 
 Backend, by file: `audio_devices` 31 · `bluetooth_avrcp` 27 · `audio_api` 21 · `follow_reconciler`
 21 · `configure_audio_hat` 17 · `audio_output_apply` 14 · `settings_store` 14 · `volume` 12 ·
