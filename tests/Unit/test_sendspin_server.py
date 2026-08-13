@@ -177,6 +177,8 @@ class _FakeManagementConnection:
 
     async def open_pairing_window(self):
         self._server.calls.append("open_pairing_window")
+        if getattr(self._server, "window_error", None) is not None:
+            raise self._server.window_error
         return type("R", (), {"value": "ok"})()
 
 
@@ -209,6 +211,7 @@ class FakeServer:
         self.pin_seen = None            # the PIN the library asked for, once supplied
         self.pairing_error = None       # set to make initiate_pairing raise
         self.management_error = None    # set to make enable_management raise
+        self.window_error = None        # set to make open_pairing_window raise
         self.calls = []  # ("trust"|"reclaim", id) in call order — ORDER is the assertion
 
     @property
@@ -274,6 +277,9 @@ class FakeServer:
         if self.management_error is not None:
             raise self.management_error
         return _FakeManagementConnection(self)
+
+    def disable_management(self, client_id):
+        self.calls.append(("disable_management", client_id))
 
 
 def make_feeder(group=None, ps=None):
@@ -1209,3 +1215,35 @@ def test_a_peer_player_is_staged_before_the_dial_not_paired_after_it(monkeypatch
     # ...and the roam path must stage it instead.
     assert asyncio.run(unit.stage_shared_psk("peer-player")) is True
     assert "peer-player" in unit.server.pairing_store.staged
+
+
+# --- the management session must never outlive the call ---------------------
+
+
+def test_the_management_session_is_closed_after_opening_a_window():
+    """A declared `management` activity makes the player UNROAMABLE until the process restarts.
+
+    Activities are part of what the client's arbitration ranks when a second server dials it, so a
+    server still holding management outranks a peer asking for plain PLAYBACK. The peer's dial is
+    accepted provisionally, handshakes, and is then rejected — it lands in the peer's registry as
+    `(disconnected)` and the reclaim polls for a client that never comes up.
+
+    Measured on .7.122 on 2026-08-13, and the reproduction is brutally simple: 12/12 successful
+    roams, ONE /api/mesh/pairing-window call, then failure on the very next attempt and every one
+    after it. A restart "fixed" it, which is what made it look like drifting state for hours.
+    """
+    unit = make_unit("airplay-1")
+    assert asyncio.run(unit.open_pairing_window("our-own-player")) is True
+    assert ("disable_management", "our-own-player") in unit.server.calls
+    enabled = unit.server.calls.index(("enable_management", "our-own-player"))
+    disabled = unit.server.calls.index(("disable_management", "our-own-player"))
+    assert enabled < disabled, "management must be enabled first and closed after"
+
+
+def test_the_management_session_is_closed_even_when_the_window_call_fails():
+    """The failure path is the one that matters: an exception mid-call must not leak the session, or
+    a single failed pairing attempt costs roaming until the next restart."""
+    unit = make_unit("airplay-1")
+    unit.server.window_error = RuntimeError("client said no")
+    assert asyncio.run(unit.open_pairing_window("our-own-player")) is False
+    assert ("disable_management", "our-own-player") in unit.server.calls
