@@ -42,6 +42,19 @@ class PlayerState:
     # distinguishable from "a peer saying this client is activated for nothing" — the same reason
     # has_player defaults True.
     active_roles: list[str] | None = None
+    # How this connection is secured, and therefore whether pairing is even a question for it.
+    # `None` means **CLEARTEXT** — a legacy `client/hello` connection, which the server activates
+    # straight from the negotiated role set with no pairing and no trust. That is every ESP32
+    # speaker, Music Assistant, and our own web GUI, and it is why they are unaffected by any
+    # pairing policy. `"sentinel"` is encrypted-but-unauthenticated (the published PSK);
+    # `"long_term"` is a real pairing record.
+    #
+    # So: `security is None` -> never needs pairing. `security == "sentinel"` with empty
+    # `active_roles` -> needs pairing. This pair is what the GUI gates its Pair button on, and it
+    # is deliberately two fields rather than one enum, because "unknown" (an older peer sending
+    # neither) must stay distinguishable from both.
+    security: str | None = None
+    paired: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -53,6 +66,8 @@ class PlayerState:
             "volume": self.volume,
             "muted": self.muted,
             "active_roles": self.active_roles,
+            "security": self.security,
+            "paired": self.paired,
         }
 
     @classmethod
@@ -66,6 +81,8 @@ class PlayerState:
             volume=int(d.get("volume", 100)),
             muted=bool(d.get("muted", False)),
             active_roles=d.get("active_roles"),
+            security=d.get("security"),
+            paired=bool(d.get("paired", False)),
         )
 
 
