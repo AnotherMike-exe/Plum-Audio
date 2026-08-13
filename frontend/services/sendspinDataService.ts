@@ -37,6 +37,15 @@ interface WirePlayer {
   url: string | null;
   volume?: number;    // as the PLAYER reports it (client/state), not as we last commanded it
   muted?: boolean;
+  /** Roles the server ACTIVATED, which is not the roles the client negotiated. An encrypted client
+   *  that has not paired negotiates everything and is activated for nothing — it appears connected,
+   *  grouped and at the right volume, and renders silence. Absent from an older peer. */
+  active_roles?: string[] | null;
+  /** How the transport is secured. **null means CLEARTEXT** — the legacy path never resolves a PSK —
+   *  so it marks a device that can never pair and must never be offered a Pair button. `sentinel` is
+   *  encrypted-but-unauthenticated; `long_term` is a real pairing record. */
+  security?: 'sentinel' | 'long_term' | null;
+  paired?: boolean;
 }
 interface WireSource {
   source_id: string;
@@ -121,6 +130,36 @@ export function parseStreamId(id: string): { unitId: string; sourceId: string } 
  * Pure: fold the mesh view + per-group now-playing into the component model. Exported for tests.
  * `npByGroup` / `offsetByGroup` are keyed by group_id (each unit's controller reports its group).
  */
+/** Whether a device needs pairing, can never need it, or has not told us.
+ *
+ * The three-way answer the GUI gates its Pair button on, and the defaulting is the whole point:
+ *
+ *   'cleartext' — `security` is null on a CONNECTED client, i.e. the legacy path. Every ESP32
+ *                 speaker, Music Assistant and our own web GUI. These can never pair, and offering
+ *                 them a Pair button would be worse than not shipping pairing at all.
+ *   'paired'    — a long-term record exists.
+ *   'trusted'   — encrypted and NOT paired, but playing anyway on the sentinel PSK because unpaired
+ *                 access is on. Deliberately not folded into 'paired': it is not, and the GUI would
+ *                 then be repeating that as fact. It plays, so it is not blocked — but it is the
+ *                 state that disappears the moment unpaired access is turned off.
+ *   'unpaired'  — encrypted, no record, and activated for NOTHING. Pairing is required AND possible.
+ *   'unknown'   — anything else: a peer on an older image that sends none of these fields, a
+ *                 device we have never connected to, or one still negotiating.
+ *
+ * `unknown` is the default and must never render a Pair button — the same rule as `hasPlayer`
+ * defaulting true. Guessing "unpaired" for a device that simply has not reported would put a Pair
+ * button on every mDNS speaker on the segment, most of which are cleartext and would fail.
+ */
+function pairingStateOf(p: WirePlayer): Client['pairingState'] {
+  if (p.active_roles === undefined || p.active_roles === null) return 'unknown';
+  if (p.paired) return 'paired';
+  // Only meaningful once we know it is connected AND has reported roles: `security: null` on a row
+  // that never reported is "unknown", not "cleartext".
+  if (p.security === null || p.security === undefined) return p.connected ? 'cleartext' : 'unknown';
+  if (p.active_roles.length === 0) return 'unpaired';
+  return 'trusted';  // encrypted, activated, but on the sentinel PSK rather than a record
+}
+
 export function mapViewToModel(
   view: MeshView,
   npByGroup: Map<string, NowPlaying>,
@@ -198,6 +237,8 @@ export function mapViewToModel(
 
   // "Ours" is decided by the player's own listener host, NOT by which unit currently reports it:
   // a roamed player is listed by the peer that reclaimed it but is still this unit's speaker.
+  //
+  // (pairingStateOf is defined at module scope, below mapViewToModel.)
   const localHost = view.units.find((u) => u.unit_id === view.local_unit_id)?.host ?? null;
   const localPlayerIds: string[] = [];
 
@@ -217,6 +258,7 @@ export function mapViewToModel(
         connected: p.connected,
         isLocal,
         url: p.url ?? undefined,
+        pairingState: pairingStateOf(p),
       });
     }
   }
@@ -259,6 +301,9 @@ export function mapViewToModel(
       isLocal,
       foreignServer,
       url: lp.url,  // how we dial it back: the router can't reclaim what it cannot see
+      // The self-report carries no role or security fields — a speaker attached to a FOREIGN server
+      // has no roles we can see at all. Unknown is the truthful answer, and it renders no button.
+      pairingState: 'unknown',
     });
   }
 
@@ -297,6 +342,10 @@ export function mapViewToModel(
       connected: true,
       isForeign: true,
       url: entry.url,
+      // Discovered over mDNS and never connected to us, so its security is unknowable until
+      // something dials it. Most are cleartext ESP32 speakers that need no pairing at all — which
+      // is exactly why this must not default to 'unpaired' and sprout a Pair button.
+      pairingState: 'unknown',
     });
   }
 
@@ -798,6 +847,80 @@ export class SendspinDataService {
   private playerUnit(playerId: string): string | undefined {
     for (const u of this.lastView.units) if (u.players.some((p) => p.player_id === playerId)) return u.unit_id;
     return undefined;
+  }
+
+  // -- pairing ---------------------------------------------------------------------------------
+  //
+  // These RETURN their outcome rather than throwing, unlike every other call here. Routing failures
+  // are recoverable by the next poll and callers fire them with a bare `void`; a pairing failure is
+  // a sentence the operator has to read — "that PIN was wrong", "nothing is waiting for a PIN" —
+  // and there is nowhere else for it to appear.
+
+  /** Begin a pairing attempt. `token` is the device's `SP:` token, required only for 'pairing_psk'. */
+  async pairDevice(
+    unitId: string,
+    clientId: string,
+    method: 'pairing_psk' | 'dynamic_pin' | 'static_pin',
+    token?: string,
+  ): Promise<{ ok: boolean; message?: string }> {
+    return this.postResult(unitId, '/pair', { client_id: clientId, method, token });
+  }
+
+  /** Answer a PIN prompt. A 409 means nothing was waiting — a timed-out or cancelled attempt, NOT a
+   *  wrong PIN, and the operator needs to start again rather than retype. */
+  async submitPairingPin(unitId: string, clientId: string, pin: string): Promise<{ ok: boolean; message?: string }> {
+    return this.postResult(unitId, '/pair/pin', { client_id: clientId, pin });
+  }
+
+  async cancelPairing(unitId: string, clientId: string): Promise<{ ok: boolean; message?: string }> {
+    return this.postResult(unitId, '/pair/cancel', { client_id: clientId });
+  }
+
+  async unpairDevice(unitId: string, clientId: string): Promise<{ ok: boolean; message?: string }> {
+    return this.postResult(unitId, '/unpair', { client_id: clientId });
+  }
+
+  /** Open this unit's own player for pairing, standing in for the physical gesture. */
+  async openPairingWindow(unitId: string, clientId?: string): Promise<{ ok: boolean; message?: string }> {
+    return this.postResult(unitId, '/pairing-window', clientId ? { client_id: clientId } : {});
+  }
+
+  /** How a pairing attempt is going. Polled while a dialog is open — an attempt runs in the
+   *  background on the unit, so its outcome arrives here rather than from the call that began it. */
+  async pairingState(unitId: string, clientId?: string): Promise<Record<string, { state: string; error?: string }>> {
+    const host = this.unitHosts.get(unitId);
+    const base = host ? `http://${host}:${MESH_API_PORT}/api/mesh` : MESH_API_BASE;
+    const q = clientId ? `?client_id=${encodeURIComponent(clientId)}` : '';
+    try {
+      const res = await fetch(`${base}/pairing${q}`);
+      if (!res.ok) return {};
+      const body = await res.json();
+      const state = body?.pairing ?? {};
+      // A single-client query answers with that client's state directly; key it so callers see one
+      // shape either way.
+      return clientId ? { [clientId]: state } : state;
+    } catch {
+      return {};
+    }
+  }
+
+  /** POST that reports its outcome instead of throwing. The unit answers `{error}` on a 400/409. */
+  private async postResult(unitId: string, path: string, body: unknown): Promise<{ ok: boolean; message?: string }> {
+    const host = this.unitHosts.get(unitId);
+    const base = host ? `http://${host}:${MESH_API_PORT}/api/mesh` : MESH_API_BASE;
+    try {
+      const res = await fetch(`${base}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const parsed = await res.json().catch(() => ({}));
+      void this.poll();
+      if (!res.ok) return { ok: false, message: parsed?.error || `request failed (${res.status})` };
+      return { ok: parsed?.ok !== false, message: parsed?.error };
+    } catch {
+      return { ok: false, message: 'Could not reach the unit' };
+    }
   }
 
   private async post(unitId: string, path: string, body: unknown): Promise<void> {

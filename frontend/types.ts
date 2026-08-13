@@ -108,6 +108,13 @@ export interface Client {
     // snapshot. Routing it uses adopt/release (dial its URL) rather than the mesh router.
     isForeign?: boolean;
     url?: string;
+    /** Whether this device needs Sendspin pairing before it can play.
+     *
+     *  `undefined`/'unknown' means we have not been told — a peer on an older image, or a speaker
+     *  we have never connected to — and must render NO pair affordance, the same defaulting rule
+     *  as `hasPlayer`. 'cleartext' devices (ESP32 speakers, Music Assistant, this GUI) can never
+     *  pair. Only 'unpaired' both needs pairing and can be paired. See pairingStateOf. */
+    pairingState?: 'paired' | 'trusted' | 'unpaired' | 'cleartext' | 'unknown';
 }
 
 export type AccentColor = 'purple' | 'blue' | 'green' | 'orange' | 'red' | 'yellow' | 'custom';
