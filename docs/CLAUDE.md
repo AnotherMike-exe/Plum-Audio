@@ -135,6 +135,15 @@ The *reasoning* behind these, and the failures that produced them, is in
   a GUI act. `pairing_psk` needs NO window; the window (300 s, ONE attempt) is for PIN methods and
   later-added units, opened via the `management` role — which is why a unit pairs with its own player
   at startup. `docs/SENDSPIN-PAIRING.md`.
+- **A `management` session must be CLOSED, or that player can never roam again.** A declared activity
+  is part of what the client's arbitration ranks when a second server dials, so a server still
+  holding `management` outranks a peer asking for plain PLAYBACK: the peer's dial is accepted
+  provisionally, handshakes, then is rejected — it lands in the peer's registry as `(disconnected)`
+  and the reclaim polls 10 s for a client that never comes up. Nothing expires the session, so the
+  player stays unroamable for the life of the process and a **restart "fixes" it**, which is what
+  makes this look like drifting state. `open_pairing_window` enables it for exactly the length of the
+  call and disables it in a `finally`. Reproduction: 12/12 roams, one `/api/mesh/pairing-window`, then
+  failure on every attempt after.
 - **Pair by STAGING before the dial, never by `initiate_pairing` after it — and never at all over
   cleartext.** Both halves cost a working rig on 2026-08-13. `initiate_pairing` on a connected client
   whose PSK is the sentinel forces a mid-connection Noise re-handshake; a peer's player is contended
