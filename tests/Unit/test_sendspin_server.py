@@ -89,11 +89,19 @@ class FakeCleanupHandle:
 
 
 class FakeClient:
-    def __init__(self, client_id, group=None, connected=True, roles=()):
+    def __init__(self, client_id, group=None, connected=True, roles=(), active=None, name=None):
         self.client_id = client_id
         self.group = group
         self.is_connected = connected
+        # The handshake name. Only the snapshot path reads it, which is why it was absent until
+        # that path got its first test.
+        self.name = name or client_id
         self.negotiated_role_ids = list(roles)
+        # NEGOTIATED and ACTIVE are different sets under 9.x, and the gap is the silent-failure
+        # mode: an encrypted-but-unpaired client negotiates everything and is activated for
+        # nothing. `active=None` defaults to "activated for what it negotiated", the healthy case;
+        # pass an explicit list (including []) to model a client that is admitted but silent.
+        self.active_role_ids = list(roles) if active is None else list(active)
         self._cleanup_handle = None  # armed by the library on every connection teardown
 
     def roles_by_family(self, family):
@@ -153,6 +161,8 @@ class FakeServer:
         self._connection_tasks = {}
         self.dialed = []  # (url, reason) in call order
         self.disconnected = []  # urls passed to disconnect_from_client, in call order
+        self.trusted = []  # client ids passed to trust_unpaired
+        self.calls = []  # ("trust"|"reclaim", id) in call order — ORDER is the assertion
 
     @property
     def clients(self):
@@ -186,6 +196,14 @@ class FakeServer:
     def connect_to_client(self, url, *, connection_reason=None, retry_initial_connection=False):
         self.dialed.append((url, connection_reason))
         self._connection_tasks.setdefault(url, make_dial_task())
+
+    async def trust_unpaired(self, client_id):
+        self.calls.append(("trust", client_id))
+        self.trusted.append(client_id)
+
+    def reclaim_client_for_playback(self, client_id, timeout_s=None):
+        self.calls.append(("reclaim", client_id))
+        return client_id in self._urls
 
 
 def make_feeder(group=None, ps=None):
@@ -766,3 +784,98 @@ def test_a_playerless_unit_still_reports_its_sources():
     assert snapshot.has_player is False
     assert [s.source_id for s in snapshot.sources] == ["airplay-1"]
     assert snapshot.players == []
+
+
+# -- the snapshot publishes ACTIVE roles, not just negotiated ones ---------------------------------
+
+
+def _snapshot_player(active):
+    """One connected player-role client on a unit, with the given ACTIVE role set."""
+    unit = make_unit("airplay-1")
+    player = FakeClient("player-1", group=unit.sources["airplay-1"].group, roles=["player@v1"], active=active)
+    unit.server.add(player)  # no url= — that spawns a dial task, which needs a running loop
+    unit.server.register_client_url("player-1", "ws://10.0.0.5:8928/sendspin")
+    return unit.snapshot().players[0]
+
+
+def test_the_snapshot_publishes_a_players_active_roles():
+    """The signal that separates a working endpoint from a silent one.
+
+    Under 9.x an encrypted-but-unpaired client negotiates its full role set and is activated for
+    none of it — it is connected, grouped, at the right volume, and renders nothing, with no error
+    at either end. `connected` cannot express that and neither can the negotiated set, so the
+    active set is published for the mesh API, the GUI and deploy.sh's verify to read.
+    """
+    assert _snapshot_player(["player@v1"]).active_roles == ["player@v1"]
+
+
+def test_an_admitted_but_unactivated_player_is_visible_as_such():
+    """The failure this field exists for: everything else about this row looks healthy."""
+    row = _snapshot_player([])
+    assert row.active_roles == []
+    assert row.connected is True, "the trap is precisely that it IS connected"
+
+
+def test_active_roles_survives_the_wire_round_trip():
+    """It crosses the mesh REST API, so a peer must see it too."""
+    from mesh.model import PlayerState
+
+    row = _snapshot_player(["player@v1"])
+    assert PlayerState.from_dict(row.to_dict()).active_roles == ["player@v1"]
+
+
+def test_a_peer_on_an_older_image_reads_as_unknown_not_as_silent():
+    """None, not [] — the same reasoning as has_player defaulting True. A peer that never sends
+    this field must not be read as reporting a client activated for nothing."""
+    from mesh.model import PlayerState
+
+    legacy = {"player_id": "p", "name": "p", "connected": True, "group_id": None}
+    assert PlayerState.from_dict(legacy).active_roles is None
+
+
+# -- a PEER's player must be trusted before we take it ---------------------------------------------
+
+
+def test_reclaiming_a_peers_player_trusts_it_first():
+    """The cross-server roam guard.
+
+    Trust is per-server AND per-peer. Trusting our own player at startup says nothing about unit
+    B's, and a peer's player arriving here is an encrypted-but-unpaired client — so without this
+    the roam SUCCEEDS in every visible way (the player detaches from its old server, reconnects
+    here, joins the group at the right volume) and is activated for no roles. The room goes silent
+    with nothing in either log.
+
+    Order matters: trust must precede the dial, so the client is already approved when it lands.
+    Late trust does recover (trust_unpaired re-activates a live connection) but only after an
+    audible gap, and only if something calls it again.
+    """
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        peer_player = "peer-player-pubkey"
+        unit.server.add(FakeClient(peer_player, roles=["player@v1"]))
+        await unit.reclaim_remote_player("airplay-1", peer_player, "ws://10.0.0.9:8928/sendspin", timeout_s=0.5)
+
+        assert ("trust", peer_player) in unit.server.calls, "a peer's player was never trusted"
+        trust_at = unit.server.calls.index(("trust", peer_player))
+        reclaim_at = unit.server.calls.index(("reclaim", peer_player))
+        assert trust_at < reclaim_at, "trusted only AFTER dialing — the player lands untrusted and silent"
+
+    run_scenario(scenario)
+
+
+def test_a_failed_trust_does_not_abort_the_route():
+    """Trust bookkeeping must never be able to fail a route — it is a store write on the audio path."""
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+
+        async def boom(_client_id):
+            raise RuntimeError("trust store unavailable")
+
+        unit.server.trust_unpaired = boom
+        unit.server.add(FakeClient("p", roles=["player@v1"]))
+        # Must not raise. It returns False only because the fake never "connects" the player.
+        await unit.reclaim_remote_player("airplay-1", "p", "ws://10.0.0.9:8928/sendspin", timeout_s=0.2)
+
+    run_scenario(scenario)

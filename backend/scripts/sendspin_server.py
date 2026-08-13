@@ -466,6 +466,27 @@ class PlumSendspinServer:
             "Sendspin server up: %s (unit %s, peer %s) :%d", self.unit_name, self.unit_id, self.server_id, self.port
         )
 
+    async def _trust_player(self, player_id: str) -> bool:
+        """Approve a player for unpaired playback on THIS server. Idempotent.
+
+        Trust is per-server and per-peer: `unpaired_access_enabled` on the client is only half, and
+        our own player being trusted says nothing about a peer's. `trust_unpaired` re-activates a
+        live connection too, so calling it late still recovers a client that is already attached
+        and silent — which is what makes it safe to call on the routing path rather than only at
+        startup.
+
+        Never raises: trust bookkeeping must not be able to fail a route. A False return means the
+        player will connect and stay silent, which is worth a warning naming the id, because that
+        symptom is otherwise indistinguishable from a wiring fault.
+        """
+        assert self.server is not None
+        try:
+            await self.server.trust_unpaired(player_id)
+        except Exception:  # noqa: BLE001 - see docstring
+            logger.warning("could not trust player %s; it will connect but stay silent", player_id)
+            return False
+        return True
+
     async def _trust_own_player(self) -> None:
         """Trust this unit's own player, so its player role is ACTIVATED and not merely negotiated.
 
@@ -482,11 +503,7 @@ class PlumSendspinServer:
         if not player_peer:
             logger.info("no local player identity — playerless unit, nothing to trust")
             return
-        try:
-            await self.server.trust_unpaired(player_peer)
-        except Exception:  # noqa: BLE001 - never let trust bookkeeping stop the audio process
-            logger.warning("could not trust the local player %s; it will connect but stay silent", player_peer)
-        else:
+        if await self._trust_player(player_peer):
             logger.info("trusted local player %s", player_peer)
 
     async def stop(self) -> None:
@@ -779,6 +796,12 @@ class PlumSendspinServer:
         if handle is None:
             raise KeyError(f"unknown source {source_id!r}")
         self.server.register_client_url(player_id, player_url)
+        # A PEER's player is an encrypted-but-unpaired client of ours, and trust is per-server:
+        # trusting our own player at startup says nothing about anyone else's. Without this the
+        # roam completes — the player detaches from its old server, reconnects here, joins the
+        # group at the right volume — and is activated for NO roles, so the room goes silent with
+        # nothing in either log. Trust-on-deploy, applied at the moment we decide to take it.
+        await self._trust_player(player_id)
         if not self.server.reclaim_client_for_playback(player_id, timeout_s=timeout_s):
             logger.warning("[%s] no URL to reclaim player %s", source_id, player_id)
             return False
@@ -1058,6 +1081,11 @@ class PlumSendspinServer:
                         url=client_url,
                         volume=int(getattr(role, "volume", 100)) if role is not None else 100,
                         muted=bool(getattr(role, "muted", False)) if role is not None else False,
+                        # What the server has ACTIVATED, not what this client negotiated. Under 9.x
+                        # they diverge for an encrypted-but-unpaired client, which is admitted,
+                        # grouped, and silent — publishing it is what makes that visible outside the
+                        # audio process (the mesh API, the GUI, deploy.sh's verify).
+                        active_roles=sorted(client.active_role_ids),
                     )
                 )
 

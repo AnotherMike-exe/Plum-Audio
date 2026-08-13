@@ -150,3 +150,55 @@ def test_starvation_after_a_resume_still_reports():
     p.resume()
     p.renderer.starved_frames += ERROR_STARVED_FRAMES
     assert p.health() is PlayerHealth.ERROR
+
+
+# -- the self-report must use the PEER id, not the listener id --------------------------------------
+
+
+class FakeIdentity:
+    peer_id = "PEERID-x25519-pubkey"
+
+
+class FakeSendspinClient:
+    identity = FakeIdentity()
+    connected = False
+    server_info = None
+    activities: list = []
+
+
+class FakeReportingPlayer:
+    """_snapshot_state unbound, with only what it reads before the `attached` branch."""
+
+    def __init__(self):
+        self.client = FakeSendspinClient()
+        self.player_id = "player-133"          # the LISTENER id, from PLUM_PLAYER_ID
+        self.player_name = "Player-133"
+        self.port = 8928
+        self._state: dict = {}
+        self._audio_flowing = False
+
+    def _host_hint(self):
+        return "10.0.0.5"
+
+    snapshot = sendspin_player.SendspinPlayer._snapshot_state
+
+
+def test_the_self_report_publishes_the_peer_id():
+    """The id namespaces must not split.
+
+    `UnitSnapshot.players[]` is keyed on `client.client_id` — the id presented at the handshake,
+    which under 9.x is the X25519 public key. This self-report is joined against that list by the
+    GUI (to dedupe a speaker into ONE row) and by mesh.router._idle_player_url (to find the URL of
+    a speaker attached to nothing). Publishing the listener id instead splits one speaker across two
+    namespaces: the GUI grows a duplicate row, and routing an idle speaker dials it and then times
+    out at 10 s, every time. They were the same string before the 9.x bump.
+    """
+    state = FakeReportingPlayer().snapshot()
+    assert state["player_id"] == "PEERID-x25519-pubkey"
+    assert state["player_id"] != "player-133", "the listener id is NOT the id a server knows us by"
+
+
+def test_the_listener_id_is_still_reported_separately():
+    """It is what we advertise over mDNS and what a server dials, so it stays visible for display
+    and debugging — just not as the join key."""
+    assert FakeReportingPlayer().snapshot()["listener_id"] == "player-133"
