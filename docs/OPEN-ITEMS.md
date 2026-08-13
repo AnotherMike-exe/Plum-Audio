@@ -69,25 +69,24 @@
    was dialled at 15:21:57.879 and paired at 15:21:58.047 — **170 ms, inside the handshake**, on a
    pairing it had never done before. So the 30 s belongs to contention (or to the pre-staging build),
    not to pairing. Measure with MA stopped.
-   **The roam failure is DIRECTIONAL, and it is not MA and not pairing.** Isolated on the rig once MA
-   went quiet, three consistent attempts:
+   ~~**The roam failure is DIRECTIONAL**~~ — **CLOSED 2026-08-13: a leaked `management` session.**
+   `open_pairing_window` called `enable_management()` and never disabled it. A declared activity is
+   part of what the client's arbitration ranks when a second server dials, so a server still holding
+   `management` outranks a peer asking for plain PLAYBACK: the peer's dial is accepted provisionally,
+   handshakes, and is then rejected — it lands in the peer's registry as `(disconnected)` and the
+   reclaim polls 10 s for a client that never comes up. Nothing expired the session, so that player
+   could not be roamed for the rest of the process's lifetime, and a restart "fixed" it.
 
-   | Route | Result |
-   |---|---|
-   | `.122`'s player → `.122`'s own source (local attach) | `ok:true` |
-   | `.204`'s player → `.122`'s source (cross-server) | `ok:true` — and the suite is 3/3 |
-   | `.122`'s player → `.204`'s source (cross-server) | **`ok:false`, every time** |
+   It looked directional only because `.122` had had a pairing window opened on its player and `.204`
+   had not. The reproduction is exact: **12/12 successful roams, ONE `/api/mesh/pairing-window` call,
+   then failure on the very next attempt and every one after.** Fixed by enabling management for the
+   length of the call and disabling it in a `finally`; verified 5/5 against that same sequence.
 
-   In the failing direction the dial *arrives*: `.122`'s player logs `server dialed us` from
-   `192.168.7.204` 0.9 s after the route, and `detached from server` 30 ms later, so it leaves its own
-   server as asked. But `.204`'s server never registers the client — nothing in its log between the
-   dial and `reclaim of remote player FjXD88ok… timed out` 10 s later — so `_await_client_connected`
-   polls `get_client(player_id)` for a client that never appears. Both players are `long_term`/paired,
-   so this is downstream of pairing. Suspect an id-namespace or stale-registration asymmetry on the
-   receiving server, not a timeout: the player is gone from its old server within 30 ms and simply
-   never lands. The one asymmetry in config is `autoSwitch.localActivity`, true on `.122` and false on
-   `.204`, but `.122` was never observed re-dialling its player back. **Next: log the client id
-   `.204` actually registers at handshake and compare it to the `player_id` the mesh passes.**
+   Two things made this cost hours, and both are now fixed. Client lifecycle was **unlogged**, so the
+   receiving server's record was a timeout with nothing before it; and a reclaim timeout did not name
+   the clients it *did* hold. The line that broke it open was
+   `clients held: … FjXD88ok…(disconnected)`.
+
    **Music Assistant also steals our players' sockets, but only while streaming.**
    `.7.226` (MA 2.9.11) accounted for **16 of the last 20 handshakes** on `.7.122`'s player, arriving
    every ~40-60 s, and each one makes the player log `server dialed us` → `detached from server`. A
