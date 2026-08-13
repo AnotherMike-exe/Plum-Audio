@@ -69,8 +69,27 @@
    was dialled at 15:21:57.879 and paired at 15:21:58.047 — **170 ms, inside the handshake**, on a
    pairing it had never done before. So the 30 s belongs to contention (or to the pre-staging build),
    not to pairing. Measure with MA stopped.
-   **Cause identified, same evening: Music Assistant is continuously stealing our players' sockets.**
-   `.7.226` (MA 2.9.11) accounts for **16 of the last 20 handshakes** on `.7.122`'s player, arriving
+   **The roam failure is DIRECTIONAL, and it is not MA and not pairing.** Isolated on the rig once MA
+   went quiet, three consistent attempts:
+
+   | Route | Result |
+   |---|---|
+   | `.122`'s player → `.122`'s own source (local attach) | `ok:true` |
+   | `.204`'s player → `.122`'s source (cross-server) | `ok:true` — and the suite is 3/3 |
+   | `.122`'s player → `.204`'s source (cross-server) | **`ok:false`, every time** |
+
+   In the failing direction the dial *arrives*: `.122`'s player logs `server dialed us` from
+   `192.168.7.204` 0.9 s after the route, and `detached from server` 30 ms later, so it leaves its own
+   server as asked. But `.204`'s server never registers the client — nothing in its log between the
+   dial and `reclaim of remote player FjXD88ok… timed out` 10 s later — so `_await_client_connected`
+   polls `get_client(player_id)` for a client that never appears. Both players are `long_term`/paired,
+   so this is downstream of pairing. Suspect an id-namespace or stale-registration asymmetry on the
+   receiving server, not a timeout: the player is gone from its old server within 30 ms and simply
+   never lands. The one asymmetry in config is `autoSwitch.localActivity`, true on `.122` and false on
+   `.204`, but `.122` was never observed re-dialling its player back. **Next: log the client id
+   `.204` actually registers at handshake and compare it to the `player_id` the mesh passes.**
+   **Music Assistant also steals our players' sockets, but only while streaming.**
+   `.7.226` (MA 2.9.11) accounted for **16 of the last 20 handshakes** on `.7.122`'s player, arriving
    every ~40-60 s, and each one makes the player log `server dialed us` → `detached from server`. A
    client holds exactly ONE websocket, so every MA dial evicts whichever Plum server currently holds
    that player. This is what makes cross-server roam intermittent on VLAN 7: the same route that
@@ -78,7 +97,10 @@
    a pairing bug and not a regression — MA is a third-party server legitimately claiming a speaker it
    has configured. **Test cross-server roam with the Plum speakers removed from MA, or MA stopped**,
    and treat any roam measurement taken on VLAN 7 with MA running as contaminated. The real fix is
-   the arbitration policy hook this item already notes we do not have.
+   the arbitration policy hook this item already notes we do not have. **Stopping the MA stream is
+   enough — it stopped dialling within minutes and had been quiet for 12-16 min before the
+   directional failure above was measured, so MA does not explain that one. Removing the speakers
+   from MA is not required.**
    **Also found: "Open the mesh for pairing" skips any unit whose player has roamed away.** The
    `management` activity is a property of a live connection between a server and a client, so a unit
    whose own player is currently attached to a PEER's source has no connection to open a window on:
