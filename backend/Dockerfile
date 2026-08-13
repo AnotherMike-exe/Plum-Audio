@@ -91,11 +91,22 @@ COPY backend/requirements.txt ./requirements.txt
 # a compiler log; with it, a missing aarch64 wheel says so immediately and legibly.
 RUN pip install --only-binary=:all: -r requirements.txt
 
-# Same reasoning as the apt assertions above, one layer down. 9.x made encryption load-bearing:
-# `noise/` is what every client handshake goes through, and `cpace` (a single-release package) backs
-# PIN pairing. A missing or broken one of these does not fail the build — it fails at the first
-# client connection, on the rig, as a handshake that never completes.
-RUN python3 -c "import aiosendspin.noise, cryptography, cpace, noiseprotocol; print('noise stack OK')"
+# Same reasoning as the apt assertions above, one layer down. 9.x made encryption load-bearing, and
+# a failure here does not surface at build time — it surfaces on the rig as a handshake that never
+# completes, or a crash-loop, with the audio path apparently fine.
+#
+# Deliberately FUNCTIONAL rather than a list of imports. Identity.generate().peer_id executes
+# cryptography's compiled X25519 on the target architecture, which is the actual risk: this image
+# has no compiler, so a missing aarch64 wheel is the thing that would bite. Importing the module
+# only proves pip put a directory somewhere. (`noise` is noiseprotocol's import name — the two
+# differ, which this assertion found the hard way.)
+RUN python3 -c "\
+import importlib.metadata as md, cpace, noise; \
+from aiosendspin.noise import Identity; \
+v = md.version('aiosendspin'); \
+assert v == '9.1.0', f'aiosendspin {v}, expected 9.1.0 — the pin did not take'; \
+assert len(Identity.generate().peer_id) > 20, 'X25519 keygen produced nothing usable'; \
+print(f'noise stack OK (aiosendspin {v}, cryptography works on this arch)')"
 
 # Application code (scripts/, config/, nginx/, supervisord/, entrypoint.sh)
 COPY backend/ /app/
