@@ -63,5 +63,34 @@ class SyncEngine(ABC):
         """Hand a foreign speaker back to whatever server had it. Optional."""
         raise NotImplementedError
 
+    # -- pairing. Optional: an engine whose protocol has no notion of it implements none of these.
+
+    async def pair_client(self, client_id: str, method: str, token: str | None = None) -> None:
+        """Begin an operator-initiated pairing attempt with a connected client.
+
+        `token` carries the device's pairing token for the no-interaction `pairing_psk` method.
+        """
+        raise NotImplementedError
+
+    def submit_pin(self, client_id: str, pin: str) -> bool:
+        """Hand a waiting attempt the PIN the operator typed. False if nothing is waiting."""
+        raise NotImplementedError
+
+    async def cancel_pairing(self, client_id: str) -> None:
+        """Abandon an attempt without finalising it."""
+        raise NotImplementedError
+
+    async def unpair_client(self, client_id: str) -> None:
+        """Drop the pairing record both ends hold."""
+        raise NotImplementedError
+
+    async def open_pairing_window(self, client_id: str) -> bool:
+        """Stand in for the operator's gesture on a client we are already paired with."""
+        raise NotImplementedError
+
+    def pairing_state(self, client_id: str | None = None) -> dict:
+        """The last pairing outcome per client, for a GUI that is waiting on one."""
+        raise NotImplementedError
+
     def snapshot(self) -> UnitSnapshot:  # noqa: B027 - optional hook; an engine with no structural view may leave it
         """This unit's local structural state for the aggregator / REST snapshot."""

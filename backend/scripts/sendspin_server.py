@@ -54,6 +54,9 @@ from collections.abc import AsyncIterator
 import sendspin_identity
 import unit_identity
 from aiosendspin.models.types import GoodbyeReason, MediaCommand, has_role_family
+from aiosendspin.noise import decode_token
+from aiosendspin.noise.pairing import PairingAttempt
+from aiosendspin.noise.trust_store import PairMethod
 from aiosendspin.server.audio import AudioFormat
 from aiosendspin.server.group import SendspinGroup
 from aiosendspin.server.push_stream import PushStream, StreamStoppedError
@@ -99,6 +102,10 @@ SOURCE_IDLE_TIMEOUT_S = float(os.environ.get("PLUM_SOURCE_IDLE_TIMEOUT", "300"))
 CONTROLLER_PREFIX = "ctrl:"  # GUI controller client id namespace: "ctrl:<source_id>:<nonce>"
 REACQUIRE_BACKOFF_S = 0.1  # pause before re-acquiring a stopped stream (avoid hot-looping)
 CANCEL_POLL_S = 0.25  # how long to wait between cancels of a dial task — see _stop_dialing
+# How long a pairing attempt waits for the operator to type the PIN. Generous: they may be
+# walking to a speaker to read it off a display. Bounded so an abandoned dialog cannot pin a
+# client in the pairing state forever, which would leave it unable to play.
+PAIRING_PIN_TIMEOUT_S = 180.0
 
 
 def _security_of(client) -> str | None:
@@ -453,6 +460,11 @@ class PlumSendspinServer:
         # phone's AirPlay/BT slider, Spotify Connect device volume). Fed by each remote's readback
         # callback and served in the snapshot; the protocol carries no such state, so this is ours.
         self._source_volumes: dict[str, dict] = {}
+        # Operator-driven pairing: the last outcome per client (polled by the GUI while it waits),
+        # the futures a PIN submission resolves, and the in-flight attempts.
+        self._pairing: dict[str, dict] = {}
+        self._pending_pins: dict[str, asyncio.Future] = {}
+        self._pairing_tasks: dict[str, asyncio.Task] = {}
         self._stop_evt = asyncio.Event()
 
     async def start(self) -> None:
@@ -527,6 +539,167 @@ class PlumSendspinServer:
         if await self._trust_player(player_peer):
             logger.info("trusted local player %s", player_peer)
 
+    # -- operator-driven pairing ---------------------------------------------
+
+    def pairing_state(self, client_id: str | None = None) -> dict:
+        """What pairing has been attempted here and how it went. Read by the GUI while it waits.
+
+        `initiate_pairing` runs the whole exchange — a PAKE round and a re-handshake — so it cannot
+        be awaited inside an HTTP handler without holding the request open for as long as an
+        operator takes to read a PIN off a speaker. It runs as a task instead, and this is where its
+        outcome lands. The GUI starts an attempt, then polls.
+        """
+        if client_id is not None:
+            return dict(self._pairing.get(client_id) or {"state": "idle"})
+        return {cid: dict(st) for cid, st in self._pairing.items()}
+
+    def submit_pin(self, client_id: str, pin: str) -> bool:
+        """Hand the operator's PIN to a waiting attempt. False if nothing is waiting for one.
+
+        The other half of `_pin_provider_for`: the library asks for a PIN by awaiting the provider,
+        and this is what completes that await. False here means the attempt already timed out or was
+        cancelled — worth telling the operator, because retyping into a dead dialog is otherwise
+        indistinguishable from a wrong PIN.
+        """
+        future = self._pending_pins.get(client_id)
+        if future is None or future.done():
+            return False
+        future.set_result(pin)
+        return True
+
+    def _pin_provider_for(self, client_id: str):
+        """A `PinProvider` — `() -> Awaitable[str]` — resolved by `submit_pin` from the API."""
+
+        async def provider() -> str:
+            loop = asyncio.get_running_loop()
+            future: asyncio.Future[str] = loop.create_future()
+            self._pending_pins[client_id] = future
+            self._pairing.setdefault(client_id, {})["state"] = "awaiting_pin"
+            try:
+                return await asyncio.wait_for(future, timeout=PAIRING_PIN_TIMEOUT_S)
+            finally:
+                self._pending_pins.pop(client_id, None)
+
+        return provider
+
+    async def pair_client(self, client_id: str, method: str, token: str | None = None) -> None:
+        """Start an operator-initiated pairing attempt with a CONNECTED client.
+
+        `token` is the device's pairing token — the `SP:`-prefixed string it shows as a QR code or
+        offers to copy — and is REQUIRED for the `pairing_psk` method, which is the no-interaction
+        one: there is no PIN to type, so the secret has to arrive some other way. The PIN methods
+        ignore it.
+
+        Runs as a background task for the reason in `pairing_state`. Raises only on a bad request —
+        an unknown method, a missing token, or a client that is not connected — so the API can
+        answer 400 for those and let everything else surface through the polled state.
+        """
+        assert self.server is not None
+        if self.server.get_client(client_id) is None:
+            raise KeyError(f"{client_id!r} is not connected; a pairing attempt needs a live connection")
+        try:
+            pair_method = PairMethod(method)
+        except ValueError as exc:
+            raise ValueError(f"unknown pairing method {method!r}") from exc
+
+        pairing_psk = None
+        if pair_method is PairMethod.PAIRING_PSK:
+            if not token:
+                raise ValueError("the pairing_psk method needs the device's pairing token")
+            try:
+                pairing_psk = decode_token(token.strip()).pairing_psk
+            except ValueError as exc:
+                raise ValueError(f"that does not look like a pairing token: {exc}") from exc
+
+        attempt = PairingAttempt(
+            method=pair_method,
+            # Only the PIN methods consult a provider, and only pairing_psk carries a secret —
+            # keeping them exclusive makes an impossible combination impossible to construct.
+            pin_provider=self._pin_provider_for(client_id) if pair_method is not PairMethod.PAIRING_PSK else None,
+            pairing_psk=pairing_psk,
+            owner="plum-gui",
+        )
+        self._pairing[client_id] = {"state": "pending", "method": method}
+        self._pairing_tasks[client_id] = asyncio.ensure_future(self._run_pairing(client_id, attempt))
+
+    async def _run_pairing(self, client_id: str, attempt) -> None:
+        """Drive one attempt to completion and record how it ended.
+
+        Every failure mode lands here as a message rather than a traceback, because the operator is
+        looking at a dialog, not a log: a wrong PIN, a timeout waiting for one, and a speaker that
+        hung up are all things they can act on, and they need different actions.
+        """
+        assert self.server is not None
+        try:
+            await self.server.initiate_pairing(client_id, attempt)
+        except asyncio.TimeoutError:
+            self._pairing[client_id] = {"state": "failed", "error": "timed out waiting for the PIN"}
+            logger.warning("pairing %s: timed out waiting for a PIN", client_id)
+        except Exception as exc:  # noqa: BLE001 - the operator needs the reason, not a 500
+            self._pairing[client_id] = {"state": "failed", "error": str(exc) or type(exc).__name__}
+            logger.warning("pairing %s failed: %s", client_id, exc)
+        else:
+            self._pairing[client_id] = {"state": "paired"}
+            logger.info("pairing %s: succeeded", client_id)
+        finally:
+            self._pairing_tasks.pop(client_id, None)
+
+    async def cancel_pairing(self, client_id: str) -> None:
+        """Abandon an attempt without finalising, leaving the connection up."""
+        assert self.server is not None
+        future = self._pending_pins.pop(client_id, None)
+        if future is not None and not future.done():
+            future.cancel()
+        with contextlib.suppress(Exception):
+            await self.server.end_pairing(client_id)
+        self._pairing[client_id] = {"state": "cancelled"}
+
+    async def unpair_client(self, client_id: str) -> None:
+        """Drop the pairing record both ends hold. The client is told, and closes."""
+        assert self.server is not None
+        await self.server.unpair(client_id)
+        self._pairing.pop(client_id, None)
+        logger.info("unpaired %s", client_id)
+
+    async def open_pairing_window(self, client_id: str) -> bool:
+        """Open a pairing window on a client we are ALREADY PAIRED WITH, over the management role.
+
+        This is the protocol's own answer to multi-server deployments, and the reason a unit pairs
+        with its own player at startup: that record is what earns us `management` on it, and thus
+        the right to stand in for the physical gesture. So a unit can open its own speaker up for a
+        NEW unit to pair with, without anyone touching the hardware.
+
+        Only ever called for our own player — management requires a long-term record, so it would
+        fail for anything we have not paired with anyway, but the caller should not rely on that.
+        """
+        assert self.server is not None
+        try:
+            connection = self.server.enable_management(client_id)
+            result = await connection.open_pairing_window()
+        except Exception as exc:  # noqa: BLE001 - a closed window is not worth a 500
+            logger.warning("could not open a pairing window on %s: %s", client_id, exc)
+            return False
+        ok = getattr(result, "value", str(result)) == "ok"
+        logger.info("pairing window on %s: %s", client_id, "open" if ok else result)
+        return ok
+
+    async def set_unpaired_access(self, enabled: bool) -> None:
+        """Apply the unpaired-access policy to every peer we have trusted.
+
+        The client half rides in `client/hello` and so is fixed for a connection's life, but the
+        SERVER half is live: `trust_unpaired`/`untrust_unpaired` both re-activate a connected
+        client's roles immediately. Without this, turning the setting off in the GUI would leave
+        every already-trusted peer playing until its next reconnect — a policy change that appears
+        to have applied and has not.
+        """
+        assert self.server is not None
+        if enabled:
+            return  # trust is granted per-peer on the routing path; nothing to grant up front
+        for client in list(self.server.clients):
+            with contextlib.suppress(Exception):
+                await self.server.untrust_unpaired(client.client_id)
+        logger.info("unpaired access off — revoked every sentinel-PSK approval")
+
     async def pair_own_player(self, client_id: str) -> bool:
         """Pair this unit's server with its OWN player, over the Pairing PSK method. Idempotent.
 
@@ -548,9 +721,6 @@ class PlumSendspinServer:
         if client is not None and getattr(client, "is_paired", False):
             return True  # already has a long-term record
         try:
-            from aiosendspin.noise.pairing import PairingAttempt
-            from aiosendspin.noise.trust_store import PairMethod
-
             await self.server.initiate_pairing(
                 client_id,
                 PairingAttempt(

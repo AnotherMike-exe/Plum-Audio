@@ -47,5 +47,23 @@ class SendspinEngine(SyncEngine):
     async def release_client(self, source_id: str, player_id: str, url: str | None = None) -> None:
         await self._server.release_foreign_client(source_id, player_id, url=url)
 
+    async def pair_client(self, client_id: str, method: str, token: str | None = None) -> None:
+        await self._server.pair_client(client_id, method, token)
+
+    def submit_pin(self, client_id: str, pin: str) -> bool:
+        return self._server.submit_pin(client_id, pin)
+
+    async def cancel_pairing(self, client_id: str) -> None:
+        await self._server.cancel_pairing(client_id)
+
+    async def unpair_client(self, client_id: str) -> None:
+        await self._server.unpair_client(client_id)
+
+    async def open_pairing_window(self, client_id: str) -> bool:
+        return await self._server.open_pairing_window(client_id)
+
+    def pairing_state(self, client_id: str | None = None) -> dict:
+        return self._server.pairing_state(client_id)
+
     def snapshot(self) -> UnitSnapshot:
         return self._server.snapshot()
