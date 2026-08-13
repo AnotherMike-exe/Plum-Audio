@@ -156,6 +156,7 @@ is never bridged between servers. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.m
 | [OPERATIONS.md](docs/OPERATIONS.md) | Build, deploy, debug — including the deceptive failure modes |
 | [HOST-PROVISIONING.md](docs/HOST-PROVISIONING.md) | Commissioning a new Pi, step by step |
 | [HARD-WON-LESSONS.md](docs/HARD-WON-LESSONS.md) | Why the code is shaped this way. Read before "simplifying" |
+| [OPEN-ITEMS.md](docs/OPEN-ITEMS.md) | Known gaps, deferred calls, and resolved-with-history |
 | [SPEC-CONFORMANCE.md](docs/SPEC-CONFORMANCE.md) | Where we stand against the Sendspin spec |
 | [SENDSPIN-PAIRING.md](docs/SENDSPIN-PAIRING.md) | Encryption/pairing: what we do instead, and what it costs |
 | [ROUTING-MODEL.md](docs/ROUTING-MODEL.md) | **Proposal** — unified attach/detach and the true-none rule |
