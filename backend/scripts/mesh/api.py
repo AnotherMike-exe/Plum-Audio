@@ -20,9 +20,21 @@ Endpoints (parity with the old /api/federation/* surface, so the GUI ports with 
   POST /api/mesh/source-volume     {source_id, volume?, muted?}    the SENDING DEVICE's own volume
   POST /api/mesh/source            {source_id, fifo?}              start a local source (a group)
   POST /api/mesh/source/stop       {source_id}                     stop a local source
+  GET  /api/mesh/pairing           [?client_id]                    what pairing was attempted, and how it went
+  POST /api/mesh/pair              {client_id, method, token?}     begin a pairing attempt
+  POST /api/mesh/pair/pin          {client_id, pin}                answer a PIN prompt (409 if none is waiting)
+  POST /api/mesh/pair/cancel       {client_id}                     abandon an attempt, keep the connection
+  POST /api/mesh/unpair            {client_id}                     drop the record both ends hold
+  POST /api/mesh/pairing-window    {client_id?}                    stand in for the operator's gesture
 
 Sources are local to the unit that ingests them ("servers stay") — /source acts on THIS unit;
 there is no delegation. Multiple sources may run concurrently, each anchoring its own group.
+
+Pairing is likewise local, and for a stronger reason: it is a property of the connection between
+THIS server and that client, so there is nothing meaningful to delegate. The GUI reaches a peer's
+pairing by calling that peer's own API, exactly as it does for volume. An attempt runs as a
+background task — the exchange includes a PAKE round and a wait on a human — so /pair returns
+immediately and the outcome is collected from GET /pairing.
 """
 
 from __future__ import annotations
@@ -156,6 +168,12 @@ class MeshApi:
                 web.post("/api/mesh/source-volume", self._source_volume),
                 web.post("/api/mesh/source", self._source_start),
                 web.post("/api/mesh/source/stop", self._source_stop),
+                web.get("/api/mesh/pairing", self._pairing_state),
+                web.post("/api/mesh/pair", self._pair),
+                web.post("/api/mesh/pair/pin", self._pair_pin),
+                web.post("/api/mesh/pair/cancel", self._pair_cancel),
+                web.post("/api/mesh/unpair", self._unpair),
+                web.post("/api/mesh/pairing-window", self._pairing_window),
                 web.route("OPTIONS", "/api/mesh/{tail:.*}", self._options),
             ]
         )
@@ -380,6 +398,113 @@ class MeshApi:
             return web.json_response({"error": "source_id required"}, status=400)
         await self._engine.stop_source(source_id)
         return web.json_response({"ok": True, "source_id": source_id})
+
+    # -- pairing -------------------------------------------------------------
+    #
+    # These drive the Sendspin pairing methods against a CONNECTED client. Pairing is not a routing
+    # operation and deliberately does not go through the router: it is a property of the connection
+    # between this server and that client, so every one of these is local to this unit. The GUI
+    # reaches a peer's pairing by calling that peer's own API, exactly as it does for volume.
+
+    async def _pairing_state(self, request: web.Request) -> web.Response:
+        """What pairing has been attempted here, and how it went. The GUI polls this while waiting.
+
+        An attempt runs as a background task — the exchange includes a PAKE round and a wait on a
+        human — so this is how its outcome is collected rather than from the POST that started it.
+        """
+        client_id = request.query.get("client_id")
+        try:
+            return web.json_response({"ok": True, "pairing": self._engine.pairing_state(client_id)})
+        except NotImplementedError:
+            return web.json_response({"ok": True, "pairing": {}, "supported": False})
+
+    async def _pair(self, request: web.Request) -> web.Response:
+        body = await self._json(request)
+        client_id, method = body.get("client_id"), body.get("method", "pairing_psk")
+        token = body.get("token")
+        if not client_id:
+            return web.json_response({"error": "client_id required"}, status=400)
+        try:
+            await self._engine.pair_client(client_id, method, token)
+        except Exception as e:  # noqa: BLE001 - report the failure rather than 500-ing
+            logger.exception("pair failed")
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response({"ok": True, "state": "pending"})
+
+    async def _pair_pin(self, request: web.Request) -> web.Response:
+        """Hand the operator's PIN to a waiting attempt.
+
+        A False from the engine is NOT a wrong PIN — it means nothing was waiting, i.e. the attempt
+        already timed out or was cancelled. Said plainly, because retyping into a dead dialog is
+        otherwise indistinguishable from getting the digits wrong.
+        """
+        body = await self._json(request)
+        client_id, pin = body.get("client_id"), body.get("pin")
+        if not client_id or not pin:
+            return web.json_response({"error": "client_id and pin required"}, status=400)
+        try:
+            accepted = self._engine.submit_pin(client_id, str(pin))
+        except Exception as e:  # noqa: BLE001
+            return web.json_response({"error": str(e)}, status=400)
+        if not accepted:
+            return web.json_response({"error": "no pairing attempt is waiting for a PIN"}, status=409)
+        return web.json_response({"ok": True})
+
+    async def _pair_cancel(self, request: web.Request) -> web.Response:
+        body = await self._json(request)
+        client_id = body.get("client_id")
+        if not client_id:
+            return web.json_response({"error": "client_id required"}, status=400)
+        try:
+            await self._engine.cancel_pairing(client_id)
+        except Exception as e:  # noqa: BLE001
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response({"ok": True})
+
+    async def _unpair(self, request: web.Request) -> web.Response:
+        body = await self._json(request)
+        client_id = body.get("client_id")
+        if not client_id:
+            return web.json_response({"error": "client_id required"}, status=400)
+        try:
+            await self._engine.unpair_client(client_id)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("unpair failed")
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response({"ok": True})
+
+    async def _pairing_window(self, request: web.Request) -> web.Response:
+        """Open this unit's own player for pairing, standing in for the physical gesture.
+
+        The protocol's answer to multi-server deployments: a server already paired with a device may
+        open its pairing window over the `management` role. A unit is always paired with its own
+        player, so it can always do this for itself — which is what lets a NEW unit pair with an
+        existing one without anyone touching hardware.
+
+        `client_id` defaults to this unit's own player precisely because that is the only client we
+        are guaranteed to hold management on; passing someone else's is allowed but will fail unless
+        we happen to be paired with them.
+        """
+        body = await self._json(request)
+        client_id = body.get("client_id") or self._own_player_id()
+        if not client_id:
+            return web.json_response({"error": "no local player to open a window on"}, status=400)
+        try:
+            opened = await self._engine.open_pairing_window(client_id)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("pairing window failed")
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response({"ok": bool(opened), "client_id": client_id})
+
+    @staticmethod
+    def _own_player_id() -> str | None:
+        """This unit's own player's peer id, read from the identity on disk."""
+        try:
+            import sendspin_identity
+
+            return sendspin_identity.peer_id_of(sendspin_identity.PLAYER_ROLE)
+        except Exception:  # noqa: BLE001 - a playerless unit, or a unit whose keys are unreadable
+            return None
 
     async def _options(self, _request: web.Request) -> web.Response:
         return web.Response()

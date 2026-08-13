@@ -168,6 +168,17 @@ def run_scenario(scenario):
     asyncio.run(wrapper())
 
 
+class _FakeManagementConnection:
+    """What enable_management returns: the object carrying the management commands."""
+
+    def __init__(self, server):
+        self._server = server
+
+    async def open_pairing_window(self):
+        self._server.calls.append("open_pairing_window")
+        return type("R", (), {"value": "ok"})()
+
+
 class FakeServer:
     def __init__(self):
         self._by_id = {}
@@ -176,6 +187,9 @@ class FakeServer:
         self.dialed = []  # (url, reason) in call order
         self.disconnected = []  # urls passed to disconnect_from_client, in call order
         self.trusted = []  # client ids passed to trust_unpaired
+        self.pin_seen = None            # the PIN the library asked for, once supplied
+        self.pairing_error = None       # set to make initiate_pairing raise
+        self.management_error = None    # set to make enable_management raise
         self.calls = []  # ("trust"|"reclaim", id) in call order — ORDER is the assertion
 
     @property
@@ -218,6 +232,29 @@ class FakeServer:
     def reclaim_client_for_playback(self, client_id, timeout_s=None):
         self.calls.append(("reclaim", client_id))
         return client_id in self._urls
+
+    # -- pairing ---------------------------------------------------------
+    async def initiate_pairing(self, client_id, attempt):
+        self.calls.append(("initiate_pairing", client_id, attempt.method.value))
+        if attempt.pin_provider is not None:
+            self.pin_seen = await attempt.pin_provider()   # exercises the future the API resolves
+        if self.pairing_error is not None:
+            raise self.pairing_error
+
+    async def end_pairing(self, client_id):
+        self.calls.append(("end_pairing", client_id))
+
+    async def unpair(self, client_id):
+        self.calls.append(("unpair", client_id))
+
+    async def untrust_unpaired(self, client_id):
+        self.calls.append(("untrust", client_id))
+
+    def enable_management(self, client_id):
+        self.calls.append(("enable_management", client_id))
+        if self.management_error is not None:
+            raise self.management_error
+        return _FakeManagementConnection(self)
 
 
 def make_feeder(group=None, ps=None):
@@ -946,3 +983,155 @@ def test_a_peer_on_an_older_image_reads_as_unknown_not_as_cleartext():
     row = PlayerState.from_dict(legacy)
     assert row.security is None and row.paired is False
     assert row.active_roles is None, "None here is what marks the whole row unknown"
+
+
+_TOKEN = None  # a real pairing token, built once at import (see below)
+
+
+def _make_token():
+    from aiosendspin.noise import Identity, PSKPairingToken, encode_token, generate_psk
+
+    return encode_token(PSKPairingToken(client_id=Identity.generate().peer_id, pairing_psk=generate_psk()))
+
+
+_TOKEN = _make_token()
+
+
+# -- operator-driven pairing ------------------------------------------------------------------------
+
+
+def test_a_pin_attempt_waits_for_the_operator_and_then_completes():
+    """The whole shape of a PIN pairing: the library asks for a PIN by awaiting a provider, the API
+    resolves it from a separate request, and the attempt finishes. It runs as a background task
+    because that await can last as long as someone walking to a speaker to read its display —
+    holding an HTTP request open for that is what this design exists to avoid."""
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        unit.server.add(FakeClient("spk", roles=["player@v1"]))
+        await unit.pair_client("spk", "dynamic_pin")
+
+        for _ in range(50):  # let the task reach the provider
+            await asyncio.sleep(0.01)
+            if unit.pairing_state("spk").get("state") == "awaiting_pin":
+                break
+        assert unit.pairing_state("spk")["state"] == "awaiting_pin"
+
+        assert unit.submit_pin("spk", "123456") is True
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if unit.pairing_state("spk").get("state") == "paired":
+                break
+        assert unit.pairing_state("spk") == {"state": "paired"}
+        assert unit.server.pin_seen == "123456", "the PIN must reach the library, not just the future"
+
+    run_scenario(scenario)
+
+
+def test_a_pin_for_nobody_is_refused_rather_than_swallowed():
+    """False here means "nothing was waiting" — a timed-out or cancelled attempt — NOT a wrong PIN.
+    The API turns it into a 409 so the operator is told to start again rather than left retyping
+    into a dead dialog, which otherwise looks identical to getting the digits wrong."""
+    unit = make_unit("airplay-1")
+    assert unit.submit_pin("spk", "123456") is False
+
+
+def test_pairing_a_disconnected_client_is_a_bad_request_not_a_crash():
+    """Pairing runs over a live connection; there is nothing to attempt without one."""
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        with pytest.raises(KeyError):
+            await unit.pair_client("never-connected", "dynamic_pin")
+
+    run_scenario(scenario)
+
+
+def test_an_unknown_pairing_method_is_rejected_before_anything_starts():
+    async def scenario():
+        unit = make_unit("airplay-1")
+        unit.server.add(FakeClient("spk", roles=["player@v1"]))
+        with pytest.raises(ValueError):
+            await unit.pair_client("spk", "telepathy")
+        assert not any(c[0] == "initiate_pairing" for c in unit.server.calls if isinstance(c, tuple))
+
+    run_scenario(scenario)
+
+
+def test_a_failed_attempt_records_a_reason_the_operator_can_act_on():
+    """A wrong PIN, a hung-up speaker and a timeout are different problems needing different
+    actions, so the failure is kept as a message rather than collapsing to False."""
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        unit.server.add(FakeClient("spk", roles=["player@v1"]))
+        unit.server.pairing_error = RuntimeError("pairing aborted by the client")
+        await unit.pair_client("spk", "pairing_psk", token=_TOKEN)
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if unit.pairing_state("spk").get("state") == "failed":
+                break
+        state = unit.pairing_state("spk")
+        assert state["state"] == "failed"
+        assert "aborted" in state["error"]
+
+    run_scenario(scenario)
+
+
+def test_the_psk_method_does_not_ask_for_a_pin():
+    """Pairing PSK is the no-interaction method — offering a PIN dialog for it would be a bug the
+    operator experiences as a prompt they cannot answer."""
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        unit.server.add(FakeClient("spk", roles=["player@v1"]))
+        await unit.pair_client("spk", "pairing_psk", token=_TOKEN)
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if unit.pairing_state("spk").get("state") == "paired":
+                break
+        assert unit.server.pin_seen is None
+
+    run_scenario(scenario)
+
+
+def test_opening_a_pairing_window_goes_through_the_management_role():
+    """The protocol's answer to multi-server pairing: a server already paired with a device may
+    stand in for the physical gesture. This is why a unit pairs with its own player at startup."""
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        unit.server.add(FakeClient("own-player", roles=["player@v1"], paired=True))
+        assert await unit.open_pairing_window("own-player") is True
+        assert ("enable_management", "own-player") in unit.server.calls
+        assert "open_pairing_window" in unit.server.calls
+
+    run_scenario(scenario)
+
+
+def test_a_refused_management_session_is_not_fatal():
+    """Management needs a long-term record, so this fails for anything we have not paired with —
+    a normal answer, not an error worth taking the API down for."""
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        unit.server.add(FakeClient("stranger", roles=["player@v1"]))
+        unit.server.management_error = RuntimeError("not paired")
+        assert await unit.open_pairing_window("stranger") is False
+
+    run_scenario(scenario)
+
+
+def test_turning_unpaired_access_off_revokes_every_existing_approval():
+    """The client half rides in client/hello and is fixed for a connection's life, but the SERVER
+    half is live. Without this, turning the setting off would leave every already-trusted peer
+    playing until its next reconnect — a policy change that appears to have applied and has not."""
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        unit.server.add(FakeClient("a", roles=["player@v1"]))
+        unit.server.add(FakeClient("b", roles=["player@v1"]))
+        await unit.set_unpaired_access(False)
+        assert {c[1] for c in unit.server.calls if isinstance(c, tuple) and c[0] == "untrust"} == {"a", "b"}
+
+    run_scenario(scenario)
