@@ -159,6 +159,7 @@ is never bridged between servers. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.m
 | [SPEC-CONFORMANCE.md](docs/SPEC-CONFORMANCE.md) | Where we stand against the Sendspin spec |
 | [ROUTING-MODEL.md](docs/ROUTING-MODEL.md) | **Proposal** — unified attach/detach and the true-none rule |
 | [UPSTREAM-AIOSENDSPIN.md](docs/UPSTREAM-AIOSENDSPIN.md) | Workarounds to delete when the pin bumps |
+| [AIOSENDSPIN-BUMP-SCOPE.md](docs/AIOSENDSPIN-BUMP-SCOPE.md) | 6.0.5 → 9.1.0 scoped, and why the pin is on hold |
 | [PHASE-HISTORY.md](docs/PHASE-HISTORY.md) | What shipped when, and what hardware proved it |
 | [TESTING.md](docs/TESTING.md) | Test tiers, and what is not yet reproducible |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Branches, commits, versioning, style |
