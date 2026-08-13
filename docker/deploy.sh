@@ -554,6 +554,13 @@ chk() {  # chk <label> <url> [jq-ish grep]
     fi
 }
 chk "config API :5002"  "http://127.0.0.1:5002/api/settings"
+# Polled, unlike the others: the mesh API is served from INSIDE the audio event loop, so it comes up
+# a little after supervisord reports sendspin_server RUNNING. A one-shot curl here raced it and
+# reported a hard FAIL against an API that was answering peers seconds later.
+for i in $(seq 1 10); do
+    curl -fsS -m 5 "http://127.0.0.1:5001/api/mesh/view" >/dev/null 2>&1 && break
+    sleep 2
+done
 chk "mesh API :5001"    "http://127.0.0.1:5001/api/mesh/view"
 chk "web GUI :80"       "http://127.0.0.1/"
 echo "    sendspin server :8927 $(s ss -ltn | grep -q ':8927' && echo listening || echo 'NOT LISTENING')"
@@ -563,24 +570,26 @@ echo "    sendspin server :8927 $(s ss -ltn | grep -q ':8927' && echo listening 
 # only signal that separates the two, so the deploy asks for it directly. Poll, because the server
 # dials the local player a few seconds after start.
 if [[ "$WANT" -ge 4 ]]; then
+    # Deliberately curl-on-the-host, NOT `s docker exec ... python3 -`: s() pipes the sudo password
+    # into stdin, so anything reading stdin gets the password instead of its script. That cost one
+    # false FAIL on this check's first real run.
     act=""
     for i in $(seq 1 15); do
-        act="$(s docker exec plum-audio python3 - <<'PY' 2>/dev/null || true
-import json, urllib.request
+        act="$(curl -fsS -m 5 http://127.0.0.1:5001/api/mesh/view 2>/dev/null | python3 -c '
+import json, sys
 try:
-    view = json.load(urllib.request.urlopen("http://127.0.0.1:5001/api/mesh/view", timeout=3))
-except Exception as exc:
-    print(f"unreachable: {exc}"); raise SystemExit
+    view = json.load(sys.stdin)
+except Exception:
+    print("mesh API not answering yet"); raise SystemExit
 me = view.get("local_unit_id")
 unit = next((u for u in view.get("units", []) if u.get("unit_id") == me), None)
 rows = [p for p in (unit or {}).get("players", []) if any(r.startswith("player@") for r in (p.get("active_roles") or []))]
 if rows:
     print("OK " + ",".join(sorted(rows[0].get("active_roles") or [])))
 else:
-    others = [(p.get("player_id", "?")[:12], p.get("active_roles")) for p in (unit or {}).get("players", [])]
-    print("NONE " + (repr(others) if others else "no players attached yet"))
-PY
-)"
+    seen = [(p.get("player_id", "?")[:12], p.get("active_roles")) for p in (unit or {}).get("players", [])]
+    print("NONE " + (repr(seen) if seen else "no player attached yet"))
+' 2>/dev/null || true)"
         [[ "$act" == OK* ]] && break
         sleep 2
     done
