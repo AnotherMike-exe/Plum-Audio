@@ -479,6 +479,13 @@ PLUM_STATIC_DELAY_MS=150
 PLUM_LOG_LEVEL=INFO
 PLUM_MESH_ENABLED=1
 PLEXAMP_ENABLED=0
+
+# Accept cleartext Sendspin clients. aiosendspin 9.x defaults this OFF and calls the cleartext path
+# "non-spec transition mode"; for us it is a standing requirement, not transitional. sendspin-cpp —
+# what ESPHome's Sendspin component, the HA Voice PE and the Esparagus/Satellite1 boards run — has
+# no Noise support in any release, and our own GUI controller is a hand-rolled cleartext WebSocket.
+# Setting this to 0 drops every third-party speaker on the LAN, Music Assistant, AND the web GUI.
+PLUM_ALLOW_UNENCRYPTED=1
 ENV
 # COMPOSE_PROFILES has to be here, not in plum-audio.env: env_file is container environment, while
 # this is compose INTERPOLATION. Written beside the compose file so a bare `docker compose up -d` or
@@ -550,6 +557,44 @@ chk "config API :5002"  "http://127.0.0.1:5002/api/settings"
 chk "mesh API :5001"    "http://127.0.0.1:5001/api/mesh/view"
 chk "web GUI :80"       "http://127.0.0.1/"
 echo "    sendspin server :8927 $(s ss -ltn | grep -q ':8927' && echo listening || echo 'NOT LISTENING')"
+# Every check above passes on a unit that renders SILENCE. Under aiosendspin 9.x a client can be
+# admitted, negotiated, grouped and at the right volume while activated for no roles — supervisord
+# is green, all three APIs answer, both ports listen, and the room is quiet. `active_roles` is the
+# only signal that separates the two, so the deploy asks for it directly. Poll, because the server
+# dials the local player a few seconds after start.
+if [[ "$WANT" -ge 4 ]]; then
+    act=""
+    for i in $(seq 1 15); do
+        act="$(s docker exec plum-audio python3 - <<'PY' 2>/dev/null || true
+import json, urllib.request
+try:
+    view = json.load(urllib.request.urlopen("http://127.0.0.1:5001/api/mesh/view", timeout=3))
+except Exception as exc:
+    print(f"unreachable: {exc}"); raise SystemExit
+me = view.get("local_unit_id")
+unit = next((u for u in view.get("units", []) if u.get("unit_id") == me), None)
+rows = [p for p in (unit or {}).get("players", []) if any(r.startswith("player@") for r in (p.get("active_roles") or []))]
+if rows:
+    print("OK " + ",".join(sorted(rows[0].get("active_roles") or [])))
+else:
+    others = [(p.get("player_id", "?")[:12], p.get("active_roles")) for p in (unit or {}).get("players", [])]
+    print("NONE " + (repr(others) if others else "no players attached yet"))
+PY
+)"
+        [[ "$act" == OK* ]] && break
+        sleep 2
+    done
+    if [[ "$act" == OK* ]]; then
+        printf '    \033[32mOK\033[0m   %-22s %s\n' "player role ACTIVE" "${act#OK }"
+    else
+        printf '    \033[31mFAIL\033[0m %-22s %s\n' "player role ACTIVE" "$act"
+        echo "      A player that is connected but activated for NO roles renders silence with no"
+        echo "      error at either end. Check /config/identity exists and the server log shows"
+        echo "      'trusted local player'; see docs/OPERATIONS.md."
+        fail=1
+    fi
+    echo "    identity: $(s docker exec plum-audio sh -c 'ls /config/identity 2>/dev/null | tr "\n" " "' || echo MISSING)"
+fi
 if [[ "$WANT" -lt 4 ]]; then
     # No player by design — reporting NOT LISTENING here would cry wolf on every headless deploy.
     echo "    sendspin player :8928 not started (this unit has no audio output)"

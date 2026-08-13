@@ -24,7 +24,15 @@ mkdir -p /data/shairport /data/go-librespot /data/bluetooth
 
 # Best-effort: a volume the operator pre-populated as another user is theirs to keep, and a failed
 # chown must not stop the unit from playing music.
-chown -R "${PUID}:${PGID}" /config /data 2>/dev/null || true
+#
+# /config/identity is EXCLUDED. It holds this unit's X25519 private keys and its pairing/trust
+# store — the closest thing this system has to a device certificate. Both audio processes run as
+# root and create it 0700/0600 themselves (sendspin_identity.py), so handing it to PUID:PGID buys
+# nothing and makes the private keys readable to the deploy user on the host, where the bind mount
+# surfaces them at /opt/plum-audio/config/identity/.
+find /config -mindepth 1 -maxdepth 1 ! -name identity -exec chown -R "${PUID}:${PGID}" {} + 2>/dev/null || true
+chown "${PUID}:${PGID}" /config 2>/dev/null || true
+chown -R "${PUID}:${PGID}" /data 2>/dev/null || true
 
 # --- Mesh identity ------------------------------------------------------------------------------
 # Every unit in the mesh must be distinct, so the bare defaults in sendspin_server.py ("unit-local")
@@ -32,10 +40,14 @@ chown -R "${PUID}:${PGID}" /config /data 2>/dev/null || true
 HOST_SHORT="$(hostname -s 2>/dev/null || cat /etc/hostname 2>/dev/null || echo plum)"
 : "${PLUM_UNIT_ID:=unit-$(echo "$HOST_SHORT" | tr '[:upper:]' '[:lower:]')}"
 : "${PLUM_UNIT_NAME:=${HOST_SHORT}}"
-# The server registers PLUM_LOCAL_PLAYER_ID and the player answers to PLUM_PLAYER_ID: they are the
-# same endpoint under two names, and a mismatch means the server dials a player that never claims to
-# be the one it registered. Whichever the operator set wins; set neither and both derive from the
-# unit id.
+# PLUM_PLAYER_ID is the player's LISTENER id — what it advertises over mDNS and what a server dials.
+# It is NOT the id a server knows it by after the handshake: aiosendspin 9.x derives that from the
+# unit's X25519 keypair (/config/identity), so it is not ours to name.
+#
+# PLUM_LOCAL_PLAYER_ID used to be the server's half of that pair, and the server now IGNORES it —
+# it reads the player's public id from the stored key instead (sendspin_server.local_player_config).
+# It is kept because a deployed units.conf still sets it and PLUM_PLAYER_ID defaults FROM it below,
+# so dropping it would silently rename every unit's mDNS listener to <unit>-player.
 : "${PLUM_LOCAL_PLAYER_ID:=${PLUM_PLAYER_ID:-${PLUM_UNIT_ID}-player}}"
 : "${PLUM_PLAYER_ID:=${PLUM_LOCAL_PLAYER_ID}}"
 : "${PLUM_PLAYER_NAME:=${PLUM_UNIT_NAME}}"
@@ -79,7 +91,9 @@ export PLUM_UNIT_ID PLUM_UNIT_NAME PLUM_LOCAL_PLAYER_ID PLUM_LOCAL_PLAYER_URL PL
 export PLUM_PLAYER_ENABLED
 
 if [ "$PLUM_PLAYER_ENABLED" = "1" ]; then
-    echo "entrypoint: unit=${PLUM_UNIT_ID} (${PLUM_UNIT_NAME}) player=${PLUM_LOCAL_PLAYER_ID} at ${PLUM_LOCAL_PLAYER_URL}"
+    # The LISTENER id, which is what a server dials. The Sendspin id it hands over at the handshake
+    # is its public key and is logged by the player itself once it has loaded its identity.
+    echo "entrypoint: unit=${PLUM_UNIT_ID} (${PLUM_UNIT_NAME}) listener=${PLUM_PLAYER_ID} at ${PLUM_LOCAL_PLAYER_URL}"
 else
     echo "entrypoint: unit=${PLUM_UNIT_ID} (${PLUM_UNIT_NAME}) player=none"
 fi
