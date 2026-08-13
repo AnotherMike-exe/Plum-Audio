@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mapViewToModel, streamId, parseStreamId, MeshView, SendspinDataService } from '../../../services/sendspinDataService';
 import { NowPlaying, currentPositionMs, SendspinControllerClient, TimeFilter } from '../../../services/sendspinControllerClient';
 
@@ -459,5 +459,51 @@ describe('pairingState — who gets a Pair button', () => {
       { players: [{ name: 'esparagus', friendly_name: 'Esparagus', url: 'ws://192.0.2.99:8928/sendspin', host: '192.0.2.99', port: 8928, is_own: false }], servers: [] },
     );
     expect(model.clients.find((c) => c.url?.includes('192.0.2.99'))!.pairingState).toBe('unknown');
+  });
+});
+
+describe('opening the mesh for pairing', () => {
+  // Fanned out from the GUI rather than unit-to-unit: each unit opens only its OWN speaker's
+  // window, through its own management session over a record it already holds. So a unit that is
+  // down simply stays closed, and that is a partial success worth reporting precisely — the
+  // operator needs to know whether the unit they are adding a speaker to is ready.
+  const svc = () => new SendspinDataService();
+
+  const withUnits = (s: SendspinDataService, hosts: Record<string, string>) => {
+    // @ts-expect-error — private: the host map is normally filled by a poll.
+    s.unitHosts = new Map(Object.entries(hosts));
+    return s;
+  };
+
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it('reports every unit when all of them open', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ ok: true }), { status: 200 })));
+    const res = await withUnits(svc(), { 'unit-a': '192.0.2.10', 'unit-b': '192.0.2.11' }).openPairingWindowEverywhere();
+    expect(res).toEqual({ opened: 2, total: 2, failed: [] });
+  });
+
+  it('names the units that did NOT open, rather than failing as a whole', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) =>
+      url.includes('192.0.2.11')
+        ? Promise.reject(new Error('unreachable'))
+        : new Response(JSON.stringify({ ok: true }), { status: 200 })));
+    const res = await withUnits(svc(), { 'unit-a': '192.0.2.10', 'unit-b': '192.0.2.11' }).openPairingWindowEverywhere();
+    expect(res.opened).toBe(1);
+    expect(res.failed).toEqual(['unit-b']);
+  });
+
+  it('treats a unit that answers ok:false as not opened', async () => {
+    // The unit is reachable but refused — e.g. it holds no pairing record on its own player, so it
+    // has no management session to open a window with. Silently counting it as open would tell the
+    // operator to go ahead with a device that will never pair.
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ ok: false }), { status: 200 })));
+    const res = await withUnits(svc(), { 'unit-a': '192.0.2.10' }).openPairingWindowEverywhere();
+    expect(res).toEqual({ opened: 0, total: 1, failed: ['unit-a'] });
+  });
+
+  it('says nothing is reachable rather than claiming success on an empty mesh', async () => {
+    const res = await withUnits(svc(), {}).openPairingWindowEverywhere();
+    expect(res).toEqual({ opened: 0, total: 0, failed: [] });
   });
 });

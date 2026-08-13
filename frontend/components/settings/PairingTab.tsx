@@ -18,6 +18,11 @@ interface PairingTabProps {
  * has to be admitted deliberately — and the protocol's own answer is the `management` role, where a
  * server already paired with a device stands in for the physical gesture. Each unit does that for
  * its OWN speaker; this button just asks them all to, at once.
+ *
+ * The window's shape comes from aiosendspin, not from us: it lasts 300 s and admits exactly ONE
+ * attempt, claimed and consumed by the first device to pair. Both halves belong in the copy —
+ * "open for five minutes" alone would imply you can add three speakers on one click, and the second
+ * and third would fail for a reason nothing on screen explained.
  */
 export const PairingTab: React.FC<PairingTabProps> = ({ onOpenPairingWindows }) => {
   const [busy, setBusy] = useState(false);
@@ -31,7 +36,7 @@ export const PairingTab: React.FC<PairingTabProps> = ({ onOpenPairingWindows }) 
     if (total === 0) {
       setResult('No units are reachable right now.');
     } else if (failed.length === 0) {
-      setResult(`${opened} unit${opened === 1 ? '' : 's'} are open for pairing.`);
+      setResult(`${opened} unit${opened === 1 ? '' : 's'} open for the next five minutes.`);
     } else {
       // A partial result is normal — a unit may be down — and is more useful than a bare failure,
       // because the operator can see whether the one they care about is ready.
@@ -44,8 +49,9 @@ export const PairingTab: React.FC<PairingTabProps> = ({ onOpenPairingWindows }) 
       <div>
         <h3 className="text-lg font-semibold text-[var(--text-primary)] mb-1">Add a unit or speaker</h3>
         <p className="text-sm text-[var(--text-secondary)]">
-          Opens every Plum unit for pairing for a few minutes, so a newly deployed unit can join the
-          mesh. Units deployed together already pair automatically — use this when you add one later.
+          Opens every Plum unit for five minutes to accept <strong>one</strong> new device each, so a
+          newly deployed unit can join the mesh. Units deployed together already pair automatically —
+          use this when you add one later. Adding two? Run it again for the second.
         </p>
       </div>
 
