@@ -49,7 +49,7 @@ import logging
 import os
 import socket
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 
 import sendspin_identity
 import unit_identity
@@ -178,6 +178,9 @@ class SourceFeeder:
         # Held across a group membership change so the pump cannot re-acquire the stream underneath
         # it — see membership_change().
         self._change_lock = asyncio.Lock()
+        # Awaited after this source detaches its players on going idle. The server sets it, so a
+        # feeder stays testable without one; see PlumSendspinServer.release_local_player.
+        self.on_idle: Callable[[], Awaitable[None]] | None = None
 
     @property
     def is_active(self) -> bool:
@@ -421,6 +424,12 @@ class SourceFeeder:
             "[%s] idle: %s (announced playback_state=stopped, detached %d player(s))",
             self.source_id, why, len(players),
         )
+        # Detaching the player is not the same as letting go of it: we still hold its ONE websocket,
+        # which is what stops a foreign server ever claiming this speaker. Released here, after the
+        # membership change, so "idle" means idle to the whole network and not just to us.
+        if self.on_idle is not None:
+            with contextlib.suppress(Exception):
+                await self.on_idle()
 
 
 class SourceHandle:
@@ -455,6 +464,8 @@ class PlumSendspinServer:
         self._speaker_names = SpeakerNames()
         self._primary_source: str | None = None  # source group that controller-only clients join
         self._local_player_tasks: list[asyncio.Task] = []
+        # Volume asked for while a player was released, applied when it reconnects.
+        self._pending_volume: dict[str, tuple[int, bool]] = {}
         self._metadata_readers: dict[str, AirplayMetadataReader] = {}  # source_id -> shairport pipe reader
         self._airplay_remotes: dict[str, AirplayRemote] = {}  # source_id -> per-instance MPRIS remote
         self._spotify_monitors: dict[str, SpotifyGoLibrespot] = {}  # source_id -> go-librespot event monitor
@@ -673,6 +684,65 @@ class PlumSendspinServer:
         self._pairing.pop(client_id, None)
         logger.info("unpaired %s", client_id)
 
+    async def _ensure_client_connected(self, client_id: str, timeout_s: float = 10.0) -> bool:
+        """Dial a client we hold a registered URL for, if it is not already connected. Idempotent.
+
+        The counterpart to `release_local_player`: once a player is only connected when something
+        wants it, every caller that needs a LIVE connection has to be able to ask for one. Returns
+        False rather than raising — a caller that cannot get its player should say so in its own
+        terms, not surface a dial failure.
+        """
+        if self.server is None or not client_id:
+            return False
+        client = self.server.get_client(client_id)
+        if client is not None and client.is_connected:
+            return True
+        url = self.server.get_client_url(client_id)
+        if not url:
+            return False
+        self.server.connect_to_client(url, connection_reason=ConnectionReason.PLAYBACK, retry_initial_connection=False)
+        return await self._await_client_connected(client_id, timeout_s)
+
+    async def release_local_player(self) -> None:
+        """Let go of this unit's own player when it is attached to no source.
+
+        Detaching a player from a group is not the same as releasing it: we still hold the ONE
+        websocket a client allows, and `SendspinClient._should_admit_connection` keeps an incumbent
+        that outranks the newcomer. So while we held it, a foreign server could never take this
+        speaker — Music Assistant registered both units and immediately marked them
+        `available=False`, because its dial was admitted and then dropped.
+
+        Releasing costs nothing we want: routing, follow and `autoSwitch.localActivity` all reach an
+        unattached player through `mesh.router`'s idle-speaker fallback, which dials it back in the
+        same breath. Local intent wins the speaker back; idleness hands it to whoever wants it.
+
+        Never raises and never releases a player that is playing: it is called from a source going
+        idle, and another source on this unit may still hold it.
+        """
+        if self.server is None:
+            return
+        player_id = sendspin_identity.peer_id_of(sendspin_identity.PLAYER_ROLE)
+        if not player_id:
+            return
+        client = self.server.get_client(player_id)
+        if client is None or not client.is_connected:
+            return
+        # Attached to a real source group? Then it is in use — some OTHER source is feeding it.
+        for handle in self.sources.values():
+            if any(c.client_id == player_id for c in handle.group.clients):
+                return
+        url = self.server.get_client_url(player_id)
+        if not url:
+            return
+        # Both suppressed: this runs on the idle path, where a bookkeeping failure must not
+        # propagate into the audio loop. Stopping the dial FIRST matters — a live retry loop would
+        # reconnect us straight back in and undo the release.
+        with contextlib.suppress(Exception):
+            await self._stop_dialing(url)
+        with contextlib.suppress(Exception):
+            self.server.disconnect_from_client(url)
+        logger.info("released the local player %s — idle, and now claimable by any server", player_id)
+
     async def open_pairing_window(self, client_id: str) -> bool:
         """Open a pairing window on a client we are ALREADY PAIRED WITH, over the management role.
 
@@ -698,6 +768,11 @@ class PlumSendspinServer:
         does not need us to hold management to stay open.
         """
         assert self.server is not None
+        # A released player has no connection to manage, and `management` is a property of a live
+        # one. Without this the window silently fails on exactly the units most likely to need it —
+        # an idle unit being commissioned. Verified both ways on .7.122: ok:false while the player
+        # was elsewhere, ok:true once it was back.
+        await self._ensure_client_connected(client_id)
         try:
             connection = self.server.enable_management(client_id)
             try:
@@ -863,6 +938,7 @@ class PlumSendspinServer:
         anchor = self.server.get_or_create_client(ANCHOR_PREFIX + source_id)
         group = anchor.group
         feeder = SourceFeeder(source_id, fifo_path, group, fmt)
+        feeder.on_idle = self.release_local_player
         handle = SourceHandle(source_id, group, feeder, name=name)
         self.sources[source_id] = handle
         if self._primary_source is None:
@@ -965,6 +1041,17 @@ class PlumSendspinServer:
         if isinstance(event, (ClientAddedEvent, ClientUpdatedEvent)):
             asyncio.ensure_future(self._maybe_group_controller(event.client_id))
             asyncio.ensure_future(self._maybe_pair_via_shared_psk(event.client_id))
+            asyncio.ensure_future(self._apply_pending_volume(event.client_id))
+
+    async def _apply_pending_volume(self, client_id: str) -> None:
+        """Send a level that was set while this player was released. Once, on reconnect."""
+        pending = self._pending_volume.pop(client_id, None)
+        if pending is None:
+            return
+        volume, muted = pending
+        with contextlib.suppress(Exception):
+            self.set_player_volume(client_id, volume, muted)
+            logger.info("applied held volume %d%% muted=%s to %s", volume, muted, client_id)
 
     async def _maybe_pair_via_shared_psk(self, client_id: str) -> None:
         """Pair a connecting client automatically where we can do so without an operator.
@@ -1081,7 +1168,12 @@ class PlumSendspinServer:
         assert self.server is not None
         client = self.server.get_client(player_id)
         if client is None or not client.is_connected:
-            raise KeyError(f"player {player_id!r} not connected")
+            # A released player is idle, not gone. Dialling it just to move a slider would yank the
+            # speaker back from whatever foreign server is playing to it — a nudge should never
+            # steal a room mid-track. Remember the level and send it when it next connects.
+            self._pending_volume[player_id] = (max(0, min(100, volume)), muted)
+            logger.info("player %s not connected; volume %d%% muted=%s held until it does", player_id, volume, muted)
+            return
         # The volume/mute setters live on the active player Role object (roles_by_family), not on
         # its persistent role *state* (which is what get_role_state returns).
         roles = [r for r in client.roles_by_family("player") if isinstance(r, PlayerV1Role)]
@@ -1747,23 +1839,27 @@ class PlumSendspinServer:
                     controller.set_shuffle(event.shuffle)
 
     def register_player(self, player_id: str, player_url: str) -> None:
-        """Dial this unit's player so it is a live, routable client, but leave it IDLE — not attached
-        to any source group.
+        """Register this unit's player as routable, WITHOUT holding a connection to it.
 
         Where an idle player goes is owned by the autoSwitch settings (localActivity auto-route /
         follow) and explicit GUI routing — NOT a hardcoded home source, which would auto-play that
         source at boot regardless of the setting (the very thing localActivity is meant to gate).
 
-        We still DIAL (connect) it, not merely register the URL: the intra-server route path
-        (attach_player) assumes an already-connected client, so a route onto a LOCAL source would
-        otherwise fail to find the player. Connected-but-ungrouped, it reports group_id=None and
-        reads as idle in the GUI until something routes it.
+        **Registered, not dialled** — and the difference is the whole of third-party interop. A
+        client holds exactly ONE websocket, and `SendspinClient._should_admit_connection` keeps the
+        incumbent whenever it outranks the newcomer. So a resident PLAYBACK-ranked connection to our
+        own player means a foreign server's discovery dial is admitted just long enough to register
+        the speaker and is then dropped: Music Assistant listed both units and marked them
+        `available=False`, which is not a state anyone can play out of. Measured 2026-08-13.
+
+        Nothing needs the dial. The intra-server route path used to assume a connected client, but a
+        player attached to nothing appears in no unit's `players` list, so `mesh.router` already
+        takes the idle-speaker fallback (`_idle_player_url` -> reclaim), which dials. Routing, follow
+        and `autoSwitch.localActivity` therefore all reclaim it in ~30 ms when they want it — the
+        deliberate choice being that local intent always wins a speaker back.
         """
         assert self.server is not None
         self.server.register_client_url(player_id, player_url)
-        self.server.connect_to_client(
-            player_url, connection_reason=ConnectionReason.PLAYBACK, retry_initial_connection=True
-        )
 
     def attach_local_player(self, source_id: str, player_id: str, player_url: str, *, supervise: bool = True) -> None:
         """Attach this unit's own player to a source, registering its reclaim URL.
