@@ -1012,6 +1012,11 @@ class PlumSendspinServer:
         if player is not None:
             await handle.group.remove_client(player)
             logger.info("[%s] detached player %s", source_id, player_id)
+            # Setting a player to "none" must release it, exactly as a source going idle does —
+            # otherwise "idle" depends on HOW it got there, and an unrouted speaker stays invisible
+            # to every other server while looking idle to us. release_local_player is a no-op for
+            # anything that is not our own player, or that another source still holds.
+            await self.release_local_player()
 
     def _on_server_event(self, _server: SendspinServer, event: object) -> None:
         """React to client lifecycle events. A controller-only client (the GUI's now-playing WS)
