@@ -27,6 +27,7 @@ import { StreamSelector } from './components/StreamSelector';
 import { SyncedDevices } from './components/SyncedDevices';
 import { ClientManager } from './components/ClientManager';
 import { PairDeviceDialog, type PairMethod } from './components/PairDeviceDialog';
+import { IncomingPairPrompt } from './components/IncomingPairPrompt';
 import { Icon } from './components/Icon';
 import { Settings } from './components/Settings';
 import { Visualizer } from './components/Visualizer';
@@ -687,6 +688,14 @@ export default function MeshApp(): React.ReactElement {
           onDone={() => setPairingTarget(null)}
         />
       )}
+
+      {/* The INBOUND direction: a foreign server pairing with OUR speaker, where the protocol makes
+          us display the PIN. Driven straight off the model rather than local state — the player
+          raises and clears it, and there is nothing here for the operator to dismiss. */}
+      <IncomingPairPrompt
+        prompt={model.pairPrompt ?? null}
+        unitName={model.servers.find((sv) => sv.id === model.localUnitId)?.name}
+      />
       {settingsOpen && (
         <Settings
           settings={settings}

@@ -109,6 +109,12 @@ export interface Model {
   localUnitId?: string;
   /** This unit's own player ids — matched by listener host, so a roamed player stays "ours". */
   localPlayerIds: string[];
+  /**
+   * A pairing prompt raised BY this unit's own player, because a FOREIGN server is pairing with it.
+   * The opposite direction from PairDeviceDialog (where we pair someone else): here the protocol
+   * makes the client display the PIN and the operator types it into the other server.
+   */
+  pairPrompt?: { pin: string | null; gesture: boolean } | null;
 }
 
 /** Federated stream id — a source_id is only unique within its unit. */
@@ -432,6 +438,8 @@ export class SendspinDataService {
     shuffle: boolean | null;   // group shuffle state
     at: number;                // Date.now() at receipt — anchor for onward extrapolation
   } | null = null;
+  /** A pairing prompt raised BY our own player because a foreign server is pairing with it. */
+  private consumePair: { pin: string | null; gesture: boolean } | null = null;
   private consumeCtrlOptimisticUntil = 0;  // ignore relayed `playing` briefly after a local toggle
   private consumeViz: VizFrame | null = null;
   private consumeArt: string | null = null;  // album art data URL from the foreign server
@@ -504,12 +512,21 @@ export class SendspinDataService {
       } else if (m.t === 'art') {
         this.consumeArt = m.d ?? null;
         this.emit();
+      } else if (m.t === 'pair') {
+        // A FOREIGN server is pairing with our player, so our player is the one that must show the
+        // PIN. This is the inbound direction, and it had no receiver at all: Music Assistant's first
+        // pair attempt derived a PIN, our player emitted it here, nothing rendered it, and the
+        // attempt expired as `user_cancelled` while the operator waited for a prompt that could
+        // never appear. `pin: null` means the exchange ended — clear the dialog either way.
+        this.consumePair = m.pin || m.gesture ? { pin: m.pin ?? null, gesture: m.gesture === true } : null;
+        this.emit();
       }
     };
     ws.onclose = () => {
       this.consumeCtrl = null;
       this.consumeViz = null;
       this.consumeArt = null;
+      this.consumePair = null;
       if (this.pollTimer) setTimeout(() => this.openConsume(), 2000); // still running → reconnect
     };
     ws.onerror = () => ws.close();
@@ -603,6 +620,7 @@ export class SendspinDataService {
     const model = mapViewToModel(this.lastView, this.npByGroup, this.offsetByGroup, Date.now(), this.neighbourhood);
     this.applyStableNames(model);
     this.applyPendingVolumes(model);
+    model.pairPrompt = this.consumePair;
     // Our player playing a FOREIGN server (MA) is not a stream in the mesh view — synthesize one so
     // now-playing, transport and the visualizer all light up on it. Its metadata rides the player's
     // self-report (foreignServer); controls + spectrum ride the consume relay.

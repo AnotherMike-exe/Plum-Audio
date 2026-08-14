@@ -136,6 +136,7 @@ class MeshApi:
         # plumbing between our own player and our own GUI; the spec-native part is the player being a
         # conformant group member. See sendspin_player.py / MeshApi._consume.
         self._consumers: set[web.WebSocketResponse] = set()
+        self._last_pair: dict | None = None   # latest pairing prompt (PIN / gesture), latest-wins
         self._producer: web.WebSocketResponse | None = None
         self._last_ctrl: dict | None = None  # cache so a GUI that connects mid-session gets it
         self._last_art: dict | None = None  # ditto for album art (per-track, low rate)
@@ -265,7 +266,7 @@ class MeshApi:
             logger.info("consume relay: player producer connected")
         else:
             self._consumers.add(ws)
-            for cached in (self._last_ctrl, self._last_art):  # bring a late GUI up to speed
+            for cached in (self._last_ctrl, self._last_art, self._last_pair):  # bring a late GUI up to speed
                 if cached is not None:
                     with contextlib.suppress(Exception):
                         await ws.send_json(cached)
@@ -282,6 +283,13 @@ class MeshApi:
                         self._last_ctrl = data
                     elif data.get("t") == "art":
                         self._last_art = data
+                    elif data.get("t") == "pair":
+                        # Cached, because a foreign server's pairing attempt is time-boxed and the
+                        # operator may open the GUI only once MA has already asked. An uncached PIN
+                        # would simply never be seen — which is exactly how MA's first pair attempt
+                        # failed: the player derived and emitted it, nothing rendered it, and the
+                        # attempt timed out as `user_cancelled`.
+                        self._last_pair = data
                     await self._broadcast(data)  # ctrl + viz + art → every GUI
                 elif data.get("t") == "cmd" and self._producer is not None:
                     with contextlib.suppress(Exception):
@@ -290,6 +298,7 @@ class MeshApi:
             if is_player and self._producer is ws:
                 self._producer = None
                 self._last_ctrl = None
+                self._last_pair = None
                 self._last_art = None
             else:
                 self._consumers.discard(ws)
