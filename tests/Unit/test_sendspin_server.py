@@ -1247,3 +1247,67 @@ def test_the_management_session_is_closed_even_when_the_window_call_fails():
     unit.server.window_error = RuntimeError("client said no")
     assert asyncio.run(unit.open_pairing_window("our-own-player")) is False
     assert ("disable_management", "our-own-player") in unit.server.calls
+
+
+# --- releasing an idle player so a foreign server can claim it ---------------
+
+
+def _own(monkeypatch, player_id="our-own-player"):
+    monkeypatch.setattr(sendspin_identity, "peer_id_of", lambda role: player_id)
+    return player_id
+
+
+def test_register_player_does_not_dial():
+    """The whole of third-party interop, in one assertion.
+
+    A client holds exactly ONE websocket and the library keeps an incumbent that outranks the
+    newcomer, so a resident PLAYBACK connection to our own player means a foreign server's dial is
+    admitted just long enough to register the speaker and then dropped. Music Assistant listed both
+    units and marked them `available=False` — not a state anyone can play out of.
+    """
+    unit = make_unit("airplay-1")
+    unit.register_player("our-own-player", "ws://127.0.0.1:8928/sendspin")
+    assert unit.server.get_client_url("our-own-player") == "ws://127.0.0.1:8928/sendspin", (
+        "the URL must still be registered — routing and peer reclaim both join on it"
+    )
+    assert unit.server.dialed == [], "registering must not dial: holding the socket is what blocks interop"
+
+
+def test_release_local_player_lets_go_of_an_idle_player(monkeypatch):
+    """Detaching from a group is NOT releasing: we still hold the websocket that blocks MA."""
+    own = _own(monkeypatch)
+    unit = make_unit("airplay-1")
+    unit.server.add(FakeClient(own, roles=["player@v1"], security="long_term"))
+    unit.server.register_client_url(own, "ws://127.0.0.1:8928/sendspin")
+
+    asyncio.run(unit.release_local_player())
+
+    assert "ws://127.0.0.1:8928/sendspin" in unit.server.disconnected
+
+
+def test_release_local_player_never_takes_a_playing_speaker(monkeypatch):
+    """Called when ONE source goes idle, while another may still be feeding that same player.
+    Releasing then would cut off a room that is audibly playing."""
+    own = _own(monkeypatch)
+    unit = make_unit("airplay-1", "spotify-1")
+    client = FakeClient(own, roles=["player@v1"], security="long_term")
+    unit.server.add(client)
+    unit.server.register_client_url(own, "ws://127.0.0.1:8928/sendspin")
+    unit.sources["spotify-1"].group.members.append(client)  # still playing on the other source
+
+    asyncio.run(unit.release_local_player())
+
+    assert unit.server.disconnected == [], "a player still attached to a live source must be left alone"
+
+
+def test_volume_set_while_released_is_held_not_dialled(monkeypatch):
+    """A slider nudge must never steal a room back mid-track from a foreign server. The level is
+    remembered and sent on the next connect instead."""
+    own = _own(monkeypatch)
+    unit = make_unit("airplay-1")
+    unit.server.register_client_url(own, "ws://127.0.0.1:8928/sendspin")
+
+    unit.set_player_volume(own, 42, False)   # not connected: must not raise, must not dial
+
+    assert unit.server.dialed == []
+    assert unit._pending_volume[own] == (42, False)
