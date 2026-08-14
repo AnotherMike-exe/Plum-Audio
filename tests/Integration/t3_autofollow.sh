@@ -18,8 +18,11 @@ echo "== Tier 3: auto-follow, edge/override semantics ($B follows $A) =="
 
 A_UNIT="$(ssh_json "$A" /api/mesh/view "next((u[\"unit_id\"] for u in d[\"units\"] if u[\"host\"]==\"$A\"), \"\")")"
 SRC_A="$(ssh_json "$A" /api/mesh/view "next((s[\"source_id\"] for u in d[\"units\"] if u[\"host\"]==\"$A\" for s in u[\"sources\"]), \"\")")"
-PLAYER_A="$(ssh_json "$A" /api/mesh/view "next((p[\"player_id\"] for u in d[\"units\"] if u[\"host\"]==\"$A\" for p in u[\"players\"]), \"\")")"
-PLAYER_B="$(ssh_json "$A" /api/mesh/view "next((p[\"player_id\"] for u in d[\"units\"] if u[\"host\"]==\"$B\" for p in u[\"players\"]), \"\")")"
+# An IDLE player is in NO unit's `players` list (it is attached to nothing) and appears only in
+# its own `local_player` self-report — the resting state since a unit releases its player when
+# idle. Resolve it the way mesh.router does.
+PLAYER_A="$(ssh_json "$A" /api/mesh/view "next((p[\"player_id\"] for u in d[\"units\"] if u[\"host\"]==\"$A\" for p in u[\"players\"]), \"\") or next(((u.get(\"local_player\") or {}).get(\"player_id\") or \"\" for u in d[\"units\"] if u[\"host\"]==\"$A\"), \"\")")"
+PLAYER_B="$(ssh_json "$A" /api/mesh/view "next((p[\"player_id\"] for u in d[\"units\"] if u[\"host\"]==\"$B\" for p in u[\"players\"]), \"\") or next(((u.get(\"local_player\") or {}).get(\"player_id\") or \"\" for u in d[\"units\"] if u[\"host\"]==\"$B\"), \"\")")"
 [[ -n "$A_UNIT" && -n "$SRC_A" && -n "$PLAYER_A" && -n "$PLAYER_B" ]] || {
     _no "could not resolve unit/source/player ids from the mesh view (are both units up and discovered?)"
     finish; exit; }

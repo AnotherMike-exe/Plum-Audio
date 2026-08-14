@@ -209,6 +209,19 @@ The *reasoning* behind these, and the failures that produced them, is in
   (`docs/ROUTING-MODEL.md` rule 1): going idle detaches every player-role client uniformly, and only
   `autoSwitch.localActivity` (own player, rising edge) or `follow` brings one back. A **reversal** —
   the old silent auto-resume was the bug.
+- **A unit does NOT hold its own player, and going idle RELEASES it.** `register_player` registers
+  the URL without dialling, and a source going idle calls `release_local_player` — detaching a player
+  from a group is not the same as letting go of the websocket. A client holds exactly ONE, and
+  `_should_admit_connection` keeps an incumbent that outranks the newcomer, so a resident
+  PLAYBACK connection means a foreign server's dial is admitted just long enough to register the
+  speaker and is then dropped: Music Assistant listed both units `available=False`, and an
+  unavailable player can never be played to, so nothing ever reaches the playback dial that WOULD
+  win. Nothing needs the resident dial — an unattached player is in no unit's `players` list, so
+  `mesh.router` takes its idle-speaker fallback (`_idle_player_url` → reclaim) and dials it back;
+  **local intent always wins the speaker back**. Two callers must therefore ask for a connection:
+  `open_pairing_window` dials on demand, and `set_player_volume` **holds** the level for the next
+  connect rather than dialling — a slider nudge must never steal a room mid-track. Anything reading
+  a unit's own player must fall back to the `local_player` self-report, never `unit.players`.
 - **Three volumes, and only two are the protocol's.** *Per-player* and *group* are Sendspin, and the
   library already does the delta-preserving group redistribution — do not fan out per client.
   *Source volume* is the level on the **sending** device (the phone's slider, Spotify Connect); the
