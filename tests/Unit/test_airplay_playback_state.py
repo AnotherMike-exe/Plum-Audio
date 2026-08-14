@@ -77,3 +77,30 @@ def test_an_unknown_duration_still_suppresses_the_position():
     md = r.group.role.metadata
     assert md.playback_speed == 1000
     assert md.track_duration == 0, "duration is unknown and must stay unknown"
+
+
+# --- the MPRIS fallback, for senders that emit no ssnc state codes ------------
+
+
+def test_mpris_state_drives_the_transport_when_the_sender_is_silent():
+    """Music Assistant's AirPlay sends metadata and artwork but never prgr/pbeg/prsm/paus — measured
+    over 19 minutes and 7 track changes. shairport's MPRIS PlaybackStatus is then the only play/pause
+    signal there is, so it has to reach the metadata role."""
+    r = _reader()
+    r.note_external_state(True)
+    assert r.group.role.metadata.playback_speed == 1000
+    r.note_external_state(False)
+    assert r.group.role.metadata.playback_speed == 0
+
+
+def test_a_pending_gui_command_is_not_overwritten_by_a_lagging_mpris_report():
+    """The GUI's optimistic pause must survive shairport still reporting Playing while its buffer
+    drains — the same race `_command_state` already guards on the ssnc path."""
+    r = _reader()
+    r.note_external_state(True)
+    r.apply_command("pause")
+    speed_after_command = r.group.role.metadata.playback_speed
+
+    r.note_external_state(True)   # shairport still says Playing; must be ignored
+
+    assert r.group.role.metadata.playback_speed == speed_after_command == 0

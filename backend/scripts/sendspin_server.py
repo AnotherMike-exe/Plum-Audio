@@ -1597,6 +1597,12 @@ class PlumSendspinServer:
         reader.start()
         logger.info("[%s] airplay metadata reader started (%s)", source_id, metadata_fifo)
 
+    def _note_airplay_playback_state(self, source_id: str, playing: bool) -> None:
+        """Route an MPRIS play/pause observation to that source's metadata reader, if it has one."""
+        reader = self._metadata_readers.get(source_id)
+        if reader is not None:
+            reader.note_external_state(playing)
+
     async def start_airplay_control(self, source_id: str, *, bus_address: str | None = None) -> None:
         """Wire GUI transport commands for an AirPlay source to shairport-sync over MPRIS.
 
@@ -1612,6 +1618,10 @@ class PlumSendspinServer:
         remote = AirplayRemote(
             bus_address=bus_address,
             on_source_volume=functools.partial(self.note_source_volume, source_id),
+            # shairport's MPRIS PlaybackStatus as the play/pause FALLBACK. Senders that emit the
+            # ssnc state codes drive the reader directly and this simply agrees with them; senders
+            # that do not (Music Assistant's AirPlay) would otherwise never report a state at all.
+            on_playback_state=functools.partial(self._note_airplay_playback_state, source_id),
         )
         # Do NOT connect eagerly: with a private per-endpoint bus, the source comes up BEFORE the
         # bus daemon (the manager starts us first so the FIFO exists), so the socket may not exist

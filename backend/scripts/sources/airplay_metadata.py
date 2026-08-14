@@ -348,6 +348,28 @@ class AirplayMetadataReader:
         self._is_playing = True
         self._emit_progress(position_ms, 1000)
 
+    def note_external_state(self, playing: bool) -> None:
+        """Play/pause observed OUT OF BAND (shairport's MPRIS PlaybackStatus), for senders that
+        never emit the ssnc state codes.
+
+        Music Assistant's AirPlay sender is one: measured over 19 minutes and 7 track changes it sent
+        metadata and artwork on every track and never a single `prgr`, `pbeg`, `prsm` or `paus`. With
+        only the ssnc path, nothing ever called _set_playing, so the transport read paused for the
+        whole session while audio played.
+
+        Idempotent, and it defers to the two authorities that already exist: a pending GUI command
+        (so an optimistic pause is not immediately overwritten by a lagging Playing), and the ssnc
+        codes themselves, which arrive from senders that do emit them and agree with this anyway.
+        """
+        if self._command_state is not None:
+            return  # a GUI command is awaiting confirmation; let the ssnc path settle it
+        if playing == self._is_playing:
+            return
+        if playing:
+            self._set_playing()
+        else:
+            self._set_paused()
+
     def _set_playing(self) -> None:
         """Resume: re-anchor the clock at the frozen position and let the ticker advance again.
 
