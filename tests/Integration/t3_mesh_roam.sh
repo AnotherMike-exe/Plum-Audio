@@ -14,8 +14,11 @@ B="${2:?usage: t3_mesh_roam.sh <unit-a-host> <unit-b-host>}"
 echo "== Tier 3: cross-server roam ($A <-> $B) =="
 
 # Each unit's own player id, and unit A's first source, from A's aggregated view.
+# An IDLE player is attached to nothing, so it is in NO unit's `players` list — it appears only in
+# its own unit's `local_player` self-report. That is the resting state now that a unit releases its
+# player when idle, so resolve it the same way mesh.router does (_idle_player_url).
 PLAYER_B="$(ssh_json "$A" /api/mesh/view \
-    "next((p[\"player_id\"] for u in d[\"units\"] if u[\"host\"]==\"$B\" for p in u[\"players\"]), \"\")")"
+    "next((p[\"player_id\"] for u in d[\"units\"] if u[\"host\"]==\"$B\" for p in u[\"players\"]), \"\") or next(((u.get(\"local_player\") or {}).get(\"player_id\") or \"\" for u in d[\"units\"] if u[\"host\"]==\"$B\"), \"\")")"
 SRC_A="$(ssh_json "$A" /api/mesh/view \
     "next((s[\"source_id\"] for u in d[\"units\"] if u[\"host\"]==\"$A\" for s in u[\"sources\"]), \"\")")"
 HOME_B="$(ssh_json "$B" /api/mesh/view \
