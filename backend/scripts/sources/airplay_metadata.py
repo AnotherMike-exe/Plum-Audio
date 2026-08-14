@@ -108,7 +108,14 @@ class AirplayMetadataReader:
 
     def _emit_progress(self, pos_ms: int, speed: int) -> None:
         role = self._metadata_role()
-        if role is None or role.metadata is None or self._duration_ms <= 0:
+        if role is None or role.metadata is None:
+            return
+        # An unknown duration suppresses the POSITION, never the SPEED. This was one guard covering
+        # two unrelated things, and it is the chokepoint that made a sender which omits `prgr` read
+        # as paused forever while audibly playing: _set_playing emitted, and this dropped it on the
+        # floor. A track of unknown length is still either playing or not.
+        if self._duration_ms <= 0:
+            role.set_metadata(replace(role.metadata, playback_speed=speed, timestamp_us=None))
             return
         # Force a FRESH server timestamp. role.update()/set_metadata otherwise INHERIT the previous
         # metadata's timestamp_us (a library quirk: replace() copies it, and set_metadata only stamps
@@ -149,8 +156,6 @@ class AirplayMetadataReader:
         suppress shairport's lagging "still playing" reports until it confirms (see _handle_ssnc /
         _handle_progress). Without this, one GUI's pause would revert to playing for the seconds the
         AirPlay buffer takes to drain, disagreeing with any other GUI watching the same group."""
-        if self._duration_ms <= 0:
-            return
         if command == "pause":
             self._command_state = "paused"
             self._command_deadline = time.monotonic() + PAUSE_CONFIRM_TIMEOUT_S
@@ -318,8 +323,8 @@ class AirplayMetadataReader:
             return
         position_ms = max(0, (current - start) * 1000 // self.rtp_rate)
         duration_ms = max(0, (end - start) * 1000 // self.rtp_rate)
-        logger.debug(
-            "prgr raw=%s -> pos=%d dur=%d wait=%s", decoded, position_ms, duration_ms, self._waiting_for_fresh_prgr
+        logger.info(
+            "DIAG prgr raw=%s -> pos=%d dur=%d wait=%s", decoded, position_ms, duration_ms, self._waiting_for_fresh_prgr
         )
         # shairport intermittently emits a frame with a STALE anchor where `current` runs past `end`
         # (observed 38 s past the end of a 290 s track), i.e. position > duration — physically
@@ -344,8 +349,15 @@ class AirplayMetadataReader:
         self._emit_progress(position_ms, 1000)
 
     def _set_playing(self) -> None:
-        """Resume: re-anchor the clock at the frozen position and let the ticker advance again."""
-        if self._metadata_role() is None or self._duration_ms <= 0:
+        """Resume: re-anchor the clock at the frozen position and let the ticker advance again.
+
+        Deliberately NOT gated on knowing the duration. Whether a source is playing and how long its
+        track is are independent facts, and requiring the second to report the first means any sender
+        that omits `prgr` shows as paused forever while audible — the transport button then reads
+        wrong until someone presses it. Progress still needs a duration to mean anything, so the
+        ticker keeps that guard; the play/pause STATE does not.
+        """
+        if self._metadata_role() is None:
             return
         self._anchor_at = time.monotonic()  # elapsed measured from now, position unchanged
         self._is_playing = True
@@ -355,8 +367,11 @@ class AirplayMetadataReader:
     def _set_paused(self) -> None:
         """Freeze at the position we're actually showing right now (speed → 0), without clearing
         metadata/artwork. Uses the live anchor position, not the last raw prgr, so it neither jumps
-        back to a stale frame nor forward past where the bar sits."""
-        if self._metadata_role() is None or self._duration_ms <= 0:
+        back to a stale frame nor forward past where the bar sits.
+
+        Ungated for the same reason as _set_playing: a paused source is paused whether or not we ever
+        learned how long its track is."""
+        if self._metadata_role() is None:
             return
         self._anchor_pos_ms = self._current_pos_ms()
         self._anchor_at = time.monotonic()
