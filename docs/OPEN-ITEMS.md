@@ -106,6 +106,18 @@
    `POST /api/mesh/pairing-window` returns `ok:false`, and returns `ok:true` the moment the player is
    routed home. Verified both ways on `.7.122`. The GUI degrades visibly ("N of M opened") but names
    no reason, and "route your speakers home before adding a unit" is not a rule anyone would guess.
+   **MA 2.10 interop, measured end to end 2026-08-13.** Two gates, one now fixed:
+   1. ~~We squatted on our own player, so MA's dial was admitted and dropped~~ — **FIXED** by
+      releasing an idle player (`b1c1fe0`, `0fbf2a1`). Proven: `Plum Amp100` flipped to
+      `available=True` in MA at 19:27:28, and MA now holds our player's socket continuously.
+   2. **Still open: MA connects but activates nothing.** MA registers both units as protocol
+      players and keeps the connection up, yet reports `available=False` — because it holds no
+      pairing record with our player and `pairing.unpairedAccess` is off, so it activates no roles.
+      Our side's last activation is by our own server; nothing since MA attached. MA's log shows it
+      never *attempted* a pairing. Resolution is a posture choice: pair MA to the player (MA 2.10
+      does ship pairing code — `providers/sendspin/security.py`, PIN-eviction tasks — so it likely
+      exposes the action), or set `pairing.unpairedAccess` on, which is the sentinel path the spec
+      calls MITM-vulnerable. Note MA's AirPlay bridge (`204 AP`) works throughout and is unaffected.
 7. **amd64 has never been built.**
 8. **The APIs are unauthenticated with blanket CORS** (`CORS(app)`, `Access-Control-Allow-Origin: *`,
    both bound to `0.0.0.0`). The injection chain behind it is closed at three layers, but any page on
