@@ -1311,3 +1311,27 @@ def test_volume_set_while_released_is_held_not_dialled(monkeypatch):
 
     assert unit.server.dialed == []
     assert unit._pending_volume[own] == (42, False)
+
+
+def test_setting_the_local_player_to_none_releases_it(monkeypatch):
+    """"Idle" must not depend on HOW it got there.
+
+    Going idle (EOF/silence) released the player, but an explicit unroute did not — so a speaker set
+    to "none" looked idle to us while still holding the websocket that makes it invisible to every
+    other server. Caught on the rig: .204 went `available=True` in Music Assistant while .122, which
+    the test teardown had unrouted, stayed False.
+    """
+    own = _own(monkeypatch)
+    unit = make_unit("airplay-1")
+    client = FakeClient(own, roles=["player@v1"], security="long_term")
+    unit.server.add(client)
+    unit.server.register_client_url(own, "ws://127.0.0.1:8928/sendspin")
+    unit.sources["airplay-1"].group.members.append(client)
+
+    async def unroute():
+        unit.sources["airplay-1"].group.members.remove(client)   # what remove_client does
+        await unit.detach_player("airplay-1", own)
+
+    asyncio.run(unroute())
+
+    assert "ws://127.0.0.1:8928/sendspin" in unit.server.disconnected
