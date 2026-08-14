@@ -46,11 +46,15 @@ class AirplayRemote:
         on_source_volume: Callable[[int], None] | None = None,
         *,
         bus_address: str | None = None,
+        on_playback_state: Callable[[bool], None] | None = None,
     ) -> None:
         self._bus_address = bus_address  # None = the system bus (single-instance fallback)
         self._bus: MessageBus | None = None
         self._player = None  # cached Player proxy interface; None = not yet bound / needs re-resolve
         self._on_source_volume = on_source_volume
+        # Play/pause as shairport sees it. The fallback for senders that emit no ssnc
+        # state codes of their own — see _note_status.
+        self._on_playback_state = on_playback_state
         self._watch_task: asyncio.Task | None = None
         # Whether a sender is actually connected. Between sessions shairport reports
         # PlaybackStatus=Stopped and Volume=0.0 — a truthful read of nothing, which as a source
@@ -187,7 +191,16 @@ class AirplayRemote:
         Gaining a session is immediate; losing one takes SESSION_LOSS_STRIKES consecutive Stopped
         observations, so a transient Stopped mid-pause does not read as a departed phone.
         """
-        present = str(getattr(status, "value", status)) != "Stopped"
+        text = str(getattr(status, "value", status))
+        # shairport's MPRIS PlaybackStatus is the ONLY play/pause signal some senders give us. Music
+        # Assistant's AirPlay emits metadata and artwork but never the ssnc state codes
+        # (pbeg/prsm/paus) nor prgr — measured over 19 min and 7 track changes on 2026-08-14 — so
+        # without this its transport reads paused forever while audibly playing. Reported separately
+        # so presence keeps its own hysteresis: a transient Stopped must not read as "paused".
+        if self._on_playback_state is not None and text in ("Playing", "Paused"):
+            with contextlib.suppress(Exception):
+                self._on_playback_state(text == "Playing")
+        present = text != "Stopped"
         if present:
             self._stopped_strikes = 0
             if not self._has_session:
