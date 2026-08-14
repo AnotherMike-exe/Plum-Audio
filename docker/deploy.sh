@@ -628,12 +628,21 @@ except Exception:
     print("mesh API not answering yet"); raise SystemExit
 me = view.get("local_unit_id")
 unit = next((u for u in view.get("units", []) if u.get("unit_id") == me), None)
-rows = [p for p in (unit or {}).get("players", []) if any(r.startswith("player@") for r in (p.get("active_roles") or []))]
+players = (unit or {}).get("players", [])
+rows = [p for p in players if any(r.startswith("player@") for r in (p.get("active_roles") or []))]
 if rows:
     print("OK " + ",".join(sorted(rows[0].get("active_roles") or [])))
+elif players:
+    # Attached but NOT activated: the silent-failure signature this check exists for. A speaker in
+    # this state joins the group at the right volume and renders nothing, with no error at either end.
+    print("NONE " + repr([(p.get("player_id", "?")[:12], p.get("active_roles")) for p in players]))
+elif (unit or {}).get("has_player") is False:
+    print("OK no player on this unit (audio.output.device=none)")
 else:
-    seen = [(p.get("player_id", "?")[:12], p.get("active_roles")) for p in (unit or {}).get("players", [])]
-    print("NONE " + (repr(seen) if seen else "no player attached yet"))
+    # No player attached at all is the NORMAL resting state since we stopped holding our own
+    # player: an idle unit releases it so a foreign server can claim the speaker. Routing dials it
+    # back. Asserting "attached at boot" here would fail every healthy unit.
+    print("OK released (idle, claimable) — routing dials it back")
 ' 2>/dev/null || true)"
         [[ "$act" == OK* ]] && break
         sleep 2
