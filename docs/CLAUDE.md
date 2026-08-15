@@ -136,25 +136,17 @@ The *reasoning* behind these, and the failures that produced them, is in
   later-added units, opened via the `management` role — which is why a unit pairs with its own player
   at startup. `docs/SENDSPIN-PAIRING.md`.
 - **A `management` session must be CLOSED, or that player can never roam again.** A declared activity
-  is part of what the client's arbitration ranks when a second server dials, so a server still
-  holding `management` outranks a peer asking for plain PLAYBACK: the peer's dial is accepted
-  provisionally, handshakes, then is rejected — it lands in the peer's registry as `(disconnected)`
-  and the reclaim polls 10 s for a client that never comes up. Nothing expires the session, so the
-  player stays unroamable for the life of the process and a **restart "fixes" it**, which is what
-  makes this look like drifting state. `open_pairing_window` enables it for exactly the length of the
-  call and disables it in a `finally`. Reproduction: 12/12 roams, one `/api/mesh/pairing-window`, then
-  failure on every attempt after.
-- **Pair by STAGING before the dial, never by `initiate_pairing` after it — and never at all over
-  cleartext.** Both halves cost a working rig on 2026-08-13. `initiate_pairing` on a connected client
-  whose PSK is the sentinel forces a mid-connection Noise re-handshake; a peer's player is contended
-  (its own server dials it too, and it holds ONE websocket) so the re-handshake finds the socket gone
-  — `expected Noise message 2 (TEXT), got CLOSE`, then that player's reclaim times out forever.
-  `stage_shared_psk` puts the PSK in front of the handshake (`_psk_provider` reads it while
-  *choosing*), so the connection arrives already paired and nothing renegotiates. Stage only ids we
-  already share a secret with — our own player, and a peer's from a snapshot. A pairing handshake
-  against a **cleartext** client is aborted outright by the library, so staging or pairing an ESP32
-  takes it offline: it connects, the doomed attempt runs, and adopt reports "never connected" about a
-  device whose MAC is in the log one line up. Signature: the NEXT adopt succeeds.
+  is ranked by the client's arbitration, so a server still holding `management` outranks a peer
+  asking for plain PLAYBACK — the peer's dial is accepted, then rejected, and lands as
+  `(disconnected)`. Nothing expires the session, so a **restart "fixes" it**, which is what makes it
+  look like drift. `open_pairing_window` enables it for the call and disables it in a `finally`.
+- **Pair by STAGING before the dial, never by `initiate_pairing` after it — and never over
+  cleartext.** Both halves cost a working rig on 2026-08-13. Pairing a *connected* client forces a
+  mid-connection Noise re-handshake, and a peer's player is contended, so it loses the race and that
+  player's reclaim then times out forever. `stage_shared_psk` puts the PSK in front of the handshake,
+  so the connection arrives already paired. Stage only ids we already share a secret with. A pairing
+  handshake against a **cleartext** client is aborted by the library, so staging or pairing an ESP32
+  takes it offline — signature: the NEXT adopt succeeds. Detail: `docs/SENDSPIN-PAIRING.md`.
 - **Cleartext clients skip the trust gate entirely, and our own player can never be one.** A legacy
   `client/hello` is activated straight from the negotiated set, so ESP32 speakers, Music Assistant
   and our hand-rolled GUI controller need no pairing — that is what `PLUM_ALLOW_UNENCRYPTED=1` buys.
@@ -209,19 +201,20 @@ The *reasoning* behind these, and the failures that produced them, is in
   (`docs/ROUTING-MODEL.md` rule 1): going idle detaches every player-role client uniformly, and only
   `autoSwitch.localActivity` (own player, rising edge) or `follow` brings one back. A **reversal** —
   the old silent auto-resume was the bug.
-- **A unit does NOT hold its own player, and going idle RELEASES it.** `register_player` registers
-  the URL without dialling, and a source going idle calls `release_local_player` — detaching a player
-  from a group is not the same as letting go of the websocket. A client holds exactly ONE, and
-  `_should_admit_connection` keeps an incumbent that outranks the newcomer, so a resident
-  PLAYBACK connection means a foreign server's dial is admitted just long enough to register the
-  speaker and is then dropped: Music Assistant listed both units `available=False`, and an
-  unavailable player can never be played to, so nothing ever reaches the playback dial that WOULD
-  win. Nothing needs the resident dial — an unattached player is in no unit's `players` list, so
-  `mesh.router` takes its idle-speaker fallback (`_idle_player_url` → reclaim) and dials it back;
-  **local intent always wins the speaker back**. Two callers must therefore ask for a connection:
-  `open_pairing_window` dials on demand, and `set_player_volume` **holds** the level for the next
-  connect rather than dialling — a slider nudge must never steal a room mid-track. Anything reading
-  a unit's own player must fall back to the `local_player` self-report, never `unit.players`.
+- **A unit does NOT hold its own player, and going idle or unrouting RELEASES it.** Detaching from a
+  group is not letting go of the websocket, and a client holds exactly ONE — a resident PLAYBACK
+  connection is why a foreign server could never claim our speaker. `register_player` registers the
+  URL without dialling; `release_local_player` runs from both `_go_idle` and `detach_player`. Nothing
+  needs the resident dial: an unattached player is in no unit's `players` list, so `mesh.router`
+  takes its idle-speaker fallback and dials it back — **local intent always wins the speaker back**.
+  So `open_pairing_window` dials on demand, `set_player_volume` **holds** the level for the next
+  connect (a slider nudge must never steal a room mid-track), and anything reading a unit's own
+  player must fall back to the `local_player` self-report, never `unit.players`.
+- **An AirPlay sender may send NO play-state or progress at all** (Music Assistant's does not). Play
+  state falls back to shairport's MPRIS `PlaybackStatus` (`airplay_remote` → `note_external_state`),
+  and **playback state is never gated on knowing the duration** — one guard covering both made the
+  transport read *paused* for a whole session while audio played. Position still needs a real `prgr`;
+  an invented one is worse than none.
 - **Three volumes, and only two are the protocol's.** *Per-player* and *group* are Sendspin, and the
   library already does the delta-preserving group redistribution — do not fan out per client.
   *Source volume* is the level on the **sending** device (the phone's slider, Spotify Connect); the
