@@ -323,8 +323,8 @@ class AirplayMetadataReader:
             return
         position_ms = max(0, (current - start) * 1000 // self.rtp_rate)
         duration_ms = max(0, (end - start) * 1000 // self.rtp_rate)
-        logger.info(
-            "DIAG prgr raw=%s -> pos=%d dur=%d wait=%s", decoded, position_ms, duration_ms, self._waiting_for_fresh_prgr
+        logger.debug(
+            "prgr raw=%s -> pos=%d dur=%d wait=%s", decoded, position_ms, duration_ms, self._waiting_for_fresh_prgr
         )
         # shairport intermittently emits a frame with a STALE anchor where `current` runs past `end`
         # (observed 38 s past the end of a 290 s track), i.e. position > duration — physically

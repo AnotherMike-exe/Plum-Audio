@@ -118,6 +118,28 @@
       does ship pairing code — `providers/sendspin/security.py`, PIN-eviction tasks — so it likely
       exposes the action), or set `pairing.unpairedAccess` on, which is the sentinel path the spec
       calls MITM-vulnerable. Note MA's AirPlay bridge (`204 AP`) works throughout and is unaffected.
+   **What MA can and cannot show about a speaker another server is driving** — settled by reading
+   `providers/sendspin/provider.py` @ 2.10.0b15, not inferred from behaviour:
+   - It cannot show **what** we are playing on a shared speaker, and never will without a spec
+     change. A client holds exactly ONE websocket, so while our server holds it MA has no connection
+     through which to learn anything at all.
+   - It does not currently show that it **lost** the device either. `ClientDisconnectedEvent` is a
+     no-op for player state — MA's own comment reads *"Transport lifecycle events, implemented in
+     another PR."* It drops a player only on `ClientRemovedEvent` (the library's ~180 s registry
+     cleanup, or an unreachable listener). So a clean handover leaves the player sitting in MA as
+     `available=True, state=idle`. A beta gap on their side, and their comment says it is coming.
+   - **Consequence, and it IS ours:** pressing play there takes the speaker back mid-stream, because
+     arbitration admits an incoming connection of EQUAL rank. Whether a unit should refuse a foreign
+     claim while playing a local source is an open design decision with a real cost to the interop
+     enabled on 2026-08-13/14 — see the arbitration gap at the head of this item.
+
+   **MA's AirPlay sender emits no `prgr` and no ssnc state codes.** Measured over 19 minutes and 7
+   track changes: metadata and artwork on every track, and not one `prgr`/`pbeg`/`prsm`/`paus`. Play
+   state therefore rides shairport's MPRIS `PlaybackStatus` (`airplay_remote` →
+   `AirplayMetadataReader.note_external_state`). **Progress is genuinely unavailable for that sender**
+   — with no `prgr` there is no position or duration in existence, and inventing one would be worse
+   than showing none. MA also wraps our two endpoints as ONE `universal_player` with a switchable
+   "active output protocol" (Sendspin or AirPlay), which is why the same box appears twice.
 7. **amd64 has never been built.**
 8. **The APIs are unauthenticated with blanket CORS** (`CORS(app)`, `Access-Control-Allow-Origin: *`,
    both bound to `0.0.0.0`). The injection chain behind it is closed at three layers, but any page on
