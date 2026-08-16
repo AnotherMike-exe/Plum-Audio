@@ -136,7 +136,7 @@ class MeshApi:
         # plumbing between our own player and our own GUI; the spec-native part is the player being a
         # conformant group member. See sendspin_player.py / MeshApi._consume.
         self._consumers: set[web.WebSocketResponse] = set()
-        self._last_pair: dict | None = None   # latest pairing prompt (PIN / gesture), latest-wins
+        self._last_pair: dict | None = None  # latest pairing prompt (PIN / gesture), latest-wins
         self._producer: web.WebSocketResponse | None = None
         self._last_ctrl: dict | None = None  # cache so a GUI that connects mid-session gets it
         self._last_art: dict | None = None  # ditto for album art (per-track, low rate)

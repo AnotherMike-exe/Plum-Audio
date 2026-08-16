@@ -415,14 +415,17 @@ class SourceFeeder:
             players = [
                 client
                 for client in self.group.clients
-                if not client.client_id.startswith(ANCHOR_PREFIX) and has_role_family("player", client.negotiated_role_ids)
+                if not client.client_id.startswith(ANCHOR_PREFIX)
+                and has_role_family("player", client.negotiated_role_ids)
             ]
             for player in players:
                 with contextlib.suppress(Exception):
                     await self.group.remove_client(player)
         logger.info(
             "[%s] idle: %s (announced playback_state=stopped, detached %d player(s))",
-            self.source_id, why, len(players),
+            self.source_id,
+            why,
+            len(players),
         )
         # Detaching the player is not the same as letting go of it: we still hold its ONE websocket,
         # which is what stops a foreign server ever claiming this speaker. Released here, after the
@@ -655,7 +658,7 @@ class PlumSendspinServer:
         assert self.server is not None
         try:
             await self.server.initiate_pairing(client_id, attempt)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._pairing[client_id] = {"state": "failed", "error": "timed out waiting for the PIN"}
             logger.warning("pairing %s: timed out waiting for a PIN", client_id)
         except Exception as exc:  # noqa: BLE001 - the operator needs the reason, not a 500
@@ -1495,7 +1498,8 @@ class PlumSendspinServer:
             "waited %.0fs for player %s; clients held: %s",
             timeout_s,
             player_id,
-            ", ".join(f"{c.client_id}{'' if c.is_connected else '(disconnected)'}" for c in self.server.clients) or "none",
+            ", ".join(f"{c.client_id}{'' if c.is_connected else '(disconnected)'}" for c in self.server.clients)
+            or "none",
         )
         return False
 

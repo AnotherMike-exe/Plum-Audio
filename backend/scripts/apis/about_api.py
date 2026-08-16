@@ -18,21 +18,18 @@ import os
 import re
 import shutil
 import subprocess
-from typing import Optional
 
 from flask import Blueprint, jsonify
 
 logger = logging.getLogger(__name__)
 
 
-def _run_version(argv: list[str]) -> Optional[str]:
+def _run_version(argv: list[str]) -> str | None:
     exe = shutil.which(argv[0])
     if not exe:
         return None
     try:
-        result = subprocess.run(
-            [exe, *argv[1:]], capture_output=True, text=True, timeout=3, check=False
-        )
+        result = subprocess.run([exe, *argv[1:]], capture_output=True, text=True, timeout=3, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         logger.debug("version probe for %s failed: %s", argv[0], exc)
         return None
@@ -40,14 +37,14 @@ def _run_version(argv: list[str]) -> Optional[str]:
     return text or None
 
 
-def _aiosendspin_version() -> Optional[str]:
+def _aiosendspin_version() -> str | None:
     try:
         return md.version("aiosendspin")
     except md.PackageNotFoundError:
         return None
 
 
-def _shairport_sync_version() -> Optional[str]:
+def _shairport_sync_version() -> str | None:
     # `shairport-sync -V` answers e.g. "4.3.7-OpenSSL-Avahi-ALSA-soxr-metadata-sysconfdir:/etc-mpris"
     # — lead with the bare version, keep the rest as detail rather than discarding it.
     raw = _run_version(["shairport-sync", "-V"])
@@ -57,11 +54,11 @@ def _shairport_sync_version() -> Optional[str]:
     return match.group(1) if match else raw
 
 
-def _go_librespot_version() -> Optional[str]:
+def _go_librespot_version() -> str | None:
     return _run_version(["go-librespot", "--version"]) or os.environ.get("PLUM_GO_LIBRESPOT_VERSION")
 
 
-def _bluez_alsa_version() -> Optional[str]:
+def _bluez_alsa_version() -> str | None:
     exe = shutil.which("dpkg-query")
     if not exe:
         return None
