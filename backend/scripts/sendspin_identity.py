@@ -260,7 +260,9 @@ async def server_pairing_store() -> FileServerPairingStore:
     return await FileServerPairingStore.open(pairing_store_path(SERVER_ROLE))
 
 
-async def client_pairing_store(role: str = PLAYER_ROLE, *, unpaired_access: bool | None = None) -> FileClientPairingStore:
+async def client_pairing_store(
+    role: str = PLAYER_ROLE, *, unpaired_access: bool | None = None
+) -> FileClientPairingStore:
     """This client's pairing store, with its policy applied.
 
     Two things are configured here, and they are independent:
