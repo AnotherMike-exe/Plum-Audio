@@ -140,6 +140,14 @@
    — with no `prgr` there is no position or duration in existence, and inventing one would be worse
    than showing none. MA also wraps our two endpoints as ONE `universal_player` with a switchable
    "active output protocol" (Sendspin or AirPlay), which is why the same box appears twice.
+   **Side effect of releasing idle players: a peer's speaker now looks adoptable.** An unattached
+   Plum player advertises over mDNS like any other client, so it appears in `/api/mesh/neighbourhood`
+   as a "foreign" speaker and can be adopted rather than reclaimed. Harmless in itself — both paths
+   land the same player on the same source — but `t4_adopt_release.sh` silently started testing a
+   sibling unit instead of an ESP32, and then FAILED its lingering-socket assertion on behaviour that
+   is correct for a Plum peer (the peer's own server re-dials its player once we let go). The suite
+   now excludes every URL the mesh knows as a `local_player`. Worth remembering before reading any
+   neighbourhood-driven result: `is_own` no longer means "not one of ours".
 7. **amd64 has never been built.**
 8. **The APIs are unauthenticated with blanket CORS** (`CORS(app)`, `Access-Control-Allow-Origin: *`,
    both bound to `0.0.0.0`). The injection chain behind it is closed at three layers, but any page on
