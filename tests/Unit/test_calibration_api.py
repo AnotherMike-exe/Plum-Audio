@@ -304,3 +304,64 @@ def test_two_concurrent_saves_both_survive(manager, settings_file):
     assert not errors, errors
     stored = json.loads(settings_file.read_text())["audio"]["calibration"]
     assert set(stored) == {"player-a", "player-b"}
+
+
+# -- causal revision ----------------------------------------------------------
+
+
+def test_each_save_allocates_the_next_rev(client):
+    first = client.put(f"{BASE}/player-a", json={"samples": _samples()}).get_json()
+    second = client.put(f"{BASE}/player-a", json={"samples": _samples(36.0)}).get_json()
+    assert first["rev"] == 1
+    assert second["rev"] == 2
+
+
+def test_a_clients_known_rev_lifts_the_counter_past_a_peers(client):
+    """The client holds the merged cross-unit view; this process cannot reach the mesh. Claiming a
+    peer's higher rev is how a save made here outranks a record written on another unit."""
+    saved = client.put(f"{BASE}/player-a", json={"samples": _samples(), "knownRev": 7}).get_json()
+    assert saved["rev"] == 8
+
+
+def test_a_stale_known_rev_still_beats_the_local_record(client):
+    client.put(f"{BASE}/player-a", json={"samples": _samples()})  # rev 1
+    client.put(f"{BASE}/player-a", json={"samples": _samples()})  # rev 2
+    saved = client.put(f"{BASE}/player-a", json={"samples": _samples(), "knownRev": 0}).get_json()
+    assert saved["rev"] == 3, "must never regress below what is already stored locally"
+
+
+def test_endpoints_have_independent_revisions(client):
+    client.put(f"{BASE}/player-a", json={"samples": _samples(), "knownRev": 20})
+    other = client.put(f"{BASE}/player-b", json={"samples": _samples()}).get_json()
+    assert other["rev"] == 1
+
+
+@pytest.mark.parametrize("bad", [{"knownRev": -1}, {"knownRev": "many"}, {"knownRev": 10**9}])
+def test_a_malformed_known_rev_is_a_400(client, bad):
+    assert client.put(f"{BASE}/player-a", json={"samples": _samples(), **bad}).status_code == 400
+
+
+def test_concurrent_saves_of_one_endpoint_do_not_share_a_rev(manager, settings_file):
+    """Allocation happens inside the settings lock, so two racing saves cannot both claim the same
+    number and fall back to a timestamp comparison."""
+    app = flask.Flask(__name__)
+    app.register_blueprint(create_calibration_blueprint(manager))
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def save():
+        try:
+            barrier.wait(timeout=5)
+            with app.test_client() as c:
+                c.put(f"{BASE}/player-a", json={"samples": _samples()})
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
+            errors.append(exc)
+
+    threads = [threading.Thread(target=save) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors, errors
+    assert json.loads(settings_file.read_text())["audio"]["calibration"]["player-a"]["rev"] == 2

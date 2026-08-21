@@ -140,6 +140,7 @@ const MatchSetEditor: React.FC<{
 export const CalibrationSection: React.FC = () => {
   const [snapshot, setSnapshot] = useState<CalibrationSnapshot | null>(null);
   const [merged, setMerged] = useState<Record<string, EndpointCalibration>>({});
+  const [knownRevs, setKnownRevs] = useState<Record<string, number>>({});
   const [endpoints, setEndpoints] = useState<CalibrationEndpoint[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -157,6 +158,17 @@ export const CalibrationSection: React.FC = () => {
       // The local snapshot wins for anything it holds: it is what a save just wrote, and the merged
       // read is a poll behind it.
       setMerged({...mergedRecords, ...snap.calibrations});
+      // But the REV high-water mark must come from both, and take the larger. The local copy can be
+      // behind a peer's, and handing the wizard the lower number would let a save fail to outrank
+      // the peer's record — the exact silent "calibration that will not take" this counter removes.
+      const revs: Record<string, number> = {};
+      for (const [id, cal] of Object.entries({...snap.calibrations})) {
+        revs[id] = Math.max(revs[id] ?? 0, cal.rev ?? 0);
+      }
+      for (const [id, cal] of Object.entries(mergedRecords)) {
+        revs[id] = Math.max(revs[id] ?? 0, cal.rev ?? 0);
+      }
+      setKnownRevs(revs);
       setEndpoints(list);
       setError(null);
     } catch (e) {
@@ -360,6 +372,7 @@ export const CalibrationSection: React.FC = () => {
         <CalibrationWizard
           endpoint={editing}
           existing={merged[editing.playerId]}
+          knownRev={knownRevs[editing.playerId] ?? 0}
           suggestedVolumes={snapshot.suggestedVolumes}
           minSamples={snapshot.minSamples}
           maxSamples={snapshot.maxSamples}

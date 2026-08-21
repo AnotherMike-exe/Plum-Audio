@@ -193,9 +193,17 @@ GUI filters it by the `cal:` prefix instead (`CALIBRATION_SOURCE_PREFIX`).
 **Read merged, write local.** A record can only be written to the unit *serving the page* — a peer's
 :5002 is deliberately not reachable cross-origin (`apis/server.py`) — but the endpoint it describes
 may be grouped on a different unit entirely, and matching runs on whichever unit owns the group. So
-each unit publishes its own map in `UnitSnapshot.calibration` and everyone merges the lot, newest
-`lastCalibrated` winning (`calibration.merge_calibrations`). Without that, *which unit's page you
-happened to open* would silently decide whether matching worked.
+each unit publishes its own map in `UnitSnapshot.calibration` and everyone merges the lot
+(`calibration.merge_calibrations`). Without that, *which unit's page you happened to open* would
+silently decide whether matching worked.
+
+Duplicates are ordered by a causal `rev`, **not by the clock**. A Pi has no RTC, so a timestamp
+comparison rests entirely on NTP — and fails silently in the worst way: a unit whose clock jumped
+ahead pins a stale curve mesh-wide, and re-calibrating from the affected page appears to save while
+never taking effect. A save stores `max(highest rev the client has seen anywhere, the local rev) + 1`,
+allocated inside the settings lock. The browser supplies the high-water mark because it is the only
+party holding the merged view; that is safe, because the value can only push the stored rev higher.
+`lastCalibrated` remains for display, and as a tiebreak for records written before `rev` existed.
 
 ### Why a polling reconciler
 

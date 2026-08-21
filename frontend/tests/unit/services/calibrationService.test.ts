@@ -170,6 +170,7 @@ describe('calibrationService', () => {
         samples: [{ volume: 35, db: 57 }, { volume: 85, db: 65 }],
         maxLimit: { mode: 'percentage', value: 100 },
         trimDb: 0,
+        knownRev: 0,
       })
       expect(saved.curve?.a).toBeCloseTo(20.1)
     })
@@ -183,6 +184,7 @@ describe('calibrationService', () => {
           samples: [{ volume: 38, db: 62 }, { volume: 80, db: 62 }],
           maxLimit: { mode: 'percentage', value: 100 },
           trimDb: 0,
+          knownRev: 0,
         }),
       ).rejects.toThrow(/rise with volume/)
     })
@@ -319,5 +321,23 @@ describe('calibrationService — third-party endpoints', () => {
   it('still lists endpoints when the neighbourhood is unavailable', async () => {
     server.use(http.get(`${MESH}/neighbourhood`, () => HttpResponse.json({ error: 'nope' }, { status: 503 })))
     expect((await calibrationService.getEndpoints()).length).toBeGreaterThan(0)
+  })
+})
+
+describe('calibrationService — causal revision', () => {
+  it('sends the high-water mark so the save outranks a peer record', async () => {
+    const spy = vi.spyOn(globalThis, 'fetch')
+    await calibrationService.save('kitchen', {
+      name: 'Kitchen',
+      url: null,
+      enabled: true,
+      samples: [{ volume: 35, db: 57 }, { volume: 85, db: 65 }],
+      maxLimit: { mode: 'percentage', value: 100 },
+      trimDb: 0,
+      knownRev: 7,
+    })
+    const body = JSON.parse(String((spy.mock.calls[0][1] as RequestInit).body))
+    expect(body.knownRev).toBe(7)
+    spy.mockRestore()
   })
 })

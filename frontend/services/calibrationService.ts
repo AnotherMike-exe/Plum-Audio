@@ -48,6 +48,13 @@ export interface CalibrationDraft {
   samples: Array<{volume: number; db: number}>;
   maxLimit: {mode: 'percentage' | 'decibel'; value: number};
   trimDb: number;
+  /**
+   * The highest `rev` this client has seen for the endpoint, across EVERY unit. The config API
+   * cannot reach the mesh, so the browser is the only party holding the merged view — it supplies
+   * the high-water mark and the backend stores max(that, local) + 1. Omitting it is safe (the save
+   * still outranks the local record); getting it right is what makes the save outrank a peer's.
+   */
+  knownRev: number;
 }
 
 /** A render endpoint that can be calibrated. */

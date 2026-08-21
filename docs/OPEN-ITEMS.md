@@ -325,7 +325,17 @@
     a Plum peer id; (c) restrict the reclaim path to ids that resolve to a unit's `local_player`.
     Option (a) looks right and is worth a rig test on the `.7` pair.
 
-22. **Cross-unit calibration merge trusts wall clocks, and a Pi has no RTC.**
+22. ~~**Cross-unit calibration merge trusts wall clocks, and a Pi has no RTC.**~~ — **FIXED
+    2026-08-21**, option (a). Records carry a causal `rev`; a save stores
+    `max(highest rev the client has seen anywhere, the local rev) + 1`, allocated inside the
+    settings lock so two racing saves cannot share a number. The merge orders on `rev` first and
+    falls back to `lastCalibrated` only for records written before the field existed (they read as
+    0, so the first re-save of each wins — no migration needed). The browser supplies the
+    high-water mark because it is the only party holding the merged cross-unit view; trusting it is
+    safe, since the value can only push the stored rev higher. `timedatectl` is no longer
+    load-bearing for calibration. Original report below.
+
+    
     `calibration.merge_calibrations` resolves duplicate records for one endpoint by newest
     `lastCalibrated`, stamped with `datetime.now(UTC)` on whichever unit served the GUI page. If a
     unit has not completed NTP sync it stamps 1970 and its records always lose; a unit whose clock
