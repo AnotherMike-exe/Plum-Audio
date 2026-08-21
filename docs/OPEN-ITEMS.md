@@ -304,7 +304,9 @@
    drop these. Not attempted here because deciding what stops being a rule is a judgement call about
    material this change did not touch.
 
-21. **`reclaim_remote_player` can stage a pairing PSK against a CLEARTEXT third-party speaker.**
+21. ~~**`reclaim_remote_player` can stage a pairing PSK against a CLEARTEXT third-party speaker.**~~ — **FIXED 2026-08-21**, option (a) as sketched below. Staging now requires POSITIVE evidence the id is one of ours: it is some unit's own speaker per `MeshView.unit_by_own_player` (conclusive — our own players are never cleartext, and it survives a peer predating the `security` field), or the holding unit reported a non-None `security`. `security is None` is deliberately NOT read as evidence of cleartext, because the field defaults to None and an older peer is indistinguishable from a genuine cleartext client — so the ambiguous case skips staging, loudly logged, rather than knocking a speaker offline. `Router._may_stage_pairing` decides and passes `stage_pairing=` down the engine seam; the server no longer stages on its own authority. Six tests in `test_mesh_routing.py`. **Still wants a rig test on the `.7` pair**: confirm a normal Plum-to-Plum roam still pairs and does not land silent. Original report below.
+
+    
     Pre-existing; nothing to do with calibration, but found while scoping it.
     `sendspin_server.py:1278` calls `stage_shared_psk(player_id)` justified by the comment at
     `:1276-1277`: *"`player_id` came from a peer snapshot, so this only ever names a Plum player."*

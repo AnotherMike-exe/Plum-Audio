@@ -34,7 +34,9 @@ class SyncEngine(ABC):
         """Remove a player from a source group (back to solo)."""
 
     @abstractmethod
-    async def reclaim_remote_player(self, source_id: str, player_id: str, player_url: str) -> bool:
+    async def reclaim_remote_player(
+        self, source_id: str, player_id: str, player_url: str, *, stage_pairing: bool = False
+    ) -> bool:
         """Cross-server roam: pull a player off its peer server onto a local source group.
 
         No DISCOVERY pre-connect counterpart exists: a client holds one websocket, so a playing
