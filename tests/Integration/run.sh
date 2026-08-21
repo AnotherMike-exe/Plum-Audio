@@ -17,6 +17,7 @@ case "$MODE" in
         run t2_calibration_tone.sh "$A"
         run t3_mesh_roam.sh "$A" "$B"
         run t3_autofollow.sh "$A" "$B"
+        run t3_loudness_match.sh "$A" "$B"
         ;;
     interop)
         U="${1:?need unit host}"
