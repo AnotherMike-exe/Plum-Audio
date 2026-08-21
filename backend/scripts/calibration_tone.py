@@ -153,6 +153,10 @@ class ToneState:
     seconds: float
     restore_source_id: str | None
     restore_volume: int | None
+    # Set when WE dialled this speaker to tone it. Letting go of an adopted speaker is not the same
+    # operation as unrouting one of our own: detaching drops it from the group but leaves the
+    # websocket up, so its real server (Music Assistant) can never take it back. See _stop_locked.
+    adopted_url: str | None = None
 
     def to_dict(self) -> dict:
         elapsed = max(0.0, time.monotonic() - self.started_at)
@@ -210,6 +214,7 @@ class CalibrationToneController:
         player_id: str,
         volume: int,
         *,
+        url: str | None = None,
         tone_type: str = TONE_PINK,
         seconds: float = DEFAULT_TONE_SECONDS,
         freq: float = DEFAULT_SINE_HZ,
@@ -246,13 +251,39 @@ class CalibrationToneController:
             self._engine.start_source(source_id, fifo_path)
             self._writer = asyncio.ensure_future(self._write_loop(fifo_path, pcm, sample_rate, channels, source_id))
 
+            adopted_url: str | None = None
             try:
-                await self._router.route_player(player_id, source_id)
+                try:
+                    await self._router.route_player(player_id, source_id)
+                except Exception as route_error:
+                    # An idle third-party speaker is in no unit's `players` and no unit's
+                    # `local_player`, so the router cannot resolve it at all — it is only visible
+                    # over mDNS, as a URL. Adoption is the way in: it dials the speaker onto this
+                    # source directly, and reports back the id its HANDSHAKE gave, which is what the
+                    # calibration record must be keyed on (mDNS names by instance, the handshake by
+                    # MAC, and the URL moves with DHCP).
+                    if not url:
+                        raise
+                    logger.info(
+                        "calibration tone: %s is not routable (%s); adopting %s instead",
+                        player_id,
+                        route_error,
+                        url,
+                    )
+                    learned = await self._engine.adopt_client(source_id, url)
+                    if not learned:
+                        raise ToneError(f"could not reach the speaker at {url}") from route_error
+                    player_id = learned
+                    adopted_url = url
                 await self._router.set_volume(player_id, volume, False)
             except Exception as exc:
                 # Never leave a half-built session behind: the source would keep a feeder and a
                 # writer alive forever, and the GUI would poll a tone that is not audible anywhere.
+                # An adopt that landed before a later step failed must still be handed back.
                 logger.warning("calibration tone for %s failed to start: %s", player_id, exc)
+                if adopted_url is not None:
+                    with contextlib.suppress(Exception):
+                        await self._engine.release_client(source_id, player_id, url=adopted_url)
                 await self._teardown(source_id, fifo_path)
                 raise
 
@@ -265,6 +296,7 @@ class CalibrationToneController:
                 seconds=seconds,
                 restore_source_id=restore_source,
                 restore_volume=restore_volume,
+                adopted_url=adopted_url,
             )
             self._watchdog = asyncio.ensure_future(self._expire_after(seconds))
             logger.info(
@@ -322,8 +354,15 @@ class CalibrationToneController:
             if source_id:
                 break
 
+        # Only OUR OWN player echoes `client/state` after a volume change — we made it do so, and
+        # the library otherwise sends exactly one, at connect (docs/SPEC-CONFORMANCE.md). So a third
+        # party's reported level is its connect-time value and nothing else; "restoring" it would
+        # assert a level we never read, and for a speaker that connected at 100 that is a loud
+        # surprise at the end of every calibration. Unknown is honest, and _stop_locked already
+        # skips the restore for None.
         found = view.find_player(player_id)
-        volume = found[1].volume if found else None
+        own = view.unit_by_own_player(player_id) is not None
+        volume = found[1].volume if (found and own) else None
         return source_id, volume
 
     async def _write_loop(self, fifo_path: str, pcm: bytes, sample_rate: int, channels: int, source_id: str) -> None:
@@ -413,7 +452,14 @@ class CalibrationToneController:
         # Move the player OFF the tone before the source dies, so it lands where it belongs rather
         # than in a group whose feeder has just been torn down.
         try:
-            if state.restore_source_id:
+            if state.adopted_url is not None:
+                # WE dialled this one, so we have to hang up, not merely detach. `unroute_player`
+                # drops it from the group and leaves the websocket up — a client holds exactly one,
+                # so the speaker would stay captured by us and its real server (Music Assistant)
+                # could never take it back. `release_client` is the three-step version: detach,
+                # stop dialling, disconnect.
+                await self._engine.release_client(state.source_id, state.player_id, url=state.adopted_url)
+            elif state.restore_source_id:
                 await self._router.route_player(state.player_id, state.restore_source_id)
             else:
                 await self._router.unroute_player(state.player_id, state.source_id)

@@ -91,6 +91,19 @@ const server = setupServer(
     return HttpResponse.json({ playing: true, playerId: 'kitchen', volume })
   }),
   http.post(`${MESH}/calibration/tone/stop`, () => HttpResponse.json({ playing: false })),
+  http.get(`${MESH}/neighbourhood`, () =>
+    HttpResponse.json({
+      players: [
+        // An idle third-party speaker: mDNS only, nothing holds it.
+        { name: 'home-assistant-voice-a1b2c3', friendly_name: 'Voice PE - 01', url: 'ws://192.168.1.87:8927/sendspin', host: '192.168.1.87', is_own: false },
+        // Our own player, which the mesh view already covers.
+        { name: 'unit-a-player', url: 'ws://a:8928/sendspin', host: 'a', is_own: true },
+        // An ALREADY-ADOPTED speaker: it is in unit.players under its MAC, so it must not double up.
+        { name: 'esp32-kitchen', url: 'ws://192.168.1.55:8927/sendspin', host: '192.168.1.55', is_own: false },
+      ],
+      servers: [],
+    }),
+  ),
   http.get(`${MESH}/view`, () =>
     HttpResponse.json({
       local_unit_id: 'unit-a',
@@ -105,6 +118,17 @@ const server = setupServer(
             { player_id: 'ctrl:airplay-1:abc', name: 'gui', volume: 100, connected: true },
           ],
           local_player: { player_id: 'living', name: 'Living', volume: 40 },
+        },
+        {
+          unit_id: 'unit-c',
+          name: 'Den',
+          host: '192.168.1.30',
+          players: [
+            // A third-party speaker adopted onto this unit: real id is its MAC, and it carries the
+            // URL mDNS also advertises.
+            { player_id: 'aa:bb:cc:dd:ee:ff', name: 'ESP32 Kitchen', url: 'ws://192.168.1.55:8927/sendspin', volume: 100, connected: true },
+          ],
+          local_player: { player_id: 'den', name: 'Den', volume: 55 },
         },
         {
           unit_id: 'unit-b',
@@ -199,7 +223,10 @@ describe('calibrationService', () => {
   describe('endpoints', () => {
     it('lists real speakers and drops server-side bookkeeping clients', async () => {
       const ids = (await calibrationService.getEndpoints()).map((e) => e.playerId)
-      expect(ids).toEqual(['kitchen', 'living'])
+      expect(ids).toEqual(expect.arrayContaining(['kitchen', 'living']))
+      // `src:` anchors a source's group and `ctrl:` is a GUI controller websocket. Neither renders
+      // audio, so neither can be calibrated.
+      expect(ids.some((id) => id.startsWith('src:') || id.startsWith('ctrl:'))).toBe(false)
     })
 
     it('keeps a speaker that is claimed by another server, via the self-report', async () => {
@@ -234,5 +261,63 @@ describe('calibrationService', () => {
     it('handles an endpoint with no record at all', () => {
       expect(calibrationService.summarize(undefined)).toBe('Not calibrated')
     })
+  })
+})
+
+describe('calibrationService — third-party endpoints', () => {
+  it('lists an idle mDNS-only speaker the mesh view cannot see', async () => {
+    const idle = (await calibrationService.getEndpoints()).find((e) => e.name === 'Voice PE - 01')
+    expect(idle).toMatchObject({
+      playerId: 'ws://192.168.1.87:8927/sendspin', // provisional until adoption reports the real id
+      foreign: true,
+      idle: true,
+      connected: false,
+    })
+  })
+
+  it('does not list our own player twice via the neighbourhood', async () => {
+    const endpoints = await calibrationService.getEndpoints()
+    expect(endpoints.filter((e) => e.playerId === 'living')).toHaveLength(1)
+    expect(endpoints.some((e) => e.playerId === 'ws://a:8928/sendspin')).toBe(false)
+  })
+
+  it('does not double-list an adopted speaker that mDNS also advertises', async () => {
+    const endpoints = await calibrationService.getEndpoints()
+    // Joined on URL: it must appear once, under its real handshake id, not again under its URL.
+    expect(endpoints.filter((e) => e.url === 'ws://192.168.1.55:8927/sendspin')).toHaveLength(1)
+    expect(endpoints.find((e) => e.url === 'ws://192.168.1.55:8927/sendspin')?.playerId).toBe('aa:bb:cc:dd:ee:ff')
+  })
+
+  it('marks an adopted speaker foreign but not idle', async () => {
+    const esp = (await calibrationService.getEndpoints()).find((e) => e.playerId === 'aa:bb:cc:dd:ee:ff')
+    expect(esp).toMatchObject({ foreign: true, idle: false })
+  })
+
+  it('marks a unit own player as neither foreign nor idle', async () => {
+    const living = (await calibrationService.getEndpoints()).find((e) => e.playerId === 'living')
+    expect(living).toMatchObject({ foreign: false, idle: false })
+  })
+
+  it('passes the listener URL when starting a tone for an idle speaker', async () => {
+    const spy = vi.spyOn(globalThis, 'fetch')
+    await calibrationService.toneStart('ws://192.168.1.87:8927/sendspin', 40, {
+      url: 'ws://192.168.1.87:8927/sendspin',
+    })
+    const body = JSON.parse(String((spy.mock.calls[0][1] as RequestInit).body))
+    expect(body.url).toBe('ws://192.168.1.87:8927/sendspin')
+    spy.mockRestore()
+  })
+
+  it('omits the URL for a routable endpoint', async () => {
+    const spy = vi.spyOn(globalThis, 'fetch')
+    await calibrationService.toneStart('living', 40)
+    const body = JSON.parse(String((spy.mock.calls[0][1] as RequestInit).body))
+    expect(body.url).toBeUndefined()
+    spy.mockRestore()
+  })
+
+  it('still lists endpoints when the neighbourhood is unavailable', async () => {
+    server.use(http.get(`${MESH}/neighbourhood`, () => HttpResponse.json({ error: 'nope' }, { status: 503 })))
+    expect((await calibrationService.getEndpoints()).length).toBeGreaterThan(0)
   })
 })

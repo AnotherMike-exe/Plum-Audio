@@ -105,52 +105,49 @@ better than a Plum player's: an adopted speaker's `player_id` is its **handshake
 (`sendspin_server.py:1567`), typically MAC-derived, which survives reconnect, reboot and a DHCP move
 — where an X25519 peer id dies with `/config/identity`.
 
-What actually works today is narrow: **a foreign speaker already adopted onto a source on the unit
-whose GUI you opened.** `snapshot()` applies no ownership filter (`sendspin_server.py:1547-1553`),
-so an adopted speaker appears in `unit.players` like any other endpoint, the calibration list shows
-it, `route_player` takes its intra-server path, and `set_player_volume` reaches it — a cleartext
-client is activated straight from its negotiated role set, so no pairing is involved.
+### Two kinds, and how each is reached
 
-### What blocks the rest
+**Already adopted onto one of our sources.** `snapshot()` applies no ownership filter
+(`sendspin_server.py:1547-1553`), so it appears in `unit.players` like any other endpoint. The list
+shows it, `route_player` takes its intra-server path, and `set_player_volume` reaches it — a
+cleartext client is activated straight from its negotiated role set, so no pairing is involved.
+
+**Idle and visible only over mDNS.** It is in no unit's `players` and no unit's `local_player`, so
+`Router.route_player` cannot resolve it at all and the mesh view does not carry it.
+`calibrationService.getEndpoints()` therefore also reads `GET /api/mesh/neighbourhood` — a separate
+surface covering everything mDNS can see that is not a Plum unit — and lists such a speaker with its
+**listener URL as a provisional id**. Starting the tone then **adopts** it, and the reply carries the
+id its handshake gave. The GUI keys the record on that, and the wizard refuses to save until it has
+one: a URL is IP-derived, so a curve stored against one is orphaned by the next DHCP lease.
+
+Stopping the tone **hands an adopted speaker back** with `release_foreign_client` — detach,
+`_stop_dialing`, `conn.disconnect()` — not `unroute_player`, which drops it from the group and
+leaves the websocket up. A client holds exactly one, so the speaker would stay captured by us and
+Music Assistant could never take it back.
+
+### What stays true regardless
 
 1. **A server cannot READ a speaker's volume, only command it.** Our own player echoes
    `client/state` after every change because we made it do so (`SPEC-CONFORMANCE.md`); a third-party
-   speaker reports its connect-time level and never moves. The matcher's `_unconfirmed` guard now
-   handles this — a commanded endpoint is not readable as user intent until its echo confirms — but
-   the consequence stands: **the mesh cannot know a foreign speaker's real level.** The tone's
-   "restore the previous volume" is therefore restoring a value it never actually read.
-2. **An idle, mDNS-only speaker cannot be listed or toned.** It is in no unit's `players` and no
-   unit's `local_player`, so `calibrationService.getEndpoints()` (which reads only `/api/mesh/view`)
-   cannot see it, and `Router.route_player` fails it with `unknown player …` — `_idle_player_url`
-   scans `local_player`, which a foreign speaker is never in. The neighbourhood is a separate
-   endpoint (`GET /api/mesh/neighbourhood`) that the calibration UI does not fetch.
-3. **Adoption is the only way in, and it does not report the id it learned.**
-   `adopt_foreign_client` returns `bool` (`sendspin_server.py:1348`), but the moment it completes is
-   the *only* moment the mDNS URL and the handshake id are both in hand — and the record must be
-   keyed by the id, not the URL (a URL is IP-derived and moves with DHCP).
-4. **Stop does not hand the speaker back.** `unroute_player` → `detach_player` removes it from the
-   group but does not hang up; only `release_foreign_client` does all three of detach,
-   `_stop_dialing` and `conn.disconnect()`. A speaker toned from idle would stay captured by us and
-   unreachable to Music Assistant.
-5. **`follow` scope excludes them by construction.** `_follow_members` builds from each unit's
+   speaker reports its connect-time level and never moves. Two consequences, both handled:
+   - The matcher's `_unconfirmed` guard means a commanded endpoint is not readable as user intent
+     until its echo confirms, so a frozen level cannot masquerade as a slider drag.
+   - The tone does **not** restore a third-party speaker's level, because it never read one.
+     `_current_placement` only trusts a reported volume for an endpoint that is some unit's own
+     player. The wizard says so, rather than leaving it as a surprise.
+2. **`follow` scope excludes them by construction.** `_follow_members` builds from each unit's
    `local_player`, and a foreign speaker is in no unit's. That is *mostly* right — `follow` means
-   unit-to-unit source slaving and a speaker with no unit participates in none — but it silently
-   drops a real case: a foreign speaker adopted onto the leader's source, in the same room as the
-   leader's own speaker, is exactly the case this feature exists for. Use `sets` scope for it.
-
-### A hazard on the cross-unit path
-
-`reclaim_remote_player` calls `stage_shared_psk(player_id)` (`sendspin_server.py:1278`) on the
-strength of a comment asserting *"`player_id` came from a peer snapshot, so this only ever names a
-Plum player"*. **That premise is false** — `snapshot()` has no ownership filter, so a peer's
-`players` list contains adopted foreign speakers. `stage_shared_psk` has no cleartext guard, and
-CLAUDE.md is explicit that a pairing handshake against a cleartext client is aborted by the library
-and takes the speaker offline.
-
-This predates calibration and is reachable today by cross-routing any adopted foreign speaker
-between units. It is tracked in OPEN-ITEMS rather than fixed here: the obvious guard (read the
-client's connection security) is not available at staging time, because staging deliberately happens
-*before* the dial.
+   unit-to-unit source slaving and a speaker with no unit participates in none — but it drops a real
+   case: a foreign speaker adopted onto the leader's source, in the same room as the leader's own
+   speaker, is exactly what this feature is for. The GUI badges such a row **"Not matched under
+   Follow"** and the scope blurb points at `sets`.
+3. **Never stage a pairing PSK against one.** Staging turns the next handshake into a pairing
+   handshake, which the library aborts against a cleartext client, taking it offline until the next
+   adopt. `reclaim_remote_player` used to stage unconditionally on the strength of a comment
+   claiming its `player_id` "only ever names a Plum player" — false, since `snapshot()` has no
+   ownership filter. `Router._may_stage_pairing` now requires positive evidence (the id is some
+   unit's own speaker, or the holder reported a non-None `security`), and the ambiguous case fails
+   safe. OPEN-ITEMS #21.
 
 ## The tone
 
@@ -289,6 +286,19 @@ Nothing below is proven on hardware yet.
 10. **Scope**: with `follow`, an office joined by hand to the same stream is left alone.
 11. **Cross-unit records**: calibrate from unit A's GUI, confirm unit B's matcher uses it.
 12. **The `cal:` source never appears** in any GUI stream list or picker, on any unit.
+
+### Third-party endpoints
+
+13. **An idle mDNS-only speaker is listed** under Settings → Audio → Calibration, named as it calls
+    itself rather than by its mDNS instance name.
+14. **Playing the tone adopts it**, the wizard picks up its handshake id, and Save is refused until
+    it has one.
+15. **Stop hands it back** — confirm Music Assistant can take it again without a power cycle.
+16. **Its level is not "restored"** to some connect-time value on stop.
+17. **A normal Plum-to-Plum roam still pairs** and does not land silent (the `stage_pairing` guard —
+    this is the regression risk of OPEN-ITEMS #21's fix, and it wants the `.7` pair).
+18. **Cross-routing an adopted ESP32 between two units does not take it offline** (the same guard,
+    from the other side). Signature of the old bug: the NEXT adopt succeeds.
 
 ## Files
 

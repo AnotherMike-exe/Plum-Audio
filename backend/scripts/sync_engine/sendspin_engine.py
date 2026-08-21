@@ -43,7 +43,7 @@ class SendspinEngine(SyncEngine):
     async def set_source_volume(self, source_id: str, volume: int | None = None, muted: bool | None = None) -> None:
         await self._server.set_source_volume(source_id, volume, muted)
 
-    async def adopt_client(self, source_id: str, url: str, player_id: str | None = None) -> bool:
+    async def adopt_client(self, source_id: str, url: str, player_id: str | None = None) -> str | None:
         return await self._server.adopt_foreign_client(source_id, url, player_id=player_id)
 
     async def release_client(self, source_id: str, player_id: str, url: str | None = None) -> None:

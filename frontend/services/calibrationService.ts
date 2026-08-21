@@ -52,6 +52,12 @@ export interface CalibrationDraft {
 
 /** A render endpoint that can be calibrated. */
 export interface CalibrationEndpoint {
+  /**
+   * Mesh player id. For an idle third-party speaker this is PROVISIONALLY its listener URL — the
+   * only thing mDNS gives us — and the real id (its handshake id, generally a MAC) comes back from
+   * the tone start, which adopts it. Save the record under that, never under the URL: a URL is
+   * IP-derived and moves with DHCP.
+   */
   playerId: string;
   name: string;
   url: string | null;
@@ -59,12 +65,17 @@ export interface CalibrationEndpoint {
   unitName: string;
   volume: number;
   connected: boolean;
+  /** Not one of our players: a third-party Sendspin speaker. See `foreignNotes` in the section UI. */
+  foreign: boolean;
+  /** True when it is only visible over mDNS — nothing holds it, so toning it must adopt it first. */
+  idle: boolean;
 }
 
 interface MeshViewPayload {
   units?: Array<{
     unit_id: string;
     name: string;
+    host?: string | null;
     players?: Array<{
       player_id: string;
       name?: string;
@@ -73,6 +84,16 @@ interface MeshViewPayload {
       connected?: boolean;
     }>;
     local_player?: {player_id?: string; name?: string; url?: string | null; volume?: number} | null;
+  }>;
+}
+
+interface NeighbourhoodPayload {
+  players?: Array<{
+    name?: string;
+    friendly_name?: string;
+    url?: string;
+    host?: string;
+    is_own?: boolean;
   }>;
 }
 
@@ -128,7 +149,7 @@ export const calibrationService = {
   async toneStart(
     playerId: string,
     volume: number,
-    opts?: {type?: 'pink' | 'sine'; seconds?: number; freq?: number},
+    opts?: {type?: 'pink' | 'sine'; seconds?: number; freq?: number; url?: string | null},
   ): Promise<ToneState> {
     return request<ToneState>(`${MESH_BASE}/calibration/tone`, {
       method: 'POST',
@@ -136,6 +157,10 @@ export const calibrationService = {
       body: JSON.stringify({
         player_id: playerId,
         volume,
+        // An idle third-party speaker cannot be routed — nothing holds it and it is in no unit's
+        // player list. Passing its listener URL lets the backend adopt it instead, and the reply's
+        // `playerId` is then the id its handshake gave, which the record must be keyed on.
+        url: opts?.url ?? undefined,
         type: opts?.type ?? 'pink',
         seconds: opts?.seconds,
         freq: opts?.freq,
@@ -170,12 +195,30 @@ export const calibrationService = {
    * unit's `players` at all, and would otherwise vanish from the list mid-calibration.
    */
   async getEndpoints(): Promise<CalibrationEndpoint[]> {
-    const view = await request<MeshViewPayload>(`${MESH_BASE}/view`);
+    // The neighbourhood is a SEPARATE surface from the mesh view: the view covers Plum units, which
+    // answer /api/mesh/snapshot, while the neighbourhood is everything else mDNS can see. An idle
+    // third-party speaker is in no unit's players and no unit's local_player, so without this it is
+    // invisible to calibration — and it is precisely the case the feature needs to reach.
+    const [view, neighbourhood] = await Promise.all([
+      request<MeshViewPayload>(`${MESH_BASE}/view`),
+      request<NeighbourhoodPayload>(`${MESH_BASE}/neighbourhood`).catch(() => ({}) as NeighbourhoodPayload),
+    ]);
+
     const byId = new Map<string, CalibrationEndpoint>();
+    const ownPlayerIds = new Set<string>();
+    const knownUrls = new Set<string>();
+    const unitHosts = new Set<string>();
+
+    for (const unit of view.units ?? []) {
+      if (unit.host) unitHosts.add(unit.host);
+      const own = unit.local_player;
+      if (own?.player_id) ownPlayerIds.add(own.player_id);
+    }
 
     for (const unit of view.units ?? []) {
       for (const player of unit.players ?? []) {
         if (isInternalClient(player.player_id)) continue;
+        if (player.url) knownUrls.add(player.url);
         byId.set(player.player_id, {
           playerId: player.player_id,
           name: player.name || player.player_id,
@@ -184,11 +227,16 @@ export const calibrationService = {
           unitName: unit.name,
           volume: player.volume ?? 100,
           connected: player.connected !== false,
+          // Attached, but not any unit's OWN speaker — so it is a third-party device, and its
+          // reported volume is its connect-time value rather than a live echo.
+          foreign: !ownPlayerIds.has(player.player_id),
+          idle: false,
         });
       }
 
       const own = unit.local_player;
       if (own?.player_id && !isInternalClient(own.player_id) && !byId.has(own.player_id)) {
+        if (own.url) knownUrls.add(own.url);
         byId.set(own.player_id, {
           playerId: own.player_id,
           name: own.name || unit.name,
@@ -197,9 +245,30 @@ export const calibrationService = {
           unitName: unit.name,
           volume: own.volume ?? 100,
           connected: true,
+          foreign: false,
+          idle: false,
         });
       }
     }
+
+    for (const entry of neighbourhood.players ?? []) {
+      if (!entry.url || entry.is_own) continue;
+      if (knownUrls.has(entry.url)) continue; // already listed above, attached, under its real id
+      if (entry.host && unitHosts.has(entry.host)) continue; // one of our own units' players
+      byId.set(entry.url, {
+        // Provisional. Adoption reports the handshake id, and that is what the record keys on.
+        playerId: entry.url,
+        name: entry.friendly_name || entry.name || entry.url,
+        url: entry.url,
+        unitId: '',
+        unitName: 'Not on a Plum unit',
+        volume: 100,
+        connected: false,
+        foreign: true,
+        idle: true,
+      });
+    }
+
     return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name));
   },
 

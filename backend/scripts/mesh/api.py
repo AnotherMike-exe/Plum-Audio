@@ -248,11 +248,15 @@ class MeshApi:
         if not url or not source_id:
             return web.json_response({"error": "url and source_id required"}, status=400)
         try:
-            ok = await self._engine.adopt_client(source_id, url, player_id=player_id)
+            adopted = await self._engine.adopt_client(source_id, url, player_id=player_id)
         except Exception as e:  # noqa: BLE001 - report the failure rather than 500-ing
             logger.exception("adopt failed")
             return web.json_response({"error": str(e)}, status=400)
-        return web.json_response({"ok": bool(ok)})
+        # `player_id` echoes the id the HANDSHAKE gave, which is generally not the hint we dialled
+        # with — mDNS names by instance, the handshake by MAC. This is the only moment both are in
+        # hand, so anything that must remember something about this speaker (a calibration curve)
+        # keys on this, never on the URL, which is IP-derived and moves with DHCP.
+        return web.json_response({"ok": adopted is not None, "player_id": adopted})
 
     async def _release(self, request: web.Request) -> web.Response:
         """Let a foreign speaker go: drop it from the group and hang up, so its own server can
@@ -463,6 +467,11 @@ class MeshApi:
             state = await self._tone.start(
                 player_id,
                 int(body["volume"]),
+                # For a third-party speaker only visible over mDNS there is nothing to route: it is
+                # in no unit's players and no unit's local_player. Passing its listener URL lets the
+                # tone adopt it instead, and the reply carries back the id its handshake gave —
+                # which is what the caller must key the calibration record on.
+                url=body.get("url") or None,
                 tone_type=body.get("type") or "pink",
                 seconds=float(body.get("seconds") or 120.0),
                 freq=float(body.get("freq") or 1000.0),
