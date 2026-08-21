@@ -1241,7 +1241,13 @@ class PlumSendspinServer:
         logger.info("[srcvol] %s -> vol=%s muted=%s", source_id, volume, muted)
 
     async def reclaim_remote_player(
-        self, source_id: str, player_id: str, player_url: str, timeout_s: float = 10.0
+        self,
+        source_id: str,
+        player_id: str,
+        player_url: str,
+        timeout_s: float = 10.0,
+        *,
+        stage_pairing: bool = False,
     ) -> bool:
         """Pull a player from its current (peer) server onto a local source group.
 
@@ -1273,9 +1279,18 @@ class PlumSendspinServer:
         # A peer's player is a client we already share a secret with (the fleet PSK), it just has no
         # record here yet. Stage it BEFORE the dial so the reclaim's own handshake pairs it — doing
         # it after it lands would need a re-handshake, which loses the race against the server it is
-        # roaming away from. `player_id` came from a peer snapshot, so this only ever names a Plum
-        # player; see stage_shared_psk for why that restriction is load-bearing.
-        await self.stage_shared_psk(player_id)
+        # roaming away from.
+        #
+        # ONLY when the caller can show this id is one of ours. This used to stage unconditionally,
+        # justified by "player_id came from a peer snapshot, so this only ever names a Plum player".
+        # That premise is false: `snapshot()` filters on anchor prefix, connectedness and player role
+        # and applies NO ownership test, so an adopted third-party speaker sits in a peer's `players`
+        # exactly like a Plum player. Staging one is not a harmless no-op — it turns the next
+        # handshake into a pairing handshake, which the library aborts against a cleartext client,
+        # taking that speaker offline until the next adopt. The caller decides, because only the
+        # caller has the mesh view needed to tell them apart: Router._may_stage_pairing.
+        if stage_pairing:
+            await self.stage_shared_psk(player_id)
         # A PEER's player is an encrypted-but-unpaired client of ours, and trust is per-server:
         # trusting our own player at startup says nothing about anyone else's. Without this the
         # roam completes — the player detaches from its old server, reconnects here, joins the

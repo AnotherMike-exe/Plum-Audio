@@ -249,6 +249,25 @@ class MeshView:
             return None
         return next((u for u in self.units if u.server_id == server_id), None)
 
+    def unit_by_own_player(self, player_id: str | None) -> UnitSnapshot | None:
+        """The unit whose OWN speaker this is, from its `local_player` self-report.
+
+        The self-report is the only authoritative statement of "this speaker belongs to this unit".
+        `players` cannot answer it: that list is every client attached to a unit's server, which
+        after an adopt includes third-party speakers and after a roam includes other units'.
+
+        This is the test for "is this one of ours", and it matters most on the pairing path — our
+        own players are never cleartext (CLAUDE.md), so a hit here is positive evidence that a
+        pairing handshake is safe against this id, where a miss is not evidence of anything.
+        """
+        if not player_id:
+            return None
+        for unit in self.units:
+            local = unit.local_player or {}
+            if local.get("player_id") == player_id:
+                return unit
+        return None
+
     def find_source(self, source_id: str) -> tuple[UnitSnapshot, SourceState] | None:
         """Locate which unit ingests a given source (audio stays on its ingesting unit)."""
         for u in self.units:

@@ -32,8 +32,10 @@ class SendspinEngine(SyncEngine):
     async def detach_player(self, source_id: str, player_id: str) -> None:
         await self._server.detach_player(source_id, player_id)
 
-    async def reclaim_remote_player(self, source_id: str, player_id: str, player_url: str) -> bool:
-        return await self._server.reclaim_remote_player(source_id, player_id, player_url)
+    async def reclaim_remote_player(
+        self, source_id: str, player_id: str, player_url: str, *, stage_pairing: bool = False
+    ) -> bool:
+        return await self._server.reclaim_remote_player(source_id, player_id, player_url, stage_pairing=stage_pairing)
 
     async def set_player_volume(self, player_id: str, volume: int, muted: bool) -> None:
         self._server.set_player_volume(player_id, volume, muted)

@@ -24,6 +24,7 @@ class FakeEngine:
 
     def __init__(self):
         self.calls = []
+        self.staged = []  # (player_id, stage_pairing) per reclaim
 
     async def attach_local_player(self, source_id, player_id):
         self.calls.append(("attach_local", source_id, player_id))
@@ -31,8 +32,11 @@ class FakeEngine:
     async def detach_player(self, source_id, player_id):
         self.calls.append(("detach", source_id, player_id))
 
-    async def reclaim_remote_player(self, source_id, player_id, url):
+    async def reclaim_remote_player(self, source_id, player_id, url, *, stage_pairing=False):
         self.calls.append(("reclaim", source_id, player_id, url))
+        # Recorded separately so the existing call assertions keep their shape: staging a pairing
+        # PSK against a cleartext speaker takes it offline, so WHETHER we stage is its own claim.
+        self.staged.append((player_id, stage_pairing))
         return True
 
     async def set_player_volume(self, player_id, volume, muted):
@@ -196,3 +200,96 @@ def test_routing_onto_a_playerless_unit_is_refused():
 
     with pytest.raises(RouteError):
         asyncio.run(router.route_player("unit-hl-player", "airplay"))
+
+
+# -- staging a pairing PSK on the reclaim path --------------------------------
+#
+# Staging turns the next handshake into a PAIRING handshake, which the library aborts against a
+# cleartext client — taking that speaker offline until the next adopt (CLAUDE.md,
+# docs/SENDSPIN-PAIRING.md). The reclaim path used to stage unconditionally, justified by "player_id
+# came from a peer snapshot, so this only ever names a Plum player". `snapshot()` applies no
+# ownership filter, so an adopted third-party speaker sits in a peer's `players` exactly like a Plum
+# player, and that premise was false. OPEN-ITEMS #21.
+
+
+def _view_with(peer_players, peer_local_player=None):
+    """Our unit plus a peer holding `peer_players`, optionally declaring its own speaker."""
+    local = UnitSnapshot(
+        "unitA",
+        "A",
+        host="10.0.0.1",
+        sources=[SourceState("airplay", "g1", "AirPlay", True, [])],
+        players=[],
+    )
+    peer = UnitSnapshot(
+        "unitB",
+        "B",
+        host="10.0.0.2",
+        sources=[],
+        players=peer_players,
+        local_player=peer_local_player,
+    )
+    return MeshView([local, peer])
+
+
+def _router_for(engine, view):
+    return Router("unitA", engine, view_provider=lambda: view, peer_provider=PEERS.get)
+
+
+def test_a_peers_own_player_is_staged():
+    """The conclusive case: it is some unit's own speaker, and ours are never cleartext."""
+    player = PlayerState("playerB", "B", True, None, url="ws://10.0.0.2:8928/sendspin", security="sentinel")
+    view = _view_with([player], peer_local_player={"player_id": "playerB", "url": player.url})
+    engine = FakeEngine()
+    asyncio.run(_router_for(engine, view).route_player("playerB", "airplay"))
+    assert engine.staged == [("playerB", True)]
+
+
+def test_an_encrypted_client_is_staged_on_its_reported_security():
+    """Not any unit's own speaker (it has roamed), but the holder reports an encrypted connection."""
+    player = PlayerState("playerC", "C", True, "g2", url="ws://10.0.0.3:8928/sendspin", security="long_term")
+    engine = FakeEngine()
+    asyncio.run(_router_for(engine, _view_with([player])).route_player("playerC", "airplay"))
+    assert engine.staged == [("playerC", True)]
+
+
+def test_an_adopted_cleartext_speaker_is_NOT_staged():
+    """The bug. A third-party speaker adopted onto a peer's source is in that peer's `players`;
+    staging it would abort its next handshake and take it offline."""
+    esp32 = PlayerState(
+        "98:A3:16:D0:9E:E8", "Voice PE", True, "g2", url="ws://10.0.0.9:8927/sendspin", security=None
+    )
+    engine = FakeEngine()
+    asyncio.run(_router_for(engine, _view_with([esp32])).route_player("98:A3:16:D0:9E:E8", "airplay"))
+    assert engine.staged == [("98:A3:16:D0:9E:E8", False)]
+    # It is still reclaimed — the route must work, it just must not pair.
+    assert any(call[0] == "reclaim" for call in engine.calls)
+
+
+def test_an_unknown_security_field_fails_safe():
+    """`security` defaults to None, so a peer on an older image is indistinguishable from a
+    cleartext client. Requiring POSITIVE evidence makes the ambiguous case skip staging (logged)
+    rather than knock a speaker offline."""
+    player = PlayerState("playerD", "D", True, "g2", url="ws://10.0.0.4:8928/sendspin")
+    engine = FakeEngine()
+    asyncio.run(_router_for(engine, _view_with([player])).route_player("playerD", "airplay"))
+    assert engine.staged == [("playerD", False)]
+
+
+def test_an_idle_player_from_a_self_report_is_staged():
+    """The idle fallback resolves through `local_player`, which only a unit's own speaker appears
+    in — so that path is conclusive and stages unconditionally."""
+    view = _view_with([], peer_local_player={"player_id": "playerB", "url": "ws://10.0.0.2:8928/sendspin"})
+    engine = FakeEngine()
+    asyncio.run(_router_for(engine, view).route_player("playerB", "airplay"))
+    assert engine.staged == [("playerB", True)]
+
+
+def test_unit_by_own_player_ignores_attached_clients():
+    """The join must read `local_player`, never `players`: after an adopt the latter contains
+    third-party speakers, which is exactly what made the old premise false."""
+    esp32 = PlayerState("aa:bb", "ESP", True, "g2", url="ws://10.0.0.9:8927/sendspin")
+    view = _view_with([esp32], peer_local_player={"player_id": "playerB"})
+    assert view.unit_by_own_player("aa:bb") is None
+    assert view.unit_by_own_player("playerB") is not None
+    assert view.unit_by_own_player(None) is None
