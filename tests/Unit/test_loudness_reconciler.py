@@ -447,3 +447,100 @@ async def test_a_third_party_speaker_is_matched_under_stream_scope(rig):
     rec._aggregator = FakeAggregator(build_view({"living": 80, "esp32": 40}))
     await rec.tick()
     assert router.last_for("esp32") is not None
+
+
+# -- endpoints that never echo their level ------------------------------------
+#
+# A server cannot READ a speaker's volume, only command it (docs/SPEC-CONFORMANCE.md). Our own
+# player echoes `client/state` after every change because we made it; a third-party speaker reports
+# its connect-time level and never moves. Divergence is this reconciler's signal for "a human moved
+# this", so a non-echoing endpoint is a permanent false positive — and being frozen high it wins
+# `max(moved)`, which pegs its whole group to its 100% loudness on every tick.
+
+
+def build_frozen_view(reference_level: int, frozen_at: int = 100):
+    """The living room reports honestly; the ESP32 is stuck at its connect-time level."""
+    return build_view({"living": reference_level, "esp32": frozen_at})
+
+
+@asyncio_test
+async def test_a_non_echoing_endpoint_never_becomes_the_reference(rig):
+    write, make = rig
+    write({"living": {"samples": samples(40.0)}, "esp32": {"samples": samples(34.0)}}, mode="stream")
+    rec, router = make(build_frozen_view(40))
+
+    await rec.tick()  # seed
+    rec._aggregator = FakeAggregator(build_frozen_view(40))
+    await rec.tick()  # a human moves the living room; the esp32 is commanded and does not echo
+    commanded_once = router.last_for("esp32")
+    assert commanded_once is not None
+
+    # Tick repeatedly with the esp32 still reporting 100. It must never drag the group up.
+    for _ in range(4):
+        rec._aggregator = FakeAggregator(build_frozen_view(40))
+        await rec.tick()
+
+    assert router.last_for("living") is None, "the reference must never be driven by a stale echo"
+    assert router.last_for("esp32") == commanded_once, "the target must not have drifted"
+
+
+@asyncio_test
+async def test_a_non_echoing_endpoint_does_not_peg_the_group_loud(rig):
+    """The concrete damage: frozen at 100, it wins max(moved) and re-derives the target from its
+    own full-scale loudness, driving every honest member to its ceiling."""
+    write, make = rig
+    write({"living": {"samples": samples(40.0)}, "esp32": {"samples": samples(40.0)}}, mode="stream")
+    rec, router = make(build_frozen_view(30))
+    await rec.tick()
+
+    for _ in range(3):
+        rec._aggregator = FakeAggregator(build_frozen_view(30))
+        await rec.tick()
+
+    assert "living" not in rec.status()["atLimit"]
+    assert router.last_for("living") is None
+
+
+@asyncio_test
+async def test_an_endpoint_that_does_echo_is_trusted_again(rig):
+    """The guard must not permanently deafen a well-behaved player: once its echo matches what we
+    asked for, moving its slider is user intent again."""
+    write, make = rig
+    write({"living": {"samples": samples(40.0)}, "kitchen": {"samples": samples(40.0)}}, mode="stream")
+    rec, router = make(build_view({"living": 40, "kitchen": 70}))
+    await rec.tick()
+
+    rec._aggregator = FakeAggregator(build_view({"living": 80, "kitchen": 70}))
+    await rec.tick()
+    echoed = router.last_for("kitchen")
+    assert echoed is not None
+
+    # The kitchen echoes the level we commanded — it is trusted from here on.
+    rec._aggregator = FakeAggregator(build_view({"living": 80, "kitchen": echoed}))
+    await rec.tick()
+    assert "kitchen" not in rec._unconfirmed
+
+    # Now a human moves the kitchen; it must be honoured as the new reference.
+    router.calls.clear()
+    rec._aggregator = FakeAggregator(build_view({"living": 80, "kitchen": 20}))
+    await rec.tick()
+    assert router.last_for("living") is not None
+
+
+@asyncio_test
+async def test_lag_between_command_and_echo_is_not_read_as_a_human(rig):
+    """Same rule covers the benign case: a command that has not landed yet leaves a STALE reported
+    level, which is not a deliberate act and must not re-derive the group."""
+    write, make = rig
+    write({"living": {"samples": samples(40.0)}, "kitchen": {"samples": samples(34.0)}}, mode="stream")
+    rec, router = make(build_view({"living": 40, "kitchen": 40}))
+    await rec.tick()
+
+    rec._aggregator = FakeAggregator(build_view({"living": 80, "kitchen": 40}))
+    await rec.tick()
+    router.calls.clear()
+
+    # The kitchen was commanded but the view still shows the old level — mid-flight, not a human.
+    rec._aggregator = FakeAggregator(build_view({"living": 80, "kitchen": 40}))
+    await rec.tick()
+    assert router.last_for("living") is None
