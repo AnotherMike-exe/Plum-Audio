@@ -8,28 +8,88 @@ export interface Track {
 }
 
 // Volume Calibration Types
-export interface CalibrationReference {
-    volume: number;      // Hardware volume % where measurement was taken (e.g., 38 or 80)
-    measuredDb: number;  // User's dB reading at that volume
+//
+// An endpoint's loudness is measured, not assumed: the tone plays from one endpoint at a few known
+// volumes, the user reads SPL from the listening position, and the backend fits
+// `dB = a*log10(volume) + b`. Everything derived from that fit (`curve`, `calibrated`,
+// `effectiveMaxVolume`, `dbRange`) is computed server-side and sent down — the GUI never refits,
+// so there is exactly one implementation of the maths. See backend/scripts/calibration.py.
+
+export interface CalibrationSample {
+    volume: number;  // endpoint volume percent the tone played at, 1-100
+    db: number;      // SPL the user read from the listening position
 }
 
 export interface CalibrationMaxLimit {
     mode: 'percentage' | 'decibel';
-    value: number;  // Either hardware % (0-100) or dB level
+    value: number; // hardware % (0-100), or an absolute SPL resolved through this endpoint's curve
+}
+
+export interface CalibrationCurve {
+    a: number;        // dB per decade of volume; ~20 for a pure amplitude scaler
+    b: number;        // dB at volume 1
+    n: number;        // samples the fit was built from
+    rmsError: number; // RMS residual in dB; 0 for a two-point (exact) fit
+    suspect: boolean; // the points do not lie on a line well enough to trust the extrapolation
+}
+
+export interface CalibrationDbRange {
+    // Never starts at volume 0 — that is silence, and reporting a finite dB for it is a lie.
+    lowVolume: number;
+    lowDb: number;
+    highVolume: number;
+    highDb: number;
 }
 
 export interface EndpointCalibration {
-    name: string;                    // Friendly name for the endpoint
-    calibrated: boolean;             // Whether calibration has been completed
-    lowRef?: CalibrationReference;   // Measurement at ~38% volume
-    highRef?: CalibrationReference;  // Measurement at ~80% volume
-    maxLimit: CalibrationMaxLimit;   // Maximum volume limit
-    defaultVolume: number;           // Default startup volume (0-100%)
-    lastCalibrated?: string;         // ISO timestamp of last calibration
+    playerId?: string;               // mesh player id (the X25519 peer id) this record is keyed by
+    name: string;                    // denormalised display copy; a speaker's name depends on where
+    url?: string | null;             // denormalised display copy; moves with DHCP, never a key
+    enabled: boolean;                // participate in loudness matching
+    samples: CalibrationSample[];
+    maxLimit: CalibrationMaxLimit;
+    trimDb: number;                  // persistent per-room taste, applied on top of every match
+    lastCalibrated?: string | null;  // ISO timestamp
+    // --- derived server-side; never written back ---
+    calibrated: boolean;
+    fitRejected: boolean;            // measurements exist but cannot describe a speaker
+    curve: CalibrationCurve | null;
+    effectiveMaxVolume: number;
+    dbRange: CalibrationDbRange | null;
 }
 
-export interface AudioCalibrationSettings {
-    [clientId: string]: EndpointCalibration;
+// How far loudness matching reaches. A SEPARATE question from calibration: a curve says how loud
+// one endpoint is, this says which endpoints are locked to each other.
+export type LoudnessMatchMode = 'off' | 'stream' | 'follow' | 'sets';
+
+export interface LoudnessMatchSet {
+    id: string;
+    name: string;
+    members: string[]; // mesh player ids
+}
+
+export interface LoudnessMatchPolicy {
+    mode: LoudnessMatchMode;
+    sets: LoudnessMatchSet[];
+}
+
+export interface CalibrationSnapshot {
+    calibrations: Record<string, EndpointCalibration>;
+    policy: LoudnessMatchPolicy;
+    modes: LoudnessMatchMode[];
+    suggestedVolumes: number[];
+    minSamples: number;
+    maxSamples: number;
+}
+
+export interface ToneState {
+    playing: boolean;
+    playerId?: string;
+    sourceId?: string;
+    volume?: number;
+    toneType?: 'pink' | 'sine';
+    elapsed?: number;
+    remaining?: number;
 }
 
 // Federation: Server representation
@@ -539,6 +599,6 @@ export interface Settings {
                 enabled: boolean;
             }>;
         };
-        calibration?: AudioCalibrationSettings;
+        calibration?: Record<string, EndpointCalibration>;
     };
 }
