@@ -21,6 +21,7 @@ import re
 import sys
 import tempfile
 import threading
+from collections.abc import Callable
 from typing import Any
 
 from flask import Blueprint, jsonify, request
@@ -196,6 +197,12 @@ DEFAULT_SETTINGS = {
         "calibration": {
             # Per-endpoint volume calibration; keys are mesh player IDs, values are calibration data.
         },
+        # How far loudness matching reaches. Scope is a SEPARATE question from calibration: a curve
+        # says how loud one endpoint is, this says which endpoints are locked to each other. Default
+        # "follow" acts only where the user has already declared two rooms slaved together, so
+        # adding an office to the same stream does not silently drag it into the kitchen's match.
+        # Modes: off | stream | follow | sets. See backend/scripts/calibration.py.
+        "loudnessMatch": {"mode": "follow", "sets": []},
     },
 }
 
@@ -532,6 +539,39 @@ class SettingsManager:
                     current[key].update(new_settings[key])
                 else:
                     current[key] = new_settings[key]
+
+            _sanitize_device_names(current)
+            _validate_audio_output(current)
+
+            current["version"] = current.get("version", 0) + 1
+            logger.info(f"Settings updated to version {current['version']}")
+
+            self._save_settings(current)
+            return current
+
+    def mutate(self, apply: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
+        """Read-modify-write under the settings lock, for edits that depend on current contents.
+
+        `update_settings` is a BLIND patch: the caller must already know the value it wants. That is
+        the wrong shape for anything keyed by id. Saving one endpoint's calibration means reading the
+        whole map, inserting into it and writing it back — and doing that as a GET then a POST lets
+        two browsers calibrating two different speakers each read the same map, with the second
+        silently dropping the first. Worse, it drops it WITH a bumped version, so the GUI's poller
+        sees nothing to reconcile and the loss is invisible. `apply` runs inside the same lock the
+        read and the write are already under, which closes that window.
+
+        Reads through `_load_merged` for the same reason `update_settings` does: `get_settings`
+        answers a damaged file with DEFAULT_SETTINGS, and building a write on that reply would
+        replace the unit's entire configuration.
+
+        `apply` mutates the settings dict in place and returns True if it changed anything.
+        Returning False skips both the save and the version bump, so a no-op edit does not churn
+        every GUI's 10 s settings poll.
+        """
+        with _SETTINGS_LOCK:
+            current = self._load_merged()
+            if not apply(current):
+                return current
 
             _sanitize_device_names(current)
             _validate_audio_output(current)
