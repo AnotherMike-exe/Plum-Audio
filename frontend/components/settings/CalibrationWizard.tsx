@@ -63,6 +63,13 @@ export const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
   const [enabled, setEnabled] = useState<boolean>(existing?.enabled ?? true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * For an idle third-party speaker `endpoint.playerId` is only its listener URL — mDNS gives
+   * nothing else. Starting the tone ADOPTS it, and the reply carries the id its handshake gave
+   * (generally a MAC). That is what the record must be keyed on: a URL is IP-derived and moves with
+   * DHCP, so a curve saved against one would be orphaned by the next lease.
+   */
+  const [resolvedId, setResolvedId] = useState<string | null>(null);
 
   // The tone lives on the server and expires on its own, but a wizard that unmounts while it is
   // playing would leave a speaker making noise until that timeout. Stop it on the way out.
@@ -93,10 +100,12 @@ export const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
       if (playingRow !== null) {
         await calibrationService.toneVolume(rows[index].volume);
       } else {
-        await calibrationService.toneStart(endpoint.playerId, rows[index].volume, {
+        const state = await calibrationService.toneStart(endpoint.playerId, rows[index].volume, {
           type: toneType,
           seconds: TONE_SECONDS,
+          url: endpoint.idle ? endpoint.url : undefined,
         });
+        if (state.playerId && state.playerId !== endpoint.playerId) setResolvedId(state.playerId);
       }
       setPlayingRow(index);
     } catch (e) {
@@ -130,6 +139,9 @@ export const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
     [rows],
   );
   const complete = parsed.length >= minSamples && parsed.length === rows.length;
+  // An idle third-party speaker has no real id until the tone has adopted it once, and a record
+  // keyed on its URL would be orphaned by the next DHCP lease. Playing any row resolves it.
+  const needsAdoption = endpoint.idle && resolvedId === null;
 
   const handleSave = async () => {
     setSaving(true);
@@ -144,7 +156,7 @@ export const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
       trimDb,
     };
     try {
-      onSaved(await calibrationService.save(endpoint.playerId, draft));
+      onSaved(await calibrationService.save(resolvedId ?? endpoint.playerId, draft));
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not save the calibration');
     } finally {
@@ -172,6 +184,13 @@ export const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
             <li>Stop other music and keep the room quiet — the meter hears everything.</li>
             <li>Measure from where you actually listen, in the same spot every time.</li>
             <li>Playing the tone moves this speaker off whatever it was playing. It goes back when you stop.</li>
+            {endpoint.foreign && (
+              <li>
+                This is not a Plum speaker. We can command its volume but cannot read it back, so we
+                will not restore its level afterwards — set it where you want it when you are done.
+                If you hear nothing at all, check it plays from its own server first.
+              </li>
+            )}
           </ul>
         </div>
 
@@ -321,7 +340,7 @@ export const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
           </button>
           <button
             onClick={() => void handleSave()}
-            disabled={!complete || saving}
+            disabled={!complete || saving || needsAdoption}
             className="rounded-md bg-[var(--accent-color)] px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
           >
             {saving ? 'Saving…' : 'Save calibration'}
@@ -330,6 +349,12 @@ export const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
         {!complete && (
           <p className="mt-2 text-right text-xs text-[var(--text-secondary)]">
             Enter a dB reading for every row ({minSamples}–{maxSamples} measurements).
+          </p>
+        )}
+        {complete && needsAdoption && (
+          <p className="mt-2 text-right text-xs text-amber-300">
+            Play the tone once first — this speaker has to identify itself before its calibration
+            can be stored.
           </p>
         )}
       </div>

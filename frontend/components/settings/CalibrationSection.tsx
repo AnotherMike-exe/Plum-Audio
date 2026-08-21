@@ -33,7 +33,8 @@ const SCOPE_LABELS: Record<LoudnessMatchMode, {title: string; blurb: string}> = 
     title: 'Rooms that follow each other',
     blurb:
       'Only units already slaved together under Playback → Follow. Acts exactly where you have '
-      + 'declared two rooms locked, and nowhere else. Recommended.',
+      + 'declared two rooms locked, and nowhere else. Recommended. Third-party speakers belong to '
+      + 'no unit, so they are never matched under this mode — put those in a group instead.',
   },
   stream: {
     title: 'Everything sharing a stream',
@@ -308,6 +309,18 @@ export const CalibrationSection: React.FC = () => {
                     <span className="rounded-full bg-amber-500/20 px-2 py-0.5 text-xs text-amber-300"
                           title={`Measurements scatter by ${cal.curve.rmsError.toFixed(1)} dB around the fit`}>
                       Check measurements
+                    </span>
+                  )}
+                  {endpoint.foreign && (
+                    <span className="rounded-full bg-sky-500/20 px-2 py-0.5 text-xs text-sky-300"
+                          title="A third-party Sendspin speaker. Its volume can be commanded but not read back.">
+                      {endpoint.idle ? 'Not connected' : 'Third-party'}
+                    </span>
+                  )}
+                  {endpoint.foreign && snapshot?.policy.mode === 'follow' && cal?.calibrated && (
+                    <span className="rounded-full bg-amber-500/20 px-2 py-0.5 text-xs text-amber-300"
+                          title="Follow scope covers units slaved to each other; a third-party speaker belongs to no unit.">
+                      Not matched under Follow
                     </span>
                   )}
                   {atLimit && (

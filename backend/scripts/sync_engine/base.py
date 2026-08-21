@@ -57,7 +57,7 @@ class SyncEngine(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def adopt_client(self, source_id: str, url: str, player_id: str | None = None) -> bool:
+    async def adopt_client(self, source_id: str, url: str, player_id: str | None = None) -> str | None:
         """Dial a foreign Sendspin speaker (discovered by mDNS) onto a source. Optional."""
         raise NotImplementedError
 

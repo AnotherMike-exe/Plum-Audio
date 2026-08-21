@@ -1309,7 +1309,7 @@ class PlumSendspinServer:
 
     async def adopt_foreign_client(
         self, source_id: str, url: str, player_id: str | None = None, timeout_s: float = 15.0
-    ) -> bool:
+    ) -> str | None:
         """Dial a Sendspin speaker we did not create and put it on one of our sources.
 
         A speaker found by mDNS is just a player whose URL came from the neighbourhood instead of a
@@ -1317,6 +1317,13 @@ class PlumSendspinServer:
         connect_to_client(PLAYBACK) then group.add_client. Its previous server loses it the spec's
         way — the client sends goodbye `another_server`. We learn its real client_id from the
         handshake, so `player_id` is only a hint for URL registration.
+
+        RETURNS THE CLIENT ID IT LEARNED (None on failure), because this is the only moment the
+        mDNS URL and the handshake id are both in hand. mDNS names a speaker by instance and the
+        handshake by MAC, and the URL is IP-derived so it moves with DHCP — so anything that has to
+        remember something ABOUT this speaker must key on the returned id, not on the URL it was
+        dialled at. Volume calibration is the first caller that needs this; it used to return a bare
+        bool and the id was simply discarded.
         """
         assert self.server is not None
         if source_id not in self.sources:
@@ -1332,7 +1339,7 @@ class PlumSendspinServer:
         if existing is not None:
             await self.attach_player(source_id, existing)
             logger.info("[%s] foreign speaker %s (%s) already connected; kept the dial", source_id, existing, url)
-            return True
+            return existing
         # Otherwise the registration is stale, and a stale one must be torn down before we redial:
         # connect_to_client is a NO-OP while a dial task for the URL exists, so without this a second
         # adopt does nothing and then times out blaming the speaker — "never connected" about a
@@ -1360,10 +1367,10 @@ class PlumSendspinServer:
                     self.server.register_client_url(client.client_id, url)
                     await self.attach_player(source_id, client.client_id)  # defuses the eviction timer
                     logger.info("[%s] adopted foreign speaker %s (%s)", source_id, client.client_id, url)
-                    return True
+                    return client.client_id
             await asyncio.sleep(0.1)
         logger.warning("[%s] foreign speaker at %s never connected", source_id, url)
-        return False
+        return None
 
     def _connected_player_at(self, url: str) -> str | None:
         """The client id of the render endpoint we already hold a live connection to at `url`.

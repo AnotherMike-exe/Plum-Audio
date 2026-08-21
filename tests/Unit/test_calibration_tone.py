@@ -101,7 +101,11 @@ class FakeEngine:
         self.sources: dict[str, str] = {}
         self.started: list[str] = []
         self.stopped: list[str] = []
+        self.adopted: list[tuple[str, str]] = []
+        self.released: list[tuple[str, str, str | None]] = []
         self._readers: dict[str, int] = {}
+
+    adopt_result: str | None = "aa:bb:cc:dd:ee:ff"
 
     def start_source(self, source_id: str, fifo_path: str) -> None:
         self.sources[source_id] = fifo_path
@@ -117,6 +121,13 @@ class FakeEngine:
         fd = self._readers.pop(source_id, None)
         if fd is not None:
             os.close(fd)
+
+    async def adopt_client(self, source_id: str, url: str, player_id: str | None = None):
+        self.adopted.append((source_id, url))
+        return self.adopt_result
+
+    async def release_client(self, source_id: str, player_id: str, url: str | None = None) -> None:
+        self.released.append((source_id, player_id, url))
 
     def drain(self, source_id: str) -> int:
         """Read whatever is buffered, so the writer never blocks on a full pipe."""
@@ -140,6 +151,7 @@ class FakeRouter:
         self.unroutes: list[tuple[str, str]] = []
         self.volumes: list[tuple[str, int, bool]] = []
         self.fail_route_to: str | None = None
+        self.fail_volume = False
 
     async def route_player(self, player_id: str, source_id: str) -> bool:
         if self.fail_route_to is not None and source_id == self.fail_route_to:
@@ -151,10 +163,14 @@ class FakeRouter:
         self.unroutes.append((player_id, source_id))
 
     async def set_volume(self, player_id: str, volume: int, muted: bool) -> None:
+        if self.fail_volume:
+            raise RuntimeError("volume failed")
         self.volumes.append((player_id, volume, muted))
 
 
-def _view(*, player_id="spk", volume=42, on_source: str | None = "airplay-1") -> MeshView:
+def _view(*, player_id="spk", volume=42, on_source: str | None = "airplay-1", own=True) -> MeshView:
+    """`own=False` models a THIRD-PARTY speaker: attached, but not the unit's own player — so its
+    reported volume is its frozen connect-time value, not something we may restore."""
     sources = []
     if on_source:
         sources.append(
@@ -171,6 +187,7 @@ def _view(*, player_id="spk", volume=42, on_source: str | None = "airplay-1") ->
         unit_id="unit-1",
         name="Unit One",
         host="192.168.1.10",
+        local_player={"player_id": player_id} if own else None,
         sources=sources,
         players=[
             PlayerState(player_id=player_id, name="Kitchen", connected=True, group_id="g1", volume=volume)
@@ -367,3 +384,97 @@ async def test_shutdown_never_leaves_a_speaker_playing(rig):
     await controller.shutdown()
     assert controller.status() == {"playing": False}
     assert router.routes[-1] == ("spk", "airplay-1")
+
+
+# -- third-party speakers -----------------------------------------------------
+#
+# An idle third-party speaker is in no unit's `players` and no unit's `local_player`, so the router
+# cannot resolve it at all — it exists only as an mDNS URL. Adoption is the way in, and it is also
+# the only moment the URL and the handshake id are both in hand: the record must be keyed on the id
+# (mDNS names by instance, the handshake by MAC, and the URL is IP-derived so it moves with DHCP).
+
+
+@asyncio_test
+async def test_an_unroutable_speaker_is_adopted_by_url(rig):
+    controller, engine, router, _ = rig
+    router.fail_route_to = CAL_SOURCE_PREFIX + "ws://192.168.1.87:8927/sendspin"
+    state = await controller.start(
+        "ws://192.168.1.87:8927/sendspin", 40, url="ws://192.168.1.87:8927/sendspin", seconds=30
+    )
+    try:
+        assert engine.adopted == [(state["sourceId"], "ws://192.168.1.87:8927/sendspin")]
+        # The reply carries the id the HANDSHAKE gave, which is what the calibration record keys on.
+        assert state["playerId"] == "aa:bb:cc:dd:ee:ff"
+        assert router.volumes[-1] == ("aa:bb:cc:dd:ee:ff", 40, False)
+    finally:
+        await controller.stop()
+
+
+@asyncio_test
+async def test_an_adopted_speaker_is_handed_back_not_merely_detached(rig):
+    """Detaching drops it from the group but leaves the websocket up, and a client holds exactly
+    one — so the speaker would stay captured and Music Assistant could never take it back."""
+    controller, engine, router, _ = rig
+    url = "ws://192.168.1.87:8927/sendspin"
+    router.fail_route_to = CAL_SOURCE_PREFIX + url
+    await controller.start(url, 40, url=url, seconds=30)
+    await controller.stop()
+
+    assert engine.released == [(CAL_SOURCE_PREFIX + url, "aa:bb:cc:dd:ee:ff", url)]
+    assert router.unroutes == []
+
+
+@asyncio_test
+async def test_a_failed_adopt_is_reported_not_silently_empty(rig):
+    controller, engine, router, _ = rig
+    url = "ws://192.168.1.87:8927/sendspin"
+    router.fail_route_to = CAL_SOURCE_PREFIX + url
+    engine.adopt_result = None
+    with pytest.raises(ToneError):
+        await controller.start(url, 40, url=url, seconds=30)
+    assert engine.sources == {}
+    assert controller.status() == {"playing": False}
+
+
+@asyncio_test
+async def test_an_adopt_that_lands_before_a_later_failure_is_still_handed_back(rig):
+    controller, engine, router, _ = rig
+    url = "ws://192.168.1.87:8927/sendspin"
+    router.fail_route_to = CAL_SOURCE_PREFIX + url
+    router.fail_volume = True
+    with pytest.raises(RuntimeError):
+        await controller.start(url, 40, url=url, seconds=30)
+    assert engine.released == [(CAL_SOURCE_PREFIX + url, "aa:bb:cc:dd:ee:ff", url)]
+    assert engine.sources == {}
+
+
+@asyncio_test
+async def test_an_unroutable_speaker_with_no_url_still_fails(rig):
+    """Adoption is only attempted when the caller supplied somewhere to dial."""
+    controller, engine, _, _ = rig
+    rig_router = rig[2]
+    rig_router.fail_route_to = CAL_SOURCE_PREFIX + "spk"
+    with pytest.raises(RuntimeError):
+        await controller.start("spk", 40, seconds=30)
+    assert engine.adopted == []
+
+
+@asyncio_test
+async def test_a_third_party_volume_is_never_restored(rig):
+    """Only our own player echoes client/state; anyone else's reported level is its connect-time
+    value, so restoring it would assert a level we never read — and for a speaker that connected at
+    100 that is a loud surprise at the end of every calibration."""
+    controller, _, router, holder = rig
+    holder["view"] = _view(volume=100, own=False)
+    await controller.start("spk", 40, seconds=30)
+    await controller.stop()
+    assert router.volumes[-1] == ("spk", 40, False), "no restore should have been issued"
+
+
+@asyncio_test
+async def test_our_own_players_volume_is_still_restored(rig):
+    controller, _, router, holder = rig
+    holder["view"] = _view(volume=42, own=True)
+    await controller.start("spk", 40, seconds=30)
+    await controller.stop()
+    assert router.volumes[-1] == ("spk", 42, False)
