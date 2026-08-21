@@ -213,6 +213,11 @@ class EndpointCalibration:
     # "the kitchen is always a little quieter" from being erased by the next re-derive.
     trim_db: float = 0.0
     last_calibrated: str | None = None
+    # Causal version, NOT a clock. A save stores max(highest rev seen anywhere, the local rev) + 1,
+    # so ordering two copies of one endpoint's record depends on what happened before what rather
+    # than on whether NTP has landed on a machine with no RTC. `last_calibrated` stays, but only for
+    # display and as a secondary tiebreak. See merge_calibrations.
+    rev: int = 0
 
     def curve(self) -> Curve | None:
         return fit_curve(self.samples)
@@ -230,6 +235,7 @@ class EndpointCalibration:
             "maxLimit": self.max_limit.to_dict(),
             "trimDb": self.trim_db,
             "lastCalibrated": self.last_calibrated,
+            "rev": self.rev,
         }
 
     @staticmethod
@@ -252,6 +258,10 @@ class EndpointCalibration:
             trim = 0.0
         url = d.get("url")
         last = d.get("lastCalibrated")
+        try:
+            rev = int(d.get("rev", 0))
+        except (TypeError, ValueError):
+            rev = 0
         return EndpointCalibration(
             name=str(d.get("name") or ""),
             url=url if isinstance(url, str) else None,
@@ -260,6 +270,7 @@ class EndpointCalibration:
             max_limit=MaxLimit.from_dict(d.get("maxLimit")),
             trim_db=trim,
             last_calibrated=last if isinstance(last, str) else None,
+            rev=max(0, rev),
         )
 
 
@@ -533,23 +544,39 @@ def merge_calibrations(sources: list[dict | None]) -> dict[str, EndpointCalibrat
     unit owns the group. Without a merge, "which unit's page you happened to open" would silently
     decide whether matching worked — the kind of difference that reads as a hardware fault.
 
-    So each unit publishes its own map in its snapshot and everyone merges the lot. `lastCalibrated`
-    breaks ties, which makes the result identical on every unit and makes a re-calibration on any
-    page win everywhere. A record with no timestamp sorts oldest: it predates the field, so anything
-    carrying one is newer by definition.
+    So each unit publishes its own map in its snapshot and everyone merges the lot, and the winner
+    is the same on every unit — which is what makes a re-calibration from any page take effect
+    everywhere.
 
-    CAVEAT, and it is a real one: a Pi has no RTC, so this rests on NTP. A unit that has not synced
-    stamps 1970 and its records always LOSE; one whose clock has jumped ahead always WINS and pins a
-    stale curve across the mesh — and re-calibrating from that unit's page appears to save (the API
-    returns the new record) while having no effect on matching. Ties are broken by source order,
-    which is stable but arbitrary. Nothing here can detect it; the symptom is a calibration that
-    will not take, and the check is `timedatectl` on the units. OPEN-ITEMS.
+    ORDERED BY `rev`, NOT BY CLOCK. A Pi has no RTC, so a wall-clock comparison rests entirely on
+    NTP: a unit that has not synced stamps 1970 and always loses, while one whose clock jumped ahead
+    always wins and pins a stale curve mesh-wide — with the nastiest possible symptom, a
+    re-calibration that appears to save (the API returns the new record, the local tab shows it) and
+    silently never takes. `rev` is a causal counter instead: a save stores
+    max(highest rev seen anywhere, the local rev) + 1, so a later edit outranks an earlier one
+    regardless of what either clock believes.
+
+    `last_calibrated` is kept for display and as a secondary tiebreak, which only matters for
+    records written before `rev` existed (they carry rev 0). A record with no timestamp sorts
+    oldest: it predates the field, so anything carrying one is newer by definition.
     """
-    best: dict[str, tuple[str, EndpointCalibration]] = {}
+    best: dict[str, tuple[tuple[int, str], EndpointCalibration]] = {}
     for raw in sources:
         for player_id, cal in load_calibrations(raw).items():
-            stamp = cal.last_calibrated or ""
+            rank = (cal.rev, cal.last_calibrated or "")
             current = best.get(player_id)
-            if current is None or stamp >= current[0]:
-                best[player_id] = (stamp, cal)
+            if current is None or rank >= current[0]:
+                best[player_id] = (rank, cal)
     return {player_id: cal for player_id, (_, cal) in best.items()}
+
+
+def highest_rev(sources: list[dict | None], player_id: str) -> int:
+    """The high-water mark for one endpoint across every map the caller can see.
+
+    What a writer must know to allocate the next `rev`. Kept beside the merge so the two cannot
+    drift apart in how they read a record.
+    """
+    return max(
+        (cal.rev for raw in sources for pid, cal in load_calibrations(raw).items() if pid == player_id),
+        default=0,
+    )

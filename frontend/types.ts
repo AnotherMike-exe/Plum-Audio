@@ -49,7 +49,13 @@ export interface EndpointCalibration {
     samples: CalibrationSample[];
     maxLimit: CalibrationMaxLimit;
     trimDb: number;                  // persistent per-room taste, applied on top of every match
-    lastCalibrated?: string | null;  // ISO timestamp
+    lastCalibrated?: string | null;  // ISO timestamp; DISPLAY ONLY — see `rev`
+    /**
+     * Causal version, not a clock. A Pi has no RTC, so ordering two copies of one endpoint's record
+     * by timestamp rests entirely on NTP — and gets it silently wrong when a clock is unsynced or
+     * has jumped. A save stores max(highest rev seen anywhere, the local rev) + 1 instead.
+     */
+    rev?: number;
     // --- derived server-side; never written back ---
     calibrated: boolean;
     fitRejected: boolean;            // measurements exist but cannot describe a speaker

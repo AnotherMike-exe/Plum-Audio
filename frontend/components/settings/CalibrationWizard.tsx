@@ -26,6 +26,8 @@ import type {EndpointCalibration} from '../../types';
 interface CalibrationWizardProps {
   endpoint: CalibrationEndpoint;
   existing?: EndpointCalibration;
+  /** Highest `rev` seen for this endpoint across every unit; the save allocates the next one. */
+  knownRev: number;
   suggestedVolumes: number[];
   minSamples: number;
   maxSamples: number;
@@ -43,6 +45,7 @@ const TONE_SECONDS = 180;
 export const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
   endpoint,
   existing,
+  knownRev,
   suggestedVolumes,
   minSamples,
   maxSamples,
@@ -154,6 +157,7 @@ export const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
       samples: parsed,
       maxLimit: {mode: maxMode, value: maxValue},
       trimDb,
+      knownRev,
     };
     try {
       onSaved(await calibrationService.save(resolvedId ?? endpoint.playerId, draft));

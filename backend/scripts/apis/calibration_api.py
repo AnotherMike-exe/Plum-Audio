@@ -42,6 +42,9 @@ MIN_MEASURED_DB = -60.0
 MAX_MEASURED_DB = 160.0
 MAX_TRIM_DB = 30.0
 MAX_NAME_LEN = 120
+# A sane ceiling on the causal counter a client may claim to have seen. It only ever grows by one
+# per save, so anything near this is a client bug or a hand-edited file, not a real history.
+MAX_REV = 1_000_000
 
 
 class ValidationError(ValueError):
@@ -111,6 +114,25 @@ def _parse_trim(raw: object) -> float:
     if not math.isfinite(trim) or abs(trim) > MAX_TRIM_DB:
         raise ValidationError(f"trimDb must be within +/-{MAX_TRIM_DB:.0f} dB")
     return trim
+
+
+def _parse_known_rev(raw: object) -> int:
+    """The highest `rev` the CLIENT has seen for this endpoint, across every unit.
+
+    The client is the only party holding the merged cross-unit view — this process is the config API
+    and deliberately cannot reach the mesh. Trusting it is safe because it can only ever push the
+    stored rev HIGHER: the write takes max(claimed, local) + 1, so a stale or missing claim still
+    beats the local record, and an inflated one only wastes counter space.
+    """
+    if raw is None:
+        return 0
+    try:
+        rev = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("knownRev must be an integer") from exc
+    if rev < 0 or rev > MAX_REV:
+        raise ValidationError("knownRev out of range")
+    return rev
 
 
 def _parse_record(body: dict) -> cal_model.EndpointCalibration:
@@ -229,6 +251,7 @@ def create_calibration_blueprint(settings_manager: SettingsManager) -> Blueprint
             return jsonify({"error": "a JSON object is required"}), 400
         try:
             record = _parse_record(body)
+            known_rev = _parse_known_rev(body.get("knownRev"))
         except ValidationError as e:
             return jsonify({"error": str(e)}), 400
 
@@ -256,6 +279,12 @@ def create_calibration_blueprint(settings_manager: SettingsManager) -> Blueprint
             audio = _audio_section(settings)
             existing = audio.get("calibration")
             table = dict(existing) if isinstance(existing, dict) else {}
+            # Allocate the next causal rev INSIDE the settings lock, against what is on disk right
+            # now rather than a copy read earlier. Two saves racing here would otherwise both claim
+            # the same number, and the merge would fall back to comparing timestamps — the clock
+            # dependency this whole field exists to remove.
+            local_rev = cal_model.highest_rev([table], player_id)
+            record.rev = max(known_rev, local_rev) + 1
             table[player_id] = record.to_dict()
             audio["calibration"] = table
             return True

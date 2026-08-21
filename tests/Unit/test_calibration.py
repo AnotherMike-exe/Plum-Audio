@@ -28,6 +28,7 @@ from calibration import (  # noqa: E402
     Sample,
     effective_max_volume,
     fit_curve,
+    highest_rev,
     describe,
     load_calibrations,
     match_volume,
@@ -490,3 +491,65 @@ def test_describe_separates_no_measurements_from_rejected_ones():
     assert blank["calibrated"] is False and blank["fitRejected"] is False
     flat = describe("b", EndpointCalibration(samples=[Sample(38, 62.0), Sample(80, 62.0)]))
     assert flat["calibrated"] is False and flat["fitRejected"] is True
+
+
+# -- causal ordering, not clock ordering --------------------------------------
+#
+# A Pi has no RTC, so a wall-clock comparison rests entirely on NTP. The failure is silent and
+# nasty: a unit whose clock jumped ahead pins a stale curve mesh-wide, and re-calibrating from the
+# affected page appears to save while never taking effect.
+
+
+def _rev_record(offset_db, rev, stamp):
+    return {
+        "samples": [{"volume": v, "db": 20.0 * math.log10(v) + offset_db} for v in (35, 85)],
+        "lastCalibrated": stamp,
+        "rev": rev,
+    }
+
+
+def test_a_higher_rev_wins_against_a_future_dated_clock():
+    """The scenario the field exists for: unit B's clock is years ahead, but unit A holds the
+    genuinely newer record."""
+    stale_but_future = {"spk": _rev_record(30.0, rev=1, stamp="2031-01-01T00:00:00Z")}
+    fresh_but_behind = {"spk": _rev_record(40.0, rev=2, stamp="2026-08-21T00:00:00Z")}
+    for order in ([stale_but_future, fresh_but_behind], [fresh_but_behind, stale_but_future]):
+        assert merge_calibrations(order)["spk"].rev == 2
+
+
+def test_a_higher_rev_wins_against_an_unsynced_1970_clock():
+    """The other direction: a unit that has not synced stamps the epoch, and must still win if its
+    record is causally later."""
+    epoch_newer = {"spk": _rev_record(40.0, rev=5, stamp="1970-01-01T00:00:00Z")}
+    dated_older = {"spk": _rev_record(30.0, rev=4, stamp="2026-08-21T00:00:00Z")}
+    assert merge_calibrations([dated_older, epoch_newer])["spk"].rev == 5
+
+
+def test_the_timestamp_still_breaks_a_rev_tie():
+    """Only reachable for records written before `rev` existed — they all carry 0."""
+    old = {"spk": _rev_record(30.0, rev=0, stamp="2026-08-01T00:00:00Z")}
+    new = {"spk": _rev_record(40.0, rev=0, stamp="2026-08-20T00:00:00Z")}
+    assert merge_calibrations([old, new])["spk"].last_calibrated == "2026-08-20T00:00:00Z"
+    assert merge_calibrations([new, old])["spk"].last_calibrated == "2026-08-20T00:00:00Z"
+
+
+def test_a_record_predating_rev_loses_to_any_saved_since():
+    """Migration: existing records have no `rev`, so they read as 0 and the first re-save wins."""
+    legacy = {"spk": {"samples": [{"volume": 35, "db": 60}, {"volume": 85, "db": 68}]}}
+    saved_since = {"spk": _rev_record(40.0, rev=1, stamp="1970-01-01T00:00:00Z")}
+    assert merge_calibrations([legacy, saved_since])["spk"].rev == 1
+
+
+def test_highest_rev_reads_the_high_water_mark():
+    a = {"spk": _rev_record(30.0, rev=3, stamp="t"), "other": _rev_record(30.0, rev=9, stamp="t")}
+    b = {"spk": _rev_record(30.0, rev=7, stamp="t")}
+    assert highest_rev([a, b], "spk") == 7
+    assert highest_rev([a, b], "absent") == 0
+    assert highest_rev([None, "junk"], "spk") == 0
+
+
+def test_rev_round_trips_and_is_never_negative():
+    assert EndpointCalibration.from_dict({"rev": 4}).rev == 4
+    assert EndpointCalibration.from_dict({"rev": -2}).rev == 0
+    assert EndpointCalibration.from_dict({"rev": "nonsense"}).rev == 0
+    assert EndpointCalibration(rev=3).to_dict()["rev"] == 3
