@@ -58,6 +58,11 @@ DEFAULT_TONE_SECONDS = 120.0
 MAX_TONE_SECONDS = 300.0
 DEFAULT_SINE_HZ = 1000.0
 
+# How long start() waits for the feeder to open the FIFO read end before giving up. Generous next to
+# the feeder's own retry loop, short enough that a broken source fails the request rather than
+# reporting a tone nobody can hear.
+WRITER_OPEN_TIMEOUT_S = 6.0
+
 # Seconds of audio synthesized once and then looped. Long enough that the loop point is not audible
 # as a rhythm, short enough that generating it costs a fraction of a second on a Pi.
 LOOP_SECONDS = 5.0
@@ -135,10 +140,28 @@ def generate_pink(sample_rate: int, channels: int, seconds: float, peak: float) 
     return buf.tobytes()
 
 
+_TONE_CACHE: dict[tuple, bytes] = {}
+
+
 def build_tone(tone_type: str, sample_rate: int, channels: int, freq: float = DEFAULT_SINE_HZ) -> bytes:
+    """The looped tone buffer, synthesized once per process.
+
+    Cached because the output is deterministic by design — and because generating it is not free.
+    `generate_pink` is a quarter of a million iterations of pure Python, which on a Pi takes on the
+    order of a second and holds the GIL for most of it: an executor thread moves it off the loop but
+    does NOT stop it competing with the feeder's 20 ms commit cadence for interpreter slices. Paying
+    that once per process rather than once per Play is worth a few hundred KB.
+    """
+    key = (tone_type, sample_rate, channels, freq if tone_type == TONE_SINE else None)
+    cached = _TONE_CACHE.get(key)
+    if cached is not None:
+        return cached
     if tone_type == TONE_SINE:
-        return generate_sine(sample_rate, channels, LOOP_SECONDS, freq, SINE_PEAK)
-    return generate_pink(sample_rate, channels, LOOP_SECONDS, PINK_PEAK)
+        pcm = generate_sine(sample_rate, channels, LOOP_SECONDS, freq, SINE_PEAK)
+    else:
+        pcm = generate_pink(sample_rate, channels, LOOP_SECONDS, PINK_PEAK)
+    _TONE_CACHE[key] = pcm
+    return pcm
 
 
 @dataclass
@@ -157,6 +180,10 @@ class ToneState:
     # operation as unrouting one of our own: detaching drops it from the group but leaves the
     # websocket up, so its real server (Music Assistant) can never take it back. See _stop_locked.
     adopted_url: str | None = None
+    # Carried rather than recomputed from `player_id`: on the adoption path the id is REPLACED by
+    # the one the handshake gave, so deriving the path at teardown would unlink a name that never
+    # existed and leak a FIFO per third-party calibration.
+    fifo_path: str = ""
 
     def to_dict(self) -> dict:
         elapsed = max(0.0, time.monotonic() - self.started_at)
@@ -249,10 +276,21 @@ class CalibrationToneController:
             pcm = await loop.run_in_executor(None, build_tone, tone_type, sample_rate, channels, freq)
 
             self._engine.start_source(source_id, fifo_path)
-            self._writer = asyncio.ensure_future(self._write_loop(fifo_path, pcm, sample_rate, channels, source_id))
+            # The writer signals when the FIFO write end is actually open. Without waiting for it, a
+            # source whose feeder never opened its read end still returns `playing: true` — the
+            # wizard shows a running tone, the room is silent, and the only thing that would ever
+            # notice is the watchdog minutes later.
+            opened: asyncio.Event = asyncio.Event()
+            self._writer = asyncio.ensure_future(
+                self._write_loop(fifo_path, pcm, sample_rate, channels, source_id, opened)
+            )
 
             adopted_url: str | None = None
             try:
+                try:
+                    await asyncio.wait_for(opened.wait(), timeout=WRITER_OPEN_TIMEOUT_S)
+                except TimeoutError as exc:
+                    raise ToneError("the calibration source never opened its FIFO") from exc
                 try:
                     await self._router.route_player(player_id, source_id)
                 except Exception as route_error:
@@ -297,6 +335,7 @@ class CalibrationToneController:
                 restore_source_id=restore_source,
                 restore_volume=restore_volume,
                 adopted_url=adopted_url,
+                fifo_path=fifo_path,
             )
             self._watchdog = asyncio.ensure_future(self._expire_after(seconds))
             logger.info(
@@ -365,11 +404,20 @@ class CalibrationToneController:
         volume = found[1].volume if (found and own) else None
         return source_id, volume
 
-    async def _write_loop(self, fifo_path: str, pcm: bytes, sample_rate: int, channels: int, source_id: str) -> None:
+    async def _write_loop(
+        self,
+        fifo_path: str,
+        pcm: bytes,
+        sample_rate: int,
+        channels: int,
+        source_id: str,
+        opened: asyncio.Event,
+    ) -> None:
         """Feed the looped tone into the source FIFO in real time until cancelled."""
         fd = None
         try:
             fd = await self._open_writer(fifo_path)
+            opened.set()
             frame = _frame_bytes(channels, 16)
             chunk = (sample_rate * _WRITE_CHUNK_MS // 1000) * frame
             period = _WRITE_CHUNK_MS / 1000.0
@@ -396,8 +444,14 @@ class CalibrationToneController:
                     except BlockingIOError:
                         await asyncio.sleep(_PIPE_FULL_SLEEP_S)
 
-                next_due += period
-                await asyncio.sleep(max(0.0, next_due - time.monotonic()))
+                # Resync rather than accumulate. Advancing `next_due` unconditionally means any
+                # stall — a GC pause, a shairport burst, an encoder spike — leaves it permanently
+                # behind wall clock, so the sleep is 0 forever after and the loop degenerates into
+                # write-until-the-pipe-fills. It never hard-spins (both sleeps yield) but it never
+                # recovers its cadence either, and runs the rest of the session ~360 ms deep.
+                now = time.monotonic()
+                next_due = max(next_due + period, now)
+                await asyncio.sleep(max(0.0, next_due - now))
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - a writer failure must not take the audio loop down
@@ -440,14 +494,23 @@ class CalibrationToneController:
 
     async def _stop_locked(self, why: str) -> None:
         state, self._state = self._state, None
-        if self._watchdog is not None:
-            self._watchdog.cancel()
-            self._watchdog = None
+        watchdog, self._watchdog = self._watchdog, None
+        # NEVER cancel the task we are running in. `_expire_after` calls this, so on the timeout
+        # path `watchdog` IS the current task: `Task.cancel()` on a running task sets a pending
+        # cancellation delivered at the next await that actually SUSPENDS — which here is the
+        # release/route call below, real network I/O on hardware. CancelledError is a BaseException,
+        # so `except Exception` does not catch it, and everything after that point — stopping the
+        # source, killing the writer, unlinking the FIFO, restoring the volume — is skipped. The
+        # speaker plays pink noise forever; `_state` is already None so a later Stop reports success
+        # and does nothing; and the next start leaves TWO writers interleaving chunks into one FIFO.
+        # Reproduced in isolation before fixing. The unit tests missed it only because the fake
+        # router never suspends, so the pending cancellation was consumed harmlessly.
+        if watchdog is not None and watchdog is not asyncio.current_task():
+            watchdog.cancel()
         if state is None:
             return
 
         logger.info("calibration tone on %s: %s", state.player_id, why)
-        fifo_path = os.path.join(self._fifo_dir, f"cal-{_fifo_safe(state.player_id)}-fifo")
 
         # Move the player OFF the tone before the source dies, so it lands where it belongs rather
         # than in a group whose feeder has just been torn down.
@@ -466,7 +529,7 @@ class CalibrationToneController:
         except Exception as exc:  # noqa: BLE001 - teardown must complete regardless
             logger.warning("could not restore %s after calibration: %s", state.player_id, exc)
 
-        await self._teardown(state.source_id, fifo_path)
+        await self._teardown(state.source_id, state.fifo_path)
 
         if state.restore_volume is not None:
             with contextlib.suppress(Exception):

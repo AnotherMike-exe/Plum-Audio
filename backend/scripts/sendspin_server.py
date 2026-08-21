@@ -2157,7 +2157,17 @@ async def main() -> None:
             await rename_watch
         if follow is not None:
             await follow.stop()
+        if loudness is not None:
+            # Before mesh.stop(): its 2 s tick reads the aggregator and drives the router, so a
+            # reconciler still running through teardown logs a burst of tracebacks and can issue a
+            # volume command into a half-dismantled server. `_run` swallows everything and loops,
+            # so it would never stop on its own.
+            await loudness.stop()
         if mesh is not None:
+            # Stops any calibration tone FIRST, and restores the endpoint. Without it a SIGTERM
+            # mid-calibration — a container restart, a deploy — leaves the speaker routed to a
+            # `cal:` source that is about to die, at the tone's volume, and an adopted third-party
+            # speaker never handed back to its own server.
             await mesh.stop()
         for manager in managers:
             await manager.stop()  # kills the source daemons before their sources go away

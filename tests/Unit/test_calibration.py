@@ -28,6 +28,7 @@ from calibration import (  # noqa: E402
     Sample,
     effective_max_volume,
     fit_curve,
+    describe,
     load_calibrations,
     match_volume,
     matching_partition,
@@ -340,7 +341,7 @@ def test_off_matches_nothing():
 
 
 def test_stream_mode_locks_everyone_sharing_the_stream():
-    assert matching_partition(["a", "b", "c"], _policy("stream")) == [["a", "b", "c"]]
+    assert matching_partition(["a", "b", "c"], _policy("stream")) == [("", ["a", "b", "c"])]
 
 
 def test_a_lone_endpoint_is_never_matched():
@@ -353,7 +354,7 @@ def test_follow_mode_only_touches_units_already_slaved_together():
     """The kitchen/living-room case: they are locked because the user already said so."""
     members = ["kitchen", "living", "office"]
     assert matching_partition(members, _policy("follow"), frozenset({"kitchen", "living"})) == [
-        ["kitchen", "living"]
+        ("", ["kitchen", "living"])
     ]
 
 
@@ -371,12 +372,12 @@ def test_sets_mode_keeps_independent_rooms_independent():
         ],
     )
     members = ["kitchen", "living", "office", "laundry", "garage"]
-    assert matching_partition(members, policy) == [["kitchen", "living"], ["office", "laundry"]]
+    assert matching_partition(members, policy) == [("s1", ["kitchen", "living"]), ("s2", ["office", "laundry"])]
 
 
 def test_sets_mode_ignores_members_not_on_the_stream():
     policy = _policy("sets", [MatchSet(id="s1", members=["kitchen", "living", "absent"])])
-    assert matching_partition(["kitchen", "living"], policy) == [["kitchen", "living"]]
+    assert matching_partition(["kitchen", "living"], policy) == [("s1", ["kitchen", "living"])]
 
 
 def test_a_set_with_one_member_present_is_dropped():
@@ -393,11 +394,11 @@ def test_an_endpoint_in_two_sets_is_claimed_by_the_first_only():
             MatchSet(id="s2", members=["b", "c"]),
         ],
     )
-    assert matching_partition(["a", "b", "c"], policy) == [["a", "b"]]
+    assert matching_partition(["a", "b", "c"], policy) == [("s1", ["a", "b"])]
 
 
 def test_partition_is_order_stable_and_deduped():
-    assert matching_partition(["a", "b", "a", "", "b"], _policy("stream")) == [["a", "b"]]
+    assert matching_partition(["a", "b", "a", "", "b"], _policy("stream")) == [("", ["a", "b"])]
 
 
 def test_policy_round_trips():
@@ -452,3 +453,40 @@ def test_merge_sorts_an_undated_record_oldest():
 
 def test_merge_tolerates_empty_and_missing_maps():
     assert merge_calibrations([None, {}, "junk"]) == {}
+
+
+def test_the_partition_label_is_stable_across_a_membership_change():
+    """The label keys a caller's remembered target, so it must not churn when a member leaves.
+    Keying on a member id instead would forget the group's level every time one was toned."""
+    policy = _policy("stream")
+    before = matching_partition(["a", "b", "c"], policy)[0][0]
+    after = matching_partition(["b", "c"], policy)[0][0]
+    assert before == after == ""
+
+
+def test_sets_labels_are_the_set_ids():
+    policy = _policy("sets", [MatchSet(id="upstairs", members=["a", "b"])])
+    assert matching_partition(["a", "b"], policy)[0][0] == "upstairs"
+
+
+# -- describe() ---------------------------------------------------------------
+
+
+def test_describe_carries_the_derived_half():
+    """Both API surfaces serve this. A record without it renders as "Not calibrated" in the GUI
+    while the matcher is driving that very speaker."""
+    cal = EndpointCalibration(name="Kitchen", samples=_ideal_samples(30.0))
+    payload = describe("kitchen", cal)
+    assert payload["playerId"] == "kitchen"
+    assert payload["calibrated"] is True
+    assert payload["curve"]["a"] == pytest.approx(20.0, abs=1e-6)
+    assert payload["effectiveMaxVolume"] == 100.0
+    assert payload["dbRange"]["lowVolume"] == 10.0
+    assert payload["fitRejected"] is False
+
+
+def test_describe_separates_no_measurements_from_rejected_ones():
+    blank = describe("a", EndpointCalibration())
+    assert blank["calibrated"] is False and blank["fitRejected"] is False
+    flat = describe("b", EndpointCalibration(samples=[Sample(38, 62.0), Sample(80, 62.0)]))
+    assert flat["calibrated"] is False and flat["fitRejected"] is True

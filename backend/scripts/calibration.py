@@ -435,13 +435,20 @@ def matching_partition(
     members: list[str],
     policy: MatchPolicy,
     follow_members: frozenset[str] = frozenset(),
-) -> list[list[str]]:
+) -> list[tuple[str, list[str]]]:
     """
     Split the endpoints sharing one stream into the subsets that should track each other.
 
     `members` are the player ids currently in a single group; `follow_members` are the player ids
     belonging to units in an active follow relationship (leader and followers alike), which only
     the ``follow`` mode consults.
+
+    Returns ``(label, members)`` pairs. The LABEL is stable for the life of the grouping — the empty
+    string when the mode produces one subset per source, the set id under ``sets`` — so a caller can
+    key remembered state on it. Keying on a member id instead would be silently wrong: membership
+    order comes from the library's client iteration and changes on any detach, so the key would
+    churn and the caller would forget its target and re-baseline. Toning one member is enough to
+    trigger it, since that pulls it out of the group.
 
     Subsets of fewer than two endpoints are dropped: there is nothing to match a lone speaker
     against, and returning it would invite a caller to "match" it to itself and move it for no
@@ -453,23 +460,67 @@ def matching_partition(
         return []
 
     if policy.mode == "stream":
-        return [present]
+        return [("", present)]
 
     if policy.mode == "follow":
         subset = [m for m in present if m in follow_members]
-        return [subset] if len(subset) >= 2 else []
+        return [("", subset)] if len(subset) >= 2 else []
 
     if policy.mode == "sets":
         claimed: set[str] = set()
-        out: list[list[str]] = []
+        out: list[tuple[str, list[str]]] = []
         for match_set in policy.sets:
             subset = [m for m in match_set.members if m in present and m not in claimed]
             if len(subset) >= 2:
                 claimed.update(subset)
-                out.append(subset)
+                out.append((match_set.id, subset))
         return out
 
     return []
+
+
+# The low anchor for a reported dB range. NOT 0: volume 0 is silence, and the model's floor would
+# report a finite loudness for it, which the predecessor printed to users as the bottom of the range.
+RANGE_LOW_VOLUME = 10.0
+
+
+def describe(player_id: str, cal: EndpointCalibration) -> dict:
+    """The stored record plus everything derived from it, so no client ever refits the curve.
+
+    Lives here rather than in either API module because BOTH serve it — the config API for this
+    unit's own records, the mesh API for the merged cross-unit view — and a merged record that
+    silently lacked the derived half rendered as "Not calibrated" in the GUI while the matcher was
+    happily driving that very speaker.
+    """
+    payload: dict = {"playerId": player_id, **cal.to_dict()}
+    curve = cal.curve()
+    payload["calibrated"] = curve is not None
+    if curve is None:
+        # Distinguish "no measurements yet" from "measurements that do not describe a speaker" —
+        # the second is a user error the wizard must explain, not a blank slate.
+        payload["curve"] = None
+        payload["fitRejected"] = len(cal.samples) >= MIN_SAMPLES
+        payload["effectiveMaxVolume"] = effective_max_volume(cal)
+        payload["dbRange"] = None
+        return payload
+
+    ceiling = effective_max_volume(cal)
+    payload["curve"] = {
+        "a": curve.a,
+        "b": curve.b,
+        "n": curve.n,
+        "rmsError": curve.rms_error,
+        "suspect": curve.suspect,
+    }
+    payload["fitRejected"] = False
+    payload["effectiveMaxVolume"] = ceiling
+    payload["dbRange"] = {
+        "lowVolume": RANGE_LOW_VOLUME,
+        "lowDb": predict_db(curve, RANGE_LOW_VOLUME),
+        "highVolume": ceiling,
+        "highDb": predict_db(curve, ceiling),
+    }
+    return payload
 
 
 def merge_calibrations(sources: list[dict | None]) -> dict[str, EndpointCalibration]:
@@ -486,6 +537,13 @@ def merge_calibrations(sources: list[dict | None]) -> dict[str, EndpointCalibrat
     breaks ties, which makes the result identical on every unit and makes a re-calibration on any
     page win everywhere. A record with no timestamp sorts oldest: it predates the field, so anything
     carrying one is newer by definition.
+
+    CAVEAT, and it is a real one: a Pi has no RTC, so this rests on NTP. A unit that has not synced
+    stamps 1970 and its records always LOSE; one whose clock has jumped ahead always WINS and pins a
+    stale curve across the mesh — and re-calibrating from that unit's page appears to save (the API
+    returns the new record) while having no effect on matching. Ties are broken by source order,
+    which is stable but arbitrary. Nothing here can detect it; the symptom is a calibration that
+    will not take, and the check is `timedatectl` on the units. OPEN-ITEMS.
     """
     best: dict[str, tuple[str, EndpointCalibration]] = {}
     for raw in sources:

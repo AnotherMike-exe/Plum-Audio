@@ -124,6 +124,8 @@ class LoudnessReconciler:
         # Endpoints clamped to their ceiling this cycle: the GUI badges these rows so a speaker that
         # physically cannot keep up is visible rather than just quietly wrong.
         self._at_limit: set[str] = set()
+        self._settings_stamp: int | None = None
+        self._settings_cache: dict | None = None
         self._task: asyncio.Task | None = None
         self._stop_evt = asyncio.Event()
 
@@ -152,14 +154,36 @@ class LoudnessReconciler:
     # -- reconcile -------------------------------------------------------------------------------
 
     def _read_settings(self) -> dict | None:
+        """settings.json, re-read only when it has actually changed.
+
+        This runs on the AUDIO event loop, so the read competes with the feeder's 20 ms commit
+        cadence for the same thread — and on a class-10 SD card being written concurrently by the
+        Flask settings API, an unlucky read is not free. The mtime check makes the steady state a
+        single stat() instead of a parse. FollowReconciler polls the same file on the same interval;
+        this deliberately does not double that cost.
+        """
+        try:
+            stamp = os.stat(self.settings_file).st_mtime_ns
+        except OSError:
+            return None
+        if stamp == self._settings_stamp and self._settings_cache is not None:
+            return self._settings_cache
         try:
             with open(self.settings_file, encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
         except (OSError, ValueError):
             return None
+        self._settings_stamp = stamp
+        self._settings_cache = data
+        return data
 
     def status(self) -> dict:
-        """What the GUI badges rows from: who is at their ceiling, and each group's target."""
+        """Introspection for tests and logs: each group's held target, and who is at their ceiling.
+
+        Deliberately NOT a REST surface. The GUI derives "at limit" itself from the endpoint's
+        resolved ceiling and its current level, both of which it already holds — exposing this would
+        add a poll to learn something the client can compute.
+        """
         return {
             "targets": dict(self._targets),
             "atLimit": sorted(self._at_limit),
@@ -198,20 +222,36 @@ class LoudnessReconciler:
         follow_members = self._follow_members(view, my_unit)
         at_limit: set[str] = set()
         live_keys: set[str] = set()
+        live_players: set[str] = set()
 
         for source in my_unit.sources:
             # A calibration tone is a deliberate one-endpoint level; never match against it.
             if source.source_id.startswith(CAL_SOURCE_PREFIX):
                 continue
-            for members in matching_partition(list(source.player_ids), policy, follow_members):
-                key = f"{source.source_id}|{members[0]}"
+            for label, members in matching_partition(list(source.player_ids), policy, follow_members):
+                # Keyed on the partition LABEL, never on a member id: membership order comes from
+                # the library's client iteration and changes on any detach, so a member-derived key
+                # churns — and a churned key is pruned as stale, which silently re-baselines the
+                # group from whoever happens to sort first. Toning one member triggers exactly that,
+                # since it pulls that member out of the group.
+                key = f"{source.source_id}|{label}"
                 live_keys.add(key)
+                live_players.update(members)
                 await self._reconcile_group(key, members, calibrations, view, tone_player, at_limit)
 
         # Drop remembered targets for groups that no longer exist, so a regrouped set of speakers
         # starts from whoever the user moves rather than a stale level from an old session.
         for stale in set(self._targets) - live_keys:
             self._targets.pop(stale, None)
+
+        # And drop the PER-PLAYER memory for anyone no longer in a matched group. Without this, an
+        # endpoint that leaves, gets turned up by hand while solo, and rejoins looks like "a human
+        # just moved this" the instant it comes back — because the level we last commanded is still
+        # remembered from its previous membership — so it becomes the reference and drags the whole
+        # group to itself. That is the opposite of the documented intent for a joiner.
+        for stale_player in set(self._commanded) - live_players:
+            self._commanded.pop(stale_player, None)
+            self._unconfirmed.discard(stale_player)
         self._at_limit = at_limit
 
     def _follow_members(self, view: MeshView, my_unit: UnitSnapshot) -> frozenset[str]:
@@ -260,9 +300,15 @@ class LoudnessReconciler:
             if observed is not None and commanded is not None and abs(observed - commanded) <= USER_INTENT_EPSILON:
                 self._unconfirmed.discard(pid)
 
-        # Whoever the view disagrees with us about is the endpoint a human just moved. If several
-        # diverge (the first tick, or two people at once) the loudest wins, so the group follows the
-        # most recent deliberate act rather than an arbitrary dict order.
+        # Whoever the view disagrees with us about is the endpoint a human just moved.
+        #
+        # If SEVERAL diverge in one window the choice is genuinely ambiguous: a 2 s poll cannot
+        # order two slider drags, so "most recent" is not knowable here. The largest divergence
+        # wins — the biggest deliberate change — which is at least deterministic and independent of
+        # dict order. It is not always the user's last act: drag A far and then B slightly, inside
+        # one tick, and A sets the target. The GUI's 5 s optimistic hold makes that visible as B
+        # snapping back. Ranking by recency would need the volume route to timestamp intent, which
+        # is a real option if this ever bites in practice.
         moved = [
             (pid, cal)
             for pid, cal in usable
@@ -271,7 +317,11 @@ class LoudnessReconciler:
             and levels[pid] is not None
             and abs(levels[pid] - self._commanded.get(pid, levels[pid])) > USER_INTENT_EPSILON
         ]
-        reference = max(moved, key=lambda item: levels[item[0]]) if moved else None
+        reference = (
+            max(moved, key=lambda item: abs(levels[item[0]] - self._commanded.get(item[0], levels[item[0]])))
+            if moved
+            else None
+        )
 
         target = self._targets.get(key)
         if reference is not None:
@@ -320,7 +370,16 @@ class LoudnessReconciler:
             if result.at_limit:
                 at_limit.add(pid)
             current = levels[pid]
-            if current == result.volume:
+            # "Already there" may only be judged from the OBSERVED level when that level is
+            # trustworthy. For an endpoint still awaiting its echo the report is stale — or, for one
+            # that never echoes, frozen at its connect-time value — and a frozen 100 would match a
+            # target of 100 and skip a command the speaker (actually sitting at 60) needs.
+            already_there = pid not in self._unconfirmed and current == result.volume
+            # "Already asked" is always safe, and it is what stops an endpoint whose echo never
+            # arrives being re-commanded every 2 s for as long as the group exists. A target change
+            # still re-sends, because the wanted value moves with it.
+            already_asked = self._commanded.get(pid) == result.volume
+            if already_there or already_asked:
                 self._commanded[pid] = result.volume
                 continue
             try:

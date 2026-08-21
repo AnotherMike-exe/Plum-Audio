@@ -154,15 +154,20 @@ class FakeRouter:
         self.fail_volume = False
 
     async def route_player(self, player_id: str, source_id: str) -> bool:
+        # Suspends, like the real thing: routing is network I/O. Without this a pending
+        # cancellation is never delivered and a whole class of teardown bug is invisible.
+        await asyncio.sleep(0)
         if self.fail_route_to is not None and source_id == self.fail_route_to:
             raise RuntimeError("nope")
         self.routes.append((player_id, source_id))
         return True
 
     async def unroute_player(self, player_id: str, source_id: str) -> None:
+        await asyncio.sleep(0)
         self.unroutes.append((player_id, source_id))
 
     async def set_volume(self, player_id: str, volume: int, muted: bool) -> None:
+        await asyncio.sleep(0)
         if self.fail_volume:
             raise RuntimeError("volume failed")
         self.volumes.append((player_id, volume, muted))
@@ -478,3 +483,108 @@ async def test_our_own_players_volume_is_still_restored(rig):
     await controller.start("spk", 40, seconds=30)
     await controller.stop()
     assert router.volumes[-1] == ("spk", 42, False)
+
+
+# -- the expiry path must complete its teardown -------------------------------
+#
+# `_expire_after` calls `_stop_locked`, so on the timeout path the watchdog is cancelling the task
+# it is itself running in. A pending self-cancellation is delivered at the next await that SUSPENDS
+# — the release/route call — and CancelledError is a BaseException, so `except Exception` lets it
+# past and every later step is skipped. That leaves the writer alive (the speaker plays noise
+# forever), the source up, the FIFO on disk, and `_state` already None so a later Stop reports
+# success and does nothing.
+
+
+@asyncio_test
+async def test_an_expired_tone_completes_its_whole_teardown(rig, tmp_path):
+    controller, engine, router, _ = rig
+    await controller.start("spk", 40, seconds=1.0)
+    await asyncio.sleep(1.4)
+
+    assert controller.status() == {"playing": False}
+    assert engine.stopped == [CAL_SOURCE_PREFIX + "spk"], "the source must be stopped"
+    assert engine.sources == {}
+    assert list(tmp_path.glob("cal-*-fifo")) == [], "the FIFO must be unlinked"
+    assert router.routes[-1] == ("spk", "airplay-1"), "the endpoint must be restored"
+    assert router.volumes[-1] == ("spk", 42, False), "the level must be restored"
+
+
+@asyncio_test
+async def test_an_expired_adopted_speaker_is_still_handed_back(rig):
+    """The worst version: a cancelled teardown leaves a third-party speaker captured by us, and
+    Music Assistant can never take it back."""
+    controller, engine, router, _ = rig
+    url = "ws://192.168.1.87:8927/sendspin"
+    router.fail_route_to = CAL_SOURCE_PREFIX + url
+    await controller.start(url, 40, url=url, seconds=1.0)
+    await asyncio.sleep(1.4)
+
+    assert engine.released == [(CAL_SOURCE_PREFIX + url, "aa:bb:cc:dd:ee:ff", url)]
+    assert engine.stopped == [CAL_SOURCE_PREFIX + url]
+
+
+@asyncio_test
+async def test_the_writer_is_dead_after_an_expiry(rig):
+    """The audible symptom: if the writer survives, the speaker keeps making noise."""
+    controller, engine, _, _ = rig
+    await controller.start("spk", 40, seconds=1.0)
+    await asyncio.sleep(1.4)
+    assert controller._writer is None or controller._writer.done()
+
+
+@asyncio_test
+async def test_an_adopted_third_party_fifo_is_unlinked(rig, tmp_path):
+    """The teardown path must use the FIFO it actually created, not one re-derived from an id that
+    adoption replaced."""
+    controller, _, router, _ = rig
+    url = "ws://192.168.1.87:8927/sendspin"
+    router.fail_route_to = CAL_SOURCE_PREFIX + url
+    await controller.start(url, 40, url=url, seconds=30)
+    assert list(tmp_path.glob("cal-*-fifo")), "a FIFO should exist while the tone runs"
+    await controller.stop()
+    assert list(tmp_path.glob("cal-*-fifo")) == []
+
+
+@asyncio_test
+async def test_a_source_that_never_opens_its_fifo_fails_the_start(rig, monkeypatch):
+    """A tone nobody can hear must not report `playing: true`. The writer's open is the only signal
+    that the audio path actually exists on the other end of the FIFO."""
+    controller, engine, _, _ = rig
+    monkeypatch.setattr(tone_mod, "WRITER_OPEN_TIMEOUT_S", 0.4)
+    # A source that creates no reader: O_WRONLY|O_NONBLOCK keeps returning ENXIO.
+    engine.start_source = lambda source_id, fifo_path: (
+        engine.sources.__setitem__(source_id, fifo_path),
+        engine.started.append(source_id),
+        os.mkfifo(fifo_path, mode=0o660) if not os.path.exists(fifo_path) else None,
+    )
+    with pytest.raises(ToneError, match="never opened its FIFO"):
+        await controller.start("spk", 40, seconds=30)
+    assert controller.status() == {"playing": False}
+    assert engine.stopped == [CAL_SOURCE_PREFIX + "spk"]
+
+
+def test_the_tone_buffer_is_synthesized_once(monkeypatch):
+    """Regenerating a deterministic buffer on every Play costs a Pi about a second of GIL each
+    time, competing with the feeder's 20 ms commit cadence."""
+    tone_mod._TONE_CACHE.clear()
+    calls = {"n": 0}
+    real = tone_mod.generate_pink
+
+    def counted(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(tone_mod, "generate_pink", counted)
+    first = tone_mod.build_tone("pink", 8000, 2)
+    second = tone_mod.build_tone("pink", 8000, 2)
+    assert calls["n"] == 1
+    assert first is second
+    tone_mod._TONE_CACHE.clear()
+
+
+def test_the_cache_keys_on_the_tone_shape(monkeypatch):
+    tone_mod._TONE_CACHE.clear()
+    sine_a = tone_mod.build_tone("sine", 8000, 2, 1000.0)
+    sine_b = tone_mod.build_tone("sine", 8000, 2, 440.0)
+    assert sine_a != sine_b, "a different frequency must not reuse the cached buffer"
+    tone_mod._TONE_CACHE.clear()

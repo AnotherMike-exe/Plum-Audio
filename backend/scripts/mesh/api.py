@@ -49,6 +49,7 @@ from collections.abc import Awaitable, Callable
 
 import cors_policy
 from aiohttp import web
+from calibration import describe as describe_calibration
 from calibration import merge_calibrations
 from calibration_tone import CalibrationToneController, ToneError
 from speaker_names import SpeakerNames
@@ -200,6 +201,12 @@ class MeshApi:
         logger.info("mesh API up on :%d", self.port)
 
     async def stop(self) -> None:
+        # Stop any calibration tone BEFORE tearing the listener down, so the endpoint is restored
+        # while the router and engine still work. Nothing else would ever do it: the tone's own
+        # watchdog is minutes long, and a SIGTERM mid-calibration — a container restart, a deploy —
+        # would otherwise leave the speaker routed to a `cal:` source that is about to die, at the
+        # tone's volume, and an adopted third-party speaker never handed back to its own server.
+        await self._tone.shutdown()
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
@@ -453,7 +460,10 @@ class MeshApi:
         """
         view = self._agg.view()
         merged = merge_calibrations([u.calibration for u in view.units])
-        return web.json_response({pid: cal.to_dict() for pid, cal in merged.items()})
+        # describe(), not to_dict(): the derived half (calibrated / curve / effectiveMaxVolume /
+        # dbRange) is what the GUI badges and summarises from. Serving the bare stored record made
+        # every cross-unit calibration render as "Not calibrated" while the matcher was driving it.
+        return web.json_response({pid: describe_calibration(pid, cal) for pid, cal in merged.items()})
 
     async def _tone_status(self, _request: web.Request) -> web.Response:
         return web.json_response(self._tone.status())
