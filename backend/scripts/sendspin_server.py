@@ -460,6 +460,14 @@ class PlumSendspinServer:
         # a peer to route audio onto. Travels in the snapshot so peers can tell "no speaker here,
         # ever" from "no speaker connected right now" — see UnitSnapshot.has_player.
         self.has_player = has_player
+        # Which unit this one is slaved to, published in the snapshot so a leader (or any third
+        # unit) can tell a room locked to it from a room that merely joined the same stream by hand.
+        # Written by FollowReconciler, which already reads the setting every tick.
+        self.follows_unit_id: str | None = None
+        # This unit's stored calibration map, republished in the snapshot so any unit can match a
+        # group whose members were calibrated from a different unit's GUI. Written by
+        # LoudnessReconciler, which already reads settings.json every tick.
+        self.calibration_export: dict = {}
         self.server: SendspinServer | None = None
         self.sources: dict[str, SourceHandle] = {}
         # What each speaker calls itself over the protocol, keyed by listener URL and persisted.
@@ -1587,6 +1595,8 @@ class PlumSendspinServer:
             # player reports itself attached to back onto a unit. Without this `follow` cannot tell
             # one of our servers from Music Assistant. None until start() has run.
             server_id=self.server_id,
+            follows_unit_id=self.follows_unit_id,
+            calibration=self.calibration_export,
         )
 
     def start_airplay_metadata(self, source_id: str, metadata_fifo: str) -> None:
@@ -2078,8 +2088,30 @@ async def main() -> None:
             peer_provider=mesh.discovery.get_peer,
             delegate=mesh.client.delegate_route,
             unroute_delegate=mesh.client.delegate_unroute,
+            # Publish the follow target into our snapshot. Follow config lives on the follower, so
+            # this is the only way a leader learns which rooms are locked to it — which is what
+            # loudness matching's default scope keys off.
+            on_master_change=lambda master: setattr(srv, "follows_unit_id", master),
         )
         follow.start()
+
+    # Loudness matching. Runs on EVERY unit with the mesh up, including a playerless one: it drives
+    # the players attached to THIS unit's own sources, which is the set `set_player_volume` can
+    # actually resolve — so an ingest-only node still levels the speakers it is feeding. It is a
+    # no-op until at least two endpoints in one group are calibrated, and it deliberately skips the
+    # endpoint currently playing a calibration tone (whose level is unrelated to the group's).
+    loudness = None
+    if mesh is not None:
+        from mesh.loudness import LoudnessReconciler  # local import: avoids an import cycle
+
+        loudness = LoudnessReconciler(
+            mesh.aggregator,
+            mesh.router,
+            local_unit_id=unit_id,
+            tone_player_provider=lambda: mesh.api.tone_player_id,
+            on_calibration_export=lambda table: setattr(srv, "calibration_export", table),
+        )
+        loudness.start()
 
     # Follow renames from Settings without a restart: the mesh snapshot reads srv.unit_name on every
     # request, so updating it is enough for the GUI and every peer's aggregated view, and the mDNS
