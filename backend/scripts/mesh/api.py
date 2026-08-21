@@ -135,7 +135,14 @@ class MeshApi:
         # The calibration tone runs here rather than on the Flask config API because only this
         # process can create a source and route a player. Its persistence half is the other side —
         # apis/calibration_api.py, which stores curves and never makes a sound.
-        self._tone = CalibrationToneController(engine, router, lambda: self._agg.view())
+        self._tone = CalibrationToneController(
+            engine,
+            router,
+            lambda: self._agg.view(),
+            # The router resolves a source through the aggregated view, which is a 2 s cache — so a
+            # tone source must be published into it before anything can be routed onto it.
+            refresh_view=self._agg.refresh,
+        )
         # Read-only here: the audio process learns these while a speaker is attached (see
         # sendspin_server.snapshot). Its own instance, so a reload picks up whatever is on disk.
         self._speaker_names = SpeakerNames()

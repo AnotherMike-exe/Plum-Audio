@@ -215,10 +215,15 @@ class CalibrationToneController:
     feeder's 20 ms commit cadence, so it is pushed to an executor thread.
     """
 
-    def __init__(self, engine, router, view_provider, *, fifo_dir: str = "/tmp") -> None:
+    def __init__(self, engine, router, view_provider, *, refresh_view=None, fifo_dir: str = "/tmp") -> None:
         self._engine = engine
         self._router = router
         self._view = view_provider
+        # The aggregated mesh view is a CACHE, rebuilt on a 2 s poll — and `Router.route_player`
+        # resolves a source through it. A source created moments ago is therefore not there yet, so
+        # routing onto a freshly-started tone fails with "no unit ingests source 'cal:...'". Measured
+        # on the rig; invisible to the unit tests, whose fake router never consults a view.
+        self._refresh_view = refresh_view
         self._fifo_dir = fifo_dir
         self._state: ToneState | None = None
         self._writer: asyncio.Task | None = None
@@ -276,6 +281,13 @@ class CalibrationToneController:
             pcm = await loop.run_in_executor(None, build_tone, tone_type, sample_rate, channels, freq)
 
             self._engine.start_source(source_id, fifo_path)
+            # Make the new source visible to the router BEFORE trying to route onto it. Without
+            # this the route fails outright: the view it resolves against is a 2 s cache that
+            # predates the source. Cheap and bounded — the local snapshot is free and peer fetches
+            # are capped and individually fault-tolerant.
+            if self._refresh_view is not None:
+                with contextlib.suppress(Exception):
+                    await self._refresh_view()
             # The writer signals when the FIFO write end is actually open. Without waiting for it, a
             # source whose feeder never opened its read end still returns `playing: true` — the
             # wizard shows a running tone, the room is silent, and the only thing that would ever

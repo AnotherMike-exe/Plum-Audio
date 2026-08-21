@@ -146,7 +146,15 @@ class FakeEngine:
 
 
 class FakeRouter:
-    def __init__(self):
+    """Resolves a source through a VIEW, as Router.route_player does.
+
+    That detail is the whole point of this fake. The real router looks the source up in the
+    aggregated mesh view, which is a 2 s cache — so a source created moments ago is not in it yet
+    and the route fails outright. A fake that simply accepted any source id hid that on the rig.
+    """
+
+    def __init__(self, view_provider=None):
+        self._view = view_provider or (lambda: None)
         self.routes: list[tuple[str, str]] = []
         self.unroutes: list[tuple[str, str]] = []
         self.volumes: list[tuple[str, int, bool]] = []
@@ -159,6 +167,11 @@ class FakeRouter:
         await asyncio.sleep(0)
         if self.fail_route_to is not None and source_id == self.fail_route_to:
             raise RuntimeError("nope")
+        view = self._view()
+        if view is not None and not any(
+            src.source_id == source_id for unit in view.units for src in unit.sources
+        ):
+            raise RuntimeError(f"no unit ingests source {source_id!r}")
         self.routes.append((player_id, source_id))
         return True
 
@@ -173,16 +186,41 @@ class FakeRouter:
         self.volumes.append((player_id, volume, muted))
 
 
-def _view(*, player_id="spk", volume=42, on_source: str | None = "airplay-1", own=True) -> MeshView:
+def _view(
+    *,
+    player_id="spk",
+    volume=42,
+    on_source: str | None = "airplay-1",
+    own=True,
+    extra_sources: list[str] | None = None,
+) -> MeshView:
     """`own=False` models a THIRD-PARTY speaker: attached, but not the unit's own player — so its
     reported volume is its frozen connect-time value, not something we may restore."""
-    sources = []
-    if on_source:
+    sources = [
+        SourceState(source_id=sid, group_id=sid, group_name=sid, streaming=False, player_ids=[])
+        for sid in (extra_sources or [])
+    ]
+    known = {src.source_id for src in sources}
+    # The home source EXISTS whether or not the player is currently on it — sources outlive
+    # membership. Modelling it any other way made a restore route fail against a source that, on a
+    # real unit, would still be sitting there.
+    if "airplay-1" not in known:
+        sources.append(
+            SourceState(
+                source_id="airplay-1",
+                group_id="g1",
+                group_name="G",
+                streaming=True,
+                player_ids=[player_id] if on_source == "airplay-1" else [],
+                active=True,
+            )
+        )
+    if on_source and on_source != "airplay-1" and on_source not in known:
         sources.append(
             SourceState(
                 source_id=on_source,
-                group_id="g1",
-                group_name="G",
+                group_id="g2",
+                group_name=on_source,
                 streaming=True,
                 player_ids=[player_id],
                 active=True,
@@ -203,10 +241,26 @@ def _view(*, player_id="spk", volume=42, on_source: str | None = "airplay-1", ow
 
 @pytest.fixture
 def rig(tmp_path):
-    engine, router = FakeEngine(), FakeRouter()
-    view_holder = {"view": _view()}
+    engine = FakeEngine()
+    view_holder: dict = {"view": _view(), "kwargs": {}, "refreshes": 0}
+    router = FakeRouter(lambda: view_holder["view"])
+
+    def rebuild():
+        """Rebuild the view from what the engine actually holds, as DataAggregator.refresh does."""
+        view_holder["view"] = _view(extra_sources=list(engine.sources), **view_holder["kwargs"])
+
+    async def refresh():
+        view_holder["refreshes"] += 1
+        rebuild()
+
+    def set_view(**kwargs):
+        """Re-point the base view; the engine's live sources are folded back in on the next refresh."""
+        view_holder["kwargs"] = kwargs
+        view_holder["view"] = _view(extra_sources=list(engine.sources), **kwargs)
+
+    view_holder["set"] = set_view
     controller = CalibrationToneController(
-        engine, router, lambda: view_holder["view"], fifo_dir=str(tmp_path)
+        engine, router, lambda: view_holder["view"], refresh_view=refresh, fifo_dir=str(tmp_path)
     )
     return controller, engine, router, view_holder
 
@@ -285,7 +339,7 @@ async def test_stopping_puts_the_endpoint_back_where_it_was(rig):
 @asyncio_test
 async def test_an_idle_endpoint_is_returned_to_idle_not_to_a_source(rig):
     controller, _, router, holder = rig
-    holder["view"] = _view(on_source=None)
+    holder["set"](on_source=None)
     await controller.start("spk", 40, seconds=30)
     await controller.stop()
     assert router.unroutes == [("spk", CAL_SOURCE_PREFIX + "spk")]
@@ -296,7 +350,7 @@ async def test_an_idle_endpoint_is_returned_to_idle_not_to_a_source(rig):
 async def test_a_previous_calibration_source_is_never_restored_onto(rig):
     """Restoring a speaker onto a dead tone source would leave it silently attached to nothing."""
     controller, _, router, holder = rig
-    holder["view"] = _view(on_source=CAL_SOURCE_PREFIX + "spk")
+    holder["set"](on_source=CAL_SOURCE_PREFIX + "spk")
     await controller.start("spk", 40, seconds=30)
     await controller.stop()
     assert router.unroutes  # treated as "was idle", not "was on the tone"
@@ -309,7 +363,7 @@ async def test_carries_the_restore_record_forward_across_a_restart(rig):
     controller, _, router, holder = rig
     await controller.start("spk", 30, seconds=30)
     # The aggregator now reports the tone's own placement and level, as it really would.
-    holder["view"] = _view(volume=30, on_source=CAL_SOURCE_PREFIX + "spk")
+    holder["set"](volume=30, on_source=CAL_SOURCE_PREFIX + "spk")
     await controller.start("spk", 60, seconds=30)
     await controller.start("spk", 85, seconds=30)
     await controller.stop()
@@ -470,7 +524,7 @@ async def test_a_third_party_volume_is_never_restored(rig):
     value, so restoring it would assert a level we never read — and for a speaker that connected at
     100 that is a loud surprise at the end of every calibration."""
     controller, _, router, holder = rig
-    holder["view"] = _view(volume=100, own=False)
+    holder["set"](volume=100, own=False)
     await controller.start("spk", 40, seconds=30)
     await controller.stop()
     assert router.volumes[-1] == ("spk", 40, False), "no restore should have been issued"
@@ -479,7 +533,7 @@ async def test_a_third_party_volume_is_never_restored(rig):
 @asyncio_test
 async def test_our_own_players_volume_is_still_restored(rig):
     controller, _, router, holder = rig
-    holder["view"] = _view(volume=42, own=True)
+    holder["set"](volume=42, own=True)
     await controller.start("spk", 40, seconds=30)
     await controller.stop()
     assert router.volumes[-1] == ("spk", 42, False)
@@ -588,3 +642,26 @@ def test_the_cache_keys_on_the_tone_shape(monkeypatch):
     sine_b = tone_mod.build_tone("sine", 8000, 2, 440.0)
     assert sine_a != sine_b, "a different frequency must not reuse the cached buffer"
     tone_mod._TONE_CACHE.clear()
+
+
+@asyncio_test
+async def test_the_new_source_is_published_before_anything_routes_onto_it(rig):
+    """Caught on the rig, not here. `Router.route_player` resolves the source through the
+    aggregated mesh view, which is a 2 s CACHE — so a source created moments earlier is not in it
+    and the route fails with "no unit ingests source 'cal:...'". The tone must publish it first."""
+    controller, _, _, holder = rig
+    await controller.start("spk", 40, seconds=30)
+    try:
+        assert holder["refreshes"] >= 1, "the view must be refreshed before routing"
+    finally:
+        await controller.stop()
+
+
+@asyncio_test
+async def test_without_the_refresh_the_route_would_fail(rig):
+    """Pins the mechanism: with the refresh suppressed, the fake router reproduces the rig error."""
+    controller, _, _, _ = rig
+    controller._refresh_view = None
+    with pytest.raises(RuntimeError, match="no unit ingests source"):
+        await controller.start("spk", 40, seconds=30)
+    assert controller.status() == {"playing": False}
