@@ -107,6 +107,17 @@ class LoudnessReconciler:
         # player_id -> the volume THIS reconciler last commanded. The view reporting anything else
         # is how a human is detected; see the module docstring.
         self._commanded: dict[str, int] = {}
+        # Endpoints we have commanded whose echo has not come back yet. They are NOT readable as
+        # user intent while in here, and that covers two cases with one rule. The benign one is
+        # lag: our command has not landed, so the reported level is stale rather than deliberate.
+        # The damaging one is an endpoint that never echoes at all — a server cannot READ a
+        # speaker's volume, only command it (docs/SPEC-CONFORMANCE.md), and only our own player
+        # echoes `client/state` because we made it. A third-party speaker reports its connect-time
+        # level forever, so the divergence never closes; without this it would read as "a human
+        # moved this" on every tick, and being frozen high it would win `max(moved)` and peg its
+        # whole group to its 100% loudness. An endpoint that does echo clears itself within a tick
+        # or two and is eligible again.
+        self._unconfirmed: set[str] = set()
         # group key -> the target dB currently held, so a membership change re-levels the joiner to
         # the group rather than re-deriving the group from whoever happens to sort first.
         self._targets: dict[str, float] = {}
@@ -243,6 +254,12 @@ class LoudnessReconciler:
 
         levels = {pid: self._observed_volume(view, pid) for pid, _ in usable}
 
+        # An echo that matches what we asked for clears the endpoint back to trusted.
+        for pid, _ in usable:
+            observed, commanded = levels[pid], self._commanded.get(pid)
+            if observed is not None and commanded is not None and abs(observed - commanded) <= USER_INTENT_EPSILON:
+                self._unconfirmed.discard(pid)
+
         # Whoever the view disagrees with us about is the endpoint a human just moved. If several
         # diverge (the first tick, or two people at once) the loudest wins, so the group follows the
         # most recent deliberate act rather than an arbitrary dict order.
@@ -250,6 +267,7 @@ class LoudnessReconciler:
             (pid, cal)
             for pid, cal in usable
             if pid != tone_player
+            and pid not in self._unconfirmed
             and levels[pid] is not None
             and abs(levels[pid] - self._commanded.get(pid, levels[pid])) > USER_INTENT_EPSILON
         ]
@@ -268,6 +286,7 @@ class LoudnessReconciler:
                 return
             self._targets[key] = target
             self._commanded[ref_id] = ref_volume
+            self._unconfirmed.discard(ref_id)  # agreeing with an observation is not commanding it
             logger.info(
                 "loudness: %s set the target to %.1f dB (%d%%); re-levelling %d endpoint(s)",
                 ref_id,
@@ -310,6 +329,7 @@ class LoudnessReconciler:
                 logger.warning("loudness: could not set %s to %d%%: %s", pid, result.volume, exc)
                 continue
             self._commanded[pid] = result.volume
+            self._unconfirmed.add(pid)
 
     @staticmethod
     def _observed_volume(view: MeshView, player_id: str) -> int | None:

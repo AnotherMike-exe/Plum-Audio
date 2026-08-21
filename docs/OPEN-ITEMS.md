@@ -303,3 +303,22 @@
    note itself prescribes OPEN-ITEMS / HARD-WON-LESSONS / PHASE-HISTORY as the destinations — not to
    drop these. Not attempted here because deciding what stops being a rule is a judgement call about
    material this change did not touch.
+
+21. **`reclaim_remote_player` can stage a pairing PSK against a CLEARTEXT third-party speaker.**
+    Pre-existing; nothing to do with calibration, but found while scoping it.
+    `sendspin_server.py:1278` calls `stage_shared_psk(player_id)` justified by the comment at
+    `:1276-1277`: *"`player_id` came from a peer snapshot, so this only ever names a Plum player."*
+    **The premise is false.** `snapshot()` (`:1547-1553`) filters on anchor prefix, connectedness and
+    player role family — there is **no ownership test** — so an adopted foreign speaker sits in a
+    peer's `players` list exactly like a Plum player. `stage_shared_psk` (`:846-865`) checks only for
+    an existing record or existing staging; it has no cleartext guard. CLAUDE.md and
+    `docs/SENDSPIN-PAIRING.md` both state that a pairing handshake against a cleartext client is
+    aborted by the library and takes that speaker offline (signature: the NEXT adopt succeeds).
+    Reachable today by cross-routing an adopted ESP32 between two units.
+    Not fixed here because the obvious guard is not actually available: staging happens deliberately
+    BEFORE the dial, so there is no connected client whose `connection_security` could be read. Real
+    options, none free — (a) carry a `security`/cleartext flag through the peer snapshot and check it
+    (`PlayerState.security` is already published and `None` means cleartext, so this may be cheap);
+    (b) have the reclaim consult `speaker_names`/adoption records to tell an adopted foreign id from
+    a Plum peer id; (c) restrict the reclaim path to ids that resolve to a unit's `local_player`.
+    Option (a) looks right and is worth a rig test on the `.7` pair.
