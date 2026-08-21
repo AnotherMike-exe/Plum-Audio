@@ -179,6 +179,17 @@ class UnitSnapshot:
     # possible again; `MeshView.unit_by_server_id` is the lookup. None for a peer that has not
     # started its server yet.
     server_id: str | None = None
+    # The unit this one is slaved to (`autoSwitch.slave.masterUnitId`), or None if it follows
+    # nobody. Published because follow config lives on the FOLLOWER, so without it no other unit can
+    # tell a room that is locked to this one from a room that merely joined the same stream by hand.
+    # Loudness matching's default scope is exactly that distinction — see mesh/loudness.py. Cheap to
+    # carry (one string) and read-only for every consumer but the follower itself.
+    follows_unit_id: str | None = None
+    # This unit's stored `audio.calibration` map, verbatim. Published because the GUI can only write
+    # calibration to the unit serving the page, while matching runs on whichever unit owns the
+    # GROUP — see calibration.merge_calibrations. Small (a few hundred bytes per endpoint) and
+    # read-only for every consumer but the owning unit.
+    calibration: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -191,6 +202,8 @@ class UnitSnapshot:
             "has_player": self.has_player,
             "hostname": self.hostname,
             "server_id": self.server_id,
+            "follows_unit_id": self.follows_unit_id,
+            "calibration": self.calibration,
         }
 
     @classmethod
@@ -205,6 +218,8 @@ class UnitSnapshot:
             has_player=bool(d.get("has_player", True)),
             hostname=d.get("hostname"),
             server_id=d.get("server_id"),
+            follows_unit_id=d.get("follows_unit_id"),
+            calibration=d.get("calibration") or {},
         )
 
 

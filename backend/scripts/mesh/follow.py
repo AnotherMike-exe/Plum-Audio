@@ -54,6 +54,7 @@ import contextlib
 import json
 import logging
 import os
+from collections.abc import Callable
 
 from mesh.aggregator import DataAggregator
 from mesh.model import MeshView
@@ -77,6 +78,7 @@ class FollowReconciler:
         unroute_delegate: RemoteDelegate | None = None,
         settings_file: str | None = None,
         poll_interval: float = POLL_INTERVAL_S,
+        on_master_change: Callable[[str | None], None] | None = None,
     ) -> None:
         self._aggregator = aggregator
         self._router = router
@@ -87,6 +89,13 @@ class FollowReconciler:
         self._unroute_delegate = unroute_delegate
         self.settings_file = settings_file or os.environ.get("PLUM_SETTINGS_FILE", "/data/settings.json")
         self.poll_interval = poll_interval
+        # Published into the unit snapshot as `follows_unit_id`. Follow config lives on the
+        # FOLLOWER, so a leader — or any third unit — otherwise cannot tell a room locked to it from
+        # a room that merely joined the same stream by hand. Loudness matching's default scope turns
+        # on exactly that distinction. Reported from here because this is already the one place that
+        # reads the setting every tick, so it stays live without a second file poll.
+        self._on_master_change = on_master_change
+        self._reported_master: str | None = None
         # (owning_unit_id, source_id) this reconciler itself last routed to.
         self._last_auto_target: tuple[str, str] | None = None
         # Local sources that were active on the previous tick, so localActivity fires only on a
@@ -133,6 +142,14 @@ class FollowReconciler:
         except (OSError, ValueError):
             return None
 
+    def _report_master(self, master_unit_id: str | None) -> None:
+        """Publish the follow target for the snapshot, but only when it actually changes."""
+        if master_unit_id == self._reported_master:
+            return
+        self._reported_master = master_unit_id
+        if self._on_master_change is not None:
+            self._on_master_change(master_unit_id)
+
     async def tick(self) -> None:
         """One reconcile cycle. Public (not `_tick`) so unit tests can drive it directly."""
         if self._local_player_id is None:
@@ -177,8 +194,11 @@ class FollowReconciler:
         slave = auto.get("slave") or {}
         master_unit_id = slave.get("masterUnitId")
         if not (slave.get("enabled") and master_unit_id):
+            self._report_master(None)
             self._overridden = False  # follow off: nothing to override
             return
+
+        self._report_master(master_unit_id)
 
         leader_target = self._leader_status(view, master_unit_id)
 
