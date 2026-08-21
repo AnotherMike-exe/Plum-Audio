@@ -20,6 +20,10 @@ Endpoints (parity with the old /api/federation/* surface, so the GUI ports with 
   POST /api/mesh/source-volume     {source_id, volume?, muted?}    the SENDING DEVICE's own volume
   POST /api/mesh/source            {source_id, fifo?}              start a local source (a group)
   POST /api/mesh/source/stop       {source_id}                     stop a local source
+  GET  /api/mesh/calibration                                       every unit's curves, merged
+  GET  /api/mesh/calibration/tone                                  is a calibration tone playing?
+  POST /api/mesh/calibration/tone  {player_id, volume, type?, ...} play the tone from ONE endpoint
+  POST /api/mesh/calibration/tone/stop                             stop it and restore the endpoint
   GET  /api/mesh/pairing           [?client_id]                    what pairing was attempted, and how it went
   POST /api/mesh/pair              {client_id, method, token?}     begin a pairing attempt
   POST /api/mesh/pair/pin          {client_id, pin}                answer a PIN prompt (409 if none is waiting)
@@ -45,6 +49,8 @@ from collections.abc import Awaitable, Callable
 
 import cors_policy
 from aiohttp import web
+from calibration import merge_calibrations
+from calibration_tone import CalibrationToneController, ToneError
 from speaker_names import SpeakerNames
 from sync_engine.base import SyncEngine
 
@@ -125,6 +131,10 @@ class MeshApi:
         self._agg = aggregator
         self._router = router
         self._neighbourhood = neighbourhood
+        # The calibration tone runs here rather than on the Flask config API because only this
+        # process can create a source and route a player. Its persistence half is the other side —
+        # apis/calibration_api.py, which stores curves and never makes a sound.
+        self._tone = CalibrationToneController(engine, router, lambda: self._agg.view())
         # Read-only here: the audio process learns these while a speaker is attached (see
         # sendspin_server.snapshot). Its own instance, so a reload picks up whatever is on disk.
         self._speaker_names = SpeakerNames()
@@ -169,6 +179,11 @@ class MeshApi:
                 web.post("/api/mesh/source-volume", self._source_volume),
                 web.post("/api/mesh/source", self._source_start),
                 web.post("/api/mesh/source/stop", self._source_stop),
+                web.get("/api/mesh/calibration", self._calibration_merged),
+                web.get("/api/mesh/calibration/tone", self._tone_status),
+                web.post("/api/mesh/calibration/tone", self._tone_start),
+                web.post("/api/mesh/calibration/tone/volume", self._tone_volume),
+                web.post("/api/mesh/calibration/tone/stop", self._tone_stop),
                 web.get("/api/mesh/pairing", self._pairing_state),
                 web.post("/api/mesh/pair", self._pair),
                 web.post("/api/mesh/pair/pin", self._pair_pin),
@@ -407,6 +422,68 @@ class MeshApi:
             return web.json_response({"error": "source_id required"}, status=400)
         await self._engine.stop_source(source_id)
         return web.json_response({"ok": True, "source_id": source_id})
+
+    # -- calibration tone ----------------------------------------------------
+    #
+    # Play a known signal from ONE endpoint so the user can read its SPL from the listening
+    # position. The tone is a real transient source routed to that player alone, so it travels the
+    # same path the music does and the endpoint's own volume actually applies to it — which is the
+    # whole measurement. See calibration_tone.py for why a local ALSA write cannot do this.
+
+    @property
+    def tone_player_id(self) -> str | None:
+        """The endpoint currently playing a calibration tone, if any.
+
+        Read by LoudnessReconciler: a tone drives one endpoint to a level that has nothing to do
+        with its group's, and reading that as a human moving a slider would re-level the whole house
+        in the middle of a measurement.
+        """
+        return self._tone.active_player_id
+
+    async def _calibration_merged(self, _request: web.Request) -> web.Response:
+        """Every unit's calibration records, merged newest-wins.
+
+        The GUI WRITES calibration same-origin to this unit's :5002 (a peer's config API is
+        deliberately not reachable cross-origin), but it must SHOW records made from any unit's
+        page. Reading the merged map here is what makes the tab look the same wherever it is opened.
+        """
+        view = self._agg.view()
+        merged = merge_calibrations([u.calibration for u in view.units])
+        return web.json_response({pid: cal.to_dict() for pid, cal in merged.items()})
+
+    async def _tone_status(self, _request: web.Request) -> web.Response:
+        return web.json_response(self._tone.status())
+
+    async def _tone_start(self, request: web.Request) -> web.Response:
+        body = await self._json(request)
+        player_id = body.get("player_id")
+        if not player_id or "volume" not in body:
+            return web.json_response({"error": "player_id and volume required"}, status=400)
+        try:
+            state = await self._tone.start(
+                player_id,
+                int(body["volume"]),
+                tone_type=body.get("type") or "pink",
+                seconds=float(body.get("seconds") or 120.0),
+                freq=float(body.get("freq") or 1000.0),
+            )
+        except (ToneError, RouteError, KeyError, ValueError) as e:
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response(state)
+
+    async def _tone_volume(self, request: web.Request) -> web.Response:
+        """Re-level a running tone without restarting it, so the noise does not gap between steps."""
+        body = await self._json(request)
+        if "volume" not in body:
+            return web.json_response({"error": "volume required"}, status=400)
+        try:
+            state = await self._tone.set_volume(int(body["volume"]))
+        except (ToneError, RouteError, KeyError, ValueError) as e:
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response(state)
+
+    async def _tone_stop(self, _request: web.Request) -> web.Response:
+        return web.json_response(await self._tone.stop())
 
     # -- pairing -------------------------------------------------------------
     #
