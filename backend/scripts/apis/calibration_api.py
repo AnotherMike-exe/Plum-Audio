@@ -36,10 +36,6 @@ from settings_api import SettingsManager  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-# The low anchor for the reported dB range. NOT 0: volume 0 is silence, and the model's floor would
-# report a finite loudness for it, which the predecessor printed to users as the bottom of the range.
-RANGE_LOW_VOLUME = 10.0
-
 # Bounds on what a user may type. A phone SPL meter reads roughly 30-120 dB; the wider band accepts
 # meters reporting dBFS-style negatives without accepting a typo of several orders of magnitude.
 MIN_MEASURED_DB = -60.0
@@ -161,36 +157,12 @@ def _parse_policy(body: dict) -> cal_model.MatchPolicy:
 
 
 def _describe(player_id: str, cal: cal_model.EndpointCalibration) -> dict[str, Any]:
-    """The stored record plus everything derived from it, so the GUI never refits the curve."""
-    payload: dict[str, Any] = {"playerId": player_id, **cal.to_dict()}
-    curve = cal.curve()
-    payload["calibrated"] = curve is not None
-    if curve is None:
-        # Distinguish "no measurements yet" from "measurements that do not describe a speaker" —
-        # the second is a user error the wizard must explain, not a blank slate.
-        payload["curve"] = None
-        payload["fitRejected"] = len(cal.samples) >= cal_model.MIN_SAMPLES
-        payload["effectiveMaxVolume"] = cal_model.effective_max_volume(cal)
-        payload["dbRange"] = None
-        return payload
+    """Delegates to calibration.describe so this surface and the mesh's merged view agree.
 
-    ceiling = cal_model.effective_max_volume(cal)
-    payload["curve"] = {
-        "a": curve.a,
-        "b": curve.b,
-        "n": curve.n,
-        "rmsError": curve.rms_error,
-        "suspect": curve.suspect,
-    }
-    payload["fitRejected"] = False
-    payload["effectiveMaxVolume"] = ceiling
-    payload["dbRange"] = {
-        "lowVolume": RANGE_LOW_VOLUME,
-        "lowDb": cal_model.predict_db(curve, RANGE_LOW_VOLUME),
-        "highVolume": ceiling,
-        "highDb": cal_model.predict_db(curve, ceiling),
-    }
-    return payload
+    They must: a record served without its derived half renders as "Not calibrated" in the GUI
+    while the matcher is driving that very speaker.
+    """
+    return cal_model.describe(player_id, cal)
 
 
 def _audio_section(settings: dict[str, Any]) -> dict[str, Any]:

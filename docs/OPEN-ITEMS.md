@@ -324,3 +324,19 @@
     (b) have the reclaim consult `speaker_names`/adoption records to tell an adopted foreign id from
     a Plum peer id; (c) restrict the reclaim path to ids that resolve to a unit's `local_player`.
     Option (a) looks right and is worth a rig test on the `.7` pair.
+
+22. **Cross-unit calibration merge trusts wall clocks, and a Pi has no RTC.**
+    `calibration.merge_calibrations` resolves duplicate records for one endpoint by newest
+    `lastCalibrated`, stamped with `datetime.now(UTC)` on whichever unit served the GUI page. If a
+    unit has not completed NTP sync it stamps 1970 and its records always lose; a unit whose clock
+    has jumped ahead always wins and pins a stale curve mesh-wide. The visible symptom is the nasty
+    one: re-calibrating from the affected unit's page **appears to succeed** — the API returns the
+    new record and the local tab shows it — while matching keeps using the old curve, because every
+    unit's merge prefers the peer's future-dated copy. Ties are broken by source ordering, stable
+    but arbitrary.
+    No code can detect this locally. Options if it ever bites: (a) a per-unit monotonic revision
+    counter carried beside the timestamp, incremented on every write, compared first; (b) prefer the
+    record from the unit that OWNS the endpoint; (c) leave it and check `timedatectl` during
+    commissioning. (a) is the honest fix and is cheap — one integer in the record — but it needs a
+    migration for records already written. Deferred until the rig says it matters.
+    Check first if a calibration ever seems not to take: `timedatectl` on every unit.

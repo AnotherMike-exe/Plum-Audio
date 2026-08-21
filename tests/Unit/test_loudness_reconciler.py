@@ -544,3 +544,142 @@ async def test_lag_between_command_and_echo_is_not_read_as_a_human(rig):
     rec._aggregator = FakeAggregator(build_view({"living": 80, "kitchen": 40}))
     await rec.tick()
     assert router.last_for("living") is None
+
+
+# -- stale per-player state ---------------------------------------------------
+
+
+@asyncio_test
+async def test_an_endpoint_that_leaves_and_rejoins_does_not_hijack_the_group(rig):
+    """`_targets` was pruned when a group dissolved but `_commanded` was not. So an endpoint that
+    left, was turned up by hand while solo, and rejoined looked like "a human just moved this" the
+    instant it came back — and dragged the whole group up to itself."""
+    write, make = rig
+    write({"living": {"samples": samples(40.0)}, "kitchen": {"samples": samples(40.0)}}, mode="stream")
+    rec, router = make(build_view({"living": 40, "kitchen": 40}))
+    await rec.tick()  # seed: both remembered at 40
+
+    # The kitchen leaves the group entirely.
+    rec._aggregator = FakeAggregator(build_view({"living": 40}))
+    await rec.tick()
+    assert "kitchen" not in rec._commanded, "per-player memory must be dropped with the group"
+
+    # It is turned up by hand while solo, then rejoins.
+    router.calls.clear()
+    rec._aggregator = FakeAggregator(build_view({"living": 40, "kitchen": 90}))
+    await rec.tick()
+    assert router.last_for("living") is None, "the joiner must not re-derive the group's target"
+
+
+@asyncio_test
+async def test_a_groups_target_survives_a_member_leaving(rig):
+    """The group key must not churn with membership: it is keyed on the partition label, not on a
+    member id, so toning one endpoint does not make the rest forget their level."""
+    write, make = rig
+    write(
+        {
+            "living": {"samples": samples(40.0)},
+            "kitchen": {"samples": samples(40.0)},
+            "office": {"samples": samples(40.0)},
+        },
+        mode="stream",
+    )
+    rec, _ = make(build_view({"living": 40, "kitchen": 40, "office": 40}))
+    await rec.tick()
+    before = dict(rec.status()["targets"])
+    assert before
+
+    # The office is pulled out (as a calibration tone would do); the remaining group keeps its key.
+    rec._aggregator = FakeAggregator(build_view({"living": 40, "kitchen": 40}))
+    await rec.tick()
+    assert list(rec.status()["targets"]) == list(before)
+
+
+# -- no unbounded re-issue ----------------------------------------------------
+
+
+@asyncio_test
+async def test_a_level_already_asked_for_is_not_asked_for_again(rig):
+    """An endpoint whose echo never arrives would otherwise be commanded every 2 s for as long as
+    the group existed — unbounded traffic to a speaker that is already where we want it."""
+    write, make = rig
+    write({"living": {"samples": samples(40.0)}, "esp32": {"samples": samples(34.0)}}, mode="stream")
+    rec, router = make(build_frozen_view(40))
+    await rec.tick()
+    rec._aggregator = FakeAggregator(build_frozen_view(40))
+    await rec.tick()
+    issued = len([c for c in router.calls if c[0] == "esp32"])
+    assert issued >= 1
+
+    for _ in range(4):
+        rec._aggregator = FakeAggregator(build_frozen_view(40))
+        await rec.tick()
+    assert len([c for c in router.calls if c[0] == "esp32"]) == issued, "must not re-issue"
+
+
+@asyncio_test
+async def test_a_target_change_still_re_sends(rig):
+    """The suppression must not stick: a new target means a new wanted level."""
+    write, make = rig
+    write({"living": {"samples": samples(40.0)}, "esp32": {"samples": samples(34.0)}}, mode="stream")
+    rec, router = make(build_frozen_view(30))
+    await rec.tick()
+    rec._aggregator = FakeAggregator(build_frozen_view(30))
+    await rec.tick()
+    first = router.last_for("esp32")
+
+    # 45 rather than something that resolves to the frozen 100 — that would let an "already there"
+    # check pass against a report we do not trust, which is a separate bug this must not mask.
+    rec._aggregator = FakeAggregator(build_frozen_view(45))
+    await rec.tick()
+    assert router.last_for("esp32") != first
+
+
+# -- settings are not re-parsed every tick ------------------------------------
+
+
+@asyncio_test
+async def test_settings_are_only_re_read_when_they_change(rig, tmp_path):
+    """This runs on the audio event loop, so an avoidable parse competes with the feeder's 20 ms
+    commit cadence on a busy SD card."""
+    write, make = rig
+    write(CALS, mode="stream")
+    rec, _ = make(build_view({"living": 40, "kitchen": 40}))
+
+    reads = {"n": 0}
+    real_open = open
+
+    def counting_open(path, *a, **k):
+        if str(path) == rec.settings_file:
+            reads["n"] += 1
+        return real_open(path, *a, **k)
+
+    import builtins
+
+    builtins.open = counting_open
+    try:
+        await rec.tick()
+        await rec.tick()
+        await rec.tick()
+    finally:
+        builtins.open = real_open
+    assert reads["n"] == 1
+
+
+@asyncio_test
+async def test_a_frozen_report_never_counts_as_already_there(rig):
+    """An endpoint whose echo never arrives reports its connect-time level forever. If the target
+    happens to resolve to that same number, comparing against the report would skip a command the
+    speaker actually needs — it is sitting wherever we last put it, not where it claims."""
+    write, make = rig
+    write({"living": {"samples": samples(40.0)}, "esp32": {"samples": samples(40.0)}}, mode="stream")
+    rec, router = make(build_frozen_view(30, frozen_at=100))
+    await rec.tick()
+    rec._aggregator = FakeAggregator(build_frozen_view(30, frozen_at=100))
+    await rec.tick()
+    assert router.last_for("esp32") == 30  # driven down to match the living room
+
+    # Now the target resolves to exactly the value the esp32 has been claiming all along.
+    rec._aggregator = FakeAggregator(build_frozen_view(100, frozen_at=100))
+    await rec.tick()
+    assert router.last_for("esp32") == 100, "must command it, not trust the frozen report"
