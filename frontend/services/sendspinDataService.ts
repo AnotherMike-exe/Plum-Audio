@@ -23,6 +23,8 @@ const POLL_INTERVAL_MS = 3000;
 const VOLUME_HOLD_MS = 5000;
 // Synthetic stream id for a foreign-server session our player renders (see snapshot()).
 export const FOREIGN_PREFIX = 'foreign::';
+// Source-id namespace for a live calibration tone (backend: calibration_tone.CAL_SOURCE_PREFIX).
+export const CALIBRATION_SOURCE_PREFIX = 'cal:';
 // Where the learned speaker names live (see rememberPlayerNames). Survives a reload so a speaker
 // that is idle when the page opens still reads the way it does when it is playing.
 const NAME_MEMO_KEY = 'plum.speakerNames';
@@ -192,6 +194,12 @@ export function mapViewToModel(
       hasPlayer: unit.has_player !== false,
     });
     for (const src of unit.sources) {
+      // A calibration tone is a real, transient source — it has to be, so the tone travels the same
+      // path the music does and the endpoint's own gain applies to it. But it is machinery, not
+      // something to route to, so it never reaches the GUI's stream lists or pickers. It stays
+      // visible on the wire deliberately: Router.route_player resolves a source through the mesh
+      // view, and hiding it there would make a peer's speaker impossible to tone.
+      if (src.source_id.startsWith(CALIBRATION_SOURCE_PREFIX)) continue;
       const sid = streamId(unit.unit_id, src.source_id);
       groupToStream.set(src.group_id, sid);
       const np = npByGroup.get(src.group_id);
