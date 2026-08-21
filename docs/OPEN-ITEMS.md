@@ -350,3 +350,32 @@
     commissioning. (a) is the honest fix and is cheap — one integer in the record — but it needs a
     migration for records already written. Deferred until the rig says it matters.
     Check first if a calibration ever seems not to take: `timedatectl` on every unit.
+
+23. **`.7.122`'s own player can wedge into "connected but undialable" under sustained mixed churn.**
+    Observed twice on 2026-08-21 while running the integration suite repeatedly back-to-back. The
+    signature is precise: `sendspin_player.log` shows `stream_end -> idle` and then **never** the
+    `detached from server` line (nor the aiohttp access-log entry that closes the websocket) that a
+    healthy release always emits. From then on every `reclaim of remote player ... timed out`, the
+    unit's `players` list is empty while the player's own self-report still says `attached: true`,
+    and only `docker restart` clears it. The player PROCESS stays RUNNING throughout — supervisord
+    never restarts it — so it presents as a speaker that has silently stopped existing.
+    **Not attributed.** Isolation runs after a clean restart did NOT reproduce it: roam-only 5/5
+    clean, calibration-tone-only 4 x 19 clean with a correct `detached from server` every time, and
+    `.7.204`'s player never wedged at all. It appears only under mixed churn across several suites.
+    Nothing in this work touches `sendspin_player.py`. Adjacent known failure modes are in
+    HARD-WON-LESSONS (the immortal dialer; a client holds exactly ONE websocket), and this looks like
+    the same family: a release where one side let go and the other did not.
+    Next step when someone has the rig: reproduce with the suite in a loop, and capture the player
+    side with debug logging around `_on_stream_end` / the detach path to see which half is missed.
+
+24. **`t2_endpoint_crud.sh` fails its first assertion when run straight after `t2_source_lifecycle.sh`.**
+    Pre-existing and unrelated to calibration. Standalone it is 5/5 every time; in the suite it
+    reports "add did not return an endpoint id", i.e. the POST to the config API did not come back
+    as parseable JSON within the 20 s curl timeout. Driving the identical request by hand while the
+    suite was failing returned a correct endpoint in well under a second, so the API is not broken —
+    something about the preceding test's teardown (a backgrounded `dd` feed killed with `pkill`, the
+    source going EOF/idle, the source manager then reconciling) makes that one write slow or drop.
+    Deliberately NOT fixed with a retry: a retry would hide whichever of those it is, and the
+    interesting question is whether the config API genuinely stalls while a source manager
+    reconciles — which would matter to the GUI too, not just to a test.
+

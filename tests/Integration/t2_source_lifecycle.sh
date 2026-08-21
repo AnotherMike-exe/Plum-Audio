@@ -13,7 +13,11 @@ SOURCE="${2:-}"
 
 echo "== Tier 2: source active/idle lifecycle (unit=$UNIT) =="
 
-[[ -z "$SOURCE" ]] && SOURCE="$(ssh_json "$UNIT" /api/mesh/snapshot 'd["sources"][0]["source_id"] if d["sources"] else ""')"
+# POLLED, not read once. Run after another suite, a unit can still be unwinding that suite's
+# teardown and answer a snapshot request slowly enough to come back empty — which aborted this test
+# with "unit has no source" against a unit that has five.
+first_source() { ssh_json "$UNIT" /api/mesh/snapshot 'd["sources"][0]["source_id"] if d["sources"] else ""'; }
+[[ -z "$SOURCE" ]] && SOURCE="$(wait_for_nonempty 30 first_source)"
 [[ -n "$SOURCE" ]] || { _no "unit has no source"; finish; exit; }
 FIFO="/tmp/${SOURCE}-fifo"
 echo "  source=$SOURCE fifo=$FIFO"
