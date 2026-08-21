@@ -220,7 +220,28 @@ The *reasoning* behind these, and the failures that produced them, is in
   *Source volume* is the level on the **sending** device (the phone's slider, Spotify Connect); the
   spec has no such concept, so it rides `POST /api/mesh/source-volume` and is driven per source. It
   stacks with the endpoint levels; never conflate them in the GUI. The main card's slider is **this
-  unit's own endpoint**, not the group.
+  unit's own endpoint**, not the group. **Loudness matching is the one sanctioned per-client fan-out**
+  — a measured per-endpoint correction the protocol cannot express as one group level; it is
+  confined to calibrated, in-scope groups. `docs/VOLUME-CALIBRATION.md`.
+- **A calibration tone must travel the ORDINARY audio path, and a bad curve must never reach a
+  speaker.** The tone is a transient source (`cal:<player_id>`) with the target player alone in its
+  group, precisely so the endpoint's own gain applies to it — that is the quantity being measured.
+  Plum-Snapcast wrote it to local ALSA with `sox`, which bypassed the volume stage, so every reading
+  was identical, the slope was 0 and the inverse was `NaN`; `audio_devices.test_device` cannot
+  substitute because it refuses the card the player already holds. The fit is
+  `dB = a*log10(v) + b` (**log space** — percent-linear is physically wrong and diverges near
+  silence), and a flat, inverted or implausible fit is REJECTED rather than stored: the failure mode
+  of a wrong curve is a real speaker moving on its own. The `cal:` source stays visible in the
+  snapshot — `Router.route_player` resolves sources through the view — and is filtered in the GUI.
+- **Calibration is read MERGED and written LOCAL.** A record can only be written to the unit serving
+  the page (a peer's :5002 is deliberately not reachable cross-origin), but matching runs on
+  whichever unit owns the GROUP. Each unit publishes its map in `UnitSnapshot.calibration` and every
+  unit merges newest-wins. Skip it and *which unit's page you opened* silently decides whether
+  matching works. Same reason `UnitSnapshot.follows_unit_id` exists: follow config lives on the
+  FOLLOWER, so nothing else can tell a locked room from one that joined by hand.
+- **Anything keyed by id must write through `SettingsManager.mutate`, not `update_settings`.** The
+  latter is a blind patch; a get-then-post on a map lets two browsers each read it and the second
+  drop the first — with a bumped version, so no poller ever reconciles the loss.
 - **A player MUST echo back both its level and the output it actually opened** into
   `/data/player_state.json` — not `settings.json`, which a different process owns. `set_volume()`
   only *sends*; the server's view moves solely on `client/state`, of which the library sends exactly

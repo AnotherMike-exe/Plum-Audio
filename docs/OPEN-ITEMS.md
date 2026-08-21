@@ -282,3 +282,24 @@
     larger, already-staged proposal about *players* staying attached to a dead source and
     auto-resuming — not implemented, not part of this fix.
 
+19. **Volume calibration and loudness matching are NOT hardware-validated.** The whole slice
+   (curve model, tone, matcher, GUI) is implemented and unit-tested — 131 backend tests, 17 frontend
+   — but nothing has been on the rig. `docs/VOLUME-CALIBRATION.md` carries a numbered rig checklist;
+   item 2 is the one that matters most, because it is the predecessor's fatal defect: **confirm the
+   endpoint's own volume actually changes the tone's measured SPL.** If 35% and 85% read the same,
+   the tone is not passing through the gain stage and nothing downstream can be trusted. Known
+   soft spots, all unproven either way:
+   - The FIFO writer opens non-blocking and polls for the feeder's read end (5 s deadline). Fine in
+     tests; untested against a real `SourceFeeder` under load.
+   - The matcher's ~2 s settle after a slider release may feel laggy on a real drag. The GUI's
+     5 s optimistic `VOLUME_HOLD_MS` should mask it, but that pairing has not been watched.
+   - Pink-noise synthesis is ~0.1 s on this workstation; a Pi will be several times slower. It runs
+     in an executor, but the first Play may still feel sluggish.
+   - `sets` scope has a GUI editor but no rig test.
+   - Tone-then-restore has never raced a real roam or a follow tick.
+20. **`docs/CLAUDE.md` is 354 lines against its own ~280-line budget.** It was already 333
+   before the calibration rules landed. The three new bullets each meet the file's own bar ("an agent
+   would break something without it"), so the fix is to move OTHER material out — the maintenance
+   note itself prescribes OPEN-ITEMS / HARD-WON-LESSONS / PHASE-HISTORY as the destinations — not to
+   drop these. Not attempted here because deciding what stops being a rule is a judgement call about
+   material this change did not touch.
