@@ -379,7 +379,19 @@
     interesting question is whether the config API genuinely stalls while a source manager
     reconciles — which would matter to the GUI too, not just to a test.
 
-25. **Two units set to follow EACH OTHER oscillate, and nothing detects it.**
+25. ~~**Two units set to follow EACH OTHER oscillate, and nothing detects it.**~~ — **FIXED
+    2026-08-22**, in two layers. `FollowReconciler` walks `follows_unit_id` from its configured
+    master; if the chain returns to itself the config closes a cycle, and the member with the LOWEST
+    unit id stands down — deterministic, so every unit computes the same answer from the same
+    snapshot with no coordination and exactly one yields. It publishes `follows_unit_id = None`
+    while standing down, which is what dissolves the cycle for the others. A state-dependent rule
+    ("whoever is playing wins") was rejected: leadership would swap as playback moved, which is the
+    oscillation this exists to stop. Handles chains (A->B->C->A), ignores cycles it is not part of,
+    and logs once per transition naming both ends. `PlaybackTab` additionally refuses to offer a
+    master that would close a loop, so the safety net is only reached by configurations made outside
+    the GUI. Eight tests; four fail if the guard is removed. Original report below.
+
+    
     Found on 2026-08-21 with `.7.122` configured (by hand, in the GUI) to follow `.7.204` while
     `t3_autofollow.sh` configured `.7.204` to follow `.7.122`. Each unit's FollowReconciler then
     routes its own player onto the other's stream, forever:
@@ -396,7 +408,11 @@
     IT, and refuse — or the GUI can refuse to offer a master that would close a loop. Not attempted
     here because picking WHICH end yields is a product decision, not a mechanical one.
 
-26. **`t3_autofollow.sh` does not defend against a pre-existing follow configuration.**
+26. ~~**`t3_autofollow.sh` does not defend against a pre-existing follow configuration.**~~ —
+    **FIXED 2026-08-22**: it now captures BOTH units' `autoSwitch` on entry, clears the leader's
+    slave setting for the duration, and restores both verbatim in a defer. Original report below.
+
+    
     It sets B to follow A and asserts the result, but never clears an existing A-follows-B, so it
     fails against a rig someone has configured by hand — which is how #25 was found. It should
     record and clear both units' `autoSwitch.slave` on entry and restore them in a `defer`, the way
