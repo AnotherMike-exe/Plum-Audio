@@ -839,3 +839,35 @@ async def test_an_intent_arriving_mid_cycle_is_not_dropped(rig):
     # 90% on living means kitchen (6 dB less efficient) is driven to its ceiling.
     assert router.last_for("kitchen") == 100
     await rec.stop()
+
+
+@asyncio_test
+async def test_a_stale_view_does_not_bounce_the_group_backwards(rig):
+    """The rig's actual "jump". After a stated volume, the view keeps reporting the PREVIOUS level
+    for a poll or two. If that endpoint stays trusted, the next tick reads the old number as a fresh
+    human action and re-derives the target backwards — the follower jumps forward, bounces back, and
+    jumps forward again, two seconds apart."""
+    write, make = rig
+    write(CALS, mode="stream")
+    rec, router = make(build_view({"living": 20, "kitchen": 40}))
+    await rec.tick()
+    await rec.tick()
+
+    rec.note_user_volume("living", 65)
+    await rec.tick()
+    after_intent = router.last_for("kitchen")
+    assert after_intent is not None
+    router.calls.clear()
+
+    # A poll lands before the echo: the view still says 20.
+    rec._aggregator = FakeAggregator(build_view({"living": 20, "kitchen": after_intent}))
+    await rec.tick()
+    assert router.calls == [], "a stale report must not re-derive the target"
+
+    # The echo lands; the endpoint is trusted again and a real move is honoured once more.
+    rec._aggregator = FakeAggregator(build_view({"living": 65, "kitchen": after_intent}))
+    await rec.tick()
+    assert "living" not in rec._unconfirmed
+    rec._aggregator = FakeAggregator(build_view({"living": 25, "kitchen": after_intent}))
+    await rec.tick()
+    assert router.last_for("kitchen") != after_intent, "a genuine later move must still work"
