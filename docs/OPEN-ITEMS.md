@@ -379,3 +379,26 @@
     interesting question is whether the config API genuinely stalls while a source manager
     reconciles — which would matter to the GUI too, not just to a test.
 
+25. **Two units set to follow EACH OTHER oscillate, and nothing detects it.**
+    Found on 2026-08-21 with `.7.122` configured (by hand, in the GUI) to follow `.7.204` while
+    `t3_autofollow.sh` configured `.7.204` to follow `.7.122`. Each unit's FollowReconciler then
+    routes its own player onto the other's stream, forever:
+
+        20:12:34 plum.mesh.follow: follow: routed FjXD88ok... -> airplay-1 (unit-7122)
+        20:13:35 plum.mesh.follow: follow: routed FjXD88ok... -> airplay-1 (unit-7204)
+
+    `follow.py` has an `_overridden` guard for "the user moved us", but nothing looks for a CYCLE —
+    and a cycle is reachable straight from the GUI, since `autoSwitch.slave.masterUnitId` is a free
+    choice per unit with no cross-unit validation. The speaker ends up switching stream roughly once
+    a minute with no explanation visible to the user.
+    Cheap fix available: `follows_unit_id` is already published in every unit's snapshot (it was
+    added for loudness matching), so a follower can see whether its intended master already follows
+    IT, and refuse — or the GUI can refuse to offer a master that would close a loop. Not attempted
+    here because picking WHICH end yields is a product decision, not a mechanical one.
+
+26. **`t3_autofollow.sh` does not defend against a pre-existing follow configuration.**
+    It sets B to follow A and asserts the result, but never clears an existing A-follows-B, so it
+    fails against a rig someone has configured by hand — which is how #25 was found. It should
+    record and clear both units' `autoSwitch.slave` on entry and restore them in a `defer`, the way
+    `t3_loudness_match.sh` does for the calibration policy.
+

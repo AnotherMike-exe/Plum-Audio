@@ -37,6 +37,48 @@ echo "  A=$PA  B=$PB  source=$SRC_A"
 CURVE_A='[{"volume":35,"db":70.88},{"volume":85,"db":78.59}]'
 CURVE_B='[{"volume":35,"db":64.88},{"volume":85,"db":72.59}]'
 
+# This test must be safe to run on a rig somebody has really calibrated, and its own numbers must
+# still be the ones in play while it runs. Two things follow.
+#
+# The test's writes claim a high `rev` so they outrank any real record for the same endpoint,
+# wherever in the mesh it is stored — records are merged newest-rev-wins across units, so a real
+# rev-2 curve would otherwise beat the test's rev-1 one and every arithmetic assertion below would
+# be computed against the wrong speaker. Observed exactly that on the .7 pair.
+#
+# And any pre-existing record is SAVED and put back, rather than deleted. An earlier version simply
+# DELETEd what it wrote, which destroys a real calibration whenever the user's record happens to
+# live on the unit the test targets.
+TEST_REV=1000
+RESTORE_REV=2000
+
+# Built with sys.argv rather than shell interpolation: nesting a rev into a single-quoted python -c
+# inside a command substitution inside a function is exactly the quoting knot that breaks scripts.
+RESTORE_PY='import json, sys
+r = json.load(sys.stdin)
+print(json.dumps({
+    "name": r.get("name", ""), "url": r.get("url"), "enabled": r.get("enabled", True),
+    "samples": r.get("samples", []),
+    "maxLimit": r.get("maxLimit", {"mode": "percentage", "value": 100}),
+    "trimDb": r.get("trimDb", 0), "knownRev": int(sys.argv[1]),
+}))'
+
+saved_record() {  # saved_record <unit> <player-id> -> the stored record as JSON, or {}
+    ssh_json "$1" /api/audio/calibration "json.dumps((d.get(\"calibrations\") or {}).get(\"$2\") or {})"
+}
+
+restore_record() {  # restore_record <unit> <player-id> <json>
+    local unit="$1" pid="$2" rec="$3" body
+    if [[ -z "$rec" || "$rec" == "{}" || "$rec" == "null" ]]; then
+        curl_ "$unit" DELETE "/api/audio/calibration/$pid" >/dev/null 2>&1
+        return
+    fi
+    body="$(printf '%s' "$rec" | python3 -c "$RESTORE_PY" "$RESTORE_REV")"
+    curl_ "$unit" PUT "/api/audio/calibration/$pid" "$body" >/dev/null 2>&1
+}
+
+ORIG_A="$(saved_record "$A" "$PA")"
+ORIG_B="$(saved_record "$B" "$PB")"
+
 # Registered FIRST so it runs LAST (defers unwind in reverse): let the rig settle before handing
 # it to the next suite. Killing the feed drives the source to EOF, which detaches every player and
 # releases them, and that churn takes a couple of aggregator polls to propagate. Without the pause,
@@ -45,8 +87,8 @@ CURVE_B='[{"volume":35,"db":64.88},{"volume":85,"db":72.59}]'
 defer "sleep 12"
 
 # Leave the rig as we found it: drop both curves, restore the policy, unroute B.
-defer "curl_ \"$A\" DELETE \"/api/audio/calibration/$PA\" >/dev/null 2>&1; true"
-defer "curl_ \"$B\" DELETE \"/api/audio/calibration/$PB\" >/dev/null 2>&1; true"
+defer "restore_record \"$A\" \"$PA\" \"\$ORIG_A\""
+defer "restore_record \"$B\" \"$PB\" \"\$ORIG_B\""
 defer "curl_ \"$A\" PUT /api/audio/calibration/policy '{\"mode\":\"follow\",\"sets\":[]}' >/dev/null 2>&1; true"
 defer "curl_ \"$A\" POST /api/mesh/unroute \"{\\\"player_id\\\":\\\"$PB\\\",\\\"source_id\\\":\\\"$SRC_A\\\"}\" >/dev/null 2>&1; true"
 # Send B's speaker home rather than leaving it parked on A's server.
@@ -54,17 +96,22 @@ defer "curl_ \"$B\" POST /api/mesh/route \"{\\\"player_id\\\":\\\"$PB\\\",\\\"so
 
 # -- curves are stored where they are written, and seen everywhere -------------------------------
 
-sa="$(curl_ "$A" PUT "/api/audio/calibration/$PA" "{\"name\":\"A\",\"samples\":$CURVE_A}")"
+sa="$(curl_ "$A" PUT "/api/audio/calibration/$PA" "{\"name\":\"A\",\"samples\":$CURVE_A,\"knownRev\":$TEST_REV}")"
 assert_not_contains "$sa" '"error"' "A's curve accepted on A" "$sa"
 assert_contains "$sa" '"calibrated":true' "A's curve fits"
 
-sb="$(curl_ "$B" PUT "/api/audio/calibration/$PB" "{\"name\":\"B\",\"samples\":$CURVE_B}")"
+sb="$(curl_ "$B" PUT "/api/audio/calibration/$PB" "{\"name\":\"B\",\"samples\":$CURVE_B,\"knownRev\":$TEST_REV}")"
 assert_not_contains "$sb" '"error"' "B's curve accepted on B" "$sb"
 
 # The causal counter, which is what makes ordering independent of a clock on a machine with no RTC.
-assert_contains "$sa" '"rev":1' "first save allocates rev 1"
-resave="$(curl_ "$A" PUT "/api/audio/calibration/$PA" "{\"name\":\"A\",\"samples\":$CURVE_A,\"knownRev\":4}")"
-assert_contains "$resave" '"rev":5' "a client's high-water mark lifts the counter"
+# Arithmetic is precomputed: $(( )) nested inside a command substitution that is already quoting
+# JSON is a parse error waiting to happen, and it was one.
+EXPECT_REV=$((TEST_REV + 1))
+BUMP_REV=$((TEST_REV + 40))
+EXPECT_BUMP=$((TEST_REV + 41))
+assert_contains "$sa" "\"rev\":$EXPECT_REV" "a save allocates the next rev above what the client knows"
+resave="$(curl_ "$A" PUT "/api/audio/calibration/$PA" "{\"name\":\"A\",\"samples\":$CURVE_A,\"knownRev\":$BUMP_REV}")"
+assert_contains "$resave" "\"rev\":$EXPECT_BUMP" "a client's high-water mark lifts the counter"
 
 # The merged view: written on two different units, readable from either.
 merged_of() { ssh_json "$1" /api/mesh/calibration "sorted(d.keys())==sorted([\"$PA\",\"$PB\"])"; }
