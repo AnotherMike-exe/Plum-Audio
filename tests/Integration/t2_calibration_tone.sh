@@ -28,8 +28,14 @@ echo "  player=$PLAYER"
 CAL_SOURCE="cal:${PLAYER}"
 
 # Where it is now, so we can assert it goes back. Empty is a legitimate answer (idle).
-before_source() { ssh_json "$UNIT" /api/mesh/snapshot \
-    "next((s[\"source_id\"] for s in d[\"sources\"] if \"$PLAYER\" in s[\"player_ids\"] and not s[\"source_id\"].startswith(\"cal:\")), \"\")"; }
+#
+# Scans the whole MESH VIEW, not this unit's snapshot. A unit's snapshot lists only the sources IT
+# ingests, so a speaker that has roamed to a peer — which is exactly what happens when this unit
+# follows another — appears nowhere in it and reads as "idle". The tone's own restore logic looks
+# across the mesh, so a local-only check here asserted the wrong thing and failed against a tone
+# that had put the speaker back correctly.
+before_source() { ssh_json "$UNIT" /api/mesh/view \
+    "next((s[\"source_id\"] for u in d[\"units\"] for s in u[\"sources\"] if \"$PLAYER\" in s[\"player_ids\"] and not s[\"source_id\"].startswith(\"cal:\")), \"\")"; }
 BEFORE="$(before_source)"
 echo "  before: source=${BEFORE:-(idle)}"
 
@@ -87,6 +93,8 @@ assert_eq "$(playing_of)" "False" "tone reports stopped"
 
 cal_gone_of() { ssh_json "$UNIT" /api/mesh/snapshot \
     "any(s[\"source_id\"]==\"$CAL_SOURCE\" for s in d[\"sources\"])"; }
+# The tone source is always created on THIS unit, so the snapshot is the right scope for it —
+# unlike the endpoint above, which may live anywhere in the mesh.
 assert_eq "$(wait_for "False" 8 cal_gone_of)" "False" "the cal: source is torn down"
 
 after="$(wait_for "$BEFORE" 10 before_source)"
