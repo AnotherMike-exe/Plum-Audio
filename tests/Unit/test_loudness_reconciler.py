@@ -683,3 +683,134 @@ async def test_a_frozen_report_never_counts_as_already_there(rig):
     rec._aggregator = FakeAggregator(build_frozen_view(100, frozen_at=100))
     await rec.tick()
     assert router.last_for("esp32") == 100, "must command it, not trust the frozen report"
+
+
+# -- the fast path ------------------------------------------------------------
+#
+# Detecting intent by divergence costs up to a whole poll interval, and that interval IS the lag
+# between moving one slider and the group following (measured on the rig: 0.5-1.5 s, entirely the
+# wait for the next tick — the follower moves 2 ms after the decision). The volume route reports the
+# request directly instead.
+
+
+@asyncio_test
+async def test_a_reported_volume_re_levels_without_waiting_for_the_view(rig):
+    """The crux: right after a volume request the view is a poll behind AND the player's echo has
+    not arrived, so a tick that only re-read state would find nothing changed. The intent has to
+    travel with the nudge."""
+    write, make = rig
+    write(CALS, mode="stream")
+    rec, router = make(build_view({"living": 40, "kitchen": 40}))
+    await rec.tick()  # seed
+    router.calls.clear()
+
+    # The view still reports the OLD level, exactly as it would in the moment after the POST.
+    rec.note_user_volume("living", 80)
+    await rec.tick()
+
+    assert router.last_for("kitchen") is not None, "the follower must move on the stated level"
+    # living is 6 dB more efficient than kitchen, so kitchen needs double the volume.
+    assert router.last_for("kitchen") == pytest.approx(100, abs=1)
+
+
+@asyncio_test
+async def test_stated_intent_beats_a_stale_divergence(rig):
+    """If both are present the one we were TOLD about wins — we were told, rather than guessing."""
+    write, make = rig
+    write(
+        {
+            "living": {"samples": samples(40.0)},
+            "kitchen": {"samples": samples(40.0)},
+        },
+        mode="stream",
+    )
+    rec, router = make(build_view({"living": 40, "kitchen": 90}))
+    await rec.tick()
+    router.calls.clear()
+
+    rec._commanded["kitchen"] = 10  # kitchen looks "moved" by divergence
+    rec.note_user_volume("living", 50)  # but the user actually moved living
+    await rec.tick()
+    assert router.last_for("kitchen") == 50, "the group must follow the endpoint we were told about"
+
+
+@asyncio_test
+async def test_the_echo_for_a_reported_volume_is_not_a_second_event(rig):
+    """After the fast path re-levels, the player's echo arrives and the view catches up. That must
+    not read as a fresh human action and re-derive the group all over again."""
+    write, make = rig
+    write(CALS, mode="stream")
+    rec, router = make(build_view({"living": 40, "kitchen": 40}))
+    await rec.tick()
+
+    rec.note_user_volume("living", 80)
+    await rec.tick()
+    after_fast_path = router.last_for("kitchen")
+    router.calls.clear()
+
+    # The view now reflects what actually happened.
+    rec._aggregator = FakeAggregator(build_view({"living": 80, "kitchen": after_fast_path}))
+    await rec.tick()
+    assert router.calls == [], "the echo of our own action is not a new one"
+
+
+@asyncio_test
+async def test_intent_for_an_endpoint_outside_any_matched_group_is_harmless(rig):
+    write, make = rig
+    write(CALS, mode="stream")
+    rec, router = make(build_view({"living": 40, "kitchen": 40}))
+    await rec.tick()  # seed
+    await rec.tick()  # converge the group to its seeded target
+    rec._aggregator = FakeAggregator(build_view({"living": 40, "kitchen": 80}))
+    await rec.tick()
+    router.calls.clear()
+
+    rec.note_user_volume("some-other-speaker", 70)
+    await rec.tick()
+    assert router.calls == []
+
+
+@asyncio_test
+async def test_note_user_volume_schedules_a_tick_of_its_own(rig):
+    """The route reports and returns; it must not await a reconcile inside the HTTP response."""
+    write, make = rig
+    write(CALS, mode="stream")
+    rec, router = make(build_view({"living": 40, "kitchen": 40}))
+    await rec.tick()
+    router.calls.clear()
+
+    rec.note_user_volume("living", 80)
+    assert rec._nudge is not None
+    await rec._nudge
+    assert router.last_for("kitchen") is not None
+    await rec.stop()
+
+
+@asyncio_test
+async def test_a_bad_player_id_is_ignored(rig):
+    rec, _ = rig[1](build_view({"living": 40, "kitchen": 40}))
+    rec.note_user_volume("", 50)
+    assert rec._user_intent is None
+
+
+@asyncio_test
+async def test_grouping_calibrated_endpoints_brings_them_into_match(rig):
+    """Pins behaviour the fast-path work surfaced and no test stated outright.
+
+    The first sight of a group only ADOPTS its level as the target — it moves nothing, so a user's
+    arrangement is never rearranged the instant the reconciler notices it. The NEXT cycle then
+    brings the other members onto that target. So grouping two calibrated speakers does match them,
+    within a poll, without anyone touching a slider. The reference for that first convergence is
+    whichever member the group lists first, which is arbitrary but harmless: any later slider move
+    re-derives the target from the endpoint the user actually touched.
+    """
+    write, make = rig
+    write(CALS, mode="stream")
+    rec, router = make(build_view({"living": 40, "kitchen": 40}))
+
+    await rec.tick()
+    assert router.calls == [], "first sight adopts, it does not impose"
+
+    await rec.tick()
+    # kitchen is 6 dB less efficient, so matching living at 40% means doubling to 80%.
+    assert router.last_for("kitchen") == pytest.approx(80, abs=1)

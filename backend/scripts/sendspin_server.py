@@ -2134,6 +2134,10 @@ async def main() -> None:
             on_calibration_export=lambda table: setattr(srv, "calibration_export", table),
         )
         loudness.start()
+        # Re-level on the volume request itself instead of on the next poll. Always the right unit:
+        # a volume POST only resolves a client on the local server, and a player in a group is
+        # connected to the server owning that group — so this unit's matcher is the one that cares.
+        mesh.api.on_user_volume = loudness.note_user_volume
 
     # Follow renames from Settings without a restart: the mesh snapshot reads srv.unit_name on every
     # request, so updating it is enough for the GUI and every peer's aggregated view, and the mDNS
