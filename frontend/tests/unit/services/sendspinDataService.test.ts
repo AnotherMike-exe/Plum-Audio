@@ -507,3 +507,58 @@ describe('opening the mesh for pairing', () => {
     expect(res).toEqual({ opened: 0, total: 0, failed: [] });
   });
 });
+
+describe('the iOS slider double-fire guard', () => {
+  // `<input type="range">` on iOS fires `change` TWICE for one touch — once on touchend and again
+  // from the synthesised click. Measured in a unit's own request log against Chrome on iPadOS: two
+  // identical POSTs 13 ms apart for every slider move. Idempotent, so nothing broke, but it doubles
+  // request volume — and since a volume request now nudges the loudness matcher, it doubles
+  // reconcile work too.
+
+  const PLAYER_ID = VIEW.units[0].players[0].player_id;
+
+  function serviceWithOneUnit() {
+    const svc = new SendspinDataService();
+    // @ts-expect-error — private hand-off, as the other suites here do. playerUnit() resolves the
+    // player against the last view, so the service needs one before it will post anything.
+    svc.applyView(structuredClone(VIEW));
+    const post = vi
+      .spyOn(svc as unknown as { post: (...a: unknown[]) => Promise<unknown> }, 'post')
+      .mockResolvedValue({});
+    return { svc, post };
+  }
+
+  it('sends an identical repeat only once', async () => {
+    const { svc, post } = serviceWithOneUnit();
+    await svc.setVolume(PLAYER_ID, 40);
+    await svc.setVolume(PLAYER_ID, 40);   // the synthesised click, milliseconds later
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets a real drag through — a drag is a stream of DIFFERENT values', async () => {
+    const { svc, post } = serviceWithOneUnit();
+    for (const v of [40, 41, 42, 43]) await svc.setVolume(PLAYER_ID, v);
+    expect(post).toHaveBeenCalledTimes(4);
+  });
+
+  it('does not suppress the same level set again later', async () => {
+    vi.useFakeTimers();
+    try {
+      const { svc, post } = serviceWithOneUnit();
+      await svc.setVolume(PLAYER_ID, 40);
+      vi.advanceTimersByTime(2000);   // well past the double-fire window
+      await svc.setVolume(PLAYER_ID, 40);
+      expect(post).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('guards each endpoint independently', async () => {
+    const { svc, post } = serviceWithOneUnit();
+    await svc.setVolume(PLAYER_ID, 40);
+    await svc.setVolume(PLAYER_ID, 40);
+    await svc.setVolume(PLAYER_ID, 55);
+    expect(post).toHaveBeenCalledTimes(2);
+  });
+});

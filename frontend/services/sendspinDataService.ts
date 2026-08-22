@@ -25,6 +25,9 @@ const VOLUME_HOLD_MS = 5000;
 export const FOREIGN_PREFIX = 'foreign::';
 // Source-id namespace for a live calibration tone (backend: calibration_tone.CAL_SOURCE_PREFIX).
 export const CALIBRATION_SOURCE_PREFIX = 'cal:';
+// How long an identical volume request is treated as a duplicate. Comfortably longer than the
+// ~13 ms iOS touch/click double-fire, far shorter than any deliberate repeat by a human.
+const DUPLICATE_VOLUME_MS = 250;
 // Where the learned speaker names live (see rememberPlayerNames). Survives a reload so a speaker
 // that is idle when the page opens still reads the way it does when it is playing.
 const NAME_MEMO_KEY = 'plum.speakerNames';
@@ -457,6 +460,8 @@ export class SendspinDataService {
   // Volume the user just set, held over the polled value until the round trip completes (set →
   // player applies → player reports → our next /view poll). Without it a drag fights the poll.
   // Player volume only; group volume needs none — the controller WS echoes it back immediately.
+  /** Last request actually sent per player, for the iOS double-fire guard above. */
+  private lastVolumeSent = new Map<string, { volume: number; muted: boolean; at: number }>();
   private pendingVolume = new Map<string, { volume: number; muted: boolean; at: number }>();
   private pendingSourceVolume = new Map<string, { volume: number; at: number }>();
   // listener URL -> the name the speaker gave over the PROTOCOL (see rememberPlayerNames).
@@ -701,9 +706,25 @@ export class SendspinDataService {
   async setVolume(playerId: string, volume: number, muted = false): Promise<void> {
     const unitId = this.playerUnit(playerId);
     if (!unitId) return;
+    // Drop an exact repeat of the request we just sent. `<input type="range">` on iOS fires its
+    // change event TWICE for one touch — once on touchend and again from the synthesised click —
+    // so every slider move on an iPad hit the API twice, ~13 ms apart, with the identical value.
+    // Measured in a unit's request log against Chrome on iPadOS.
+    //
+    // Harmless in itself (the commands are idempotent), but it doubles request volume and, since a
+    // volume request now nudges the loudness matcher, it doubles reconcile work for nothing. Keyed
+    // on the VALUE as well as the player, and on a short window, so a genuine drag — which sends a
+    // stream of different values — and a deliberate re-set of the same level both still get through.
+    const previous = this.lastVolumeSent.get(playerId);
+    const now = Date.now();
+    if (previous && previous.volume === volume && previous.muted === muted
+        && now - previous.at < DUPLICATE_VOLUME_MS) {
+      return;
+    }
+    this.lastVolumeSent.set(playerId, { volume, muted, at: now });
     // Hold what the user just chose until the poll catches up: the round trip is player → server
     // → next /view poll, so without this a drag fights the last polled value and the knob jumps.
-    this.pendingVolume.set(playerId, { volume, muted, at: Date.now() });
+    this.pendingVolume.set(playerId, { volume, muted, at: now });
     await this.post(unitId, '/volume', { player_id: playerId, volume, muted });
   }
 
