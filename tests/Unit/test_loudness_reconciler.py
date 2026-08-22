@@ -814,3 +814,28 @@ async def test_grouping_calibrated_endpoints_brings_them_into_match(rig):
     await rec.tick()
     # kitchen is 6 dB less efficient, so matching living at 40% means doubling to 80%.
     assert router.last_for("kitchen") == pytest.approx(80, abs=1)
+
+
+@asyncio_test
+async def test_an_intent_arriving_mid_cycle_is_not_dropped(rig):
+    """Measured on the rig: one move in three fell back to the poll (2.95 s) while its neighbours
+    took 3 ms. Coalescing to one in-flight nudge is right, but a request that lands after the
+    running cycle has already read the intent must still be honoured."""
+    write, make = rig
+    write(CALS, mode="stream")
+    rec, router = make(build_view({"living": 40, "kitchen": 40}))
+    await rec.tick()
+    await rec.tick()
+    router.calls.clear()
+
+    # Simulate a cycle in flight that has already consumed its intent.
+    rec.note_user_volume("living", 30)
+    rec._user_intent = None  # the running cycle took it
+    rec.note_user_volume("living", 90)  # a second move lands mid-cycle
+    assert rec._nudge is not None
+    await rec._nudge
+
+    assert rec._user_intent is None, "the later intent must have been consumed, not left pending"
+    # 90% on living means kitchen (6 dB less efficient) is driven to its ceiling.
+    assert router.last_for("kitchen") == 100
+    await rec.stop()

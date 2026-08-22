@@ -130,6 +130,11 @@ class LoudnessReconciler:
         # nothing. Carrying the intent is what makes the fast path actually fast.
         self._user_intent: tuple[str, int] | None = None
         self._nudge: asyncio.Task | None = None
+        # Set whenever an intent arrives; cleared by the nudge task as it begins a cycle. If an
+        # intent lands while a cycle is already past the point where it reads one, this is what
+        # makes the task go round again instead of silently dropping it — measured on the rig, that
+        # drop cost a full poll interval and was the difference between 3 ms and 2.95 s.
+        self._nudge_pending = False
         self._settings_stamp: int | None = None
         self._settings_cache: dict | None = None
         self._task: asyncio.Task | None = None
@@ -172,15 +177,25 @@ class LoudnessReconciler:
         if not player_id:
             return
         self._user_intent = (player_id, max(0, min(100, int(volume))))
+        self._nudge_pending = True
         if self._nudge is not None and not self._nudge.done():
-            return  # one in flight is enough; it will read the latest intent
+            return  # a cycle is running; the pending flag makes it go round again for this intent
         self._nudge = asyncio.ensure_future(self._nudge_once())
 
     async def _nudge_once(self) -> None:
-        try:
-            await self.tick()
-        except Exception:  # noqa: BLE001 - a nudge must never surface in the caller's HTTP response
-            logger.exception("loudness reconciler: nudged cycle failed")
+        """Reconcile now, and again if another intent arrived while we were doing it.
+
+        Coalescing to a single in-flight task is right, but only if a request that lands mid-cycle
+        is still honoured. Simply returning early would drop it whenever the running cycle had
+        already read `_user_intent` — which on the rig meant one slider move in three fell back to
+        the poll and took 2.95 s while its neighbours took 3 ms.
+        """
+        while self._nudge_pending and not self._stop_evt.is_set():
+            self._nudge_pending = False
+            try:
+                await self.tick()
+            except Exception:  # noqa: BLE001 - never surfaces in the caller's HTTP response
+                logger.exception("loudness reconciler: nudged cycle failed")
 
     async def _run(self) -> None:
         while not self._stop_evt.is_set():
