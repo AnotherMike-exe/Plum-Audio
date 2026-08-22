@@ -79,6 +79,26 @@ restore_record() {  # restore_record <unit> <player-id> <json>
 ORIG_A="$(saved_record "$A" "$PA")"
 ORIG_B="$(saved_record "$B" "$PB")"
 
+# Auto-follow will fight this test. It routes both players onto A's source, while a unit configured
+# to follow another wants ITS player on the other unit's stream — so follow yanks an endpoint back
+# out of the group mid-test and every matching assertion then reads a speaker that is not there.
+# Capture both units' config, neutralise it for the duration, and put it back verbatim. Same class
+# of bug as OPEN-ITEMS #26, in this test rather than t3_autofollow.
+AUTO_A="$(ssh_json "$A" /api/settings 'json.dumps(d.get("autoSwitch") or {})')"
+AUTO_B="$(ssh_json "$B" /api/settings 'json.dumps(d.get("autoSwitch") or {})')"
+
+restore_auto() {  # restore_auto <unit> <json>
+    [[ -z "$2" || "$2" == "{}" ]] && return
+    curl_ "$1" POST /api/settings "{\"autoSwitch\":$2}" >/dev/null 2>&1
+}
+defer "restore_auto \"$A\" \"\$AUTO_A\""
+defer "restore_auto \"$B\" \"\$AUTO_B\""
+
+for _u in "$A" "$B"; do
+    curl_ "$_u" POST /api/settings \
+        "{\"autoSwitch\":{\"localActivity\":false,\"slave\":{\"enabled\":false,\"masterUnitId\":null}}}" >/dev/null
+done
+
 # Registered FIRST so it runs LAST (defers unwind in reverse): let the rig settle before handing
 # it to the next suite. Killing the feed drives the source to EOF, which detaches every player and
 # releases them, and that churn takes a couple of aggregator polls to propagate. Without the pause,
