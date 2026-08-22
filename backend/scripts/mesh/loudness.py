@@ -124,6 +124,12 @@ class LoudnessReconciler:
         # Endpoints clamped to their ceiling this cycle: the GUI badges these rows so a speaker that
         # physically cannot keep up is visible rather than just quietly wrong.
         self._at_limit: set[str] = set()
+        # A volume the user just asked for, reported by the volume route the moment it happens.
+        # The poll cannot see it yet — the mesh view is a 2 s cache and the player's echo has not
+        # arrived — so an immediate tick that only re-read state would find nothing changed and do
+        # nothing. Carrying the intent is what makes the fast path actually fast.
+        self._user_intent: tuple[str, int] | None = None
+        self._nudge: asyncio.Task | None = None
         self._settings_stamp: int | None = None
         self._settings_cache: dict | None = None
         self._task: asyncio.Task | None = None
@@ -137,11 +143,44 @@ class LoudnessReconciler:
 
     async def stop(self) -> None:
         self._stop_evt.set()
+        if self._nudge is not None:
+            self._nudge.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._nudge
+            self._nudge = None
         if self._task is not None:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
             self._task = None
+
+    def note_user_volume(self, player_id: str, volume: int) -> None:
+        """A volume the USER asked for, reported at the moment it is applied.
+
+        Detecting intent by divergence costs up to a whole poll interval, which is the entire lag
+        between moving one slider and the rest of a group following. A volume request IS the event,
+        so the route hands it straight here.
+
+        Always the right unit: `Router.set_volume` only resolves a client on the local server, and a
+        player attached to a group is by definition connected to the server that owns that group —
+        so the unit receiving a volume POST is always the unit whose matcher cares about it.
+
+        Divergence detection stays, because it catches the changes this cannot see: a third-party
+        controller such as Music Assistant commanding one of our players, or anything else that
+        moves a level without coming through our API.
+        """
+        if not player_id:
+            return
+        self._user_intent = (player_id, max(0, min(100, int(volume))))
+        if self._nudge is not None and not self._nudge.done():
+            return  # one in flight is enough; it will read the latest intent
+        self._nudge = asyncio.ensure_future(self._nudge_once())
+
+    async def _nudge_once(self) -> None:
+        try:
+            await self.tick()
+        except Exception:  # noqa: BLE001 - a nudge must never surface in the caller's HTTP response
+            logger.exception("loudness reconciler: nudged cycle failed")
 
     async def _run(self) -> None:
         while not self._stop_evt.is_set():
@@ -294,6 +333,17 @@ class LoudnessReconciler:
 
         levels = {pid: self._observed_volume(view, pid) for pid, _ in usable}
 
+        # A level the user just asked for OVERRIDES what the view reports for that endpoint. The
+        # view is a poll behind and the player's echo is a round trip behind that, so on the fast
+        # path the observed number is simply out of date — trusting it would either do nothing or,
+        # worse, re-derive the group from the pre-move level.
+        intent = self._user_intent
+        intent_ref: tuple[str, EndpointCalibration] | None = None
+        if intent is not None and intent[0] in levels:
+            levels[intent[0]] = intent[1]
+            intent_ref = next(((pid, cal) for pid, cal in usable if pid == intent[0]), None)
+            self._user_intent = None
+
         # An echo that matches what we asked for clears the endpoint back to trusted.
         for pid, _ in usable:
             observed, commanded = levels[pid], self._commanded.get(pid)
@@ -317,7 +367,8 @@ class LoudnessReconciler:
             and levels[pid] is not None
             and abs(levels[pid] - self._commanded.get(pid, levels[pid])) > USER_INTENT_EPSILON
         ]
-        reference = (
+        # Stated intent beats inferred intent: we were told, rather than having to guess.
+        reference = intent_ref or (
             max(moved, key=lambda item: abs(levels[item[0]] - self._commanded.get(item[0], levels[item[0]])))
             if moved
             else None

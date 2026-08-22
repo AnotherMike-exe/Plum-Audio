@@ -154,6 +154,10 @@ class MeshApi:
         # plumbing between our own player and our own GUI; the spec-native part is the player being a
         # conformant group member. See sendspin_player.py / MeshApi._consume.
         self._consumers: set[web.WebSocketResponse] = set()
+        # Reports a user-driven volume to the loudness reconciler the moment it happens, so a group
+        # re-levels immediately instead of waiting for the next 2 s poll to notice. Set in
+        # sendspin_server.main() once the reconciler exists; None on a unit running without it.
+        self.on_user_volume: Callable[[str, int], None] | None = None
         self._last_pair: dict | None = None  # latest pairing prompt (PIN / gesture), latest-wins
         self._producer: web.WebSocketResponse | None = None
         self._last_ctrl: dict | None = None  # cache so a GUI that connects mid-session gets it
@@ -399,10 +403,17 @@ class MeshApi:
         player_id = body.get("player_id")
         if not player_id or "volume" not in body:
             return web.json_response({"error": "player_id and volume required"}, status=400)
+        volume = int(body["volume"])
         try:
-            await self._router.set_volume(player_id, int(body["volume"]), bool(body.get("muted", False)))
+            await self._router.set_volume(player_id, volume, bool(body.get("muted", False)))
         except (KeyError, RuntimeError) as e:
             return web.json_response({"error": str(e)}, status=400)
+        # Tell the matcher what the user asked for rather than making it infer the same fact from a
+        # cached view one poll later. This request IS the event; without it the whole lag between
+        # moving one slider and the group following is the poll interval.
+        if self.on_user_volume is not None:
+            with contextlib.suppress(Exception):
+                self.on_user_volume(player_id, volume)
         return web.json_response({"ok": True})
 
     async def _source_volume(self, request: web.Request) -> web.Response:
