@@ -15,12 +15,12 @@ API="/api/integrations/$SRC"
 
 count_sources() { ssh_json "$UNIT" /api/mesh/snapshot "len([s for s in d[\"sources\"] if s[\"source_id\"].startswith(\"$SRC-\")])"; }
 before_count="$(count_sources)"
-existing_ids="$(curl_ "$UNIT" GET "$API/endpoints" | ssh_ "$UNIT" "python3 -c 'import json,sys; print(sorted(e[\"id\"] for e in json.load(sys.stdin)[\"endpoints\"]))'")"
+existing_ids="$(curl_ "$UNIT" GET "$API/endpoints" | json_ 'sorted(e["id"] for e in d["endpoints"])')"
 echo "  before: $before_count live source(s); endpoint ids=$existing_ids"
 
 # -- add --------------------------------------------------------------------------------------
 add="$(curl_ "$UNIT" POST "$API/endpoints" '{"deviceName":"CRUD Probe","enabled":true}')"
-ID="$(printf '%s' "$add" | ssh_ "$UNIT" "python3 -c 'import json,sys; print(json.load(sys.stdin)[\"endpoint\"][\"id\"])'")"
+ID="$(printf '%s' "$add" | json_ 'd["endpoint"]["id"]')"
 [[ -n "$ID" ]] || { _no "add did not return an endpoint id"; finish; exit; }
 defer "curl_ \"$UNIT\" DELETE \"$API/endpoints/$ID\" >/dev/null 2>&1; true"   # always clean up the probe
 _ok "added endpoint id=$ID"
@@ -42,7 +42,7 @@ gone="$(wait_for "False" 8 ssh_json "$UNIT" /api/mesh/snapshot \
 assert_eq "$gone" "False" "remove tore the source down live"
 
 # -- the pre-existing endpoints are all still there -------------------------------------------
-after_ids="$(curl_ "$UNIT" GET "$API/endpoints" | ssh_ "$UNIT" "python3 -c 'import json,sys; print(sorted(e[\"id\"] for e in json.load(sys.stdin)[\"endpoints\"]))'")"
+after_ids="$(curl_ "$UNIT" GET "$API/endpoints" | json_ 'sorted(e["id"] for e in d["endpoints"])')"
 assert_eq "$after_ids" "$existing_ids" "pre-existing endpoints untouched by the CRUD cycle"
 
 finish

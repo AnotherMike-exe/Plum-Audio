@@ -368,7 +368,22 @@
     Next step when someone has the rig: reproduce with the suite in a loop, and capture the player
     side with debug logging around `_on_stream_end` / the detach path to see which half is missed.
 
-24. **`t2_endpoint_crud.sh` fails its first assertion when run straight after `t2_source_lifecycle.sh`.**
+24. ~~**`t2_endpoint_crud.sh` fails its first assertion when run straight after
+    `t2_source_lifecycle.sh`.**~~ — **FIXED 2026-08-22**, and the original hypothesis was WRONG.
+    The config API does not stall while a source manager reconciles: timed on the rig immediately
+    after the lifecycle test, an endpoint add takes 15-25 ms against 14-54 ms on a quiet unit. The
+    failures were in the harness. Every extracted value cost TWO ssh connections — one to run curl,
+    another to pipe the JSON back to the unit for a second `python3 -c` — and `lib.sh`, unlike
+    `deploy.sh`, had no retry, on a rig `deploy.sh`'s own comment says "occasionally refuses one".
+    Hundreds of connections per suite makes an occasional refusal near-certain, which is why the
+    failures moved between assertions and vanished when a test ran alone.
+    Two changes. `json_` parses the JSON LOCALLY, halving the connections and removing the reason
+    ssh_ could not be retried (a retry would have resent a stdin the first attempt consumed).
+    `retry_ssh_` then retries only exit 255 — ssh's own transport failure — so a remote command that
+    legitimately exits non-zero still passes its status straight through. Two full suites
+    back-to-back with no settle: 52/52 both times. Original report below.
+
+    
     Pre-existing and unrelated to calibration. Standalone it is 5/5 every time; in the suite it
     reports "add did not return an endpoint id", i.e. the POST to the config API did not come back
     as parseable JSON within the 20 s curl timeout. Driving the identical request by hand while the
