@@ -62,9 +62,10 @@ class FakeDelegate:
         return not self.fail
 
 
-def _unit(unit_id, *, sources=None, local_player=None) -> UnitSnapshot:
+def _unit(unit_id, *, sources=None, local_player=None, follows=None) -> UnitSnapshot:
     return UnitSnapshot(unit_id=unit_id, name=unit_id, host="10.0.0.1", sources=sources or [],
-                        local_player=local_player, server_id=f"peer-{unit_id}")
+                        local_player=local_player, server_id=f"peer-{unit_id}",
+                        follows_unit_id=follows)
 
 
 def _source(source_id, group_id, *, active=True, player_ids=None) -> SourceState:
@@ -724,3 +725,114 @@ def test_a_peer_that_has_not_started_its_server_never_matches():
     view.units[0].server_id = None
     view.units[1].server_id = None
     assert view.unit_by_server_id(None) is None
+
+
+# -- follow cycles ---------------------------------------------------------------------------------
+#
+# Two units set to follow each other each route their own player onto the other's stream, forever.
+# Measured on the .7 pair: the speaker changed stream roughly once a minute with nothing to explain
+# it. `masterUnitId` is a free per-unit choice with no cross-unit validation, so a user reaches this
+# straight from the GUI. One member stands down, chosen deterministically so every unit in the cycle
+# computes the same answer with no coordination and exactly one yields.
+
+
+def _leader(unit_id, *, group=None, follows=None, source_id="spotify-1"):
+    """A unit that is playing, and therefore followable."""
+    group = group or f"g{unit_id[-1]}"
+    return _unit(
+        unit_id,
+        sources=[_source(source_id, group, active=True)],
+        local_player={"attached": True, "group_id": group, "server_id": f"peer-{unit_id}"},
+        follows=follows,
+    )
+
+
+def _slaved(master):
+    return {"autoSwitch": {"localActivity": False, "slave": {"enabled": True, "masterUnitId": master}}}
+
+
+def test_the_lowest_unit_id_in_a_mutual_follow_stands_down():
+    """unit-A follows unit-B while unit-B publishes that it follows unit-A."""
+    view = MeshView(units=[_unit("unit-A"), _leader("unit-B", follows="unit-A")])
+    r, router, delegate, _ = _reconciler(view, _slaved("unit-B"), peers={"unit-B": FakePeer("unit-B")})
+    _run(r)
+    assert delegate.calls == [], "the lowest id must not route while the cycle stands"
+    assert router.calls == []
+
+
+def test_the_higher_unit_id_keeps_following():
+    """The same cycle from the other end: the higher id carries on, so one leader emerges."""
+    view = MeshView(units=[_unit("unit-Z"), _leader("unit-A", follows="unit-Z")])
+    r, _router, delegate, _ = _reconciler(view, _slaved("unit-A"), peers={"unit-A": FakePeer("unit-A")})
+    r._local_unit_id = "unit-Z"  # noqa: SLF001 - drive this instance as the HIGHER id
+    _run(r)
+    assert delegate.calls, "the higher id must still follow"
+
+
+def test_standing_down_publishes_that_we_follow_nobody():
+    """Publishing None is what breaks the cycle for everyone else: once we report following nobody,
+    their own walk finds no loop and they follow us normally."""
+    healthy = MeshView(units=[_unit("unit-A"), _leader("unit-B")])
+    r, _router, _delegate, _ = _reconciler(healthy, _slaved("unit-B"), peers={"unit-B": FakePeer("unit-B")})
+    _run(r)
+    assert r._reported_master == "unit-B"  # noqa: SLF001
+
+    # unit-B is now configured to follow us, closing the loop.
+    r._aggregator = FakeAggregator(MeshView(units=[_unit("unit-A"), _leader("unit-B", follows="unit-A")]))  # noqa: SLF001
+    _run(r)
+    assert r._reported_master is None  # noqa: SLF001
+
+
+def test_a_longer_cycle_is_detected_too():
+    """A -> B -> C -> A is the same bug, and unit-A is lowest, so it stands down."""
+    view = MeshView(units=[
+        _unit("unit-A"),
+        _leader("unit-B", follows="unit-C"),
+        _unit("unit-C", follows="unit-A"),
+    ])
+    r, _router, delegate, _ = _reconciler(view, _slaved("unit-B"), peers={"unit-B": FakePeer("unit-B")})
+    _run(r)
+    assert delegate.calls == []
+
+
+def test_a_cycle_we_are_not_part_of_is_left_alone():
+    """Somebody else's loop is not ours to break — standing down for it would stop a perfectly
+    good follow relationship for no reason."""
+    view = MeshView(units=[
+        _unit("unit-A"),
+        _leader("unit-M", follows="unit-N"),
+        _unit("unit-N", follows="unit-M"),
+    ])
+    r, _router, delegate, _ = _reconciler(view, _slaved("unit-M"), peers={"unit-M": FakePeer("unit-M")})
+    _run(r)
+    assert delegate.calls, "our own follow is unaffected by a cycle elsewhere"
+
+
+def test_a_plain_chain_is_not_a_cycle():
+    """A -> B -> C, with C following nobody, is legitimate and must keep working."""
+    view = MeshView(units=[
+        _unit("unit-A"),
+        _leader("unit-B", follows="unit-C"),
+        _unit("unit-C"),
+    ])
+    r, _router, delegate, _ = _reconciler(view, _slaved("unit-B"), peers={"unit-B": FakePeer("unit-B")})
+    _run(r)
+    assert delegate.calls
+
+
+def test_following_resumes_once_the_other_end_is_reconfigured():
+    view = MeshView(units=[_unit("unit-A"), _leader("unit-B", follows="unit-A")])
+    r, _router, delegate, _ = _reconciler(view, _slaved("unit-B"), peers={"unit-B": FakePeer("unit-B")})
+    _run(r)
+    assert delegate.calls == []
+
+    r._aggregator = FakeAggregator(MeshView(units=[_unit("unit-A"), _leader("unit-B")]))  # noqa: SLF001
+    _run(r)
+    assert delegate.calls, "the cycle is gone, so follow resumes with no restart"
+
+
+def test_a_unit_set_to_follow_itself_stands_down():
+    view = MeshView(units=[_leader("unit-A")])
+    r, router, delegate, _ = _reconciler(view, _slaved("unit-A"))
+    _run(r)
+    assert delegate.calls == [] and router.calls == []

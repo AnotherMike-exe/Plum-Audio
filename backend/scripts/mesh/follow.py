@@ -96,6 +96,9 @@ class FollowReconciler:
         # reads the setting every tick, so it stays live without a second file poll.
         self._on_master_change = on_master_change
         self._reported_master: str | None = None
+        # Whether we are currently standing down because our follow config closes a cycle. Held so
+        # the explanation is logged on the transition rather than every two seconds.
+        self._yielded_to_cycle = False
         # (owning_unit_id, source_id) this reconciler itself last routed to.
         self._last_auto_target: tuple[str, str] | None = None
         # Local sources that were active on the previous tick, so localActivity fires only on a
@@ -141,6 +144,31 @@ class FollowReconciler:
                 return json.load(f)
         except (OSError, ValueError):
             return None
+
+    def _follow_cycle(self, view: MeshView, master_unit_id: str) -> list[str] | None:
+        """The follow cycle our config closes, as a unit-id chain, or None if there is none.
+
+        Walks `follows_unit_id` from our master. That field is published in every unit's snapshot
+        (it was added so a leader could tell a room locked to it from one that merely joined the
+        same stream), which is what makes this answerable locally with no extra plumbing.
+
+        Handles chains, not just mutual follow: A -> B -> C -> A is the same bug. A cycle that does
+        NOT contain us is somebody else's to break — we would otherwise stand down for a loop we are
+        not part of.
+        """
+        chain = [self._local_unit_id]
+        seen = {self._local_unit_id}
+        current: str | None = master_unit_id
+        while current:
+            if current == self._local_unit_id:
+                return chain  # the chain came back to us: we are in the cycle
+            if current in seen:
+                return None  # a cycle further along that does not include us
+            seen.add(current)
+            chain.append(current)
+            unit = view.unit(current)
+            current = unit.follows_unit_id if unit is not None else None
+        return None
 
     def _report_master(self, master_unit_id: str | None) -> None:
         """Publish the follow target for the snapshot, but only when it actually changes."""
@@ -197,6 +225,37 @@ class FollowReconciler:
             self._report_master(None)
             self._overridden = False  # follow off: nothing to override
             return
+
+        # A follow CYCLE — most simply, two units set to follow each other — makes every unit in it
+        # route its own player onto the next one's stream, forever. Measured on the .7 pair: the
+        # speaker changed stream roughly once a minute with nothing to explain it. `masterUnitId` is
+        # a free per-unit choice with no cross-unit validation, so this is reachable straight from
+        # the GUI. One member has to stand down, and it has to be decidable with no coordination.
+        cycle = self._follow_cycle(view, master_unit_id)
+        if cycle is not None and min(cycle) == self._local_unit_id:
+            # Lowest unit id yields. Arbitrary between peers, but DETERMINISTIC — every unit in the
+            # cycle computes the same answer from the same snapshot, so exactly one stands down and
+            # the rest keep following it. A state-dependent rule ("whoever is playing wins") would
+            # hand leadership back and forth as playback moves, which is the oscillation this
+            # exists to stop.
+            #
+            # Publishing None is what actually breaks the cycle for the others: once we report that
+            # we follow nobody, their own walk finds no loop and they follow us normally.
+            self._report_master(None)
+            self._overridden = False
+            if not self._yielded_to_cycle:
+                self._yielded_to_cycle = True
+                logger.warning(
+                    "follow: %s and %s are set to follow each other; standing down here (lowest "
+                    "unit id in the cycle %s). Change one unit's master in Playback -> Follow.",
+                    self._local_unit_id,
+                    master_unit_id,
+                    " -> ".join(cycle),
+                )
+            return
+        if self._yielded_to_cycle:
+            self._yielded_to_cycle = False
+            logger.info("follow: the cycle is gone; following %s again", master_unit_id)
 
         self._report_master(master_unit_id)
 

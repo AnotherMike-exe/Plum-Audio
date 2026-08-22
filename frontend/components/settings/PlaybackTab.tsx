@@ -19,12 +19,18 @@ interface MeshUnit {
     unit_id: string;
     name: string;
     host: string;
+    /** Which unit this one follows, if any — published so a follow CYCLE can be spotted. */
+    follows_unit_id?: string | null;
 }
 
 export const PlaybackTab: React.FC<PlaybackTabProps> = ({settings, onSettingsChange}) => {
     const autoSwitch = settings.autoSwitch ?? DEFAULT_AUTO_SWITCH;
 
     const [units, setUnits] = useState<MeshUnit[]>([]);
+    // Every unit including this one, plus our own id: choosing a master is only safe if it does not
+    // close a follow loop, and answering that means walking the whole chain.
+    const [allUnits, setAllUnits] = useState<MeshUnit[]>([]);
+    const [localUnitId, setLocalUnitId] = useState<string | null>(null);
     // An ingest/routing-only unit has no speaker, so it has nothing to auto-switch OR to follow with.
     // Both toggles below drive routing of THIS unit's player; the backend refuses outright (its
     // FollowReconciler is never even started), so leaving them live would offer a setting that
@@ -43,6 +49,8 @@ export const PlaybackTab: React.FC<PlaybackTabProps> = ({settings, onSettingsCha
                     const all = d.units ?? [];
                     const others = all.filter((u: MeshUnit & {unit_id: string}) => u.unit_id !== d.local_unit_id);
                     setUnits(others);
+                    setAllUnits(all);
+                    setLocalUnitId(d.local_unit_id ?? null);
                     const me = all.find((u: {unit_id: string}) => u.unit_id === d.local_unit_id);
                     // `!== false`, never `=== false`: a response without the field (an older image)
                     // must read as "has a speaker".
@@ -83,6 +91,29 @@ export const PlaybackTab: React.FC<PlaybackTabProps> = ({settings, onSettingsCha
     };
 
     const followedUnit = units.find(u => u.unit_id === autoSwitch.slave.masterUnitId);
+
+    /**
+     * Would following `candidate` close a loop back to us?
+     *
+     * Two units set to follow each other each route their own player onto the other's stream,
+     * forever — the speaker changes stream about once a minute with nothing on screen to explain
+     * it. The backend breaks such a cycle on its own (the lowest unit id stands down), but that is
+     * a safety net for configurations made outside this page; far better not to offer the choice.
+     * Handles chains, not just mutual follow: A -> B -> C -> A is the same bug.
+     */
+    const wouldLoop = (candidate: string): boolean => {
+        if (!localUnitId) return false;              // we do not know who we are yet; do not block
+        if (candidate === localUnitId) return true;  // following ourselves is a cycle of one
+        const seen = new Set<string>([localUnitId]);
+        let current: string | null | undefined = candidate;
+        while (current) {
+            if (current === localUnitId) return true;
+            if (seen.has(current)) return false;     // a loop further along that we are not part of
+            seen.add(current);
+            current = allUnits.find(u => u.unit_id === current)?.follows_unit_id ?? null;
+        }
+        return false;
+    };
 
     return (
         <div className="space-y-6">
@@ -139,19 +170,29 @@ export const PlaybackTab: React.FC<PlaybackTabProps> = ({settings, onSettingsCha
                                 </p>
                             ) : (
                                 <div className="flex flex-wrap gap-2">
-                                    {units.map(({unit_id, name}) => (
-                                        <button
-                                            key={unit_id}
-                                            onClick={() => handleSelectMaster(unit_id)}
-                                            className={`px-3 py-1 rounded-full text-xs border transition ${
-                                                autoSwitch.slave.masterUnitId === unit_id
-                                                    ? 'bg-[var(--accent-color)] text-white border-[var(--accent-color)]'
-                                                    : 'text-[var(--text-secondary)] border-[var(--border-color)] hover:border-[var(--accent-color)]'
-                                            }`}
-                                        >
-                                            {name}
-                                        </button>
-                                    ))}
+                                    {units.map(({unit_id, name}) => {
+                                        const loops = wouldLoop(unit_id);
+                                        const selected = autoSwitch.slave.masterUnitId === unit_id;
+                                        return (
+                                            <button
+                                                key={unit_id}
+                                                onClick={() => !loops && handleSelectMaster(unit_id)}
+                                                disabled={loops}
+                                                title={loops
+                                                    ? `${name} already follows this unit — following it back would leave both speakers switching stream every couple of minutes.`
+                                                    : undefined}
+                                                className={`px-3 py-1 rounded-full text-xs border transition ${
+                                                    selected
+                                                        ? 'bg-[var(--accent-color)] text-white border-[var(--accent-color)]'
+                                                        : loops
+                                                            ? 'text-[var(--text-muted)] border-[var(--border-color)] opacity-40 cursor-not-allowed'
+                                                            : 'text-[var(--text-secondary)] border-[var(--border-color)] hover:border-[var(--accent-color)]'
+                                                }`}
+                                            >
+                                                {name}{loops ? ' — follows this unit' : ''}
+                                            </button>
+                                        );
+                                    })}
                                 </div>
                             )}
                         </div>

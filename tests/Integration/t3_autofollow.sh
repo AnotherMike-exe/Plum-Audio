@@ -34,7 +34,23 @@ HOME_B="$(ssh_json "$B" /api/mesh/view "next((s[\"source_id\"] for u in d[\"unit
 # -- teardown, LIFO: settings disabled, A player home/idle, B re-homed to its OWN unit (routing it
 # onto its home source reclaims it back from A), feeder killed. Just unrouting B off A would leave
 # it DETACHED on A, breaking the next run's resolve — so route B home, then leave it idle. --------
-defer "curl_ \"$B\" POST /api/settings \"{\\\"autoSwitch\\\":{\\\"localActivity\\\":false,\\\"slave\\\":{\\\"enabled\\\":false,\\\"masterUnitId\\\":null}}}\" >/dev/null 2>&1; true"
+# Capture BOTH units' auto-switch config and put it back verbatim. Resetting only B leaves any
+# pre-existing A-follows-B in place, and A following B while this test makes B follow A is a follow
+# CYCLE: each unit routes its own player onto the other's stream, about once a minute, and the
+# assertions below then fail against a rig that is merely configured, not broken. That is exactly
+# how OPEN-ITEMS #25 was found — on a rig someone had set up by hand.
+AUTO_A="$(ssh_json "$A" /api/settings 'json.dumps(d.get("autoSwitch") or {})')"
+AUTO_B="$(ssh_json "$B" /api/settings 'json.dumps(d.get("autoSwitch") or {})')"
+
+restore_auto() {  # restore_auto <unit> <json>
+    [[ -z "$2" || "$2" == "{}" ]] && return
+    curl_ "$1" POST /api/settings "{\"autoSwitch\":$2}" >/dev/null 2>&1
+}
+defer "restore_auto \"$A\" \"\$AUTO_A\""
+defer "restore_auto \"$B\" \"\$AUTO_B\""
+
+# A must not follow anyone while this test makes B follow A.
+curl_ "$A" POST /api/settings "{\"autoSwitch\":{\"slave\":{\"enabled\":false,\"masterUnitId\":null}}}" >/dev/null
 defer "curl_ \"$B\" POST /api/mesh/unroute \"{\\\"player_id\\\":\\\"$PLAYER_B\\\",\\\"source_id\\\":\\\"$HOME_B\\\"}\" >/dev/null 2>&1; true"
 defer "curl_ \"$B\" POST /api/mesh/route \"{\\\"player_id\\\":\\\"$PLAYER_B\\\",\\\"source_id\\\":\\\"$HOME_B\\\"}\" >/dev/null 2>&1; sleep 2; true"
 defer "curl_ \"$A\" POST /api/mesh/unroute \"{\\\"player_id\\\":\\\"$PLAYER_A\\\",\\\"source_id\\\":\\\"$SRC_A\\\"}\" >/dev/null 2>&1; true"
