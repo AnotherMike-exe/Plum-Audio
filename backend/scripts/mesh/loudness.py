@@ -402,7 +402,19 @@ class LoudnessReconciler:
                 return
             self._targets[key] = target
             self._commanded[ref_id] = ref_volume
-            self._unconfirmed.discard(ref_id)  # agreeing with an observation is not commanding it
+            if intent_ref is not None and ref_id == intent_ref[0]:
+                # A STATED level is ahead of the view: the mesh view is a poll behind and the
+                # player's echo a round trip behind that, so for the next second or two the view
+                # still reports the PREVIOUS level for this endpoint. Left trusted, the very next
+                # poll reads that stale number, mistakes it for a fresh human action, and re-derives
+                # the group's target BACKWARDS — the follower jumps to the new level, then bounces
+                # back to the old one, then forward again. Measured on the rig as alternating
+                # targets 2 s apart after two quick slider moves. Treat it as unconfirmed until its
+                # echo matches, which is the same rule already used for an endpoint we commanded.
+                self._unconfirmed.add(ref_id)
+            else:
+                # This reference came FROM the view, so the view already agrees with us.
+                self._unconfirmed.discard(ref_id)
             logger.info(
                 "loudness: %s set the target to %.1f dB (%d%%); re-levelling %d endpoint(s)",
                 ref_id,
