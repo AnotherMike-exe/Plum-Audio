@@ -93,6 +93,32 @@ dump_diagnostics() {  # dump_diagnostics <unit> <label>
 # -- the churn -------------------------------------------------------------------------------------
 
 route()   { curl_ "$1" POST /api/mesh/route   "{\"player_id\":\"$2\",\"source_id\":\"$3\"}" >/dev/null 2>&1; }
+
+# Create and destroy a real source mid-cycle. This is the churn the earlier version lacked, and the
+# reason it matters: removing an endpoint tears its source down WHILE a player is attached to it,
+# which is a strong candidate for leaving a connection half-open — exactly the state the wedge looks
+# like from the player's side. The full suite did this (t2_endpoint_crud) during both real wedges.
+add_source() {  # add_source <unit> -> prints the new endpoint id, or empty
+    local raw
+    raw="$(curl_ "$1" POST /api/integrations/spotify/endpoints '{"deviceName":"WedgeProbe","enabled":true}')"
+    printf '%s' "$raw" | json_ 'd["endpoint"]["id"]' 2>/dev/null
+}
+
+drop_source() {  # drop_source <unit> <endpoint-id>
+    [[ -n "$2" ]] && curl_ "$1" DELETE "/api/integrations/spotify/endpoints/$2" >/dev/null 2>&1
+}
+
+# Never leave a probe endpoint behind. t2_endpoint_crud once did exactly that and its orphan sat in
+# a real unit's config for days, so this sweeps by NAME rather than by a remembered id — the id is
+# lost if the run dies mid-cycle.
+sweep_probes() {  # sweep_probes <unit>
+    local ids
+    ids="$(curl_ "$1" GET /api/integrations/spotify/endpoints \
+        | json_ '" ".join(e["id"] for e in d["endpoints"] if e.get("deviceName") == "WedgeProbe")' 2>/dev/null)"
+    for _id in $ids; do drop_source "$1" "$_id"; done
+}
+defer "sweep_probes \"$A\""
+defer "sweep_probes \"$B\""
 unroute() { curl_ "$1" POST /api/mesh/unroute "{\"player_id\":\"$2\",\"source_id\":\"$3\"}" >/dev/null 2>&1; }
 tone()    { curl_ "$1" POST /api/mesh/calibration/tone "{\"player_id\":\"$2\",\"volume\":30,\"seconds\":8}" >/dev/null 2>&1; }
 tone_off(){ curl_ "$1" POST /api/mesh/calibration/tone/stop >/dev/null 2>&1; }
@@ -115,6 +141,20 @@ for cycle in $(seq 1 "$CYCLES"); do
     tone_off "$A"; printf 'T'
     route "$B" "$PB" "$SRC_B"; printf 'b'           # send B's speaker home (reclaim the other way)
     sleep 3
+
+    # A source that appears, takes a player, and is destroyed under it.
+    PROBE_ID="$(add_source "$A")"
+    if [[ -n "$PROBE_ID" ]]; then
+        printf 's'
+        PROBE_SRC="spotify-$PROBE_ID"
+        # Wait for the source manager to actually bring it up before routing onto it.
+        wait_for "True" 12 ssh_json "$A" /api/mesh/snapshot \
+            "any(s[\"source_id\"]==\"$PROBE_SRC\" for s in d[\"sources\"])" >/dev/null
+        route "$A" "$PA" "$PROBE_SRC"; printf 'r'
+        sleep 4
+        drop_source "$A" "$PROBE_ID"; printf 'S'    # destroyed with a player still attached
+        sleep 4
+    fi
     unroute "$A" "$PA" "$SRC_A"; printf 'u'
     stop_feed_ "$A" "$FIFO_A"; stop_feed_ "$B" "$FIFO_B"; printf 'e'   # EOF -> go idle -> detach all
     sleep 5
