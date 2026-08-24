@@ -105,6 +105,10 @@ OVERRUN_LOG_EVERY = 50  # ditto for buffer overruns — enqueue() runs once per 
 # a server learns to send more lead time. See _health for why this is not pad_frames.
 ERROR_STARVED_FRAMES = DEFAULT_RATE // 20
 HEALTH_POLL_S = 3.0  # how often we re-evaluate whether to report client/state error
+# How long one attached session may run before it is worth a line in the log. Comfortably longer
+# than any normal roam or listening session boundary, so a healthy player never trips it — this is
+# only meant to make a connection nobody is on the other end of visible after the fact.
+STUCK_SESSION_WARN_S = 900.0
 
 
 class PlayerHealth(StrEnum):
@@ -482,6 +486,11 @@ class SendspinPlayer:
         # elsewhere by definition. Any Sendspin server can take this speaker (that is the point of
         # the standard), so the GUI has to learn about it from the speaker itself.
         self._state: dict = {"attached": False}
+        # One attached server connection at a time; `attach_websocket` blocks for its whole life, so
+        # these are how a session that never ends becomes visible. See _warn_if_session_is_stuck.
+        self._session_seq = 0
+        self._session_at: float | None = None
+        self._session_warned = False
         self._report_task: asyncio.Task | None = None
         self._health_task: asyncio.Task | None = None
         self.report_url = os.environ.get("PLUM_PLAYER_STATE_URL", "http://127.0.0.1:5001/api/mesh/player-state")
@@ -835,12 +844,43 @@ class SendspinPlayer:
         while True:
             await asyncio.sleep(HEALTH_POLL_S)
             self._remember_playing_server()
+            self._warn_if_session_is_stuck()
             if not self.client.connected:
                 continue
             state = self._health()
             if state is not self._last_reported_state:
                 with contextlib.suppress(Exception):  # never break the render path over a report
                     await self._send_client_state(state)
+
+    def _warn_if_session_is_stuck(self) -> None:
+        """Say so when we have held one server connection implausibly long.
+
+        `attach_websocket` blocks for the whole life of a connection, so "detached from server"
+        only prints when it RETURNS. A wedge observed on the rig showed `stream_end -> idle` and
+        then that line never arriving, while the server had already dropped the client and every
+        later dial timed out — a client holds exactly ONE websocket, so nothing could get in.
+
+        That points at the player still sitting inside `attach_websocket` on a connection the other
+        end has abandoned: a half-open socket we never noticed. This does not fix it and does not
+        guess; it makes the state visible in the log, once, so a soak run can be read afterwards.
+        `connected` is reported alongside because the interesting case is the library still
+        believing it has a live peer.
+        """
+        started = self._session_at
+        if started is None or self._session_warned:
+            return
+        held = time.monotonic() - started
+        if held < STUCK_SESSION_WARN_S:
+            return
+        self._session_warned = True
+        logger.warning(
+            "session %d has been attached for %.0fs without detaching (client.connected=%s, "
+            "audio_flowing=%s) — if dials are timing out, this is the held websocket",
+            self._session_seq,
+            held,
+            self.client.connected,
+            self._audio_flowing,
+        )
 
     def _remember_playing_server(self) -> None:
         """Persist the server_id of whoever most recently had us actually playing.
@@ -908,9 +948,17 @@ class SendspinPlayer:
             # attach: everything up to now is idle by definition, and the attach does not return
             # until the connection is over.
             self._last_starved_frames = self.renderer.starved_frames
-            logger.info("server dialed us %s", self.renderer.stats())
-            await self.client.attach_websocket(ws)
-            logger.info("detached from server %s", self.renderer.stats())
+            self._session_seq += 1
+            session = self._session_seq
+            self._session_at = time.monotonic()
+            self._session_warned = False
+            logger.info("server dialed us [session %d] %s", session, self.renderer.stats())
+            try:
+                await self.client.attach_websocket(ws)
+            finally:
+                held = time.monotonic() - (self._session_at or time.monotonic())
+                self._session_at = None
+                logger.info("detached from server [session %d after %.1fs] %s", session, held, self.renderer.stats())
 
         self._listener = ClientListener(
             client_id=self.player_id, on_connection=on_connection, port=self.port, advertise_mdns=False
