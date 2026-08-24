@@ -352,6 +352,39 @@
     Check first if a calibration ever seems not to take: `timedatectl` on every unit.
 
 23. **`.7.122`'s own player can wedge into "connected but undialable" under sustained mixed churn.**
+    **STILL OPEN. Investigation 2026-08-24 — two hypotheses tested, both dead; three facts gained.**
+
+    *What the tools now show.* The player numbers each attached session and logs its duration, and
+    warns once for any session held past `STUCK_SESSION_WARN_S`. That instrumentation was itself
+    wrong on the first attempt and the rig caught it: it assumed one connection at a time, so
+    overlapping sessions clobbered the start time and it could never have fired for the session that
+    mattered. Fixed — sessions are keyed by sequence number and every open one is checked.
+
+    *Fact 1: connections OVERLAP.* Session 306 stayed open while 307-311 opened and closed. So "a
+    client holds exactly ONE websocket", true of 6.0.5 and repeated throughout this repo, is not the
+    whole story under 9.x: it brings an incoming connection up provisionally, then arbitrates.
+
+    *Fact 2: the half-open state is real.* `t4_player_halfopen.sh` freezes a peer mid-connection
+    with `docker pause` — the only way to get a peer that stops answering without closing, which is
+    what a power cut looks like from the other end. The player's session did NOT end for the 45 s
+    the peer was frozen, confirming it sits inside `attach_websocket` on a dead connection.
+
+    *Fact 3: that alone does not wedge it.* A dial arriving during that window WAS answered, and the
+    speaker was reachable again afterwards. So the mechanism exists but something recovers from it.
+
+    *Dead hypothesis A:* mixed routing/tone/feed churn reproduces it. 40 cycles: no. Every
+    disconnect those profiles produce is clean, and the wedge is the case where a session never
+    ends, so this was never going to find it.
+    *Dead hypothesis B:* source destroyed under an attached player reproduces it. 40 more cycles
+    with endpoint create/route/destroy per cycle: no.
+
+    *Where to look next.* The recovery in Fact 3 is the interesting part — find what performs it and
+    under which conditions it does NOT, since the wedge is precisely that recovery failing. Worth
+    capturing the full player log at DEBUG across a reproduction rather than widening the soak
+    further; two profiles at 40 cycles each argue the trigger is not ordinary churn volume.
+    Original report below.
+
+    
     Observed twice on 2026-08-21 while running the integration suite repeatedly back-to-back. The
     signature is precise: `sendspin_player.log` shows `stream_end -> idle` and then **never** the
     `detached from server` line (nor the aiohttp access-log entry that closes the websocket) that a
