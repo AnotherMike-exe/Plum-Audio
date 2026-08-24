@@ -282,7 +282,12 @@
     larger, already-staged proposal about *players* staying attached to a dead source and
     auto-resuming — not implemented, not part of this fix.
 
-19. **Volume calibration and loudness matching are NOT hardware-validated.** The whole slice
+27. ~~**Volume calibration and loudness matching are NOT hardware-validated.**~~ — **DONE
+    2026-08-21/22**: calibrated on real speakers with a meter on the `.7` pair, curves fitted at
+    20.99 and 17.60 dB/decade with 0.30 and 0.06 dB residuals, and matching driven live. The tone,
+    the cross-unit merge and the matcher all have rig tests (`t2_calibration_tone.sh`,
+    `t3_loudness_match.sh`). *(Numbered 19 when written, which collided with the resolved item 19
+    above; renumbered 2026-08-24.)* Original report below. The whole slice
    (curve model, tone, matcher, GUI) is implemented and unit-tested — 131 backend tests, 17 frontend
    — but nothing has been on the rig. `docs/VOLUME-CALIBRATION.md` carries a numbered rig checklist;
    item 2 is the one that matters most, because it is the predecessor's fatal defect: **confirm the
@@ -297,7 +302,9 @@
      in an executor, but the first Play may still feel sluggish.
    - `sets` scope has a GUI editor but no rig test.
    - Tone-then-restore has never raced a real roam or a follow tick.
-20. **`docs/CLAUDE.md` is 354 lines against its own ~280-line budget.** It was already 333
+28. **`docs/CLAUDE.md` is over its own ~280-line budget** (371 as of 2026-08-24).
+    *(Numbered 20 when written, which collided with the resolved item 20 above; renumbered
+    2026-08-24.)* It was already 333
    before the calibration rules landed. The three new bullets each meet the file's own bar ("an agent
    would break something without it"), so the fix is to move OTHER material out — the maintenance
    note itself prescribes OPEN-ITEMS / HARD-WON-LESSONS / PHASE-HISTORY as the destinations — not to

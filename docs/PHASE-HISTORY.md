@@ -43,6 +43,44 @@ image compares as different across units.
 
 ## Phase 3 — remaining sources, GUI, container (`feature/phase3-sources-gui`, in progress)
 
+### Volume calibration and loudness matching, on real speakers — 2026-08-21/24
+
+Ported in CONCEPT from Plum-Snapcast, where it was built and never tested. Almost none of the
+implementation survived: its tone wrote straight to local ALSA with `sox`, so it bypassed the volume
+stage entirely and every measurement read the same SPL — slope 0, inverse `NaN`. Its persistence
+was silently dropped by a frontend key whitelist, and `sox` was not even in the image. The design
+and the full post-mortem are in `docs/VOLUME-CALIBRATION.md`.
+
+**What it is.** Play a known signal from ONE endpoint at a few known volumes, have the user read SPL
+from where they listen, and fit `dB = a*log10(volume) + b`. The tone is a real transient Sendspin
+source (`cal:<player_id>`) with the target player alone in its group, so it travels the same path
+the music does and the endpoint's own gain applies to it — the whole measurement. Grouped endpoints
+then hold a matched loudness, scoped by an explicit policy (`off` / `follow` / `stream` / `sets`)
+because "how loud is this endpoint" and "which endpoints are locked together" are different
+questions.
+
+**Proven on the `.7` pair.** First real calibration fitted 20.99 and 17.60 dB/decade with 0.30 and
+0.06 dB residuals against an ideal 20 — the log-space model holds on real hardware, on two very
+different amplifiers. Matching drove one speaker to exactly 60% and 90% as the other moved,
+computed through its own curve.
+
+**What the rig taught that no unit test could.** Routing onto a freshly created source failed
+outright, because the router resolves a source through a 2 s-cached view. Re-levelling lagged
+0.5-1.5 s until the volume request itself nudged the matcher — and then a stale view read the old
+level as a fresh human action and bounced the group backwards. An iPad sends every slider move
+twice, 13 ms apart, because `<input type="range">` double-fires on iOS.
+
+**Two bugs found in passing, neither caused by this work.** `reclaim_remote_player` staged a pairing
+PSK on the strength of a comment claiming its `player_id` "only ever names a Plum player" — false,
+since `snapshot()` has no ownership filter, and staging one takes a cleartext ESP32 offline
+(OPEN-ITEMS #21). And two units set to follow each other oscillated forever with nothing detecting
+the cycle (#25).
+
+**Deployed:** `192.168.7.122` and `192.168.7.204`. Suite: 52/52, twice back-to-back.
+
+**Still open:** the player wedge (#23) — two hypotheses tested and dead, three facts gained, written
+up rather than guessed at.
+
 ### aiosendspin 6.0.5 → 9.1.0, proven on the `.7` pair — 2026-08-13
 
 **Three majors, ported on `feature/aiosendspin-9x` and validated on hardware.** The scoping (why the

@@ -358,6 +358,14 @@ forever. That is the whole 19:05–19:39 window in that unit's server log.
 `disconnect_from_client` is still synchronous and still clobbers `_connection_tasks[url]`, so
 `_stop_dialing` stays.
 
+> **Correction, 2026-08-24.** "A client holds exactly ONE websocket" is true of 6.0.5 and is what
+> the account above was written against. Under 9.1.0 connections OVERLAP: measured on the rig, our
+> player's session 306 stayed open while sessions 307-311 opened and closed, because 9.x brings an
+> incoming connection up provisionally and then arbitrates by activity rank rather than refusing it
+> outright. The lesson is unaffected — two dialers still fight, and one holder still wins — but do
+> not use "it holds one websocket" to predict that a dial will be REFUSED. It may be accepted and
+> then lose the arbitration, which is a different failure with a different signature. OPEN-ITEMS #23.
+
 **The orphaned eviction timer.** Found the same night, with DEBUG on, chasing "reroute a speaker, it
 plays for a few seconds, then drops back to idle". `SendspinClient._schedule_cleanup` assigns
 `_cleanup_handle` **without cancelling whatever was already there**, so scheduling twice orphans the

@@ -90,7 +90,8 @@ between servers (that would need the unmerged `Roles.SOURCE`). Two tiers:
 2. **Cross-server** roam → `reclaim_client_for_playback` + `GoodbyeReason.ANOTHER_SERVER`.
 
 A roam is inaudible: the player never flushes, so its ~300 ms jitter buffer drains through the
-~25-55 ms reconnect. **There is no DISCOVERY pre-connect** — a client holds one websocket, so a
+~25-55 ms reconnect. **There is no DISCOVERY pre-connect** — a client holds one websocket *for
+playback* (but see the 9.x caveat under the pairing rules), so a
 playing player cannot be warmed on a second server, and a DISCOVERY dial would steal it. Refuted on
 hardware; do not reintroduce it.
 
@@ -147,6 +148,13 @@ The *reasoning* behind these, and the failures that produced them, is in
   so the connection arrives already paired. Stage only ids we already share a secret with. A pairing
   handshake against a **cleartext** client is aborted by the library, so staging or pairing an ESP32
   takes it offline — signature: the NEXT adopt succeeds. Detail: `docs/SENDSPIN-PAIRING.md`.
+- **"A client holds exactly ONE websocket" is a 6.0.5 truth, and 9.x is more subtle.** Measured
+  2026-08-24: connections OVERLAP — session 306 stayed open on our player while 307-311 opened and
+  closed — because 9.x brings an incoming connection up provisionally and then arbitrates by
+  activity rank. The old statement still describes the OUTCOME (one server ends up holding a player)
+  and every rule resting on it stands; what is wrong is treating a held connection as a hard refusal
+  of the next dial. Anything reasoning about connection *count* must measure rather than assume.
+  OPEN-ITEMS #23.
 - **Cleartext clients skip the trust gate entirely, and our own player can never be one.** A legacy
   `client/hello` is activated straight from the negotiated set, so ESP32 speakers, Music Assistant
   and our hand-rolled GUI controller need no pairing — that is what `PLUM_ALLOW_UNENCRYPTED=1` buys.
@@ -330,6 +338,15 @@ items that change how you would write code *today* are repeated here:
 - **`@sendspin/sendspin-js` is deliberately held at 3.2.1.** 5.0.0 is Noise-only and drops the
   caller-chosen `playerId` that `MeshApp`'s browser-route reconciler joins on. It becomes forced the
   day `PLUM_ALLOW_UNENCRYPTED` goes off.
+- **Two units set to follow each other OSCILLATE, and `_overridden` does not catch it.** It covers
+  "the user moved us", not "the config is circular". `masterUnitId` is a free per-unit choice with no
+  cross-unit validation, so a GUI user reaches it: each unit then routes its own player onto the
+  other's stream, about once a minute, forever. `FollowReconciler` walks `follows_unit_id` from its
+  master and, if the chain returns to itself, the LOWEST unit id stands down and publishes
+  `follows_unit_id = None` — which is what dissolves the cycle for the others. Deterministic on
+  purpose: a state-dependent rule ("whoever is playing wins") hands leadership back and forth as
+  playback moves, which is the oscillation it exists to stop. `PlaybackTab` will not offer a master
+  that would close a loop. OPEN-ITEMS #25.
 - **A follower stops following when its leader switches source** (`follow.tick()` reads the
   resulting `current_target = None` as "the user moved us"). Pinned by a parity test rather than
   changed; distinguishing "went idle" from "was moved" needs a real decision.
