@@ -160,7 +160,58 @@ non-negotiable for tier 4's live third-party devices. `run.sh` drives a whole ri
 | `t4_adopt_release.sh` | ✅ passing — adopt an HA Voice PE, release incl. the socket-closed check |
 | `t2_bt_avrcp_position.sh` | ✅ passing (interop unit + iPhone, 2026-07-29) — 8 polls / 12 s, 4 Position signals / 9 s |
 | `t3_mesh_roam.sh` | ✅ passing (mesh pair, 2026-07-24) |
-| `t3_autofollow.sh` | written, syntax-checked; **pending** a run on the mesh pair |
+| `t3_autofollow.sh` | ✅ passing (mesh pair, 2026-08-22) — also clears BOTH units' follow config now, see below |
+| `t2_calibration_tone.sh` | ✅ passing (both `.7` units, 2026-08-22) — the tone reaches the audio path; needs no meter or speaker |
+| `t3_loudness_match.sh` | ✅ passing (mesh pair, 2026-08-22) — cross-unit curve merge, causal rev, and matching driven live |
+| `t4_player_wedge_soak.sh` | ran 2026-08-24, **did not reproduce** in 80 cycles across two churn profiles (OPEN-ITEMS #23) |
+| `t4_player_halfopen.sh` | ✅ passing (mesh pair, 2026-08-24) — freezes a peer mid-connection; the half-open state is real but does not wedge |
 
-**Remaining:** run `t3_autofollow.sh` on the mesh rig; add `t2_airplay_mpris.sh` (per-endpoint
-private-bus MPRIS ownership) and a `t3_multigroup.sh`; the tier-5 soak and tier-6 container tiers.
+**Remaining:** add `t2_airplay_mpris.sh` (per-endpoint private-bus MPRIS ownership) and a
+`t3_multigroup.sh`; the tier-5 soak and tier-6 container tiers.
+
+### What the calibration and wedge tests are for
+
+`t2_calibration_tone.sh` proves the STRUCTURAL half of volume calibration with no meter and no
+speaker attached. The assertion that earns its place is `streaming=True` on the `cal:` source: it
+means audio is being committed to a group, so it travels encode → websocket → the player's gain
+stage, which is the quantity being measured. The predecessor's tone wrote straight to local ALSA and
+could never have made that true — and shipped, because nothing tested this layer.
+
+`t3_loudness_match.sh` covers the rest without acoustics: a curve saved on one unit is visible to
+another, the causal `rev` advances, and moving one slider re-derives the other THROUGH ITS OWN CURVE
+rather than copying the percentage. Its curves are synthetic but physically shaped (ideal 20 dB per
+decade, B six decibels less efficient), so the expected answer is arithmetic rather than a fudge
+factor. What neither test can do is confirm that an endpoint's volume actually changes its measured
+SPL — that needs a person with a meter, and is item 2 of the checklist in docs/VOLUME-CALIBRATION.md.
+
+The two tier-4 wedge tests are a HUNT, not an assertion. `t4_player_wedge_soak.sh` passing means
+"did not reproduce in N cycles", which is weaker than a green tick normally implies, and it says so
+in its own output. `t4_player_halfopen.sh` is the targeted counterpart: it freezes a peer with
+`docker pause` — the only way to get a peer that stops answering WITHOUT closing — and it always
+unfreezes, because a paused container is invisible in the `docker ps` output people skim.
+
+### A test that runs on a configured rig must leave it as it found it
+
+Three of these bit us, and all three were the same mistake in different clothes: assuming the rig is
+blank.
+
+- `t3_loudness_match.sh` wrote its own curves against the same player ids as real calibration, then
+  DELETED them — which destroys a real curve whenever the operator's record happens to live on the
+  unit the test targets. It now saves and restores. It also has to claim a high `rev`, or a real
+  rev-2 curve outranks its own and every arithmetic assertion is computed against the wrong speaker.
+- `t3_autofollow.sh` reset only the follower's config, so a pre-existing A-follows-B plus its own
+  B-follows-A made a follow CYCLE — which is how OPEN-ITEMS #25 was found, on a rig someone had set
+  up by hand.
+- `t2_endpoint_crud.sh` once left a probe endpoint behind that sat in a real unit's configuration
+  for days. Sweep by NAME, not by a remembered id: the id is lost if a run dies mid-cycle.
+
+### The harness itself was a source of failures
+
+Intermittent, moving failures across back-to-back suite runs were NOT the product. Every extracted
+value used to cost two ssh connections — one to run curl on the unit, another to pipe the JSON back
+for a second `python3 -c` — and `lib.sh` had no retry, on a rig whose deploy script has carried one
+since it was built because it "occasionally refuses one". `json_` now parses locally, which halves
+the connections and is what makes a retry safe at all (retrying an ssh with local stdin piped into
+it would resend a stream the first attempt consumed). `retry_ssh_` retries only exit 255 — ssh's own
+transport failure — so a remote command that legitimately fails still reports honestly. Confirmed
+live: a `Permission denied (publickey,password)` was absorbed mid-soak and the cycle continued.

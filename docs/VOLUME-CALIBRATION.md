@@ -205,6 +205,41 @@ allocated inside the settings lock. The browser supplies the high-water mark bec
 party holding the merged view; that is safe, because the value can only push the stored rev higher.
 `lastCalibrated` remains for display, and as a tiebreak for records written before `rev` existed.
 
+### Re-levelling happens on the request, not on the next poll
+
+Detecting intent by divergence costs up to a whole poll interval, and on the rig that interval WAS
+the lag: measured 0.5-1.5 s from moving one slider to the other following, of which the follower's
+own move was 2 ms. So `POST /api/mesh/volume` hands the request straight to the reconciler
+(`note_user_volume`), which re-levels immediately. Divergence detection stays as the fallback for
+changes this cannot see — a third-party controller such as Music Assistant commanding one of our
+players, or anything else moving a level outside our API.
+
+Always the right unit, and not by luck: `Router.set_volume` only resolves a client on the local
+server, and a player attached to a group is by definition connected to the server owning that group.
+
+Two things this got wrong first, both found by measuring rather than reasoning:
+
+- **A nudge that only triggers an early tick does nothing.** In the moment after a volume request the
+  view is a poll behind and the player's echo a round trip behind that, so a re-read sees the old
+  level and finds no divergence. The intent has to TRAVEL with the nudge and override what the view
+  reports for that endpoint.
+- **A stale view bounces the group backwards.** After a stated volume the view keeps reporting the
+  previous level for a poll or two. Left trusted, the next tick reads that as a fresh human action
+  and re-derives the target backwards — the follower jumps forward, bounces back, then forward
+  again, two seconds apart. Two quick moves produced seven decisions with alternating targets. An
+  endpoint whose level we STATED is now held unconfirmed until its echo matches, the same rule
+  already applied to one we commanded. After the fix: three moves, three decisions, 2 ms each.
+
+### One slider move, two requests
+
+`<input type="range">` on iOS fires its change event TWICE for a single touch — once on `touchend`
+and again from the synthesised click. Every slider move from an iPad arrived twice, ~13 ms apart,
+with an identical value; the polling GETs double the same way, so it is the platform rather than
+anything specific to volume. Idempotent, so nothing broke, but it doubled request volume and — once
+a volume request started nudging the matcher — doubled reconcile work. `sendspinDataService.setVolume`
+drops an exact repeat within 250 ms, keyed on the value as well as the player, so a genuine drag (a
+stream of DIFFERENT values) and a deliberate re-set of the same level both still get through.
+
 ### Why a polling reconciler
 
 Same reasons as `FollowReconciler`: the audio hot path stays untouched, membership changes and
@@ -294,6 +329,25 @@ Nothing below is proven on hardware yet.
 10. **Scope**: with `follow`, an office joined by hand to the same stream is left alone.
 11. **Cross-unit records**: calibrate from unit A's GUI, confirm unit B's matcher uses it.
 12. **The `cal:` source never appears** in any GUI stream list or picker, on any unit.
+
+### Measured on real speakers
+
+First real calibration, 2026-08-21, two very different endpoints:
+
+| | slope `a` | fit residual | samples |
+|---|---|---|---|
+| HiFiBerry Amp100 | 20.99 dB/decade | 0.30 dB | 78.0 / 83.5 / 86.0 |
+| Pi 3.5 mm + small speaker | 17.60 dB/decade | 0.06 dB | 62.0 / 66.0 / 68.8 |
+
+A pure amplitude scaler is exactly 20 dB per decade, so both landed close with tight residuals —
+the log-space model holds on real hardware. The 17.6 reads as a slightly tapered volume control
+rather than a pure scaler, which is what the wide plausible-slope band exists to absorb.
+
+Worth knowing when matching very different speakers: the efficient one ends up running at a low
+percentage. Matched to the small speaker's ceiling, the Amp100 sat at 3-14%, and volume is a float
+multiply on the samples — at 3% that is 30 dB of attenuation in software, roughly five bits of a
+16-bit signal. Nothing is wrong; it is the honest consequence of matching a loud speaker to a quiet
+one. Attenuating in the HAT's hardware mixer instead keeps the software gain higher.
 
 ### Third-party endpoints
 
