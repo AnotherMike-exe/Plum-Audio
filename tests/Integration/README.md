@@ -25,6 +25,7 @@ tier 4, which runs against live third-party devices in someone's home.
 | `t2_endpoint_crud.sh` | any one unit (config API on :5002) | `./t2_endpoint_crud.sh <host> [spotify\|airplay]` |
 | `t2_calibration_tone.sh` | any one unit **with a player** | `./t2_calibration_tone.sh <host>` |
 | `t3_loudness_match.sh` | two units, both with a player | `./t3_loudness_match.sh <a> <b>` |
+| `t4_player_wedge_soak.sh` | two units, both with a player; long-running | `./t4_player_wedge_soak.sh <a> <b> [cycles]` |
 | `t3_mesh_roam.sh` | **two** Plum units on one segment | `./t3_mesh_roam.sh <unit-a> <unit-b>` |
 | `t3_autofollow.sh` | **two** Plum units on one segment | `./t3_autofollow.sh <unit-a> <unit-b>` |
 | `t2_bt_avrcp_position.sh` | one unit + **a phone connected and playing** | `./t2_bt_avrcp_position.sh <host>` |
