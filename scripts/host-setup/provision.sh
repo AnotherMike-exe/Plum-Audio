@@ -3,7 +3,13 @@
 #
 #   ./provision.sh all                           # every unit in docker/units.conf
 #   ./provision.sh 192.0.2.10                    # one unit
-#   ./provision.sh all --overlay hifiberry-amp100 --unity   # a unit with an audio HAT (reboots)
+#   ./provision.sh <host> --overlay hifiberry-amp100        # a unit with an audio HAT — then REBOOT
+#   ./provision.sh <host> --unity                           # ...and only AFTER that reboot
+#
+# --overlay and --unity are two passes ON PURPOSE and must not be combined: --unity needs the card
+# to be enumerated, which does not happen until the overlay is applied and the Pi has rebooted. This
+# script never reboots for you. Combined, --unity finds no card, says so, and leaves a HAT ~22 dB
+# quiet with every volume slider reading correctly.
 #   ./provision.sh all --with-bluez              # + rebuild bluetoothd for AVRCP position (~30 min)
 #   ./provision.sh all --check                   # report only, change nothing
 #
@@ -67,7 +73,7 @@ while [[ $# -gt 0 ]]; do
         --unity)      DO_UNITY=1; shift ;;
         --with-bluez) WITH_BLUEZ=1; shift ;;
         --check)      CHECK_ONLY=1; shift ;;
-        -h|--help)    sed -n '2,40p' "$0"; exit 0 ;;
+        -h|--help)    sed -n '2,38p' "$0"; exit 0 ;;
         -*)           echo "unknown flag $1" >&2; exit 2 ;;
         *)            HOSTS+=("$1"); shift ;;
     esac

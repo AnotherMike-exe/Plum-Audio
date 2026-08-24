@@ -504,3 +504,14 @@
     inside a block whose exit status is then discarded. Worth auditing every step against the
     question "if this failed, would the unit still be serving audio, and would the summary say so?"
 
+31. **`provision.sh`'s remote checklist can hard-abort on a non-Lite image, half-provisioned.**
+    Found in the 2026-08-24 greenfield doc audit; latent on Pi OS Lite, which ships bluez and a user
+    bus, so it has never fired on the rig. Two branches run under `set -euo pipefail` with no guard:
+    the `grep` of `/etc/bluetooth/main.conf` (dies if bluez is absent) and the
+    `systemctl --user is-enabled obex.service` check (whose output on a session with no user bus is
+    an error string matching neither expected state, falling through to a `mask` that then fails).
+    Either aborts the checklist AFTER the payload push but BEFORE the bluealsa D-Bus policy — step 5,
+    the one whose absence is catastrophic and silent. `--check` already handles both gracefully;
+    the provisioning path should too. Also: `rfkill` is assumed present on the unit and never
+    stated as a prerequisite.
+
