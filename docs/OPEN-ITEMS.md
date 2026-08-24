@@ -473,3 +473,20 @@
     record and clear both units' `autoSwitch.slave` on entry and restore them in a `defer`, the way
     `t3_loudness_match.sh` does for the calibration policy.
 
+29. ~~**Every deploy left another ~600 MB image on the unit, and nothing ever removed them.**~~ —
+    **FIXED 2026-08-24.** On a 29 GB SD card that is roughly forty deploys to a full disk, reached on
+    BOTH rig units in a single afternoon of iteration. The failure is nasty rather than obvious: the
+    image loads fine, then the compose file is truncated to zero bytes, compose refuses it as an
+    "empty compose file", and the unit ends up with NO CONTAINER AT ALL — silently, because the `up`
+    step was the one `ssh_` call in `deploy.sh` without `|| return 1`, so the run still printed "all
+    units deployed" while both units were offline.
+    `deploy.sh` now prunes to the deploying tag, `latest` and `PLUM_KEEP_IMAGES` (default 2)
+    previous ones before loading, refuses to deploy with under 1.5 GB free, and propagates the up
+    step's failure. This matters more with more units, not less: it is per-unit and time-based, so a
+    wider rollout reaches it sooner.
+
+30. **`deploy.sh` reports success for steps it does not check.** #29 fixed the one that left units
+    down, but the pattern is worth a sweep: several `ssh_` heredocs there rely on remote `set -e`
+    inside a block whose exit status is then discarded. Worth auditing every step against the
+    question "if this failed, would the unit still be serving audio, and would the summary say so?"
+

@@ -81,6 +81,10 @@ MIGRATE=1
 TARBALL=""
 IMAGE_REF=""
 DEFAULT_REGISTRY="ghcr.io/anothermike-exe/plum-audio"
+# How many PREVIOUS image tags to keep on a unit, beyond the one being deployed and `latest`. Two is
+# enough for a rollback without letting a 29 GB SD card fill; the tarballs in dist/ are the real
+# rollback anyway.
+KEEP_IMAGES="${PLUM_KEEP_IMAGES:-2}"
 HOSTS=()
 
 while [[ $# -gt 0 ]]; do
@@ -464,10 +468,31 @@ EOS
     else
         say "$host — loading $(basename "$TARBALL")"
         scp_ "$TARBALL" "$host" "/tmp/plum-audio-image.tar.gz" || return 1
-        ssh_ "$host" "bash -s -- '$PW'" <<'EOS' || return 1
+        # Every deploy leaves another ~600 MB image behind, and nothing ever removed them. On a 29 GB
+        # SD card that is roughly forty deploys to a FULL DISK — reached on both rig units in one
+        # afternoon. The failure is nasty rather than obvious: the image loads, the compose file is
+        # truncated to nothing, and the unit ends up with no container. Keep the tag being deployed
+        # plus KEEP_IMAGES previous ones, and fail loudly if there is still no room afterwards.
+        ssh_ "$host" "bash -s -- '$PW' '$PLUM_IMAGE_NAME' '$PLUM_IMAGE_TAG' '$KEEP_IMAGES'" <<'EOS' || return 1
 set -euo pipefail
-PW="$1"
+PW="$1"; IMAGE_NAME="$2"; IMAGE_TAG="$3"; KEEP="$4"
 s() { echo "$PW" | sudo -S -p '' "$@"; }
+
+# Ordered newest-first by creation, so "keep the last N" means what it says. `latest` and the tag we
+# are about to deploy are never candidates.
+stale="$(s docker images "$IMAGE_NAME" --format '{{.Tag}}\t{{.CreatedAt}}' 2>/dev/null \
+    | grep -vE "^(latest|${IMAGE_TAG})\s" | sort -k2 -r | awk -v k="$KEEP" 'NR>k{print $1}')"
+for t in $stale; do
+    echo "    pruning old image ${IMAGE_NAME}:${t}"
+    s docker rmi -f "${IMAGE_NAME}:${t}" >/dev/null 2>&1 || true
+done
+
+free_kb="$(df -Pk / | awk 'NR==2{print $4}')"
+if [[ "$free_kb" -lt 1500000 ]]; then
+    echo "    !! only $((free_kb / 1024)) MB free after pruning — refusing to deploy into a full disk" >&2
+    exit 1
+fi
+
 s docker load -i /tmp/plum-audio-image.tar.gz | sed 's/^/    /'
 rm -f /tmp/plum-audio-image.tar.gz
 EOS
@@ -553,7 +578,12 @@ EOS
     # 7 + 8. Up, then prove it actually serves — a running container says nothing about whether
     # supervisord's tree came up.
     say "$host — up"
-    ssh_ "$host" "bash -s -- '$PW' '$REMOTE_ROOT' '$expected_programs' '$profile' '$PLUM_IMAGE_NAME' '$PLUM_IMAGE_TAG'" <<'EOS'
+    # `|| return 1` is load-bearing: this is the step that decides whether the unit is actually
+    # RUNNING, and it was the one ssh_ call without it. A full disk truncated docker-compose.yml,
+    # compose refused it as an "empty compose file", and the run still printed "all units deployed"
+    # while BOTH units were left with no container at all. Any step that can leave a unit down has
+    # to be able to fail that unit.
+    ssh_ "$host" "bash -s -- '$PW' '$REMOTE_ROOT' '$expected_programs' '$profile' '$PLUM_IMAGE_NAME' '$PLUM_IMAGE_TAG'" <<'EOS' || return 1
 set -euo pipefail
 PW="$1"; ROOT="$2"; WANT="$3"; PROFILE="$4"; IMAGE_NAME="$5"; IMAGE_TAG="$6"
 # Belt and braces alongside $ROOT/.env: compose v1 (the Debian units) and v2 (the Docker-CE one)
