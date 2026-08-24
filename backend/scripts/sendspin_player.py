@@ -486,11 +486,15 @@ class SendspinPlayer:
         # elsewhere by definition. Any Sendspin server can take this speaker (that is the point of
         # the standard), so the GUI has to learn about it from the speaker itself.
         self._state: dict = {"attached": False}
-        # One attached server connection at a time; `attach_websocket` blocks for its whole life, so
-        # these are how a session that never ends becomes visible. See _warn_if_session_is_stuck.
+        # Server connections OVERLAP. A single "current session" field was wrong: 9.x brings an
+        # incoming connection up provisionally before deciding whether to keep it, so short-lived
+        # dials open and close while an older connection is still held — and each one clobbered the
+        # start time, producing durations like "-0.0s" and, far worse, hiding the very thing this
+        # was added to catch. Measured on the rig: session 306 stayed open while 307-311 came and
+        # went. Keyed by sequence number so each session carries its own start.
         self._session_seq = 0
-        self._session_at: float | None = None
-        self._session_warned = False
+        self._sessions: dict[int, float] = {}
+        self._sessions_warned: set[int] = set()
         self._report_task: asyncio.Task | None = None
         self._health_task: asyncio.Task | None = None
         self.report_url = os.environ.get("PLUM_PLAYER_STATE_URL", "http://127.0.0.1:5001/api/mesh/player-state")
@@ -853,7 +857,7 @@ class SendspinPlayer:
                     await self._send_client_state(state)
 
     def _warn_if_session_is_stuck(self) -> None:
-        """Say so when we have held one server connection implausibly long.
+        """Say so when a server connection has been held implausibly long.
 
         `attach_websocket` blocks for the whole life of a connection, so "detached from server"
         only prints when it RETURNS. A wedge observed on the rig showed `stream_end -> idle` and
@@ -862,25 +866,32 @@ class SendspinPlayer:
 
         That points at the player still sitting inside `attach_websocket` on a connection the other
         end has abandoned: a half-open socket we never noticed. This does not fix it and does not
-        guess; it makes the state visible in the log, once, so a soak run can be read afterwards.
-        `connected` is reported alongside because the interesting case is the library still
-        believing it has a live peer.
+        guess; it makes the state visible in the log, once per session, so a soak run can be read
+        afterwards. `connected` is reported alongside because the interesting case is the library
+        still believing it has a live peer.
+
+        Checks EVERY open session, not just the newest. Connections overlap — 9.x brings an incoming
+        one up provisionally before deciding whether to keep it — so the stuck one is by definition
+        the old one that newer, short-lived dials would otherwise hide.
         """
-        started = self._session_at
-        if started is None or self._session_warned:
-            return
-        held = time.monotonic() - started
-        if held < STUCK_SESSION_WARN_S:
-            return
-        self._session_warned = True
-        logger.warning(
-            "session %d has been attached for %.0fs without detaching (client.connected=%s, "
-            "audio_flowing=%s) — if dials are timing out, this is the held websocket",
-            self._session_seq,
-            held,
-            self.client.connected,
-            self._audio_flowing,
-        )
+        now = time.monotonic()
+        for session, started in sorted(self._sessions.items()):
+            if session in self._sessions_warned:
+                continue
+            held = now - started
+            if held < STUCK_SESSION_WARN_S:
+                continue
+            self._sessions_warned.add(session)
+            logger.warning(
+                "session %d has been attached for %.0fs without detaching (%d sessions open, "
+                "client.connected=%s, audio_flowing=%s) — if dials are timing out, this is the "
+                "websocket holding them off",
+                session,
+                held,
+                len(self._sessions),
+                self.client.connected,
+                self._audio_flowing,
+            )
 
     def _remember_playing_server(self) -> None:
         """Persist the server_id of whoever most recently had us actually playing.
@@ -950,15 +961,23 @@ class SendspinPlayer:
             self._last_starved_frames = self.renderer.starved_frames
             self._session_seq += 1
             session = self._session_seq
-            self._session_at = time.monotonic()
-            self._session_warned = False
-            logger.info("server dialed us [session %d] %s", session, self.renderer.stats())
+            self._sessions[session] = time.monotonic()
+            logger.info(
+                "server dialed us [session %d, %d open] %s", session, len(self._sessions), self.renderer.stats()
+            )
             try:
                 await self.client.attach_websocket(ws)
             finally:
-                held = time.monotonic() - (self._session_at or time.monotonic())
-                self._session_at = None
-                logger.info("detached from server [session %d after %.1fs] %s", session, held, self.renderer.stats())
+                started = self._sessions.pop(session, None)
+                self._sessions_warned.discard(session)
+                held = time.monotonic() - started if started is not None else float("nan")
+                logger.info(
+                    "detached from server [session %d after %.1fs, %d still open] %s",
+                    session,
+                    held,
+                    len(self._sessions),
+                    self.renderer.stats(),
+                )
 
         self._listener = ClientListener(
             client_id=self.player_id, on_connection=on_connection, port=self.port, advertise_mdns=False
