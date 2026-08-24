@@ -485,7 +485,21 @@
     step's failure. This matters more with more units, not less: it is per-unit and time-based, so a
     wider rollout reaches it sooner.
 
-30. **`deploy.sh` reports success for steps it does not check.** #29 fixed the one that left units
+30. ~~**`deploy.sh` reports success for steps it does not check.**~~ — **FIXED 2026-08-24.** Swept
+    every remote step: all ten `ssh_`/`scp_`/`put_` calls now propagate, and the three remaining
+    `|| true` cases are deliberate cleanup where failure is genuinely fine. Two deeper fixes came out
+    of the sweep. `retry_` re-ran a whole remote block on ANY failure, so a state-changing step that
+    failed once and "succeeded" on a second attempt — because the first left the file half-written —
+    reported success for work it had not done; that is the likeliest route by which a truncated
+    docker-compose.yml got past `set -e`. `ssh_`/`put_` now retry only exit 255, ssh's own transport
+    failure, so a refused connection is still absorbed while a genuine remote failure is not (`scp_`
+    keeps the blanket retry: 200 MB, no remote state to half-change). And the config step now checks
+    its POST-CONDITION — that both files exist and are non-empty — because an exit status describes
+    what a command believed, not what the unit actually has. Verified against a live unit: a good
+    unit passes, a missing file is rejected, and a remote `exit 7` returns 7 in one second rather
+    than being retried away. Original report below.
+
+     #29 fixed the one that left units
     down, but the pattern is worth a sweep: several `ssh_` heredocs there rely on remote `set -e`
     inside a block whose exit status is then discarded. Worth auditing every step against the
     question "if this failed, would the unit still be serving audio, and would the summary say so?"

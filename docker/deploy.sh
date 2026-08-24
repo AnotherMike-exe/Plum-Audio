@@ -148,6 +148,14 @@ fi
 # A deploy opens a dozen authenticated connections per unit in quick succession, and sshd will
 # occasionally refuse one ("Permission denied" on a password that is demonstrably correct). Retry
 # rather than fail a whole unit on a transient auth refusal.
+#
+# But retry the TRANSPORT ONLY. `retry_` re-runs the whole remote block, so a state-changing step
+# that fails once and then "succeeds" on a second attempt — because the first attempt already left
+# the file half-written — reports success for a step that did not do what it says. That is the
+# likeliest way a full disk truncated docker-compose.yml and the deploy carried on regardless.
+# ssh exits 255 for its own failures and otherwise passes the remote command's status straight
+# through, so keying on 255 retries a refused connection and never masks a genuine failure.
+# (tests/Integration/lib.sh carries the same rule for the same reason.)
 retry_() {
     local n=0
     until "$@"; do
@@ -156,11 +164,23 @@ retry_() {
         sleep 3
     done
 }
-ssh_()  { retry_ sshpass -p "$PW" ssh $SSH_OPTS "${USER_}@$1" "${@:2}"; }
+retry_ssh_() {
+    local n=0 rc
+    while :; do
+        "$@"; rc=$?
+        [[ $rc -ne 255 ]] && return $rc
+        n=$((n + 1))
+        [[ $n -ge 3 ]] && return $rc
+        sleep 3
+    done
+}
+ssh_()  { retry_ssh_ sshpass -p "$PW" ssh $SSH_OPTS "${USER_}@$1" "${@:2}"; }
+# scp keeps the blanket retry: it moves 200 MB and an interrupted transfer is genuinely worth
+# re-running, with no remote state to leave half-changed.
 scp_()  { retry_ sshpass -p "$PW" scp $SSH_OPTS "$1" "${USER_}@$2:$3"; }
 # Send a local file over an existing-style ssh session instead of a second scp auth. Used for the
 # small config files; the image tarball still goes by scp (scp is far faster for 200 MB).
-put_()  { retry_ sshpass -p "$PW" ssh $SSH_OPTS "${USER_}@$1" "cat > '$3'" < "$2"; }
+put_()  { retry_ssh_ sshpass -p "$PW" ssh $SSH_OPTS "${USER_}@$1" "cat > '$3'" < "$2"; }
 say()   { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 warn()  { printf '\033[33m    !! %s\033[0m\n' "$*"; }
 
@@ -577,6 +597,15 @@ EOS
 
     # 7 + 8. Up, then prove it actually serves — a running container says nothing about whether
     # supervisord's tree came up.
+    # Check the POST-CONDITION, not just the exit status. This step's entire purpose is that two
+    # files exist and are non-empty, and the observed failure was exactly that they were not: a full
+    # disk truncated docker-compose.yml to zero bytes while the step still reported success. An exit
+    # status describes what a command believed; this describes what the unit actually has.
+    ssh_ "$host" "test -s '$REMOTE_ROOT/docker-compose.yml' && test -s '$REMOTE_ROOT/plum-audio.env'" || {
+        warn "$host: docker-compose.yml or plum-audio.env is missing/empty after the config step"
+        return 1
+    }
+
     say "$host — up"
     # `|| return 1` is load-bearing: this is the step that decides whether the unit is actually
     # RUNNING, and it was the one ssh_ call without it. A full disk truncated docker-compose.yml,
