@@ -40,14 +40,40 @@ riding the audio stream, so artwork changes and track updates cannot disturb pla
 - The **host's** Avahi and D-Bus (the container uses them rather than running its own).
 - An audio output — the Pi's 3.5 mm jack, a HAT, or a USB DAC. Optional; see headless units above.
 - Images are built for **`linux/arm64` only**. See [Other platforms](#other-platforms).
+- **Each Pi needs a route to the internet for its first deploy** — `deploy.sh` installs Docker over
+  `apt` on a fresh card. After that the units only need each other and your LAN.
+
+### On your workstation
+
+| Need | Why |
+|---|---|
+| Docker | builds the image. On Apple Silicon the arm64 build is native; on an Intel Mac or x86 Linux you must register QEMU/binfmt first or `build.sh` fails with an exec-format error |
+| `git`, `bash`, `ssh`/`scp` | the tooling is shell scripts driven over SSH |
+| **`sshpass`** | every script authenticates non-interactively and refuses to start without it |
+
+`sshpass` is no longer in homebrew-core (it was removed as a security risk), so the obvious
+`brew install sshpass` fails. On macOS use:
+
+```bash
+brew tap hudochenkov/sshpass
+brew install sshpass
+```
 
 ## Deploying to a fresh Pi
 
 Everything is driven from your workstation. A Pi needs no copy of this repo and no registry
-credentials.
+credentials — but it does need internet access the first time, to install Docker.
 
-**1. Flash and boot** Raspberry Pi OS Lite (64-bit, Debian 13). Enable SSH and create a user — the
-scripts default to `plum-admin`. Give every unit a static address or a DHCP reservation.
+**1. Flash and boot** Raspberry Pi OS Lite (64-bit, Debian 13).
+
+- **Enable SSH** and create a user. The scripts default to `plum-admin`; if you use another name,
+  set `PLUM_TEST_USER` in step 2 — nothing else will tell you why every connection is refused.
+- **Set the hostname per unit** in Pi Imager. Two identically-flashed Pis both claim
+  `raspberrypi.local` and Avahi renames one of them.
+- **Configure WiFi in Imager if the unit has no ethernet** — a headless Pi with neither never
+  appears on the network.
+- Give every unit a **static address or DHCP reservation**, and put them **on the same subnet**:
+  mDNS is link-local, so units on different VLANs cannot discover each other.
 
 **2. Tell the tooling about your units.**
 
@@ -56,13 +82,24 @@ git clone https://github.com/AnotherMike-exe/Plum-Audio.git
 cd Plum-Audio
 
 cp docker/units.conf.example docker/units.conf   # one line per unit; the file explains each column
-echo 'PLUM_TEST_PW=<your pi password>' > docker/.deploy.env
+
+printf 'PLUM_TEST_USER=%s\nPLUM_TEST_PW=%s\n' 'plum-admin' '<your pi password>' > docker/.deploy.env
+chmod 600 docker/.deploy.env
 ```
 
 Both files are gitignored. `units.conf` is where unit names, ids and audio devices are decided, and
-its comments are worth reading — the ids are what the mesh routes on.
+its comments are worth reading — the ids are what the mesh routes on. The example ships a two-VLAN
+table because that is the author's rig; **yours should list only your own units, on one subnet.**
+
+> **Write `.deploy.env` once.** The first `deploy.sh` run mints a fleet pairing secret and
+> **appends** `PLUM_FLEET_PSK=…` to this file. Every unit must share it, and there is no way to
+> recover it once some units have it and the file does not. If you need to fix a typo, edit the
+> file — never re-run the `>` redirect above, which would truncate the secret away.
+>
+> If your password contains a space, `$`, `'` or `#`, quote it: the file is `source`d.
 
 **3. Provision each Pi — once per SD card image, not per deploy.**
+Full detail and the by-hand equivalent of every step: [docs/HOST-PROVISIONING.md](docs/HOST-PROVISIONING.md).
 
 ```bash
 scripts/host-setup/provision.sh all --check   # report what is missing, change nothing
@@ -71,8 +108,18 @@ scripts/host-setup/provision.sh all           # rfkill, bluez config, D-Bus poli
 
 Two steps are opt-in because neither can be inferred:
 
-- `--overlay <name> [--unity]` for an audio HAT. Boards without an ID EEPROM cannot be detected, so
-  choosing the overlay is your call. Needs a reboot.
+- **An audio HAT** needs the overlay and, separately, unity gain. These are **two passes with a
+  reboot between them** — the second needs the card to exist, and the card does not exist until the
+  overlay has been applied and the Pi rebooted:
+
+  ```bash
+  scripts/host-setup/provision.sh <ip> --overlay hifiberry-amp100
+  ssh plum-admin@<ip> sudo reboot          # the script does NOT reboot for you
+  scripts/host-setup/provision.sh <ip> --unity
+  ```
+
+  Running them together silently does nothing useful: `--unity` finds no card and the HAT is left
+  ~22 dB quiet with every volume slider reading correctly.
 - `--with-bluez` builds a patched `bluetoothd` (~30 min) that polls AVRCP play status, which is what
   makes Bluetooth scrub position report correctly. Skip it if you do not need Bluetooth metadata.
 
@@ -81,7 +128,7 @@ A unit on the Pi's onboard 3.5 mm output needs neither.
 **4. Build and deploy.**
 
 ```bash
-docker/build.sh                # arm64 image -> dist/plum-audio-<tag>.tar.gz
+docker/build.sh                # arm64 image -> dist/plum-audio-<tag>-arm64.tar.gz
 docker/deploy.sh all           # every unit in units.conf
 docker/deploy.sh 192.0.2.10    # or just one
 ```
@@ -90,7 +137,22 @@ docker/deploy.sh 192.0.2.10    # or just one
 `docker load`s it. On Apple Silicon the arm64 build is native — no QEMU.
 
 **5. Open `http://<unit-ip>/`.** Add your sources under Settings → Integrations and pick an output
-under Settings → Audio.
+under Settings → Audio. A freshly deployed unit offers **AirPlay only**, with Spotify and Bluetooth
+switched off until you configure them — that is correct, not a fault. What a greenfield unit does
+and does not start with is in
+[docs/OPERATIONS.md](docs/OPERATIONS.md#what-a-greenfield-unit-actually-offers).
+
+**6. Confirm the two units can see each other.** This is the part `deploy.sh` cannot verify: it
+checks each unit in isolation, so a unit can pass every check and still be alone on the network.
+
+```bash
+curl -s http://<unit-a-ip>/api/mesh/view \
+  | python3 -c 'import json,sys; print([u["unit_id"] for u in json.load(sys.stdin)["units"]])'
+```
+
+Both unit ids should be listed, and asking the other unit should give the same answer. Allow ~10 seconds — peers announce on a 2 s beacon
+with an 8 s expiry, so a unit that has just booted takes a moment to appear. If only one is listed,
+they are not on the same layer-2 segment; mDNS will not cross a VLAN boundary.
 
 Re-run provisioning only after re-flashing a card. Redeploys are just steps 4 and 5, and they leave
 `settings.json` and your Spotify authorizations intact.
@@ -169,7 +231,7 @@ is never bridged between servers. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.m
 
 ## Tech stack
 
-- **Backend** — Python 3.13, [`aiosendspin`](https://github.com/Sendspin/aiosendspin) (pinned 6.0.5),
+- **Backend** — Python 3.13, [`aiosendspin`](https://github.com/Sendspin/aiosendspin) (pinned 9.1.0),
   PyAV, NumPy, Flask + aiohttp, supervisord
 - **Frontend** — React 19, TypeScript 5, Vite 6, served by nginx inside the container
 - **Base image** — `python:3.13-slim-trixie`. glibc rather than Alpine, deliberately: PyAV, PortAudio

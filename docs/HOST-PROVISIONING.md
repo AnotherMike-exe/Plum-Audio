@@ -10,10 +10,13 @@
 ```bash
 scripts/host-setup/provision.sh all --check      # report only — what is missing on every unit
 scripts/host-setup/provision.sh all              # steps 2, 3b, 4, 5, 6 below
-scripts/host-setup/provision.sh 192.0.2.10 --overlay hifiberry-amp100   # step 1 (reboots)
+scripts/host-setup/provision.sh 192.0.2.10 --overlay hifiberry-amp100   # step 1 — then reboot BY HAND
 scripts/host-setup/provision.sh 192.0.2.10 --unity                      # step 1, after that reboot
 scripts/host-setup/provision.sh all --with-bluez                            # step 3a (~30 min/unit)
 ```
+
+Its two prerequisites are the same as `deploy.sh`'s, and it will not start without them: `sshpass`
+on the workstation, and `docker/units.conf` plus a `PLUM_TEST_PW` (see the README's step 2).
 
 It runs from the **workstation**, against `docker/units.conf`, and pushes the host-setup payload
 (`configure-audio-hat.sh`, `backend/config/bluez/`, `bluealsa-plum-dbus.conf`) to `~/plum-audio-hostsetup`
@@ -30,8 +33,9 @@ capability that is genuinely optional (§3).
 
 `--check` changes nothing and is the fastest way to answer "is this unit provisioned?".
 
-> **`provision.sh all` means all four units in `units.conf`**, across both VLANs — name the hosts
-> explicitly when you mean a subset. Every step is idempotent, but §3b restarts `bluetoothd`, which
+> **`provision.sh all` means every row in YOUR `units.conf`** — name the hosts explicitly when you
+> mean a subset. (The table shipped in this repo happens to span two VLANs; that is the author's rig,
+> not a property of the tooling.) Every step is idempotent, but §3b restarts `bluetoothd`, which
 > drops a connected phone on a unit that was mid-playback.
 
 ## Why any of this is on the host
@@ -63,7 +67,11 @@ Raspberry Pi OS does not auto-detect audio HATs, and the boards on this rig expo
 (`/proc/device-tree/hat` does not exist on the Amp100), so there is no auto-detect to fall back on —
 choosing the overlay is the operator's job.
 
+These run ON THE UNIT, from where `provision.sh` pushed the payload — not from a repo checkout,
+which a fresh Pi does not have.
+
 ```bash
+cd ~/plum-audio-hostsetup
 sudo ./configure-audio-hat.sh --list          # supported overlays
 sudo ./configure-audio-hat.sh --detect        # what is fitted / configured right now
 sudo ./configure-audio-hat.sh --overlay hifiberry-amp100
@@ -127,7 +135,12 @@ in `/var/lib/systemd/rfkill`, so it survives reboots; re-flashing the card loses
 
 ## 3. Patched `bluetoothd` — `backend/config/bluez/install_patched_bluez.sh`
 
+On the unit, from the pushed payload. Needs working `apt` with source repositories: the script
+derives throwaway `deb-src` entries from `/etc/apt/sources.list.d/*.sources` and hard-fails without
+them — fine on Pi OS 13, which uses deb822, but it fails half an hour into the operator's attention.
+
 ```bash
+cd ~/plum-audio-hostsetup/bluez
 sudo ./install_patched_bluez.sh          # build + install + apt-mark hold
 sudo ./install_patched_bluez.sh --revert # unhold + restore the distro package
 ```
@@ -200,8 +213,11 @@ because we never got to ask. Same class as disabling `bluealsa-aplay.service`.
 
 ## 5. Install the bluealsa D-Bus policy
 
+On the unit. `backend/config/…` is a WORKSTATION path — on the Pi the file is in the pushed payload.
+
 ```bash
-sudo cp backend/config/bluealsa-plum-dbus.conf /etc/dbus-1/system.d/
+cd ~/plum-audio-hostsetup
+sudo cp bluealsa-plum-dbus.conf /etc/dbus-1/system.d/
 sudo systemctl reload dbus     # or reboot
 ```
 
