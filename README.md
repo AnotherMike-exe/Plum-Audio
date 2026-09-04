@@ -100,20 +100,20 @@ sudo ./plum-init.sh "Kitchen"
 Allow about 10 minutes on a fresh card. Most of that is the Docker install and the image pull. Add
 `--check` first if you want a report of the host and no changes.
 
-> **Testing an unreleased branch.** Both the `curl` line above and the default `:latest` image track
-> `main`, which is the last release. To commission a unit from work that has not been released, do
-> not mix the two — a unit running a `main` image and a branch script can differ by an `aiosendspin`
-> major, and two units across such a split cannot mesh at all. Build the branch and hand the unit
-> that one artifact:
+> **Testing an unreleased branch.** The `curl` line above and the default `:latest` image both track
+> `main`, which is the last release. Do not mix a branch script with a `main` image: they can differ
+> by an `aiosendspin` major, and two units across such a split cannot mesh at all.
+>
+> Every push to `dev` publishes `:dev` from that same commit, so pull it rather than building:
 >
 > ```bash
-> docker/build.sh                                              # on your workstation
-> scp dist/plum-audio-<tag>-arm64.tar.gz scripts/plum-init.sh plum-admin@<pi>:
+> scp scripts/plum-init.sh plum-admin@<pi>:          # the script is not on main yet
 > ssh plum-admin@<pi>
-> sudo ./plum-init.sh "Kitchen" --tarball plum-audio-<tag>-arm64.tar.gz
+> sudo ./plum-init.sh "Kitchen" --image ghcr.io/anothermike-exe/plum-audio:dev
 > ```
 >
-> The locally built image carries the host-setup payload, so nothing is fetched from GitHub.
+> That image carries the host-setup payload, so nothing is fetched from GitHub. Use `--tarball` with
+> a local `docker/build.sh` only for work you have not pushed, or for a unit with no internet.
 
 **3. Write down the fleet pairing secret it prints.** The first unit mints one. Every later unit
 must get the same value, or the units cannot pair with each other's speakers:
