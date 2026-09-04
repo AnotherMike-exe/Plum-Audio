@@ -5,6 +5,7 @@
 #   ./deploy.sh 192.0.2.10                   # one unit
 #   ./deploy.sh all --tarball dist/x.tar.gz  # a specific build (default: newest in dist/)
 #   ./deploy.sh all --no-migrate             # skip importing the ~/plum-test state
+#   ./deploy.sh all --new-fleet-psk          # mint a NEW fleet pairing secret (then redeploy all)
 #   ./deploy.sh all --image ghcr.io/anothermike-exe/plum-audio:1.0.0   # pull a published release
 #   ./deploy.sh all --pull                   # shorthand for the default registry at :latest
 #
@@ -45,20 +46,29 @@ PW="${PLUM_TEST_PW:?not set — export it, or create docker/.deploy.env containi
 #
 # Generated ONCE and kept in .deploy.env, which is gitignored, because the whole point is that every
 # unit gets the SAME value — regenerating per deploy would silently unpair the fleet on every run.
-# Losing it is recoverable: delete the line, redeploy every unit together, and they re-pair on the
-# new secret. Losing it while deploying only SOME units is not, so deploy the fleet together after
-# a rotation.
+# Losing the workstation copy is NOT losing the secret: every unit holds it in its own
+# plum-audio.env, and the recovery below reads it back from one. Rotating (--new-fleet-psk) is the
+# last resort, and it means redeploying every unit together.
 #
 # It is a shared secret: anyone holding it can pair with any unit. That is a real step down from a
 # per-pair record and a real step up from the sentinel PSK, which is published. Unset it for the
 # stricter posture, where units pair only with their own speaker and everything else is deliberate.
+# LOSING .deploy.env IS THE COMMON CASE, not the exotic one: units get commissioned today and
+# extended months later, from a laptop that has been reinstalled in between. The secret is NOT lost
+# when that happens — deploy.sh wrote it into every unit's /opt/plum-audio/plum-audio.env, so a
+# single already-deployed unit can hand it back.
+#
+# Minting a fresh one instead is the failure this guards. It does not error: the new units come up
+# perfectly, pair with their own speakers, and serve their GUIs, and only CROSS-UNIT routing to the
+# older generation is dead — a speaker that joins the group at the right volume and renders nothing.
+# So recovery is attempted before minting, and minting is refused outright when any unit could not
+# be asked. See "Losing the fleet secret" in docs/SENDSPIN-PAIRING.md.
+NEED_PSK=0
 if [[ -z "${PLUM_FLEET_PSK:-}" ]]; then
     if [[ -f "${HERE}/.deploy.env" ]] && grep -q '^PLUM_FLEET_PSK=' "${HERE}/.deploy.env"; then
         PLUM_FLEET_PSK="$(grep '^PLUM_FLEET_PSK=' "${HERE}/.deploy.env" | tail -1 | cut -d= -f2-)"
     else
-        PLUM_FLEET_PSK="$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')"
-        printf 'PLUM_FLEET_PSK=%s\n' "$PLUM_FLEET_PSK" >> "${HERE}/.deploy.env"
-        echo "==> minted a fleet pairing secret into docker/.deploy.env (shared by every unit)"
+        NEED_PSK=1   # resolved below, once ssh_ and the unit table exist
     fi
 fi
 # UserKnownHostsFile=/dev/null, not just StrictHostKeyChecking=no: a REIMAGED unit presents a new
@@ -78,6 +88,7 @@ UNITS_FILE="${HERE}/units.conf"
 }
 
 MIGRATE=1
+FORCE_NEW_PSK=0
 TARBALL=""
 IMAGE_REF=""
 DEFAULT_REGISTRY="ghcr.io/anothermike-exe/plum-audio"
@@ -94,6 +105,7 @@ while [[ $# -gt 0 ]]; do
         --image)      IMAGE_REF="$2"; shift 2 ;;
         --pull)       IMAGE_REF="${DEFAULT_REGISTRY}:latest"; shift ;;
         --no-migrate) MIGRATE=0; shift ;;
+        --new-fleet-psk) FORCE_NEW_PSK=1; shift ;;
         -h|--help)    sed -n '2,32p' "$0"; exit 0 ;;
         -*)           echo "unknown flag $1" >&2; exit 2 ;;
         *)            HOSTS+=("$1"); shift ;;
@@ -214,16 +226,34 @@ dup_in_column() {  # dup_in_column <1-based field>
         | awk -F'|' -v f="$1" '{v=$f; gsub(/^[ \t]+|[ \t]+$/,"",v); if (v!="") print v}' \
         | sort | uniq -d
 }
-DUP_HOST="$(dup_in_column 1)"
-DUP_UNIT_ID="$(dup_in_column 2)"
-DUP_UNIT_NAME="$(dup_in_column 3)"
-DUP_PLAYER_ID="$(dup_in_column 4)"
-DUP_PLAYER_NAME="$(dup_in_column 5)"
+# LEGACY TABLES. units.conf used to be six columns —
+#   host | unit id | unit name | player id | player name | DAC
+# — and is now two, with an optional third:
+#   host | name | [DAC]
+# The ids went away because nothing needed an operator to choose them: entrypoint.sh derives them
+# from the hostname, and this script preserves whatever a unit is ALREADY running under. But the
+# two formats are indistinguishable by shape alone, and reading a six-column row as a two-column
+# one takes `unit-133` for the unit NAME — which would rename a live unit to its own id. So detect
+# the column count and map the old layout, loudly, rather than quietly getting it wrong.
+LEGACY_TABLE=0
+if grep -vE '^\s*(#|$)' "$UNITS_FILE" | awk -F'|' 'NF>=5{f=1} END{exit !f}'; then
+    LEGACY_TABLE=1
+    printf '\033[33m!! %s is in the old six-column format. Reading it, but the ids are now derived —\033[0m\n' "${UNITS_FILE##*/}"
+    printf '\033[33m   see docker/units.conf.example for the two-column layout.\033[0m\n'
+fi
+# Which field holds what, in each layout.
+if [[ "$LEGACY_TABLE" == 1 ]]; then
+    F_NAME=3; F_DAC=6
+else
+    F_NAME=2; F_DAC=3
+fi
 
-if [[ -n "$DUP_HOST$DUP_UNIT_ID$DUP_UNIT_NAME$DUP_PLAYER_ID$DUP_PLAYER_NAME" ]]; then
+DUP_HOST="$(dup_in_column 1)"
+DUP_UNIT_NAME="$(dup_in_column "$F_NAME")"
+
+if [[ -n "$DUP_HOST$DUP_UNIT_NAME" ]]; then
     printf '\033[33m!! %s has duplicate values; they will be suffixed per unit:\033[0m\n' "${UNITS_FILE##*/}"
-    for pair in "host:$DUP_HOST" "unit_id:$DUP_UNIT_ID" "unit_name:$DUP_UNIT_NAME" \
-                "player_id:$DUP_PLAYER_ID" "player_name:$DUP_PLAYER_NAME"; do
+    for pair in "host:$DUP_HOST" "name:$DUP_UNIT_NAME"; do
         [[ -n "${pair#*:}" ]] && printf '     %-12s %s\n' "${pair%%:*}" "$(echo "${pair#*:}" | tr '\n' ' ')"
     done
     # A duplicated HOST is the one case a suffix cannot help — it is the same box twice, so the second
@@ -258,6 +288,44 @@ printf '%s' "$t" | tr -cd '0-9A-Fa-f' | tail -c 4 | tr '[:lower:]' '[:upper:]'
 EOS
 }
 
+# The unit's audio output, read from the cards it actually has.
+#
+# This is the column an operator used to have to fill in, and it is the one they were least able to
+# answer from the workstation: the spec is a PortAudio NAME FRAGMENT, matched as a substring against
+# PortAudio's own device names, and it is not the same list as `aplay -l`. The long name at the tail
+# of a /proc/asound/cards line is the form already proven on this rig (`bcm2835`,
+# `snd_rpi_hifiberry_dacplus`), so take that.
+#
+# Ranking, lowest wins. A HAT or USB DAC is something someone fitted ON PURPOSE, so it outranks the
+# onboard jack. HDMI is last: it is present on every Pi, it is almost never the intended output for
+# this, and PortAudio's own default lands on it more often than not. Empty output means no cards at
+# all, which the caller reads as a headless unit.
+#
+# Mirrored in scripts/plum-init.sh, which does the same job from the unit itself. Keep the two in
+# step; a unit must not get a different answer depending on which script commissioned it.
+detect_output_on() {  # detect_output_on <host>
+    ssh_ "$1" "bash -s" <<'EOS'
+set -uo pipefail
+best=""; best_rank=99
+while IFS= read -r line; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    # A glob, not a regex: a bracket inside [[ =~ ]] is a portability trap.
+    case "$trimmed" in [0-9]*"["*) ;; *) continue ;; esac
+    id="${trimmed#*[}"; id="${id%%]*}"; id="$(printf '%s' "$id" | tr -d ' ')"
+    longname="${line##* - }"
+    [ -n "$longname" ] && [ "$longname" != "$line" ] || longname="$id"
+    case "$id$longname" in
+        *vc4hdmi*|*HDMI*|*hdmi*)             rank=3 ;;
+        *bcm2835*|*Headphones*|*headphones*) rank=2 ;;
+        *)                                   rank=1 ;;
+    esac
+    [ "$rank" -lt "$best_rank" ] && { best_rank="$rank"; best="$longname"; }
+    printf '      card %-18s %s\n' "$id" "$longname" >&2
+done < /proc/asound/cards 2>/dev/null
+printf '%s' "$best"
+EOS
+}
+
 # Echo $1, suffixed with the unit's token when $2 (a newline-separated duplicate list) contains it.
 # Warnings go to STDERR: this runs inside a command substitution, so anything on stdout becomes part
 # of the value and would end up in plum-audio.env.
@@ -285,38 +353,76 @@ if [[ " ${HOSTS[*]} " == *" all "* ]]; then
     done < <(units_all)
 fi
 
+# --- fleet pairing secret, part two: recover it before inventing one -------------------------------
+
+if [[ "$NEED_PSK" == 1 ]]; then
+    say "no fleet pairing secret on this workstation — asking the units"
+    # EVERY unit in the table, not just the ones being deployed. A peer that is not part of this run
+    # still holds the fleet's secret, and it is exactly the unit an operator forgets to mention when
+    # adding two new rooms to a system built months ago.
+    _found=""; _found_on=""; _unreachable=""
+    while IFS= read -r _h; do
+        [[ -n "$_h" ]] || continue
+        _psk="$(ssh_ "$_h" "grep -h '^PLUM_FLEET_PSK=' ${REMOTE_ROOT}/plum-audio.env 2>/dev/null | tail -1 | cut -d= -f2-" 2>/dev/null | tr -d '\r\n' || true)"
+        if [[ -z "$_psk" ]]; then
+            # Tell "answered, has no secret" from "did not answer at all". Only the first is safe to
+            # mint over: it means the unit is genuinely greenfield, not merely switched off.
+            if ssh_ "$_h" true >/dev/null 2>&1; then
+                echo "    $_h — reachable, no secret stored"
+            else
+                echo "    $_h — UNREACHABLE"
+                _unreachable="${_unreachable}${_h} "
+            fi
+            continue
+        fi
+        echo "    $_h — has one"
+        if [[ -z "$_found" ]]; then
+            _found="$_psk"; _found_on="$_h"
+        elif [[ "$_psk" != "$_found" ]]; then
+            warn "$_h disagrees with $_found_on — this fleet is ALREADY split into two pairing groups."
+            warn "Pick one and redeploy every unit with it: deploy.sh all (after fixing .deploy.env)."
+        fi
+    done < <(units_all)
+
+    if [[ -n "$_found" ]]; then
+        PLUM_FLEET_PSK="$_found"
+        printf 'PLUM_FLEET_PSK=%s\n' "$PLUM_FLEET_PSK" >> "${HERE}/.deploy.env"
+        say "recovered the fleet pairing secret from ${_found_on} and restored it to docker/.deploy.env"
+    elif [[ -n "$_unreachable" && "$FORCE_NEW_PSK" != 1 ]]; then
+        # Refusing beats a silent split. A new secret here would leave the units that ARE up unable
+        # to pair with the ones that are down, and nothing would report it as an error.
+        echo
+        warn "no unit could hand back a fleet secret, and these were unreachable: ${_unreachable}"
+        warn "Minting a new one now would split the fleet, and cross-unit routing would go silent."
+        warn "Either bring those units up and re-run, or pass --new-fleet-psk to mint one anyway"
+        warn "and then redeploy EVERY unit together so they all share it."
+        exit 1
+    else
+        PLUM_FLEET_PSK="$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')"
+        printf 'PLUM_FLEET_PSK=%s\n' "$PLUM_FLEET_PSK" >> "${HERE}/.deploy.env"
+        say "minted a fleet pairing secret into docker/.deploy.env (shared by every unit)"
+        [[ "$FORCE_NEW_PSK" == 1 ]] && warn "--new-fleet-psk: redeploy EVERY unit so they all get this value"
+    fi
+fi
+
 # --- per-unit deploy ---------------------------------------------------------------------------
 
 deploy_one() {
     local host="$1"
     local unit_id unit_name player_id player_name dac
-    unit_id="$(unit_field "$host" 2)"
-    unit_name="$(unit_field "$host" 3)"
-    player_id="$(unit_field "$host" 4)"
-    player_name="$(unit_field "$host" 5)"
-    dac="$(unit_field "$host" 6)"
-    [[ -n "$unit_id" ]] || { warn "$host is not in units.conf — skipping"; return 1; }
+    unit_name="$(unit_field "$host" "$F_NAME")"
+    dac="$(unit_field "$host" "$F_DAC")"
+    [[ -n "$unit_name" ]] || { warn "$host is not in units.conf — skipping"; return 1; }
 
-    # Break any units.conf clash before the values reach plum-audio.env. TOKEN is fetched at most once
-    # per unit, and only when there is actually a clash — an unambiguous table costs no extra ssh.
+    # Break any units.conf clash before the value reaches plum-audio.env. TOKEN is fetched at most
+    # once per unit, and only when there is actually a clash — an unambiguous table costs no extra ssh.
     local TOKEN=""
-    unit_id="$(disambiguate "$unit_id" "$DUP_UNIT_ID" unit_id "$host")"
-    unit_name="$(disambiguate "$unit_name" "$DUP_UNIT_NAME" unit_name "$host")"
-    player_id="$(disambiguate "$player_id" "$DUP_PLAYER_ID" player_id "$host")"
-    player_name="$(disambiguate "$player_name" "$DUP_PLAYER_NAME" player_name "$host")"
+    unit_name="$(disambiguate "$unit_name" "$DUP_UNIT_NAME" name "$host")"
+    # A unit and its speaker are one thing to the user, and entrypoint.sh already defaults the player
+    # name to the unit name. Naming them apart only ever produced two names for one box.
+    player_name="$unit_name"
 
-    # A DAC column of `none` means this host has no audio output: no player process, no /dev/snd, and
-    # the headless compose profile (the audio one cannot even be CREATED without /dev/snd).
-    local profile player_enabled expected_programs
-    # `tr`, not ${dac,,}: that is bash 4+, and macOS — where this script is RUN — ships bash 3.2,
-    # so the parameter expansion is a hard syntax error before any unit is contacted.
-    if [[ "$(printf '%s' "$dac" | tr '[:upper:]' '[:lower:]')" == "none" ]]; then
-        profile="headless"; player_enabled=0; expected_programs=3
-    else
-        profile="audio";    player_enabled=1; expected_programs=4
-    fi
-
-    say "$host — ${unit_id} (${unit_name})"
+    say "$host — ${unit_name}"
 
     # 1. Preflight: reachable, arm64, sudo, and the host daemons this container depends on.
     ssh_ "$host" "bash -s -- '$PW'" <<'EOS' || return 1
@@ -335,6 +441,65 @@ systemctl is-active --quiet bluetooth    || echo "    !! bluetoothd is NOT runni
 dpkg -l bluez 2>/dev/null | grep -q '+plum' \
     || echo "    !! host bluez is UNPATCHED (no AVRCP position; see backend/config/bluez/)"
 EOS
+
+    # THE UNIT IDENTITY, in one place, and only after the host has answered.
+    #
+    # A Sendspin id is what the mesh keys routing, group membership and per-player volume off, and
+    # settings.json on the unit already refers to it. So the first question is never "what does the
+    # table say", it is "what is this unit already running under" — redeploying a live unit must
+    # never rename it into a stranger its peers have never met.
+    #
+    # Nothing is lost by deriving the rest. entrypoint.sh has always defaulted the unit id from the
+    # hostname and the player id from the unit id, so the old six-column table only wrote down what
+    # those defaults would have produced anyway. What an operator actually chooses is the NAME.
+    local existing derived_id
+    existing="$(ssh_ "$host" "cat ${REMOTE_ROOT}/plum-audio.env 2>/dev/null" 2>/dev/null || true)"
+    unit_id="$(printf '%s\n' "$existing" | sed -n 's/^PLUM_UNIT_ID=//p' | tail -1)"
+    player_id="$(printf '%s\n' "$existing" | sed -n 's/^PLUM_LOCAL_PLAYER_ID=//p' | tail -1)"
+    if [[ -n "$unit_id" ]]; then
+        echo "    unit id: $unit_id  (already deployed — kept)"
+    else
+        derived_id="$(ssh_ "$host" "hostname -s" 2>/dev/null | tr -d '\r' | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')"
+        # `raspberrypi` is Pi Imager's default, and the one hostname a rig genuinely repeats. Two
+        # units claiming one unit id corrupt each other's routing rather than merely looking alike,
+        # so break that case with the SoC token, exactly as a duplicated name is broken.
+        if [[ -z "$derived_id" || "$derived_id" == "raspberrypi" ]]; then
+            [[ -n "$TOKEN" ]] || TOKEN="$(unit_token "$host")"
+            warn "hostname is '${derived_id:-unknown}' — set a unique one in Pi Imager; using the SoC token"
+            derived_id="${derived_id:-plum}-${TOKEN:-$RANDOM}"
+        fi
+        unit_id="unit-${derived_id}"
+        echo "    unit id: $unit_id  (derived from the hostname)"
+    fi
+    [[ -n "$player_id" ]] || player_id="${unit_id}-player"
+
+    # THE OUTPUT. Optional in the table, because it is derivable AND because getting it wrong is
+    # cheap: PLUM_DAC_DEVICE is only what a unit boots with, and Settings -> Audio overrides it
+    # permanently the first time anyone picks a device. So read the cards the Pi actually has, and
+    # let the column exist as an override for the case where the guess is wrong.
+    if [[ -z "$dac" ]]; then
+        dac="$(detect_output_on "$host")"
+        if [[ -n "$dac" ]]; then
+            echo "    audio output: $dac  (detected — change it in Settings -> Audio)"
+        else
+            dac="none"
+            echo "    audio output: none — this unit will ingest and route only"
+        fi
+    else
+        echo "    audio output: $dac  (from units.conf)"
+    fi
+
+    # A DAC of `none` means this host has no audio output: no player process, no /dev/snd, and the
+    # headless compose profile (the audio one cannot even be CREATED without /dev/snd).
+    local profile player_enabled expected_programs
+    # `tr`, not ${dac,,}: that is bash 4+, and macOS — where this script is RUN — ships bash 3.2,
+    # so the parameter expansion is a hard syntax error before any unit is contacted.
+    if [[ "$(printf '%s' "$dac" | tr '[:upper:]' '[:lower:]')" == "none" ]]; then
+        profile="headless"; player_enabled=0; expected_programs=3
+    else
+        profile="audio";    player_enabled=1; expected_programs=4
+    fi
+
 
     # 2. Docker. .113 shipped without it, and compose reaches the units two different ways: .122
     #    runs Docker CE from Docker's own apt repo (compose as a CLI plugin, `docker compose`),

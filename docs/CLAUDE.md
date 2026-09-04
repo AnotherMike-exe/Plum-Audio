@@ -76,8 +76,9 @@ backend/
     sources/           # per-integration config/manager/metadata + shared config_render, artwork
     apis/              # settings/integrations/audio Flask blueprints (mesh API is mesh/api.py)
   supervisord/         # four programs: sendspin_server, sendspin_player, config-api, nginx
-scripts/host-setup/    # configure-audio-hat.sh — runs on the HOST
-docker/                # compose + build.sh/deploy.sh + units.conf (the rig's unit table)
+scripts/plum-init.sh   # commission ONE unit, run ON the Pi; needs only the device name
+scripts/host-setup/    # provision.sh + configure-audio-hat.sh — run on the HOST
+docker/                # compose + build.sh/deploy.sh + units.conf (host | name | [audio output])
 tests/{Unit,Integration}/
 ```
 
@@ -304,7 +305,9 @@ The *reasoning* behind these, and the failures that produced them, is in
 - **Host provisioning is not optional, and is once per IMAGE.** The bluez patches, the D-Bus policy,
   the rfkill unblock and the HAT mixer are installed by nothing the container does, and each absence
   fails silently or catastrophically. Run `scripts/host-setup/provision.sh` from the workstation — a
-  freshly imaged Pi has no copy of this repo. `docs/HOST-PROVISIONING.md`.
+  freshly imaged Pi has no copy of this repo. The one exception is `scripts/plum-init.sh`, which
+  runs the same checklist ON the Pi and reads the payload out of the image it pulled (the Dockerfile
+  copies `scripts/host-setup/` and the compose file in for exactly this). `docs/HOST-PROVISIONING.md`.
 - **WiFi/host concerns** (NetworkManager owns `wlan0`) live on the host, not the container.
 
 ## Common tasks
@@ -324,9 +327,20 @@ reach the audio loop, and the dev rig has no supervisord.
 6. Deploy to the rig → verify live add/rename/disable/remove → then build the image.
 
 ### Build, deploy, debug
-`scripts/host-setup/provision.sh all` once per Pi image, then `docker/build.sh` and
-`docker/deploy.sh all` per deploy. Full loop, the deceptive failure modes, and the debugging cookbook
-are in **`docs/OPERATIONS.md`**; commissioning in **`docs/HOST-PROVISIONING.md`**.
+Fleet: `scripts/host-setup/provision.sh all` once per Pi image, then `docker/build.sh` and
+`docker/deploy.sh all` per deploy. One Pi: `sudo scripts/plum-init.sh "<name>"` ON the unit — same
+`plum-audio.env`, so either script can redeploy a unit the other commissioned. Full loop, the
+deceptive failure modes, and the debugging cookbook are in **`docs/OPERATIONS.md`**; commissioning
+in **`docs/HOST-PROVISIONING.md`**.
+
+**A unit's identity is DERIVED and PRESERVED, never chosen in `units.conf`.** The table is
+`host | name | [audio output]`; the ids came out of it because `entrypoint.sh` already defaults the
+unit id from the hostname and the player id from the unit id. Both deploy paths read the unit's
+existing `plum-audio.env` first and keep the id it is running under — a redeploy that renamed a live
+unit would make it a stranger to every peer. The audio output is a detected default (HAT/USB > onboard
+> HDMI), safe to guess because Settings → Audio outranks `PLUM_DAC_DEVICE` permanently. A six-column
+table still parses, detected by column count, because reading an old row as a new one takes the unit
+id for the NAME.
 
 ## Open
 

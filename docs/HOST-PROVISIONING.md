@@ -60,8 +60,8 @@ nothing in the container can substitute for any of it:
 `dtparam=audio=on`, enumerates `bcm2835 Headphones` as card 0, and leaves its `PCM` control at
 0.00 dB — verified on both mesh-pair units on 2026-08-06, where the whole of this section was correctly
 a no-op. `--unity` is not applicable either: it resolves the **HAT** card and exits with "no HAT card
-found in aplay -l" on such a unit, which is the right answer, not a failure to work around. Give
-`units.conf` a DAC column of `bcm2835` and skip to §2.
+found in aplay -l" on such a unit, which is the right answer, not a failure to work around. Leave the
+`units.conf` audio-output column blank and skip to §2 — the deploy detects `bcm2835` itself.
 
 Raspberry Pi OS does not auto-detect audio HATs, and the boards on this rig expose no ID EEPROM
 (`/proc/device-tree/hat` does not exist on the Amp100), so there is no auto-detect to fall back on —

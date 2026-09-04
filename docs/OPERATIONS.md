@@ -13,6 +13,27 @@ docker/deploy.sh 192.0.2.10    # one unit
 docker/deploy.sh all --tarball dist/plum-audio-bfa4812-arm64.tar.gz   # a specific build
 ```
 
+A single Pi does not need any of this. `scripts/plum-init.sh "Kitchen"` runs ON the unit, pulls a
+published image, and needs no workstation, no checkout and no `units.conf` — see the README. The two
+paths write the same `/opt/plum-audio/plum-audio.env`, so a unit commissioned either way is the same
+unit, and either script can redeploy it afterwards.
+
+### The unit table
+
+`docker/units.conf` is `host | name | [audio output]`. The name is the only required choice.
+
+- **The ids are derived, not chosen.** `entrypoint.sh` defaults the unit id from the Pi's hostname
+  and the player id from the unit id. `deploy.sh` reads the unit's existing `plum-audio.env` FIRST
+  and keeps whatever id it is already running under, so a redeploy never renames a live unit into a
+  stranger its peers have never met. Only a unit with no `/opt/plum-audio` gets a fresh id.
+- **The audio output is optional.** Left blank, `deploy.sh` reads `/proc/asound/cards` on the unit
+  and picks one, preferring a HAT or USB DAC over the onboard jack over HDMI. It is safe to guess
+  because `PLUM_DAC_DEVICE` is only what a unit BOOTS with — Settings → Audio outranks it
+  permanently the first time anyone picks a device.
+- **A six-column table still works**, with a warning naming the new format. The two layouts are
+  indistinguishable by shape, and reading an old row as a new one would take `unit-133` for the unit
+  NAME — so the column count is detected rather than assumed.
+
 There is no registry. `docker save | gzip -1` + scp + `docker load` beats standing one up for four
 Pis on two VLANs, and `gzip -1` is the right trade for a LAN copy. The default tag is the short
 commit, `-dirty` appended when the tree is not clean — so `docker images` on a unit answers "which
@@ -44,17 +65,18 @@ A re-imaged Pi has no dev stack, so the import is skipped and the container writ
   exist but are `enabled: false` — so a fresh unit is an AirPlay receiver and nothing else until
   someone opens Settings → Integrations.
 - **`audio.output.device` is `null`**, which deliberately means "whatever `PLUM_DAC_DEVICE` says", so
-  the player opens the DAC column from `units.conf` (`bcm2835` → PortAudio 0 → `hw:0,0`) and echoes
-  the resolved card back as `Headphones:0`. Nothing needs choosing in the GUI for audio to work.
-- **`deviceName` and every source endpoint's name come from `PLUM_UNIT_NAME`** (the unit-name column
-  of `units.conf`) — but only since `2f9c1d9`/`f381ce3`. Before that every fresh unit came up as
+  the player opens whatever the deploy detected — or the audio-output override column of
+  `units.conf`, when one is set (`bcm2835` → PortAudio 0 → `hw:0,0`) — and echoes the resolved card
+  back as `Headphones:0`. Nothing needs choosing in the GUI for audio to work.
+- **`deviceName` and every source endpoint's name come from `PLUM_UNIT_NAME`** (the name column
+  of `units.conf`, or the argument to `scripts/plum-init.sh`) — but only since `2f9c1d9`/`f381ce3`. Before that every fresh unit came up as
   "Plum Sendspin" offering a "Plum Audio" AirPlay receiver, so a two-unit greenfield mesh showed one
   name twice in the mesh view, the unit cards, mDNS and to a sender. On an older image, rename each
   unit in Settings → General and each endpoint in Settings → Integrations.
 
 ### Naming across multiple units — how a clash resolves itself
 
-`units.conf`'s unit-name column reaches further than it looks: `deploy.sh` writes it as
+`units.conf`'s name column reaches further than it looks: `deploy.sh` writes it as
 `PLUM_UNIT_NAME`, and a unit with no `settings.json` yet adopts it as its own display name **and** as
 the name of every source endpoint it offers. So a duplicate there is a duplicate in the mesh view, on
 the unit cards, in mDNS, and in an AirPlay sender's speaker list.
@@ -67,9 +89,12 @@ Nothing refuses. **A clash gets a stable per-unit token appended**, at two layer
 
    ```
    !! units.conf has duplicate values; they will be suffixed per unit:
-        unit_name    Pi4-02
-       !! unit_name Pi4-02 is duplicated in units.conf -> using Pi4-02-EE12
+        name         Pi4-02
+       !! name Pi4-02 is duplicated in units.conf -> using Pi4-02-EE12
    ```
+
+   Only the host and name columns can clash now. The unit and player ids used to be operator-chosen
+   and are derived — see "The unit table" below.
 
 2. **The container itself, when `PLUM_UNIT_NAME` is unset entirely** — a hand-run `docker compose up`,
    or any path that is not `deploy.sh`. `unit_identity.default_device_name()` makes the floor

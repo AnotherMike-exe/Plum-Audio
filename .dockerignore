@@ -24,6 +24,10 @@ frontend/dist/
 docs/
 tests/
 scripts/
+# ...except the host-setup payload. scripts/plum-init.sh reads these OUT of the image so a Pi being
+# commissioned from a published image needs no checkout of this repo. Last match wins, so this
+# negation has to come after the `scripts/` line above.
+!scripts/host-setup/
 README.md
 CLAUDE.md
 
