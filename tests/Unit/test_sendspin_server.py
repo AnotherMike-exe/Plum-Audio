@@ -487,7 +487,9 @@ def test_adopting_a_speaker_we_already_hold_does_not_redial_it():
 
         ok = await unit.adopt_foreign_client("airplay-1", SPEAKER_URL, player_id="esparagus-hifi-1")
 
-        assert ok is True
+        # The client id, not a bool: adopt_foreign_client returns the id it learned from the
+        # handshake, because this is the only moment the mDNS URL and that id are both in hand.
+        assert ok == "08:B6:1F:B7:AF:5C"
         assert unit.server.dialed == []  # no redial
         assert unit.server.disconnected == []  # and nothing torn down
         assert handle.group.calls == ["stop_stream", ("add", "08:B6:1F:B7:AF:5C"), "start_stream"]
@@ -508,7 +510,7 @@ def test_re_adopting_a_speaker_already_on_that_source_leaves_the_whole_group_alo
 
         ok = await unit.adopt_foreign_client("airplay-1", SPEAKER_URL)
 
-        assert ok is True
+        assert ok == "08:B6:1F:B7:AF:5C"
         assert unit.server.dialed == []
         assert handle.group.calls == []  # no remove/add, and above all no start_stream
 
@@ -524,7 +526,7 @@ def test_adopting_a_speaker_we_do_not_hold_still_dials_it():
 
         ok = await unit.adopt_foreign_client("airplay-1", SPEAKER_URL, timeout_s=0.3)
 
-        assert ok is False  # nothing ever connected within the timeout
+        assert ok is None  # nothing ever connected within the timeout
         assert [url for url, _ in unit.server.dialed] == [SPEAKER_URL]
 
     run_scenario(scenario)
