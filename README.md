@@ -100,6 +100,21 @@ sudo ./plum-init.sh "Kitchen"
 Allow about 10 minutes on a fresh card. Most of that is the Docker install and the image pull. Add
 `--check` first if you want a report of the host and no changes.
 
+> **Testing an unreleased branch.** Both the `curl` line above and the default `:latest` image track
+> `main`, which is the last release. To commission a unit from work that has not been released, do
+> not mix the two — a unit running a `main` image and a branch script can differ by an `aiosendspin`
+> major, and two units across such a split cannot mesh at all. Build the branch and hand the unit
+> that one artifact:
+>
+> ```bash
+> docker/build.sh                                              # on your workstation
+> scp dist/plum-audio-<tag>-arm64.tar.gz scripts/plum-init.sh plum-admin@<pi>:
+> ssh plum-admin@<pi>
+> sudo ./plum-init.sh "Kitchen" --tarball plum-audio-<tag>-arm64.tar.gz
+> ```
+>
+> The locally built image carries the host-setup payload, so nothing is fetched from GitHub.
+
 **3. Write down the fleet pairing secret it prints.** The first unit mints one. Every later unit
 must get the same value, or the units cannot pair with each other's speakers:
 
