@@ -151,6 +151,43 @@ Weaker than a per-pair record, stronger than the sentinel PSK, which is *publish
 unset is a supported, stricter posture — units then pair only with their own speaker automatically.
 Rotating it unpairs the fleet, so redeploy every unit together afterwards.
 
+### Losing the fleet secret
+
+The common shape is not a lost file, it is a lost *workstation*: some units get commissioned, and
+months later a few more are added from a laptop that has been reinstalled in between.
+
+**The secret is still there.** Both deploy paths write it into each unit's
+`/opt/plum-audio/plum-audio.env`, so any single running unit can hand it back:
+
+```bash
+ssh plum-admin@<an-existing-unit> 'grep PLUM_FLEET_PSK /opt/plum-audio/plum-audio.env'
+```
+
+Both scripts now do this for you rather than making you remember to:
+
+| Situation | What happens |
+|---|---|
+| `docker/.deploy.env` has the line | Used, as before. No unit is contacted. |
+| The line is missing | `deploy.sh` asks every unit in `units.conf`, adopts the first secret it finds, and restores the line. |
+| No unit has one, and all were reachable | A genuine greenfield fleet. One is minted. |
+| No unit has one, and some were **unreachable** | The deploy **refuses**. Minting here would split the fleet silently. Bring them up, or pass `--new-fleet-psk`. |
+| Two units disagree | Warned by host. The fleet is already split into two pairing groups. |
+| A single Pi, via `plum-init.sh` | `--fleet-psk-from <an existing unit>` copies it over ssh. Minting without it warns first. |
+
+**Why this is worth guarding.** A wrong secret does not look like an error. The new unit deploys
+clean, passes every check in the deploy's verify step, pairs with its own speaker (the fleet PSK
+takes the `local-pair.psk` slot either way) and serves its GUI. Only pairing with a *peer's* speaker
+fails, and it fails as `reclaim of remote player … timed out` in a log nobody is reading — in the
+GUI, a room you route to that joins the group at the right volume and stays silent. Cleartext
+clients (ESP32 speakers, Music Assistant, the web GUI) never reach this gate, so they keep working
+and make the fleet look healthy.
+
+**Rotating, when nothing can hand the secret back.** Mint a new one and redeploy every unit
+*together* — `deploy.sh all --new-fleet-psk`, or `plum-init.sh` on each unit with the same
+`--fleet-psk`. The units keep their identities (`/config/identity` is untouched), so this changes
+which pairing records exist, not who the units are. Deploying only some of them is what leaves a
+fleet split.
+
 ### Unpaired access is now OFF
 
 `unpaired_access_enabled` + `trust_unpaired()` remain, gated by a setting whose precedence is

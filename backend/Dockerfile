@@ -127,6 +127,13 @@ print(f'noise stack OK (aiosendspin {v}, cryptography works on this arch)')"
 COPY backend/ /app/
 RUN chmod +x /app/entrypoint.sh
 
+# The on-Pi installer's payload. scripts/plum-init.sh runs ON a fresh Pi with no checkout of this
+# repo, and reads the host-setup scripts and the compose file straight out of the image it just
+# pulled — so there is ONE source of truth for them rather than a second copy to keep in step.
+# Nothing in the running container uses either path.
+COPY scripts/host-setup/ /app/host-setup/
+COPY docker/docker-compose.yml /app/docker-compose.yml
+
 # Web GUI: built assets + the nginx site that serves them and proxies :5001/:5002.
 COPY --from=webui /ui/dist /app/www
 RUN rm -f /etc/nginx/sites-enabled/default \
