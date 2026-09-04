@@ -343,6 +343,11 @@ fetch_payload() {  # fetch_payload <path-in-repo> <dest>
     fi
     rm -f /tmp/plum-payload.$$
     if curl -fsSL -m 30 "${RAW_BASE}/${rel}" -o /tmp/plum-payload.$$ 2>/dev/null; then
+        # Say which ref this came from. The fallback only fires for an image built before the
+        # payload was baked in, and `main` can be far behind the image being deployed — the compose
+        # file in particular has differed across a release, and a mismatched one starts the wrong
+        # service or none at all.
+        warn "fetched ${rel} from ${RAW_BASE} — the image did not carry it. Check that ref matches your image."
         s cp /tmp/plum-payload.$$ "$dest"; rm -f /tmp/plum-payload.$$; return 0
     fi
     rm -f /tmp/plum-payload.$$
