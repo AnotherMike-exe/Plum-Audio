@@ -336,6 +336,42 @@ registers** and a loopback default advertises an endpoint no peer can reach.
 `playback_speed` flip re-stamps a *stale* anchor and the timeline jumps, so play/pause must re-anchor
 to the daemon's real position. Latent since Phase 2; a second source exposed it.
 
+**Releasing the idle player handed our speakers to Music Assistant permanently (2026-09-07).**
+`b1c1fe0` shipped half a policy. It made `_go_idle` and `detach_player` release the unit's own
+player, so a foreign server could finally claim it, on the stated premise that "routing, follow and
+`autoSwitch.localActivity` all reach an unattached player through `mesh.router`'s idle-speaker
+fallback". The premise never held on a VLAN with MA on it: **MA re-dials a released speaker within
+seconds and then parks a silent websocket on it indefinitely**, so the player is never *unattached*
+again. Measured on `.7.200` (fresh deploy, `XLR-Pro`): one MA connection held **87,111 s — 24 h —
+with `audio_flowing=False`**, and when it finally let go a *second* MA instance on the same host
+took the speaker back **17 s later**.
+
+`follow._player_status` read that as `(False, None)` — "busy, but nothing we can route onto" — which
+is right for a *leader* (there is no `source_id` of ours to follow) and wrong for our own player,
+because `idle` is also what gates `localActivity` at `follow.py:204`. So the setting was on, the
+source went active, and nothing happened: `[airplay-1] active: sender feeding us` followed 300 s
+later by `[airplay-1] idle: no audio for 300s (... detached 0 player(s))`, with **no `follow:` line
+in any of four rotated logs**. It looked like a broken toggle and was a disarmed trigger.
+
+Nothing was missing from the mechanism. `Router.route_player` already wins the speaker back:
+`view.find_player` misses (MA is not one of our units), so it takes the idle-speaker fallback, reads
+the URL from our own `local_player`, and calls `reclaim_remote_player(stage_pairing=True)` —
+`GoodbyeReason.ANOTHER_SERVER`, proven live on `.7.200` at 2026-09-06 19:02. A manual GUI route
+therefore always worked, which is exactly why this read as a settings bug.
+
+The fix is the gate, not the mechanism: the foreign branch returns `(not lp["playing"], None)`.
+`playing` is the player's audio-flow truth (driven by `stream_start`/`stream_end` with a 1.5 s stall
+net) and deliberately **not** the foreign server's `playback_state`, which MA reports unreliably to a
+member player. Two properties are load-bearing and both have tests:
+
+- while MA really is feeding the speaker, `playing` is True and we leave it alone — that is what
+  lets a user push an MA stream to this endpoint mid-AirPlay and keep it, with no further input;
+- if MA takes the speaker while our source is already streaming, there is no rising edge, so we do
+  not grab it back. Without that, two servers would trade the one websocket a client allows.
+
+Both limits are accepted, not overlooked: a **paused** MA reads as parked, so a fresh AirPlay
+connection does take the room; and a speaker lost mid-AirPlay stays lost until the next connection.
+
 ## Connection lifecycle & identity (2026-08)
 
 Moved here from `docs/CLAUDE.md` on 2026-08-13 when that file was trimmed back toward its own

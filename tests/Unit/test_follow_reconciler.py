@@ -144,6 +144,53 @@ def test_local_activity_noop_when_already_attached():
     assert router.calls == []
 
 
+def test_local_activity_reclaims_a_speaker_parked_by_music_assistant():
+    """The bug this fix exists for. MA holds our speaker but feeds it nothing; AirPlay connects
+    here; we take the speaker back. `Router.route_player` already handles the reclaim (its
+    idle-speaker fallback dials our own local_player URL) — only this trigger was missing."""
+    view = MeshView(units=[
+        _unit("unit-A", sources=[_source("airplay-1", "gA", active=True)],
+              local_player={"attached": True, "group_id": "gX", "server_id": "music-assistant",
+                            "playing": False}),
+    ])
+    settings = {"autoSwitch": {"localActivity": True, "slave": {"enabled": False, "masterUnitId": None}}}
+    r, router, delegate, unroute = _reconciler(view, settings)
+    r._prev_active = set()  # AirPlay just connected -> rising edge
+    _run(r)
+    assert router.calls == [("player-A", "airplay-1")]
+
+
+def test_local_activity_does_not_steal_a_speaker_music_assistant_is_feeding():
+    """A live MA stream on this endpoint outranks a fresh local AirPlay connection. Same view as
+    above but with audio actually flowing, which is the only difference that may decide it."""
+    view = MeshView(units=[
+        _unit("unit-A", sources=[_source("airplay-1", "gA", active=True)],
+              local_player={"attached": True, "group_id": "gX", "server_id": "music-assistant",
+                            "playing": True}),
+    ])
+    settings = {"autoSwitch": {"localActivity": True, "slave": {"enabled": False, "masterUnitId": None}}}
+    r, router, delegate, unroute = _reconciler(view, settings)
+    r._prev_active = set()
+    _run(r)
+    assert router.calls == []
+
+
+def test_music_assistant_keeps_a_speaker_it_took_mid_airplay():
+    """MA claims this endpoint while AirPlay is already streaming here, then goes quiet between
+    tracks. There is no NEW local connection, so we must not grab it back — that is what stops the
+    two servers fighting over the one websocket a client allows."""
+    view = MeshView(units=[
+        _unit("unit-A", sources=[_source("airplay-1", "gA", active=True)],
+              local_player={"attached": True, "group_id": "gX", "server_id": "music-assistant",
+                            "playing": False}),
+    ])
+    settings = {"autoSwitch": {"localActivity": True, "slave": {"enabled": False, "masterUnitId": None}}}
+    r, router, delegate, unroute = _reconciler(view, settings)
+    r._prev_active = {"airplay-1"}  # AirPlay was already streaming when MA took the speaker
+    _run(r)
+    assert router.calls == []
+
+
 def test_local_activity_disabled_does_nothing():
     view = MeshView(units=[_unit("unit-A", sources=[_source("airplay-1", "gA", active=True)])])
     settings = {"autoSwitch": {"localActivity": False, "slave": {"enabled": False, "masterUnitId": None}}}
@@ -706,16 +753,37 @@ def test_a_unit_id_is_not_accepted_as_a_server_id():
     ])
     assert view.unit_by_server_id("unit-A") is None
     idle, target = FollowReconciler._player_status(view, "unit-A")
-    assert (idle, target) == (False, None), "an unresolvable server means busy-but-unroutable"
+    assert target is None, "an unresolvable server is never a route target"
+    assert idle is True, "no audio flowing, so the speaker is reclaimable — see the parked-MA test"
 
 
-def test_a_foreign_server_still_reads_as_busy_but_unroutable():
-    """Music Assistant holding our speaker: not idle, and nothing of ours to route onto."""
+def test_a_foreign_server_that_is_feeding_our_speaker_reads_as_busy():
+    """Music Assistant actually streaming to our speaker: busy, and nothing of ours to route onto.
+
+    This is the half that must not regress. It is what lets a user push an MA stream to this
+    endpoint while AirPlay is playing here and keep it, with no further input.
+    """
     view = MeshView(units=[
         _unit("unit-A", sources=[_source("airplay-1", "gA", active=True)],
-              local_player={"attached": True, "group_id": "gX", "server_id": "music-assistant"}),
+              local_player={"attached": True, "group_id": "gX", "server_id": "music-assistant",
+                            "playing": True}),
     ])
     assert FollowReconciler._player_status(view, "unit-A") == (False, None)
+
+
+def test_a_foreign_server_parking_our_speaker_reads_as_idle():
+    """MA holding a SILENT websocket on our speaker: idle, though still nothing to route onto.
+
+    Since b1c1fe0 an idle unit releases its own player, and MA re-dials within seconds and then
+    parks that connection indefinitely (measured on .7.200: 24 h, audio_flowing=False). Reading
+    that as busy made `localActivity` permanently dead on any VLAN running MA.
+    """
+    view = MeshView(units=[
+        _unit("unit-A", sources=[_source("airplay-1", "gA", active=True)],
+              local_player={"attached": True, "group_id": "gX", "server_id": "music-assistant",
+                            "playing": False}),
+    ])
+    assert FollowReconciler._player_status(view, "unit-A") == (True, None)
 
 
 def test_a_peer_that_has_not_started_its_server_never_matches():
