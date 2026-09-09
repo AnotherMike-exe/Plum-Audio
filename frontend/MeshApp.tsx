@@ -657,7 +657,7 @@ export default function MeshApp(): React.ReactElement {
       <footer className="w-full max-w-7xl mx-auto grid grid-cols-3 items-center text-[var(--text-muted)] mt-12 text-sm">
         <div />
         <p className="text-center">
-          Plum Audio — Mesh{appVersion && <span className="opacity-60"> · v{appVersion}</span>}
+          Plum Audio{appVersion && <span className="opacity-60"> — v{appVersion}</span>}
         </p>
         <div className="flex justify-end gap-2">
           <button
