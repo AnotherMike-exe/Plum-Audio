@@ -55,7 +55,16 @@ def _shairport_sync_version() -> str | None:
 
 
 def _go_librespot_version() -> str | None:
-    return _run_version(["go-librespot", "--version"]) or os.environ.get("PLUM_GO_LIBRESPOT_VERSION")
+    # go-librespot has no --version flag (0.7.4 answers `level=fatal msg="failed loading config"
+    # error="unknown flag: --version"` and exits 1). `_run_version` returns whatever came back, so
+    # the truthy error string used to satisfy the `or` and that whole line landed in the About panel
+    # where a version belongs. Accept the output only if it LOOKS like a version, and fall back to
+    # the tag the Dockerfile downloaded, which is the honest answer either way.
+    raw = _run_version(["go-librespot", "--version"])
+    # `\b` cannot open this pattern: there is no word boundary inside "v0.7.4", so it would match
+    # "7.4" and report the wrong version. Look-arounds instead, with the leading "v" optional.
+    match = re.search(r"(?<![\w.])v?(\d+\.\d+(?:\.\d+)?)(?![\w.])", raw) if raw else None
+    return match.group(1) if match else os.environ.get("PLUM_GO_LIBRESPOT_VERSION")
 
 
 def _bluez_alsa_version() -> str | None:
