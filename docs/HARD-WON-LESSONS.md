@@ -226,6 +226,23 @@ See: `backend/scripts/mesh/avahi.py`, `backend/scripts/mesh/neighbourhood.py`.
 
 ## GUI
 
+**An unproxied `/api/` path answers 200 with index.html, so the GUI fails as "still loading"
+(2026-09-08).** `about_api.py` shipped with a Flask route, a service, a typed response and two
+callers, and never had an nginx `location`. The request therefore fell through to `location /`, whose
+`try_files ... /index.html` is what makes the SPA's client-side routing work — so `response.ok` was
+**true**, `response.json()` threw on the HTML, and both the About panel and the page footer sat in
+their empty state permanently. It reads exactly like a slow or broken backend, and `curl` on `:5002`
+answers perfectly, which sends you looking at the API. **Any new API prefix needs a block in
+`backend/nginx/plum-audio.conf`** — check there first when a panel will not populate, and test the
+proxied port, not the origin.
+
+**CI published every image with the Dockerfile's placeholder version.** `docker/build.sh` derives
+`PLUM_APP_VERSION` from `git describe` and passes it as a build-arg, but neither `dev.yml` nor
+`release.yml` did — so the ARG defaults won and every `:dev` AND every tagged release reported
+`0.0.0-dev` / `gitDescribe: unknown`. Doubly hidden: nginx was swallowing the endpoint anyway (above),
+and `actions/checkout` is shallow by default, so even adding the build-arg without `fetch-depth: 0`
+would have stamped "unknown". A release is the tag; a dev build is the last tag plus `-dev`.
+
 **Themed scrollbars need `color-scheme`, not just `::-webkit-scrollbar` — and the two standards must
 not be combined.** Two independent mechanisms. The pseudo-elements style a *persistent* scrollbar,
 but an **overlay** scrollbar (macOS's default unless "show scroll bars: always" is set) cannot be
