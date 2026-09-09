@@ -83,6 +83,39 @@ def test_go_librespot_falls_back_to_the_baked_in_env_when_the_binary_cannot_answ
     assert body["spotify"]["goLibrespot"] == "0.7.4"
 
 
+def test_go_librespot_error_output_is_not_mistaken_for_a_version(client, monkeypatch):
+    """Measured on .7.200: go-librespot 0.7.4 has no --version flag, so the probe came back with
+    `level=fatal msg="failed loading config" error="unknown flag: --version"`. That string is
+    truthy, so it satisfied the fallback `or` and the whole log line rendered in the About panel
+    where a version belongs."""
+    monkeypatch.setattr(
+        about_api,
+        "_run_version",
+        lambda argv: 'time="2026-09-08T18:03:35-07:00" level=fatal msg="failed loading config" '
+        'error="unknown flag: --version"'
+        if argv[0] == "go-librespot"
+        else None,
+    )
+    monkeypatch.setenv("PLUM_GO_LIBRESPOT_VERSION", "0.7.4")
+
+    body = client.get("/api/about/versions").get_json()
+
+    assert body["spotify"]["goLibrespot"] == "0.7.4"
+
+
+def test_go_librespot_reports_a_real_version_when_the_binary_gains_the_flag(client, monkeypatch):
+    """And the leading "v" must not eat the major: `\b` cannot open the pattern, because there is
+    no word boundary inside "v0.7.4" — it would report 7.4."""
+    monkeypatch.setattr(
+        about_api, "_run_version", lambda argv: "go-librespot v0.8.0 (commit abc1234)" if argv[0] == "go-librespot" else None
+    )
+    monkeypatch.setenv("PLUM_GO_LIBRESPOT_VERSION", "0.7.4")
+
+    body = client.get("/api/about/versions").get_json()
+
+    assert body["spotify"]["goLibrespot"] == "0.8.0"
+
+
 def test_a_probe_that_cannot_find_its_binary_reports_none_not_an_error(client, monkeypatch):
     monkeypatch.setattr(about_api.shutil, "which", lambda _exe: None)
     monkeypatch.delenv("PLUM_GO_LIBRESPOT_VERSION", raising=False)
