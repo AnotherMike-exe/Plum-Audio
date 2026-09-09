@@ -26,7 +26,9 @@ Both the follower's own status and any leader's status are read from `UnitSnapsh
 onto a different unit's server (or a leader's player has roamed onto a THIRD unit). If a leader's
 speaker is attached to a server outside our mesh (Music Assistant, any foreign Sendspin server),
 there is no `source_id` to route onto — follow is a no-op until it comes back, same graceful
-degradation as when the leader unit is simply offline.
+degradation as when the leader unit is simply offline. Our OWN player held by a foreign server is
+NOT the same case: there is still no target, but it is only busy while that server is actually
+feeding it, or `localActivity` could never take our own speaker back (see `_player_status`).
 
 A `source_id` is only unique WITHIN a unit (every unit's own AirPlay endpoint is happily also
 "airplay-1"), so a "target" is tracked as an `(owning_unit_id, source_id)` pair EVERYWHERE in this
@@ -357,9 +359,10 @@ class FollowReconciler:
         `_player_state`), so it stays correct even when that player has roamed onto a different
         unit's server (or, for a leader, a third unit's — `owning_unit_id` in the result is
         wherever it ACTUALLY is, not necessarily `unit_id`). "Idle" here means not actually playing
-        anything right now — ungrouped, or grouped to a source that has since gone quiet — not
-        merely "never been routed," so a player is freed to be auto-managed again the moment its
-        current source stops, matching the idle contract elsewhere in the mesh.
+        anything right now — ungrouped, grouped to a source that has since gone quiet, or parked
+        silent on a FOREIGN server — not merely "never been routed," so a player is freed to be
+        auto-managed again the moment its current source stops, matching the idle contract
+        elsewhere in the mesh.
         """
         unit = view.unit(unit_id)
         lp = unit.local_player if unit else None
@@ -372,9 +375,24 @@ class FollowReconciler:
         # silently, which is why the lookup is now named for the namespace it searches.
         server_unit = view.unit_by_server_id(lp.get("server_id"))
         if server_unit is None:
-            # Attached to a server outside our mesh (Music Assistant, any foreign Sendspin server):
-            # busy, but nothing we can route onto.
-            return False, None
+            # Attached to a server OUTSIDE our mesh (Music Assistant, any foreign Sendspin server).
+            # There is nothing of ours to route onto either way, so the target stays None. But
+            # "attached" is not "busy": since b1c1fe0 an idle unit RELEASES its own speaker, and MA
+            # re-dials within seconds and then parks a SILENT websocket on it indefinitely (measured
+            # on .7.200: one connection held 24 h with audio_flowing=False). Foreign-held is
+            # therefore the steady state of every unit on a VLAN that runs MA, not an exception —
+            # and reading it as busy disarmed `localActivity` permanently, because the "local intent
+            # always wins the speaker back" half of that policy was only ever written for an
+            # UNATTACHED player, a state MA never lets one reach.
+            #
+            # `playing` is the player's own audio-flow truth (driven by stream start/end, with a
+            # 1.5 s stall net) and NOT the foreign server's playback_state, which MA reports
+            # unreliably. While it is True that server really is feeding this speaker, so we leave
+            # it alone: that is what lets a user push an MA stream to this endpoint mid-AirPlay and
+            # keep it. The rising-edge guard in tick() is the other half of that — a source already
+            # active when MA took the speaker never counts as a new local connection, so we do not
+            # grab it back and the two do not fight over the socket.
+            return not lp.get("playing"), None
         src = next((s for s in server_unit.sources if s.group_id == lp["group_id"]), None)
         if src is None or not src.active:
             return True, None

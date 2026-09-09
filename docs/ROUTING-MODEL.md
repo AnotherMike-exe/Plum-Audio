@@ -133,7 +133,10 @@ vocabulary work is unnecessary — it's still a reasonable recommendation, just 
 3. Verify `localActivity` covers the local-player case end-to-end on hardware, including its
    rising-edge behaviour after a true-none. **Still open** — reading the code says it already
    handles this (`follow.py:287`, `router.py:126-140`), but it hasn't been run on the rig against
-   this specific transition yet.
+   this specific transition yet. That code-read is also where this was missed: it only considered
+   a *released* player, and on 2026-09-07 `.7.200` showed the real steady state is a player parked
+   by Music Assistant, which read as busy and disarmed the whole branch. Fixed in
+   `follow._player_status`; the rig check is still owed. HARD-WON-LESSONS.
 4. Migrate the GUI to the new pair; default "set to none" to `detach(hold)`. Blocked on 1, which
    wasn't done.
 5. Retire the aliases. Blocked on 1 and 4.

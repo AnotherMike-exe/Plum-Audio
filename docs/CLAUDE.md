@@ -219,6 +219,15 @@ The *reasoning* behind these, and the failures that produced them, is in
   So `open_pairing_window` dials on demand, `set_player_volume` **holds** the level for the next
   connect (a slider nudge must never steal a room mid-track), and anything reading a unit's own
   player must fall back to the `local_player` self-report, never `unit.players`.
+- **"Unattached" for that purpose means SILENT, not disconnected.** MA re-dials a released speaker
+  within seconds and then parks a mute websocket on it for as long as it likes, so foreign-held is
+  the steady state on any VLAN running MA — not an exception. `follow._player_status` therefore
+  keys the foreign branch on `local_player.playing` (audio-flow truth, driven by stream start/end)
+  rather than on `attached`, or the release above hands the speaker away permanently and
+  `localActivity` never fires again. While that server really is feeding the speaker we leave it
+  alone, which is what lets an MA stream take this endpoint over mid-AirPlay with no user input;
+  the rising-edge guard is what stops us grabbing it back and starting a fight over the one
+  websocket a client allows. HARD-WON-LESSONS.
 - **An AirPlay sender may send NO play-state or progress at all** (Music Assistant's does not). Play
   state falls back to shairport's MPRIS `PlaybackStatus` (`airplay_remote` → `note_external_state`),
   and **playback state is never gated on knowing the duration** — one guard covering both made the
