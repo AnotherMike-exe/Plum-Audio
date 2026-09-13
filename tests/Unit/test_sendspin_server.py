@@ -127,6 +127,21 @@ class FakeClient:
         return self._cleanup_handle
 
 
+class FakePlayerRole:
+    """A player role OBJECT, as `roles_by_family()` really hands back.
+
+    Everywhere else in this file a role is just its id string, which is enough for membership
+    assertions. The buffer cap has to reach a live attribute and write it back, so it needs the real
+    shape. `__str__` keeps it compatible with FakeClient.roles_by_family's prefix match.
+    """
+
+    def __init__(self, min_buffer_ms=1000):
+        self.min_buffer_ms = min_buffer_ms
+
+    def __str__(self):
+        return "player@v1"
+
+
 def make_dial_task(swallows=1):
     """A real task standing in for a server-initiated dial, swallowing its first N cancels.
 
@@ -1337,3 +1352,78 @@ def test_setting_the_local_player_to_none_releases_it(monkeypatch):
     asyncio.run(unroute())
 
     assert "ws://127.0.0.1:8928/sendspin" in unit.server.disconnected
+
+
+# --- min_buffer clamp -------------------------------------------------------
+#
+# `PushStream._min_send_ahead_us()` takes the MAXIMUM across every audio role in a group, and a live
+# source cannot grow its queue after playback starts. So a client asking for more buffer than the
+# feeder ever holds does not fail alone — it starves every member of the group.
+#
+# This is not hypothetical. aiosendspin 9.1.1 raised the SERVER-side default from 500 ms to 1000 ms
+# for a client that declares no timing fields. Measured on .7.204: an ESPHome speaker took that
+# default, rendered nothing, dropped its websocket after 16 s, and made the Amp100 already playing
+# in the same group stutter the whole time.
+
+
+def test_a_player_asking_for_more_buffer_than_the_feeder_holds_is_capped():
+    unit = make_unit("src1")
+    role = FakePlayerRole(min_buffer_ms=1000)
+    unit.server.add(FakeClient("esp32", roles=[role]))
+
+    unit._clamp_player_min_buffer("esp32")
+
+    assert role.min_buffer_ms == ss.MAX_PLAYER_MIN_BUFFER_MS
+
+
+def test_the_cap_is_what_the_feeder_can_actually_serve():
+    """The two constants must stay tied together, or this bug comes back on the next bump.
+
+    The cap is expressed as a fraction of TARGET_BUFFER_US precisely so that raising or lowering the
+    feeder's ceiling moves the cap with it. A literal here would drift the first time either moves.
+    """
+    assert ss.MAX_PLAYER_MIN_BUFFER_MS == ss.TARGET_BUFFER_US // 2000
+    assert ss.MAX_PLAYER_MIN_BUFFER_MS * 1000 <= ss.TARGET_BUFFER_US
+
+
+def test_a_player_within_the_ceiling_is_left_alone():
+    """Our own player and the browser SDK both report 250. Neither must be touched."""
+    unit = make_unit("src1")
+    role = FakePlayerRole(min_buffer_ms=250)
+    unit.server.add(FakeClient("our-player", roles=[role]))
+
+    unit._clamp_player_min_buffer("our-player")
+
+    assert role.min_buffer_ms == 250
+
+
+def test_every_player_role_on_a_client_is_capped():
+    unit = make_unit("src1")
+    roles = [FakePlayerRole(min_buffer_ms=1000), FakePlayerRole(min_buffer_ms=800)]
+    unit.server.add(FakeClient("esp32", roles=roles))
+
+    unit._clamp_player_min_buffer("esp32")
+
+    assert [r.min_buffer_ms for r in roles] == [ss.MAX_PLAYER_MIN_BUFFER_MS] * 2
+
+
+def test_the_clamp_never_raises_on_a_client_that_is_gone():
+    """Called straight off a lifecycle event, so the client can already have disconnected. A raise
+    here would take the whole client-added path down with it."""
+    unit = make_unit("src1")
+    unit._clamp_player_min_buffer("never-existed")  # must not raise
+
+
+def test_the_clamp_never_raises_before_the_server_exists():
+    unit = ss.PlumSendspinServer("unitA", "A")
+    unit.server = None
+    unit._clamp_player_min_buffer("anyone")  # must not raise
+
+
+def test_a_role_with_no_buffer_attribute_is_skipped():
+    """Non-player roles reach roles_by_family as plain id strings elsewhere in this file, and a
+    future role type may carry no timing at all. Neither may crash the join."""
+    unit = make_unit("src1")
+    unit.server.add(FakeClient("ctrl", roles=["player@v1"]))  # a bare string, not a role object
+
+    unit._clamp_player_min_buffer("ctrl")  # must not raise
