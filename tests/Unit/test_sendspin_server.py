@@ -1366,7 +1366,24 @@ def test_setting_the_local_player_to_none_releases_it(monkeypatch):
 # in the same group stutter the whole time.
 
 
-def test_a_player_asking_for_more_buffer_than_the_feeder_holds_is_capped():
+def test_a_player_at_the_ceiling_is_left_alone():
+    """The clamp is a guard against one client taking a group down, not a way to make a device run
+    on less buffer than its pipeline expects.
+
+    Measured on .7.204: forcing an ESPHome speaker from 1000 ms to 250 ms stopped the starvation and
+    left its start time unanchored — the same build put it 500 ms BEHIND the room in one session and
+    250-500 ms AHEAD in the next. Capping to the floor keeps the guard and drops the squeeze.
+    """
+    unit = make_unit("src1")
+    role = FakePlayerRole(min_buffer_ms=ss.MAX_PLAYER_MIN_BUFFER_MS)
+    unit.server.add(FakeClient("esp32", roles=[role]))
+
+    unit._clamp_player_min_buffer("esp32")
+
+    assert role.min_buffer_ms == ss.MAX_PLAYER_MIN_BUFFER_MS
+
+
+def test_a_player_above_the_ceiling_is_capped():
     unit = make_unit("src1")
     role = FakePlayerRole(min_buffer_ms=1000)
     unit.server.add(FakeClient("esp32", roles=[role]))
@@ -1374,6 +1391,16 @@ def test_a_player_asking_for_more_buffer_than_the_feeder_holds_is_capped():
     unit._clamp_player_min_buffer("esp32")
 
     assert role.min_buffer_ms == ss.MAX_PLAYER_MIN_BUFFER_MS
+
+
+def test_the_clamp_floor_is_off_by_default():
+    """The 1000 ms an ESP32 appears to ask for is aiosendspin's own default, not a device figure.
+
+    sendspin-cpp has never implemented `min_buffer_ms` — the string appears in no commit on any
+    branch, though the spec made it REQUIRED for players on 2026-06-01. So the clamp is overriding
+    an invented number, and a floor that respected it would only re-create the starvation.
+    """
+    assert ss.MIN_PLAYER_BUFFER_FLOOR_MS == 0
 
 
 def test_the_cap_is_what_the_feeder_can_actually_serve():
