@@ -99,9 +99,26 @@ SERVER_PORT = 8927
 # AirPlay (shairport-sync pipe backend) emits 44100:16:2 PCM by default.
 DEFAULT_FORMAT = AudioFormat(44100, 16, 2)
 COMMIT_CHUNK_MS = 20  # feeder read/commit cadence — small for low added latency
-# Keep this much audio buffered ahead of playback. Covers the player's default
-# required_lead_time (250 ms) + min_buffer (250 ms) with margin, and bounds ingest latency.
+# Keep this much audio buffered ahead of playback. Bounds ingest latency, and is the HARD ceiling
+# on what any player in a group may ask us to buffer ahead — see MAX_PLAYER_MIN_BUFFER_MS.
 TARGET_BUFFER_US = 500_000
+# The largest `min_buffer_ms` we can actually honour, and the reason the two constants live
+# together: `PushStream._min_send_ahead_us()` takes the MAXIMUM across every audio role in a group,
+# and for a LIVE source the per-role floor is `min_buffer + static_delay`. So one client asking for
+# more than the feeder ever holds does not starve itself — it starves the whole group, including
+# rooms that were already playing.
+#
+# Half the target, which is 250 ms. That is not an arbitrary fraction: it is the aiosendspin CLIENT
+# default, so it puts a client that declares nothing on exactly the same footing as our own player
+# and the browser SDK, both of which report 250. It also leaves the feeder 2x headroom rather than
+# running at the limit.
+#
+# This exists because the SERVER-side default moved and the feeder did not: 250 ms on 6.0.5, 500 ms
+# on 9.1.0 (exactly at the limit, no headroom), 1000 ms on 9.1.1 — which is more than we can ever
+# hold. Measured on .7.204: an ESPHome speaker that omits the timing fields took the 1000 ms default,
+# raised the group floor above the feeder ceiling, rendered nothing, and dropped the websocket after
+# 16 s while the Amp100 in the same group stuttered. docs/HARD-WON-LESSONS.md.
+MAX_PLAYER_MIN_BUFFER_MS = TARGET_BUFFER_US // 2000
 ANCHOR_PREFIX = "src:"  # server-side group anchor client id namespace
 # A source counts as "in use" while audio keeps arriving. Past this gap (or once the writer closes)
 # it goes idle: we announce group playback_state=stopped, and the GUI drops it from the stream list.
@@ -1055,9 +1072,56 @@ class PlumSendspinServer:
                 "client %s %s", event.client_id, "removed" if isinstance(event, ClientRemovedEvent) else "disconnected"
             )
         if isinstance(event, (ClientAddedEvent, ClientUpdatedEvent)):
+            # BEFORE anything else: a player asking for more buffer than the feeder can hold starves
+            # the whole group, so cap it while it is still joining rather than after it has taken the
+            # room down with it. On ClientUpdatedEvent too, because the library re-reads
+            # min_buffer_ms from every client/state and would otherwise undo this on the next one.
+            self._clamp_player_min_buffer(event.client_id)
             asyncio.ensure_future(self._maybe_group_controller(event.client_id))
             asyncio.ensure_future(self._maybe_pair_via_shared_psk(event.client_id))
             asyncio.ensure_future(self._apply_pending_volume(event.client_id))
+
+    def _clamp_player_min_buffer(self, client_id: str) -> None:
+        """Cap a player's `min_buffer_ms` at what this feeder can actually serve.
+
+        `PushStream._min_send_ahead_us()` takes the MAXIMUM across every audio role in the group, and
+        a LIVE source cannot grow its queue after playback starts. So a single client asking for more
+        than `TARGET_BUFFER_US` does not merely fail itself — the stream never reaches the floor for
+        ANY member, and rooms that were already playing starve with it.
+
+        Clamping rather than raising the feeder is deliberate. Serving a 1000 ms request would add
+        ~700 ms of ingest latency to every source on the unit, AirPlay lip-sync included, to
+        accommodate one client that never asked for it in the first place: 9.1.1 raised the
+        server-side DEFAULT, so this figure belongs to clients that declared nothing at all. The
+        cap puts them where our own player and the browser SDK already sit.
+
+        Synchronous, and called before the join tasks are scheduled, because the alternative is
+        racing the first `commit_audio` with the group floor already wrong.
+        """
+        if self.server is None:
+            return
+        try:
+            client = self.server.get_client(client_id)
+            if client is None:
+                return
+            for role in client.roles_by_family("player"):
+                current = getattr(role, "min_buffer_ms", None)
+                if not isinstance(current, int) or current <= MAX_PLAYER_MIN_BUFFER_MS:
+                    continue
+                role.min_buffer_ms = MAX_PLAYER_MIN_BUFFER_MS
+                # WARNING, not debug: this is the difference between a room that plays and one that
+                # goes silent, and the client id here is the only way to tell which device did it.
+                logger.warning(
+                    "player %s asked for min_buffer=%d ms, more than this feeder holds (%d ms) — "
+                    "capped to %d ms. Uncapped it would raise the send-ahead floor for the WHOLE "
+                    "group and starve every member.",
+                    client_id,
+                    current,
+                    TARGET_BUFFER_US // 1000,
+                    MAX_PLAYER_MIN_BUFFER_MS,
+                )
+        except Exception:  # noqa: BLE001 - never let a buffer cap take the client lifecycle down
+            logger.exception("could not clamp min_buffer for %s", client_id)
 
     async def _apply_pending_volume(self, client_id: str) -> None:
         """Send a level that was set while this player was released. Once, on reconnect."""
