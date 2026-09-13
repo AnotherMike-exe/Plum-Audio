@@ -291,6 +291,78 @@ docker pull ghcr.io/anothermike-exe/plum-audio:latest   # or :1.0.0, or :dev
 `--image` says otherwise. `deploy.sh` deploys your own local build unless you pass `--pull` or
 `--image`.
 
+## Updating
+
+### From the GUI
+
+**Settings → Updates.** Tick the units to update, pick a channel, press Update.
+
+The page defaults to the unit you are looking at, so you can test a new image in one room before the
+house follows. Press **All** when you are ready for the rest. A unit that is already current is left
+playing — nothing restarts unless there is something new to install.
+
+Each unit is unreachable for about ten seconds while its container restarts. The row says
+`Restarting`. That is the update working, not a fault.
+
+> **Keep the fleet together.** A 9.x client cannot reach a 6.0.5 server, so units split across an
+> `aiosendspin` major cannot sync at all. The page warns when a selection would leave reachable peers
+> behind. Read that warning before you update one room and walk away.
+
+### From the command line
+
+On the unit:
+
+```bash
+cd /opt/plum-audio
+docker compose pull && docker compose up -d
+```
+
+Or drive the host agent directly, which is what the GUI does:
+
+```bash
+sudo plum-updater.sh check        # refresh "what is available", install nothing
+sudo plum-updater.sh update       # pull and restart now
+sudo plum-updater.sh update latest  # switch channel and update
+sudo plum-updater.sh state        # print what it last did
+```
+
+From your workstation, for the whole fleet at once:
+
+```bash
+docker/deploy.sh all --image ghcr.io/anothermike-exe/plum-audio:dev
+```
+
+### How it updates itself
+
+A container cannot replace itself — the process that would pull a new image runs inside the thing
+being replaced. Mounting the Docker socket would fix that and open a much worse hole: these APIs are
+unauthenticated and bound to `0.0.0.0`, so a socket inside the container is root on the host for
+anyone on the VLAN.
+
+So the work happens on the host, and the two halves pass files through the `/config` bind mount:
+
+```
+GUI ──POST /api/mesh/update──▶ container writes /config/update.request
+                                          │
+                        systemd path unit sees the file
+                                          ▼
+                        plum-updater.sh: docker compose pull
+                                         then up -d, only if the pull worked
+                                          │
+                              writes /config/update.state ──▶ the GUI polls it
+```
+
+The state file lives on the bind mount so the result survives the container restart that ends the
+request.
+
+**The agent is installed by `provision.sh`, once per Pi image.** A unit without it works perfectly
+and updates by hand — the Updates tab reports its host as unprovisioned and refuses to pretend
+otherwise. Units commissioned before the agent existed are in exactly this state.
+
+A daily timer checks the registry and never installs anything. Applying an update is always a
+deliberate act, because a timer that applied them would split the mesh across a protocol major
+while nobody was watching.
+
 ## Other platforms
 
 Nothing in the application is Pi-specific, but the deployment tooling is, and **amd64 has never been

@@ -53,6 +53,10 @@ nothing in the container can substitute for any of it:
 - **The host owns the mDNS responder.** A second one is the exact UDP 5353 collision
   `start_server(advertise_addresses=[])` exists to avoid.
 - **NetworkManager owns `wlan0`** — WiFi was a host concern in Plum-Snapcast and stays one.
+- **Only the host can replace the container.** The process that would pull a new image runs inside
+  the thing being replaced. Mounting the Docker socket would solve that and open a far worse hole:
+  these APIs are unauthenticated on `0.0.0.0`, so a socket in the container is root on the host for
+  anyone on the VLAN. Hence the update agent in step 7.
 
 ## 1. Audio HAT — `scripts/host-setup/configure-audio-hat.sh`
 
@@ -258,6 +262,34 @@ pre-container GUI. Under host networking the container's nginx crash-loops on `b
 host keeps answering :80 — a GUI that looks perfect and is a stale build. Config and webroot are
 left on disk.
 
+## 7. Install the update agent
+
+```bash
+sudo install -m 0755 plum-updater.sh /usr/local/bin/plum-updater.sh
+sudo install -m 0644 plum-updater.path plum-updater.service \
+                     plum-updater-check.timer plum-updater-check.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now plum-updater.path plum-updater-check.timer
+sudo plum-updater.sh init          # registers the agent, once /opt/plum-audio exists
+```
+
+`provision.sh` does all of this. It is listed here because the failure has no symptom on the unit
+itself: everything runs perfectly, and only the GUI's Updates tab reports the host as unprovisioned
+and refuses to offer a button it cannot honour.
+
+**Enable the `.path` and the `.timer`, never their `.service` pairs.** Those two are oneshots that
+the path and timer trigger. Enabling a oneshot runs it at every boot instead.
+
+`plum-updater.sh init` writes `/opt/plum-audio/config/update.state`, and that file existing is the
+only way the container learns an agent is here at all. On a greenfield Pi `provision.sh` runs before
+`/opt/plum-audio` exists, so it cannot write it then — `deploy.sh` and `plum-init.sh` both run `init`
+once the directory is there. A unit provisioned and never deployed reports no agent, correctly.
+
+The timer runs a daily CHECK and installs nothing. Applying an update is always deliberate: a 9.x
+client cannot reach a 6.0.5 server, so a timer that applied updates per unit would split the mesh
+across a protocol major overnight, and the symptom is a speaker that joins the group at the right
+volume and renders nothing.
+
 ## Verify it took
 
 ```bash
@@ -282,6 +314,11 @@ systemctl --user is-enabled obex.service  # masked
 # Host services the container reaches over mounted sockets
 systemctl is-active avahi-daemon bluetooth
 systemctl is-enabled nginx                # disabled (or not installed)
+
+# Update agent
+systemctl is-active plum-updater.path     # active — nothing consumes a request without it
+systemctl list-timers plum-updater-check.timer
+sudo plum-updater.sh state                # JSON, with agentVersion set
 
 # Then deploy and let it check the rest
 docker/deploy.sh <host>
