@@ -20,7 +20,7 @@ COPY frontend/ ./
 # serves every unit.
 RUN npm run build
 
-FROM python:3.13-slim-trixie AS base
+FROM python:3.14-slim-trixie AS base
 
 ENV PUID=99 \
     PGID=100 \
