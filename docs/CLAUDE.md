@@ -34,7 +34,7 @@ Solo developer + AI assistance. Priority: correct mesh + audio reliability first
 
 ## Stack and ports
 
-**Backend** — Python 3.13 · `aiosendspin` **pinned 9.1.0** · PyAV · numpy · Flask (:5002) + aiohttp
+**Backend** — Python 3.13 · `aiosendspin` **pinned 9.1.1** · PyAV · numpy · Flask (:5002) + aiohttp
 (:5001) · supervisord · Avahi + D-Bus + host networking.
 Base image **`python:3.13-slim-trixie`** — glibc, not Alpine (deliberate: trivial PyAV/PortAudio/
 numpy wheels). **Trixie specifically** to match the units' Debian 13: bluez-alsa still names its
@@ -122,7 +122,7 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
 The *reasoning* behind these, and the failures that produced them, is in
 **`docs/HARD-WON-LESSONS.md`**. Do not re-litigate them from first principles.
 
-- **Pin `aiosendspin`** (9.1.0). On any bump run `tests/Integration/t0_sendspin_protocol.py` first
+- **Pin `aiosendspin`** (9.1.1). On any bump run `tests/Integration/t0_sendspin_protocol.py` first
   (tier 0 — real protocol, no rig; needs a venv on the candidate version), and re-check
   `docs/UPSTREAM-AIOSENDSPIN.md`. Port notes: `docs/AIOSENDSPIN-BUMP-SCOPE.md`.
 - **A role is ALWAYS negotiated but only ACTIVATED when the client is PAIRED** (or, with unpaired

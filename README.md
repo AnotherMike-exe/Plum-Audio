@@ -355,7 +355,7 @@ is never bridged between servers. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.m
 
 ## Tech stack
 
-- **Backend** — Python 3.13, [`aiosendspin`](https://github.com/Sendspin/aiosendspin) (pinned 9.1.0),
+- **Backend** — Python 3.13, [`aiosendspin`](https://github.com/Sendspin/aiosendspin) (pinned 9.1.1),
   PyAV, NumPy, Flask + aiohttp, supervisord
 - **Frontend** — React 19, TypeScript 5, Vite 6, served by nginx inside the container
 - **Base image** — `python:3.13-slim-trixie`. glibc rather than Alpine, deliberately: PyAV, PortAudio

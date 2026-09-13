@@ -6,7 +6,7 @@
 # Identity + a pairing_store, and cleartext clients need allow_unencrypted=True — which is permanent,
 # not transitional, because sendspin-cpp (the ESP32 clients) has no encryption. A 9.x client CANNOT
 # reach a 6.0.5 server, so the whole rig cuts over at once; there is no rolling upgrade.
-aiosendspin==9.1.0
+aiosendspin==9.1.1
 # Pulled in by aiosendspin 9.x's noise/ package. Listed explicitly because they are new mandatory
 # runtime deps, they install whether or not encryption is enabled, and cpace has exactly one release.
 cryptography>=42

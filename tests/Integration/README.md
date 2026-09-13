@@ -55,7 +55,7 @@ candidate:
 
 ```
 python3.13 -m venv /tmp/venv91
-/tmp/venv91/bin/pip install 'aiosendspin[server]==9.1.0'
+/tmp/venv91/bin/pip install 'aiosendspin[server]==9.1.1'
 /tmp/venv91/bin/python t0_sendspin_protocol.py
 ```
 

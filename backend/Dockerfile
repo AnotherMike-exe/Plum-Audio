@@ -119,7 +119,7 @@ RUN python3 -c "\
 import importlib.metadata as md, cpace, noise; \
 from aiosendspin.noise import Identity; \
 v = md.version('aiosendspin'); \
-assert v == '9.1.0', f'aiosendspin {v}, expected 9.1.0 — the pin did not take'; \
+assert v == '9.1.1', f'aiosendspin {v}, expected 9.1.1 — the pin did not take'; \
 assert len(Identity.generate().peer_id) > 20, 'X25519 keygen produced nothing usable'; \
 print(f'noise stack OK (aiosendspin {v}, cryptography works on this arch)')"
 
