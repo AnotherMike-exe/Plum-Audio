@@ -40,6 +40,9 @@ class SendspinEngine(SyncEngine):
     async def set_player_volume(self, player_id: str, volume: int, muted: bool) -> None:
         self._server.set_player_volume(player_id, volume, muted)
 
+    async def set_player_delay(self, player_id: str, delay_ms: int) -> None:
+        self._server.set_player_delay(player_id, delay_ms)
+
     async def set_source_volume(self, source_id: str, volume: int | None = None, muted: bool | None = None) -> None:
         await self._server.set_source_volume(source_id, volume, muted)
 

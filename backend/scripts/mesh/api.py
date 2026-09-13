@@ -17,6 +17,7 @@ Endpoints (parity with the old /api/federation/* surface, so the GUI ports with 
   POST /api/mesh/route             {player_id, source_id}          route a player onto a source
   POST /api/mesh/unroute           {player_id, source_id}          remove a player from a source
   POST /api/mesh/volume            {player_id, volume, muted}      per-player (endpoint) volume
+  POST /api/mesh/player-delay      {player_id, delay_ms}           correct an endpoint that plays LATE
   POST /api/mesh/source-volume     {source_id, volume?, muted?}    the SENDING DEVICE's own volume
   POST /api/mesh/source            {source_id, fifo?}              start a local source (a group)
   POST /api/mesh/source/stop       {source_id}                     stop a local source
@@ -193,6 +194,7 @@ class MeshApi:
                 web.post("/api/mesh/route", self._route),
                 web.post("/api/mesh/unroute", self._unroute),
                 web.post("/api/mesh/volume", self._volume),
+                web.post("/api/mesh/player-delay", self._player_delay),
                 web.post("/api/mesh/source-volume", self._source_volume),
                 web.post("/api/mesh/source", self._source_start),
                 web.post("/api/mesh/source/stop", self._source_stop),
@@ -422,6 +424,32 @@ class MeshApi:
             with contextlib.suppress(Exception):
                 self.on_user_volume(player_id, volume)
         return web.json_response({"ok": True})
+
+    async def _player_delay(self, request: web.Request) -> web.Response:
+        """Tell the server how much output latency an endpoint has, so it can send it earlier.
+
+        This is the spec's `static_delay_ms`, and it is the answer for a client that does not report
+        its own — an ESPHome speaker omits the player timing fields entirely, so the library assumes
+        zero and the device plays late by however long its real path takes. Buffering cannot fix
+        that: the figure is a property of the hardware.
+
+        Larger sends EARLIER. An endpoint running half a second behind the room takes ~500.
+
+        Bounded at 5 s. The field is a hardware latency, not a party trick, and an unbounded value
+        would let one slider push an endpoint so far ahead that it can never be fed.
+        """
+        body = await self._json(request)
+        player_id = body.get("player_id")
+        if not player_id:
+            return web.json_response({"error": "player_id required"}, status=400)
+        try:
+            delay_ms = int(body.get("delay_ms", 0))
+        except (TypeError, ValueError):
+            return web.json_response({"error": "delay_ms must be an integer"}, status=400)
+        if not 0 <= delay_ms <= 5000:
+            return web.json_response({"error": "delay_ms must be between 0 and 5000"}, status=400)
+        await self._engine.set_player_delay(player_id, delay_ms)
+        return web.json_response({"ok": True, "player_id": player_id, "delay_ms": delay_ms})
 
     async def _source_volume(self, request: web.Request) -> web.Response:
         """The volume ON THE SENDING DEVICE — the phone's AirPlay/BT slider, Spotify's device volume.

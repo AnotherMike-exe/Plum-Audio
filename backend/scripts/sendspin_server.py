@@ -118,7 +118,11 @@ TARGET_BUFFER_US = 500_000
 # hold. Measured on .7.204: an ESPHome speaker that omits the timing fields took the 1000 ms default,
 # raised the group floor above the feeder ceiling, rendered nothing, and dropped the websocket after
 # 16 s while the Amp100 in the same group stuttered. docs/HARD-WON-LESSONS.md.
-MAX_PLAYER_MIN_BUFFER_MS = TARGET_BUFFER_US // 2000
+# Overridable at runtime ONLY so the two competing explanations for a late endpoint can be told
+# apart on a rig without a rebuild: if raising this shrinks a fixed offset, the cap is implicated;
+# if the offset does not move, the device's uncompensated output latency is, and the answer is a
+# per-player delay instead. Leave it unset in normal operation.
+MAX_PLAYER_MIN_BUFFER_MS = int(os.environ.get("PLUM_MAX_PLAYER_MIN_BUFFER_MS", TARGET_BUFFER_US // 2000))
 ANCHOR_PREFIX = "src:"  # server-side group anchor client id namespace
 # A source counts as "in use" while audio keeps arriving. Past this gap (or once the writer closes)
 # it goes idle: we announce group playback_state=stopped, and the GUI drops it from the stream list.
@@ -494,6 +498,10 @@ class PlumSendspinServer:
         self._local_player_tasks: list[asyncio.Task] = []
         # Volume asked for while a player was released, applied when it reconnects.
         self._pending_volume: dict[str, tuple[int, bool]] = {}
+        # Per-player output-latency correction, by client id. Held here for the same reason volume
+        # is: a speaker that is idle or foreign-held must not be dialled just to carry a number, and
+        # the value has to survive every reconnect or the room drifts out again on the next roam.
+        self._player_delay_ms: dict[str, int] = {}
         self._metadata_readers: dict[str, AirplayMetadataReader] = {}  # source_id -> shairport pipe reader
         self._airplay_remotes: dict[str, AirplayRemote] = {}  # source_id -> per-instance MPRIS remote
         self._spotify_monitors: dict[str, SpotifyGoLibrespot] = {}  # source_id -> go-librespot event monitor
@@ -1077,6 +1085,7 @@ class PlumSendspinServer:
             # room down with it. On ClientUpdatedEvent too, because the library re-reads
             # min_buffer_ms from every client/state and would otherwise undo this on the next one.
             self._clamp_player_min_buffer(event.client_id)
+            self._apply_player_delay(event.client_id)
             asyncio.ensure_future(self._maybe_group_controller(event.client_id))
             asyncio.ensure_future(self._maybe_pair_via_shared_psk(event.client_id))
             asyncio.ensure_future(self._apply_pending_volume(event.client_id))
@@ -1122,6 +1131,51 @@ class PlumSendspinServer:
                 )
         except Exception:  # noqa: BLE001 - never let a buffer cap take the client lifecycle down
             logger.exception("could not clamp min_buffer for %s", client_id)
+
+    def set_player_delay(self, player_id: str, delay_ms: int) -> None:
+        """Correct an endpoint that plays LATE, by telling the server how much latency it has.
+
+        `static_delay_ms` is the spec's field for a device's own output latency — DAC, amplifier and
+        whatever the firmware buffers before the first sample leaves the speaker. The server
+        subtracts it when scheduling (`effective_ts = timestamp - static_delay`), so a LARGER value
+        sends that endpoint EARLIER. An endpoint running half a second behind the room takes ~500.
+
+        It exists because a client is supposed to report its own figure and some do not. Our player
+        reports `PLUM_STATIC_DELAY_MS`; an ESPHome speaker omits the timing fields entirely, so the
+        library defaults it to 0 and the device plays late by however long its real path takes. No
+        amount of buffering fixes that — the number is a property of the hardware and has to be
+        measured once, then remembered.
+
+        Held per client id and re-applied on every connect, exactly like volume: a speaker that is
+        idle or foreign-held must never be dialled just to carry a number, and a correction that did
+        not survive a roam would let the room drift out again the moment it moved.
+        """
+        self._player_delay_ms[player_id] = int(delay_ms)
+        self._apply_player_delay(player_id)
+
+    def get_player_delay(self, player_id: str) -> int:
+        """The correction currently held for this endpoint, or 0."""
+        return self._player_delay_ms.get(player_id, 0)
+
+    def _apply_player_delay(self, client_id: str) -> None:
+        """Push a held correction onto the live role. Silent no-op when there is nothing to apply."""
+        delay_ms = self._player_delay_ms.get(client_id)
+        if delay_ms is None or self.server is None:
+            return
+        try:
+            client = self.server.get_client(client_id)
+            if client is None:
+                return
+            applied = False
+            for role in client.roles_by_family("player"):
+                if not hasattr(role, "static_delay_ms"):
+                    continue
+                role.static_delay_ms = delay_ms
+                applied = True
+            if applied:
+                logger.info("player %s static_delay set to %d ms", client_id, delay_ms)
+        except Exception:  # noqa: BLE001 - a timing correction must never break the client lifecycle
+            logger.exception("could not apply static_delay for %s", client_id)
 
     async def _apply_pending_volume(self, client_id: str) -> None:
         """Send a level that was set while this player was released. Once, on reconnect."""

@@ -48,6 +48,14 @@ class SyncEngine(ABC):
     async def set_player_volume(self, player_id: str, volume: int, muted: bool) -> None:
         """Set a player's volume/mute (per-client)."""
 
+    async def set_player_delay(self, player_id: str, delay_ms: int) -> None:
+        """Correct an endpoint that plays LATE, by declaring its own output latency.
+
+        Optional, like `set_source_volume`: an engine whose protocol carries no per-endpoint
+        latency has nothing to set.
+        """
+        raise NotImplementedError
+
     async def set_source_volume(self, source_id: str, volume: int | None = None, muted: bool | None = None) -> None:
         """Set the volume/mute ON THE SENDING DEVICE feeding a source (AirPlay/BT/Spotify).
 
