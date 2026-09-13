@@ -51,7 +51,7 @@ TIER 0 — real protocol, no hardware. Unlike its tier 2-4 neighbours this is Py
 host argument, and touches no rig: it stands two servers up on localhost. It does need an
 interpreter with the aiosendspin version under test, which is NOT the repo's pinned one:
 
-    python3.13 -m venv /tmp/venv91 && /tmp/venv91/bin/pip install 'aiosendspin[server]==9.1.0'
+    python3.13 -m venv /tmp/venv91 && /tmp/venv91/bin/pip install 'aiosendspin[server]==9.1.1'
     /tmp/venv91/bin/python tests/Integration/t0_sendspin_protocol.py
 
 Formerly _resources/spike/mesh_smoke.py. Promoted out of the gitignored spike area on

@@ -241,13 +241,21 @@ re-exports it — our import path still works. Also unchanged: `has_role_family`
   the event loop, yielding every few keys"*, and `_encode_pcm_sequence` became `async` with a 500 ms
   yield interval. On a Pi driving several heterogeneous-codec endpoints from the loop that **also**
   serves the mesh API on :5001, that is a plausible xrun source. Measure; do not assume.
-- **`min_buffer_ms` and the lead-time formula.** The 250 → 500 default is server-side only and is
+- **`min_buffer_ms` and the lead-time formula.** The default is server-side only and is
   overwritten by the client's first `client/state`; the client SDK default is still 250, so it never
   applies to our own player. The real change is `_role_send_ahead_us`: for a live source it is now
   `min_buffer + static` where it was `max(required_lead, min_buffer) + static`. Identical at our
   defaults, but a client declaring a small `min_buffer` and a large `required_lead` now gets *less*
   lead. Late-join anchoring also now includes the full send-ahead — and a cross-server roam **is** a
-  late join, so the code path behind "a roam is inaudible" changes, in the safe direction.
+  late join, so the code path behind "a roam is inaudible" changes.
+
+  **Corrected on 9.1.1.** Two claims above were read against 9.1.0 and no longer hold:
+  the default is 250 → **1000**, not 500 (`server/roles/player/v1.py:74`), which doubles the window
+  a client that never reports the field waits before the stream starts. Our own player and the
+  browser SDK both report it, so both still land on 250. And "in the safe direction" is withdrawn:
+  9.1.1 anchors a late-joining channel at `min(shared_candidates)` where 9.1.0 used
+  `max(shared_timing_us, target_min_us)`, which is the opposite direction. Rig test #5 below is
+  open again.
 
 ## New dependencies
 
@@ -271,7 +279,10 @@ note, not a defect.
    deliberate audible discontinuity `CLAUDE.md` records as the cost of the membership rule.
    It may even be a true wire no-op: `stop(keep_stream=True)` skips the `on_stream_end` fan-out, and
    the successor's `on_stream_start` only *marks* a pending start, which is then deduplicated against
-   `_last_sent_format` — state that lives on the role and survives the swap. Whether the audio is
+   `_last_sent_format` — state that lives on the role and survives the swap.
+   **Do not rely on that last clause on 9.1.1.** Its new `_begin_format_transition()` clears
+   `_last_sent_format` deliberately, so a format flip-flop is no longer deduplicated. The A/B is
+   still the right test — the "true wire no-op" prediction it was meant to confirm is not. Whether the audio is
    genuinely gapless is a timing question the source cannot settle: it needs the rig A/B, capturing
    frames exactly as the 2026-08-10 `unit-7204` measurement did.
    **Caveat:** upstream gates *its* version behind `allow_noncompliant_clients=False` (strict mode),

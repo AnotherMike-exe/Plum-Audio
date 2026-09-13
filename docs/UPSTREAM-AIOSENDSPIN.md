@@ -1,6 +1,6 @@
 # Upstream asks — `aiosendspin`
 
-> Things Plum-Audio currently works **around** because the pinned `aiosendspin` (**6.0.5**) doesn't
+> Things Plum-Audio currently works **around** because the pinned `aiosendspin` (**9.1.1**) doesn't
 > expose the seam cleanly. Each is a real, shipped workaround — not a hypothetical — so this file is
 > the checklist to revisit on every pin bump: if a release closes one, delete the workaround and the
 > corresponding note in `docs/SPEC-CONFORMANCE.md`.
@@ -335,9 +335,13 @@ That gate was `_resources/spike/mesh_smoke.py` until 2026-08-12, when porting it
 did not survive the constructor changes it was supposed to gate — and that being gitignored, the
 port would be lost. It now also asserts role **activation**, not just connection.
 
-**Status as of 2026-08-12** (all six read against 9.1.0 — see `docs/AIOSENDSPIN-BUMP-SCOPE.md`):
+**Status as of 2026-09-13** (all seven re-read against 9.1.1 — see `docs/AIOSENDSPIN-BUMP-SCOPE.md`).
+9.1.1 changes nothing here: every one of its edits lands in the encoder, push-stream,
+format-transition or binary-send path, and this file tracks connection lifecycle, identity,
+metadata stamping and cleanup timers. In particular 9.1.1's new public `ServerClient` method is
+`drop_pending_binary()`, NOT the §3 hang-up — do not read it as closing §3:
 
-| § | 9.1.0 |
+| § | 9.1.1 |
 |---|---|
 | 0 | **Fixed**, by replacing `state` with `available: bool` — our workaround becomes the non-conformance |
 | 1 | **Fixed** — real arbitration in `attach_websocket`; closes `CLAUDE.md` Open #6 |
