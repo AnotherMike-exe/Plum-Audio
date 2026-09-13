@@ -7,6 +7,7 @@ import {PlaybackTab} from './settings/PlaybackTab';
 import {ThemeTab} from './settings/ThemeTab';
 import {VisualizerTab} from './settings/VisualizerTab';
 import {AboutTab} from './settings/AboutTab';
+import {UpdatesTab} from './settings/UpdatesTab';
 import {PairingTab} from './settings/PairingTab';
 import { Icon } from './Icon';
 
@@ -35,6 +36,7 @@ const tabs: Tab[] = [
     {id: 'pairing', label: 'Pairing', icon: 'network-wired'},
     {id: 'theme', label: 'Theme', icon: 'palette'},
     {id: 'visualizer', label: 'Visualizer', icon: 'waveform'},
+    {id: 'updates', label: 'Updates', icon: 'tower-broadcast'},
     {id: 'about', label: 'About', icon: 'circle-info'},
 ];
 
@@ -55,6 +57,8 @@ export const Settings: React.FC<SettingsProps> = ({settings, onSettingsChange, o
                 return <ThemeTab settings={settings} onSettingsChange={onSettingsChange} />;
             case 'visualizer':
                 return <VisualizerTab settings={settings} onSettingsChange={onSettingsChange} />;
+            case 'updates':
+                return <UpdatesTab />;
             case 'about':
                 return <AboutTab settings={settings} onSettingsChange={onSettingsChange} />;
             default:
