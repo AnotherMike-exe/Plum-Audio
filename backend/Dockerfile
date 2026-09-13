@@ -11,7 +11,7 @@
 # Debian release.
 
 # --- Frontend build: the React GUI nginx serves from /app/www ------------------------------------
-FROM node:22-alpine AS webui
+FROM node:26-alpine AS webui
 WORKDIR /ui
 COPY frontend/package*.json ./
 RUN npm ci
