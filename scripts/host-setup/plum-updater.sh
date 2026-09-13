@@ -259,6 +259,24 @@ do_update() {
         return 1
     fi
 
+    # Nothing new? Then do NOT restart. `docker compose up -d` recreates the container even when the
+    # image did not move, and a recreate is ~10 s of silence — so an "Update" on an already-current
+    # unit would drop audio for no reason at all. Measured on .7.122, which is what put this here.
+    #
+    # Guarded on the container actually RUNNING, because "same digest" is also true of a unit whose
+    # container is stopped or crash-looping, and there the restart is the whole point.
+    local after_pull running=""
+    after_pull="$(local_digest)"
+    running="$(docker inspect -f '{{.State.Running}}' plum-audio 2>/dev/null)"
+    if [[ -n "$S_PREVIOUS" && "$S_PREVIOUS" == "$after_pull" && "$running" == "true" ]]; then
+        S_DIGEST="$after_pull"
+        S_PHASE="idle"
+        record_result ok "already up to date — nothing pulled, audio untouched"
+        save_state
+        log "already up to date (${S_DIGEST}) — skipping the restart"
+        return 0
+    fi
+
     phase "restarting"
     if ! compose up -d 2>&1 | sed 's/^/    /'; then
         S_PHASE="failed"
@@ -271,11 +289,7 @@ do_update() {
 
     S_DIGEST="$(local_digest)"
     S_PHASE="idle"
-    if [[ -n "$S_PREVIOUS" && "$S_PREVIOUS" == "$S_DIGEST" ]]; then
-        record_result ok "already up to date — no new image"
-    else
-        record_result ok "updated"
-    fi
+    record_result ok "updated"
     save_state
     log "update complete: ${S_PREVIOUS:-unknown} -> ${S_DIGEST:-unknown}"
     return 0
