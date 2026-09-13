@@ -99,9 +99,14 @@ SERVER_PORT = 8927
 # AirPlay (shairport-sync pipe backend) emits 44100:16:2 PCM by default.
 DEFAULT_FORMAT = AudioFormat(44100, 16, 2)
 COMMIT_CHUNK_MS = 20  # feeder read/commit cadence — small for low added latency
-# Keep this much audio buffered ahead of playback. Bounds ingest latency, and is the HARD ceiling
-# on what any player in a group may ask us to buffer ahead — see MAX_PLAYER_MIN_BUFFER_MS.
-TARGET_BUFFER_US = 500_000
+# Keep this much audio buffered ahead of playback. Bounds ingest latency, and is the ceiling on
+# what any player in a group can be served — see MAX_PLAYER_MIN_BUFFER_MS.
+#
+# 500 ms was sized for 6.0.5, whose server-side min_buffer default was 250 ms. That default is now
+# 1000 ms, so this has been below what an endpoint declaring nothing is assumed to need since the
+# 9.1.1 bump. Tunable at runtime so the right figure can be found on a rig rather than guessed:
+# raising it costs ingest latency on every source, which is why it is not simply set large.
+TARGET_BUFFER_US = int(os.environ.get("PLUM_TARGET_BUFFER_MS", "500")) * 1000
 # The largest `min_buffer_ms` we can actually honour, and the reason the two constants live
 # together: `PushStream._min_send_ahead_us()` takes the MAXIMUM across every audio role in a group,
 # and for a LIVE source the per-role floor is `min_buffer + static_delay`. So one client asking for
@@ -123,6 +128,19 @@ TARGET_BUFFER_US = 500_000
 # if the offset does not move, the device's uncompensated output latency is, and the answer is a
 # per-player delay instead. Leave it unset in normal operation.
 MAX_PLAYER_MIN_BUFFER_MS = int(os.environ.get("PLUM_MAX_PLAYER_MIN_BUFFER_MS", TARGET_BUFFER_US // 2000))
+
+# A floor on the clamp, DISABLED by default, and the reasoning behind that is worth keeping.
+#
+# The 1000 ms an ESPHome speaker appears to "ask for" is not a device requirement at all. It is
+# aiosendspin's own default (server/roles/player/v1.py). sendspin-cpp has never implemented
+# `min_buffer_ms` — the string does not appear in any commit on any branch of that repository, the
+# spec made the field REQUIRED for players on 2026-06-01, and four releases have shipped since
+# without it. So there is nothing to respect here: capping to what the feeder can serve overrides an
+# invented figure, not the hardware's own.
+#
+# This knob exists only so that assumption can be re-tested if sendspin-cpp ever does implement the
+# field. Set it to the value a real client declares and the clamp will stop squeezing it.
+MIN_PLAYER_BUFFER_FLOOR_MS = int(os.environ.get("PLUM_MIN_PLAYER_BUFFER_FLOOR_MS", "0"))
 ANCHOR_PREFIX = "src:"  # server-side group anchor client id namespace
 # A source counts as "in use" while audio keeps arriving. Past this gap (or once the writer closes)
 # it goes idle: we announce group playback_state=stopped, and the GUI drops it from the stream list.
@@ -1113,21 +1131,35 @@ class PlumSendspinServer:
             client = self.server.get_client(client_id)
             if client is None:
                 return
+            # Never below the floor. Squeezing a device under what its pipeline expects trades a
+            # silent endpoint for an unanchored one, which is worse: it plays, so it looks fixed,
+            # and it drifts a different way on every reconnect.
+            target = max(MAX_PLAYER_MIN_BUFFER_MS, MIN_PLAYER_BUFFER_FLOOR_MS)
             for role in client.roles_by_family("player"):
                 current = getattr(role, "min_buffer_ms", None)
-                if not isinstance(current, int) or current <= MAX_PLAYER_MIN_BUFFER_MS:
+                if not isinstance(current, int) or current <= target:
                     continue
-                role.min_buffer_ms = MAX_PLAYER_MIN_BUFFER_MS
+                role.min_buffer_ms = target
                 # WARNING, not debug: this is the difference between a room that plays and one that
                 # goes silent, and the client id here is the only way to tell which device did it.
                 logger.warning(
                     "player %s asked for min_buffer=%d ms, more than this feeder holds (%d ms) — "
-                    "capped to %d ms. Uncapped it would raise the send-ahead floor for the WHOLE "
-                    "group and starve every member.",
+                    "capped to %d ms. If this fires in normal operation the feeder is too small: "
+                    "raise PLUM_TARGET_BUFFER_MS rather than squeezing the client further.",
                     client_id,
                     current,
                     TARGET_BUFFER_US // 1000,
-                    MAX_PLAYER_MIN_BUFFER_MS,
+                    target,
+                )
+            if TARGET_BUFFER_US // 1000 < MIN_PLAYER_BUFFER_FLOOR_MS:
+                # Said once per join, because it is the actionable half: the feeder cannot serve what
+                # this group is being told to expect, and no per-client tweak closes that gap.
+                logger.warning(
+                    "feeder holds %d ms but players are floored at %d ms — endpoints may start "
+                    "unanchored. Raise PLUM_TARGET_BUFFER_MS to at least %d.",
+                    TARGET_BUFFER_US // 1000,
+                    MIN_PLAYER_BUFFER_FLOOR_MS,
+                    MIN_PLAYER_BUFFER_FLOOR_MS,
                 )
         except Exception:  # noqa: BLE001 - never let a buffer cap take the client lifecycle down
             logger.exception("could not clamp min_buffer for %s", client_id)
