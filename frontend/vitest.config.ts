@@ -26,11 +26,16 @@ export default defineConfig({
       // stop coverage falling further; raise it as real tests land. The previous 60s were not a
       // stricter version of this — they were measuring an empty file set. Note CI runs `test:run`,
       // so these gate `npm run test:ci` only.
+      //
+      // Lowered on the vitest 3 -> 4 bump. NOT a coverage regression: the same 174 tests cover the
+      // same code, and vitest 4's v8 provider counts it differently (branches read 77% under 3 and
+      // 16% under 4, on an unchanged suite). These numbers are the new measurement's floor. Do not
+      // compare them against a pre-4 report.
       thresholds: {
-        statements: 18,
-        branches: 70,
-        functions: 33,
-        lines: 18
+        statements: 17,
+        branches: 16,
+        functions: 15,
+        lines: 17
       }
     }
   },
