@@ -624,6 +624,41 @@ s chown "${RUN_UID}:${RUN_GID}" "$REMOTE_ROOT/docker-compose.yml" "$OLD_ENV" "$R
 echo "    $OLD_ENV  (tz=${TZ_HOST}, uid=${RUN_UID}:${RUN_GID}, profile=${PROFILE})"
 echo "    $REMOTE_ROOT/.env            (image=${IMAGE_FULL})"
 
+# --- 6b. the update agent ----------------------------------------------------------------------------
+# A container cannot replace itself: the process that would pull a new image runs inside the thing
+# being replaced. Mounting the Docker socket into a container whose APIs are unauthenticated on
+# 0.0.0.0 would be root on this host for anyone on the VLAN, so the pull and the `up -d` live out
+# here, behind a systemd path unit watching a file the container writes to /config.
+#
+# Best-effort by design. A unit with no agent still runs perfectly — the GUI's Updates tab reports
+# the host as unprovisioned and refuses requests, which is honest, and `docker compose pull && up -d`
+# by hand keeps working. Failing the whole commission over the update path would be the wrong trade.
+say "update agent"
+if fetch_payload "scripts/host-setup/plum-updater.sh" "$PAYLOAD/plum-updater.sh"; then
+    s install -m 0755 "$PAYLOAD/plum-updater.sh" /usr/local/bin/plum-updater.sh
+    AGENT_UNITS_OK=1
+    for unit in plum-updater.path plum-updater.service plum-updater-check.timer plum-updater-check.service; do
+        if fetch_payload "scripts/host-setup/$unit" "$PAYLOAD/$unit"; then
+            s install -m 0644 "$PAYLOAD/$unit" /etc/systemd/system/
+        else
+            AGENT_UNITS_OK=0
+        fi
+    done
+    if [[ "$AGENT_UNITS_OK" == 1 ]]; then
+        s systemctl daemon-reload
+        # Only the .path and the .timer are enabled. Their .service pairs are the oneshots those two
+        # trigger, and enabling a oneshot would run it at every boot.
+        s systemctl enable --now plum-updater.path >/dev/null 2>&1 || true
+        s systemctl enable --now plum-updater-check.timer >/dev/null 2>&1 || true
+        s /usr/local/bin/plum-updater.sh init >/dev/null 2>&1 || true
+        echo "    installed and registered — Settings -> Updates can drive this unit"
+    else
+        warn "some systemd units were missing — the agent is installed but not scheduled"
+    fi
+else
+    warn "no update agent in the payload — Settings -> Updates will report this host as unprovisioned"
+fi
+
 # --- 7. up + verify ---------------------------------------------------------------------------------
 
 say "up"

@@ -617,6 +617,16 @@ s() { echo "$PW" | sudo -S -p '' "$@"; }
 s mkdir -p "$ROOT"/{config,data,media}
 s chown -R "$(id -u):$(id -g)" "$ROOT"
 
+# Register the host update agent, if provision.sh put one here. It writes $ROOT/config/update.state,
+# which is the ONLY way the container learns an agent exists at all — and on a greenfield unit
+# provision.sh ran before this directory existed, so it could not write it then. Silent and
+# best-effort: a unit with no agent is a working unit whose Updates tab says the host is
+# unprovisioned, not a failed deploy.
+if [[ -x /usr/local/bin/plum-updater.sh ]]; then
+    s /usr/local/bin/plum-updater.sh init >/dev/null 2>&1 || true
+    echo "    update agent: registered"
+fi
+
 if [[ "$MIGRATE" == "1" && -d ~/plum-test && ! -f "$ROOT/data/settings.json" ]]; then
     echo "    first deploy — importing ~/plum-test state"
     # settings.json IS the unit's configuration: endpoints, device names, visualiser prefs, audio
