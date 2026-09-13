@@ -4,8 +4,8 @@ import {
   updateService,
   deriveState,
   shortDigest,
+  type StatusProbe,
   type UnitUpdateState,
-  type UnitUpdateStatus,
 } from '../../services/updateService';
 
 /**
@@ -30,6 +30,7 @@ interface MeshUnit {
 
 const STATE_LABEL: Record<UnitUpdateState, string> = {
   'unreachable': 'Unreachable',
+  'needs-image': 'Needs a newer image',
   'no-agent': 'No agent',
   'unknown': 'Unknown',
   'up-to-date': 'Up to date',
@@ -41,6 +42,7 @@ const STATE_LABEL: Record<UnitUpdateState, string> = {
 
 const STATE_CLASS: Record<UnitUpdateState, string> = {
   'unreachable': 'text-[var(--text-muted)]',
+  'needs-image': 'text-amber-500',
   'no-agent': 'text-amber-500',
   'unknown': 'text-[var(--text-muted)]',
   'up-to-date': 'text-green-500',
@@ -53,7 +55,7 @@ const STATE_CLASS: Record<UnitUpdateState, string> = {
 export const UpdatesTab: React.FC = () => {
   const [units, setUnits] = useState<MeshUnit[]>([]);
   const [localUnitId, setLocalUnitId] = useState<string | null>(null);
-  const [statuses, setStatuses] = useState<Map<string, UnitUpdateStatus | null>>(new Map());
+  const [probes, setProbes] = useState<Map<string, StatusProbe>>(new Map());
   // Overrides the derived state while a run is in flight, so a row can read "Restarting" during the
   // window where the unit answers nothing at all.
   const [liveState, setLiveState] = useState<Map<string, UnitUpdateState>>(new Map());
@@ -90,7 +92,7 @@ export const UpdatesTab: React.FC = () => {
   const refresh = useCallback(async () => {
     if (units.length === 0) return;
     const next = await updateService.statusAll(units.map((u) => u.unit_id));
-    setStatuses(next);
+    setProbes(next);
   }, [units]);
 
   useEffect(() => {
@@ -101,8 +103,11 @@ export const UpdatesTab: React.FC = () => {
   // that a leaked poll loop would keep fetching a peer forever.
   useEffect(() => () => abortRef.current?.abort(), []);
 
+  const probeOf = (unitId: string): StatusProbe =>
+    probes.get(unitId) ?? { kind: 'unreachable' };
+
   const stateOf = (unitId: string): UnitUpdateState =>
-    liveState.get(unitId) ?? deriveState(statuses.get(unitId) ?? null);
+    liveState.get(unitId) ?? deriveState(probeOf(unitId));
 
   const setRow = (unitId: string, state: UnitUpdateState, message?: string) => {
     setLiveState((prev) => new Map(prev).set(unitId, state));
@@ -125,13 +130,15 @@ export const UpdatesTab: React.FC = () => {
   const strandedWarning = useMemo(() => {
     if (selected.size === 0 || selected.size === units.length) return null;
     const left = units.filter((u) => !selected.has(u.unit_id));
+    // Only count peers that could actually take an update. A unit on an old image or with no agent
+    // is not "left behind" by this selection — it was never going to move either way.
     const reachable = left.filter((u) => {
-      const s = statuses.get(u.unit_id);
-      return s != null && s.agent.installed;
+      const p = probes.get(u.unit_id);
+      return p?.kind === 'ok' && p.status.agent.installed;
     });
     if (reachable.length === 0) return null;
     return `${reachable.length} other unit${reachable.length === 1 ? '' : 's'} will stay on the current image. A mesh split across an aiosendspin major cannot sync at all.`;
-  }, [selected, units, statuses]);
+  }, [selected, units, probes]);
 
   const run = async (checkOnly: boolean) => {
     if (selected.size === 0 || busy) return;
@@ -156,8 +163,8 @@ export const UpdatesTab: React.FC = () => {
       if (checkOnly) {
         // A check never restarts anything, so the unit stays up and one settle pass is enough.
         await new Promise((r) => setTimeout(r, 2500));
-        const status = await updateService.status(unitId);
-        setStatuses((prev) => new Map(prev).set(unitId, status));
+        const probe = await updateService.status(unitId);
+        setProbes((prev) => new Map(prev).set(unitId, probe));
         setLiveState((prev) => {
           const next = new Map(prev);
           next.delete(unitId);
@@ -169,15 +176,15 @@ export const UpdatesTab: React.FC = () => {
         unitId,
         (state, status) => {
           setRow(unitId, state);
-          if (status) setStatuses((prev) => new Map(prev).set(unitId, status));
+          if (status) setProbes((prev) => new Map(prev).set(unitId, { kind: 'ok', status }));
         },
         { signal: controller.signal },
       );
-      const status = await updateService.status(unitId);
-      setStatuses((prev) => new Map(prev).set(unitId, status));
-      const note = status?.lastUpdate?.message;
+      const probe = await updateService.status(unitId);
+      setProbes((prev) => new Map(prev).set(unitId, probe));
+      const note = probe.kind === 'ok' ? probe.status.lastUpdate?.message : undefined;
       if (note) setMessages((prev) => new Map(prev).set(unitId, note));
-      if (final !== 'failed' && final !== 'unreachable') {
+      if (final !== 'failed' && final !== 'unreachable' && final !== 'needs-image') {
         setLiveState((prev) => {
           const next = new Map(prev);
           next.delete(unitId);
@@ -189,7 +196,11 @@ export const UpdatesTab: React.FC = () => {
     void refresh();
   };
 
-  const anyAgentMissing = units.some((u) => statuses.get(u.unit_id)?.agent.installed === false);
+  const anyAgentMissing = units.some((u) => {
+    const p = probes.get(u.unit_id);
+    return p?.kind === 'ok' && p.status.agent.installed === false;
+  });
+  const anyOldImage = units.some((u) => probes.get(u.unit_id)?.kind === 'no-endpoint');
 
   return (
     <div className="space-y-6">
@@ -257,7 +268,8 @@ export const UpdatesTab: React.FC = () => {
 
         <div className="space-y-2">
           {units.map((u) => {
-            const status = statuses.get(u.unit_id) ?? null;
+            const probe = probeOf(u.unit_id);
+            const status = probe.kind === 'ok' ? probe.status : null;
             const state = stateOf(u.unit_id);
             const message = messages.get(u.unit_id);
             const isLocal = u.unit_id === localUnitId;
@@ -306,6 +318,17 @@ export const UpdatesTab: React.FC = () => {
           })}
         </div>
       </div>
+
+      {anyOldImage && (
+        <div className="p-3 rounded-lg border border-amber-500/40 bg-amber-500/10">
+          <p className="text-xs text-amber-500">
+            <Icon name="circle-info" className="inline mr-1" />
+            A unit answered but has no update endpoint, so it runs an image from before this feature.
+            It is reachable and working — deploy a newer image to it once, by hand, and it can update
+            itself after that.
+          </p>
+        </div>
+      )}
 
       {anyAgentMissing && (
         <div className="p-3 rounded-lg border border-amber-500/40 bg-amber-500/10">

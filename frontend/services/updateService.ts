@@ -59,9 +59,24 @@ export interface UnitUpdateStatus {
   phase?: UpdatePhase;
 }
 
+/**
+ * The outcome of asking one unit for its status.
+ *
+ * `no-endpoint` is separate from `unreachable` because they need different actions and look
+ * identical from a bare fetch. A unit running an image from before this feature answers 405 for
+ * GET /api/mesh/update while serving audio and its GUI perfectly. Collapsing that into
+ * "unreachable" sends the operator to check the network, when the fix is to deploy a newer image.
+ * Measured on .7.200/.203/.204, which all answered 405 with a healthy /api/mesh/snapshot.
+ */
+export type StatusProbe =
+  | { kind: 'ok'; status: UnitUpdateStatus }
+  | { kind: 'no-endpoint' }
+  | { kind: 'unreachable' };
+
 /** What a row shows. Derived rather than stored, so it cannot drift from the fields above. */
 export type UnitUpdateState =
   | 'unreachable'
+  | 'needs-image'
   | 'no-agent'
   | 'unknown'
   | 'up-to-date'
@@ -70,8 +85,10 @@ export type UnitUpdateState =
   | 'restarting'
   | 'failed';
 
-export function deriveState(status: UnitUpdateStatus | null): UnitUpdateState {
-  if (status === null) return 'unreachable';
+export function deriveState(probe: StatusProbe): UnitUpdateState {
+  if (probe.kind === 'unreachable') return 'unreachable';
+  if (probe.kind === 'no-endpoint') return 'needs-image';
+  const status = probe.status;
   if (!status.agent.installed) return 'no-agent';
   if (status.phase === 'pulling') return 'pulling';
   if (status.phase === 'restarting') return 'restarting';
@@ -118,19 +135,30 @@ class UpdateService {
     return host ? `http://${host}:${MESH_API_PORT}/api/mesh` : MESH_API_BASE;
   }
 
-  /** This unit's update status, or null if it could not be reached at all. Never throws: a null is
-   *  the honest answer for a unit that is mid-restart, and the caller decides what that means. */
-  async status(unitId: string): Promise<UnitUpdateStatus | null> {
+  /** Ask one unit for its status. Never throws — an unreachable unit is an expected answer here,
+   *  because applying an update kills the container that would otherwise reply. */
+  async status(unitId: string): Promise<StatusProbe> {
+    let res: Response;
     try {
-      const res = await fetch(`${this.base(unitId)}/update`);
-      if (!res.ok) return null;
-      return (await res.json()) as UnitUpdateStatus;
+      res = await fetch(`${this.base(unitId)}/update`);
     } catch {
-      return null;
+      // A network-layer failure. Either the unit is genuinely down, or it is mid-restart, or the
+      // browser refused the cross-origin call. The caller decides which, from context.
+      return { kind: 'unreachable' };
+    }
+    // The unit ANSWERED and does not have this route: an image from before the feature existed.
+    // aiohttp says 405 rather than 404 because the OPTIONS catch-all matches /api/mesh/{tail} on
+    // path but not on method, so both have to count.
+    if (res.status === 404 || res.status === 405) return { kind: 'no-endpoint' };
+    if (!res.ok) return { kind: 'unreachable' };
+    try {
+      return { kind: 'ok', status: (await res.json()) as UnitUpdateStatus };
+    } catch {
+      return { kind: 'unreachable' };
     }
   }
 
-  async statusAll(unitIds: string[]): Promise<Map<string, UnitUpdateStatus | null>> {
+  async statusAll(unitIds: string[]): Promise<Map<string, StatusProbe>> {
     const entries = await Promise.all(
       unitIds.map(async (id) => [id, await this.status(id)] as const),
     );
@@ -154,6 +182,14 @@ class UpdateService {
         headers,
         body: JSON.stringify({ channel, check_only: !!opts.checkOnly }),
       });
+      if (res.status === 404 || res.status === 405) {
+        // Naming the fix matters: "HTTP 405" sends the reader to the network, and the answer is a
+        // deploy. This is every unit still on an image from before the update feature.
+        return {
+          ok: false,
+          message: 'this unit runs an image without the update endpoint — deploy a newer image first',
+        };
+      }
       const body = await res.json().catch(() => ({}));
       if (!res.ok) return { ok: false, message: body?.error || `HTTP ${res.status}` };
       return { ok: true };
@@ -185,18 +221,24 @@ class UpdateService {
 
     for (;;) {
       if (opts.signal?.aborted) return 'unknown';
-      const status = await this.status(unitId);
+      const probe = await this.status(unitId);
       const elapsed = Date.now() - startedAt;
 
-      if (status === null) {
+      if (probe.kind === 'unreachable') {
         sawItGo = true;
         if (elapsed > grace) {
           onState('unreachable', null);
           return 'unreachable';
         }
         onState('restarting', null);
+      } else if (probe.kind === 'no-endpoint') {
+        // The unit answered without the route. Nothing is coming, so stop rather than waiting out
+        // the whole restart grace on an image that can never satisfy this request.
+        onState('needs-image', null);
+        return 'needs-image';
       } else {
-        const state = deriveState(status);
+        const status = probe.status;
+        const state = deriveState(probe);
         onState(state, status);
         if (state === 'failed') return state;
         // Settled means: back up, nothing pending, and either we watched it go away and return, or
