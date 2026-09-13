@@ -77,7 +77,7 @@ backend/
     apis/              # settings/integrations/audio Flask blueprints (mesh API is mesh/api.py)
   supervisord/         # four programs: sendspin_server, sendspin_player, config-api, nginx
 scripts/plum-init.sh   # commission ONE unit, run ON the Pi; needs only the device name
-scripts/host-setup/    # provision.sh + configure-audio-hat.sh — run on the HOST
+scripts/host-setup/    # provision.sh + configure-audio-hat.sh + plum-updater.sh (+ its systemd units)
 docker/                # compose + build.sh/deploy.sh + units.conf (host | name | [audio output])
 tests/{Unit,Integration}/
 ```
@@ -311,6 +311,16 @@ The *reasoning* behind these, and the failures that produced them, is in
   the listener), hence the restart requirement and `has_player` on the snapshot — **defaulting
   True**, or a peer on an older image reads as playerless. A playerless unit leads follow, never
   follows. `find_device` short-circuits the sentinel before its substring pass.
+- **A container cannot replace itself, and there is deliberately NO Docker socket.** Updates go
+  through a HOST agent (`scripts/host-setup/plum-updater.sh`, a systemd path unit): the container
+  writes `/config/update.request` and reads back `/config/update.state`; the agent runs
+  `docker compose pull` and then `up -d` **only if the pull succeeded**, so a failed pull leaves the
+  unit playing. Mounting the socket is the obvious "simplification" and is remote root — these APIs
+  are unauthenticated on `0.0.0.0`. The endpoints are on the mesh API (:5001), never :5002, because
+  a peer's :5002 is unreachable cross-origin and the GUI drives a SET of units. The daily timer
+  CHECKS and never applies: a per-unit timer would split the mesh across a protocol major unattended.
+  Skip the restart when the digest did not move, or an "update" on a current unit costs ~10 s of
+  silence for nothing. `docs/OPERATIONS.md`.
 - **Host provisioning is not optional, and is once per IMAGE.** The bluez patches, the D-Bus policy,
   the rfkill unblock and the HAT mixer are installed by nothing the container does, and each absence
   fails silently or catastrophically. Run `scripts/host-setup/provision.sh` from the workstation — a

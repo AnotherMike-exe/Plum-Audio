@@ -324,6 +324,66 @@ which reads as a failed deploy. Either compare a unit's ids against *its own*
 curl -s http://<unit>/ | grep -o 'assets/index-[^"]*\.js'
 ```
 
+The update agent sidesteps this entirely: it records the image's **RepoDigest**, which is the
+registry's own identity for the image and is the same string on every unit. `plum-updater.sh state`
+prints it, and so does `GET /api/mesh/update`.
+
+## Updating a running unit
+
+Settings → Updates in the GUI, or on the unit:
+
+```bash
+sudo plum-updater.sh check      # refresh what is available; installs nothing
+sudo plum-updater.sh update     # pull, then restart only if something was pulled
+sudo plum-updater.sh state      # what it last did, as JSON
+journalctl -u plum-updater.service -n 50    # what happened, in full
+```
+
+`docker compose pull && docker compose up -d` in `/opt/plum-audio` still works and always will. The
+agent exists so the GUI can do it, not to replace it.
+
+### How the two halves fit
+
+A container cannot replace itself, and no Docker socket is mounted into it — deliberately, because
+these APIs are unauthenticated on `0.0.0.0`. The container writes a request across the `/config`
+bind mount and a systemd path unit on the host acts on it:
+
+| Path | Written by | Read by |
+|---|---|---|
+| `/opt/plum-audio/config/update.request` | the container (`POST /api/mesh/update`) | `plum-updater.sh`, which deletes it |
+| `/opt/plum-audio/config/update.state` | `plum-updater.sh` | the container, for `GET /api/mesh/update` |
+
+`plum-updater.path` watches the request file. `plum-updater-check.timer` runs the daily check, which
+never installs anything.
+
+### The four failures worth knowing
+
+1. **"No update agent on this host."** `provision.sh` has not run on that Pi since the agent landed.
+   It is once per image. The unit is fine and updates by hand.
+2. **The agent is installed but the request is never consumed.** `systemctl is-active
+   plum-updater.path` — if it is not active, nothing watches the file. `provision.sh --check`
+   reports exactly this case.
+3. **`available` is null.** The registry could not be reached. Normal on an isolated AV VLAN, and it
+   reads as `Unknown` in the GUI rather than as up to date, on purpose: green there would hide a
+   unit stuck on an old image.
+4. **`digest` is null.** The image came from a tarball (`deploy.sh`'s default path) and has no
+   registry digest at all. There is nothing to compare against, so the GUI says `Unknown`.
+
+### Rolling back
+
+The agent records `previousDigest` before every pull. `deploy.sh` also keeps the previous image tags
+on the unit. To go back:
+
+```bash
+docker image ls ghcr.io/anothermike-exe/plum-audio    # find the tag you want
+cd /opt/plum-audio
+sed -i 's/^PLUM_TAG=.*/PLUM_TAG=<old-tag>/' .env
+docker compose up -d
+```
+
+There is no automatic rollback. A unit that fails to start is visible and recoverable; a unit that
+silently reverted itself is neither.
+
 ## Ports
 
 Every number below is from the code, not from the plan.
