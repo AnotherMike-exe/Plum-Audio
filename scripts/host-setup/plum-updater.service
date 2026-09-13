@@ -1,0 +1,18 @@
+# Plum-Audio — apply an update request. Triggered by plum-updater.path, or run by hand.
+#
+# Type=oneshot and no Restart=: a failed update must stay failed and visible in the state file, not
+# retry in a loop against a registry that is unreachable. The agent records the failure and leaves
+# the running container alone.
+[Unit]
+Description=Plum-Audio update agent
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/plum-updater.sh watch
+# The pull is the long part and a Pi on a slow link is normal. Well under the 600 s after which the
+# container's API reports the request as stale, so a genuine hang still surfaces in the GUI.
+TimeoutStartSec=420
+StandardOutput=journal
+StandardError=journal

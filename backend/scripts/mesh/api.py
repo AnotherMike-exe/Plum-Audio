@@ -30,6 +30,8 @@ Endpoints (parity with the old /api/federation/* surface, so the GUI ports with 
   POST /api/mesh/pair/cancel       {client_id}                     abandon an attempt, keep the connection
   POST /api/mesh/unpair            {client_id}                     drop the record both ends hold
   POST /api/mesh/pairing-window    {client_id?}                    stand in for the operator's gesture
+  GET  /api/mesh/update                                            what this unit runs, and what is available
+  POST /api/mesh/update            {channel?, check_only?}         ask the HOST agent to update this unit
 
 Sources are local to the unit that ingests them ("servers stay") — /source acts on THIS unit;
 there is no delegation. Multiple sources may run concurrently, each anchoring its own group.
@@ -44,10 +46,13 @@ immediately and the outcome is collected from GET /pairing.
 from __future__ import annotations
 
 import contextlib
+import hmac
 import logging
+import os
 from collections.abc import Awaitable, Callable
 
 import cors_policy
+import updater
 from aiohttp import web
 from calibration import describe as describe_calibration
 from calibration import merge_calibrations
@@ -202,6 +207,8 @@ class MeshApi:
                 web.post("/api/mesh/pair/cancel", self._pair_cancel),
                 web.post("/api/mesh/unpair", self._unpair),
                 web.post("/api/mesh/pairing-window", self._pairing_window),
+                web.get("/api/mesh/update", self._update_status),
+                web.post("/api/mesh/update", self._update_apply),
                 web.route("OPTIONS", "/api/mesh/{tail:.*}", self._options),
             ]
         )
@@ -451,6 +458,63 @@ class MeshApi:
             return web.json_response({"error": "source_id required"}, status=400)
         await self._engine.stop_source(source_id)
         return web.json_response({"ok": True, "source_id": source_id})
+
+    # -- updates -------------------------------------------------------------
+    #
+    # The container cannot replace itself, so both handlers below only move a file across the
+    # /config bind mount; the HOST agent does the pull and the recreate. See updater.py for why
+    # there is no Docker socket in here.
+    #
+    # These live on :5001 rather than the config API on :5002 for one concrete reason: a peer's
+    # :5002 is deliberately unreachable cross-origin (the same rule that makes calibration
+    # write-local), and the GUI must be able to drive a SET of units from one page. It already
+    # calls a peer's :5001 directly for volume and pairing, so the fan-out needs no new server-side
+    # delegation — the page addresses each unit itself, and a partial failure names the unit.
+
+    async def _update_status(self, request: web.Request) -> web.Response:
+        return web.json_response(updater.status())
+
+    async def _update_apply(self, request: web.Request) -> web.Response:
+        """Write an update request for THIS unit and return at once.
+
+        Deliberately not a fan-out. Delegating here would make one unit responsible for the
+        outcome on every other, and the failure it would have to report ("peer 3 never came back")
+        is exactly the thing the caller can see better than we can. The GUI posts to each selected
+        unit and renders a row per unit.
+
+        The response is 202: the work has not happened yet, and on success this process is killed
+        by it. Anything polling for the result must read GET /api/mesh/update afterwards, through
+        the window where this unit refuses connections entirely.
+        """
+        if not self._update_token_ok(request):
+            return web.json_response({"error": "bad or missing update token"}, status=403)
+        body = await self._json(request)
+        try:
+            accepted = updater.request_update(
+                body.get("channel"),
+                check_only=bool(body.get("check_only")),
+            )
+        except updater.UpdateError as exc:
+            # A missing agent is the common case on a unit provisioned before the agent existed,
+            # and it is the operator's to fix — 409, not 500.
+            return web.json_response({"error": str(exc)}, status=409)
+        return web.json_response({"ok": True, "accepted": accepted}, status=202)
+
+    @staticmethod
+    def _update_token_ok(request: web.Request) -> bool:
+        """Gate /update behind a shared token, but only when one is configured.
+
+        Unset is the default and matches every other endpoint here: the APIs are unauthenticated on
+        0.0.0.0 (CLAUDE.md "Open"), and a lone guarded route would be security theatre. Set
+        PLUM_UPDATE_TOKEN in plum-audio.env and this route alone starts requiring it, which is the
+        cheap option for anyone who does not want a reachable "restart my audio" button. The
+        comparison is constant-time so a wrong token cannot be discovered a byte at a time.
+        """
+        expected = os.environ.get("PLUM_UPDATE_TOKEN")
+        if not expected:
+            return True
+        presented = request.headers.get("X-Plum-Update-Token", "")
+        return hmac.compare_digest(presented, expected)
 
     # -- calibration tone ----------------------------------------------------
     #

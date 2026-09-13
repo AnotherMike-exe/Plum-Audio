@@ -169,6 +169,18 @@ case "$(systemctl is-enabled nginx 2>&1)" in
     *)         ok   "host nginx" "$(systemctl is-enabled nginx 2>&1)" ;;
 esac
 
+# The update agent. Installed but NOT triggered is the failure worth naming: the GUI would offer a
+# button whose request no one consumes, and the unit would read as hung rather than unprovisioned.
+if [[ -x /usr/local/bin/plum-updater.sh ]]; then
+    if systemctl is-active --quiet plum-updater.path; then
+        ok "update agent" "installed, watching ($([[ -f /opt/plum-audio/config/update.state ]] && echo registered || echo 'registers on next deploy'))"
+    else
+        bad "update agent" "installed but plum-updater.path is NOT active — requests are never consumed"
+    fi
+else
+    bad "update agent" "not installed — Settings -> Updates will report this host as unprovisioned"
+fi
+
 note "onboard audio" "$(grep -E '^dtparam=audio' /boot/firmware/config.txt 2>/dev/null || echo 'no dtparam=audio line')"
 for c in Digital PCM Master; do
     if amixer -c 0 sget "$c" >/dev/null 2>&1; then
@@ -199,7 +211,11 @@ provision_one() {
         "${ROOT}/backend/config/bluez/"* "${USER_}@${host}:${PAYLOAD}/bluez/" || return 1
     retry_ sshpass -p "$PW" scp $SSH_OPTS \
         "${ROOT}/backend/config/bluealsa-plum-dbus.conf" "${USER_}@${host}:${PAYLOAD}/" || return 1
-    ssh_ "$host" "chmod +x '$PAYLOAD/configure-audio-hat.sh' '$PAYLOAD/bluez/install_patched_bluez.sh'" || return 1
+    retry_ sshpass -p "$PW" scp $SSH_OPTS \
+        "${HERE}/plum-updater.sh" "${HERE}/plum-updater.path" "${HERE}/plum-updater.service" \
+        "${HERE}/plum-updater-check.timer" "${HERE}/plum-updater-check.service" \
+        "${USER_}@${host}:${PAYLOAD}/" || return 1
+    ssh_ "$host" "chmod +x '$PAYLOAD/configure-audio-hat.sh' '$PAYLOAD/bluez/install_patched_bluez.sh' '$PAYLOAD/plum-updater.sh'" || return 1
 
     # Steps 2, 3 (Experimental), 4, 5, 6 — all quick, all idempotent.
     say "$host — checklist"
@@ -261,6 +277,35 @@ if systemctl is-enabled nginx >/dev/null 2>&1; then
     s systemctl disable --now nginx >/dev/null 2>&1 || true
 else
     echo "    host nginx: not installed"
+fi
+
+# 7. The update agent. A container cannot replace itself — the process that would pull a new image
+#    is inside the thing being replaced — and mounting the Docker socket into a container whose APIs
+#    are unauthenticated on 0.0.0.0 would be root on this host for anyone on the VLAN. So the pull
+#    and the `up -d` live here, behind a systemd path unit watching a file the container writes.
+#    Without this step the GUI's Updates tab correctly reports the host as unprovisioned and refuses
+#    every request, which is the state of any unit provisioned before the agent existed.
+if s cmp -s "$PAYLOAD/plum-updater.sh" /usr/local/bin/plum-updater.sh 2>/dev/null; then
+    echo "    update agent: already current"
+else
+    echo "    update agent: installing"
+    s install -m 0755 "$PAYLOAD/plum-updater.sh" /usr/local/bin/plum-updater.sh
+fi
+for unit in plum-updater.path plum-updater.service plum-updater-check.timer plum-updater-check.service; do
+    s install -m 0644 "$PAYLOAD/$unit" /etc/systemd/system/
+done
+s systemctl daemon-reload
+# The .path and the .timer are the only two that are ENABLED. Their .service pairs are oneshots
+# those two trigger, and enabling a oneshot would run it at every boot.
+s systemctl enable --now plum-updater.path >/dev/null 2>&1 || true
+s systemctl enable --now plum-updater-check.timer >/dev/null 2>&1 || true
+# Register the agent so the container knows one exists. Harmless before /opt/plum-audio is created:
+# the state file lands once the deploy makes the directory, and a re-run is idempotent.
+if [[ -d /opt/plum-audio ]]; then
+    s /usr/local/bin/plum-updater.sh init >/dev/null 2>&1 || true
+    echo "    update agent: registered"
+else
+    echo "    update agent: installed (registers on the first deploy)"
 fi
 
 if [[ "${RESTART_BT:-0}" == "1" ]]; then

@@ -1,0 +1,8 @@
+[Unit]
+Description=Plum-Audio update check (notify only)
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/plum-updater.sh check
+TimeoutStartSec=120
