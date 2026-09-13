@@ -17,4 +17,4 @@ requests>=2.31
 dbus-next>=0.2.3,<0.3
 
 # Utility
-aiohttp>=3.9          # transitive via aiosendspin; pinned for clarity
+aiohttp>=3.14.3          # transitive via aiosendspin; pinned for clarity
