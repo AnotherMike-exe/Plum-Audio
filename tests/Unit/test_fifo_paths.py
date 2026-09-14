@@ -17,6 +17,7 @@ scanner.
 Run: `pytest tests/Unit/test_fifo_paths.py`.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -26,7 +27,6 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "backend" / "scripts"))
 
 import fifo_paths  # noqa: E402
-
 
 # -- source ids ------------------------------------------------------------------------------------
 
@@ -117,5 +117,13 @@ def test_the_feeder_refuses_a_bad_path_at_the_syscall_itself():
     with pytest.raises(ValueError, match="directly inside"):
         feeder._ensure_fifo()  # noqa: SLF001
 
+    # A real path passes, and the checked value is what the syscalls get. It is RESOLVED, so a
+    # traversal that lands back inside is normalised rather than merely tolerated — and on a Mac,
+    # where /tmp is a symlink to /private/tmp, the expected value has to be resolved too.
+    expected = os.path.realpath(fifo_paths.fifo_path_for("airplay-1"))
+
     feeder.fifo_path = fifo_paths.fifo_path_for("airplay-1")
-    feeder._guard_fifo_path()  # noqa: SLF001 - a real path must pass
+    assert feeder._checked_fifo_path() == expected  # noqa: SLF001
+
+    feeder.fifo_path = f"{fifo_paths.FIFO_DIR}/sub/../airplay-1-fifo"
+    assert feeder._checked_fifo_path() == expected  # noqa: SLF001
