@@ -279,7 +279,8 @@ The *reasoning* behind these, and the failures that produced them, is in
   uses that return value — checking `self.fifo_path` and then passing `self.fifo_path` proves
   nothing about what reaches the kernel, and it cost three PRs to state properly. The charset is
   what real ids contain (`cal:` carries a colon and a base64url key), not the narrowest set that
-  passes a scanner. Five CodeQL alerts are dismissed on purpose — HARD-WON-LESSONS lists them.
+  passes a scanner. Eight CodeQL alerts are dismissed on purpose, including these three: the scanner cannot
+  model the barrier, and its recognised shape is weaker. HARD-WON-LESSONS lists them all.
 - **Anything keyed by id must write through `SettingsManager.mutate`, not `update_settings`.** The
   latter is a blind patch; a get-then-post on a map lets two browsers each read it and the second
   drop the first — with a bumped version, so no poller ever reconciles the loss.

@@ -221,11 +221,21 @@ path was ever checked. The fix returns the RESOLVED path from the check and hand
 syscall. Resolving first also collapses `/tmp/../etc` and a symlinked `/tmp` before the comparison.
 The macOS `/tmp` symlink caught the test assertion, which is the same ambiguity in miniature.
 
-**Five alerts are dismissed on purpose. Do not "fix" them.** Each has the reason recorded on the
+**CodeQL does not accept this barrier, and the code is right anyway. Stop at three.** The rule
+`py/path-injection` models a small set of sanitizer shapes. `os.path.realpath` propagates taint in
+its model, and a `dirname(resolved) != realpath(FIFO_DIR)` comparison is not a shape it recognises,
+so all three sinks stay flagged through every version of the fix. The recognised shape is a
+`startswith` test against a prefix, which is WEAKER here — a `/tmpfoo` prefix passes it and a
+`dirname` comparison does not. Do not trade a correct check for one a pattern matcher prefers. The
+guarantee rests on the guard, on `fifo_path_is_safe`, and on the test that points a `SourceFeeder`
+at `/etc/passwd` and asserts it raises.
+
+**Eight alerts are dismissed on purpose. Do not "fix" them.** Each has the reason recorded on the
 alert itself:
 
 | what | why it stays |
 |---|---|
+| `py/path-injection`, `sendspin_server.py` x3 | Checked and resolved before every syscall, and unit-tested. CodeQL cannot model the barrier — see above. |
 | `py/bind-socket-all-network-interfaces`, `mesh/discovery.py` | The beacon is a UDP broadcast on 8929. Loopback would stop discovery entirely. |
 | `py/stack-trace-exposure`, `calibration_api.py` x2 | Our own `ValidationError` text, returned as 400. The wizard has to say WHY at the moment the user presses Save, and two unit tests assert on it. |
 | `py/stack-trace-exposure`, `settings_api.py` | Our own `ValueError` from `_validate_audio_output`, describing the caller's own bad device spec. |
