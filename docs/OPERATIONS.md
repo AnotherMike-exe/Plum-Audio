@@ -13,6 +13,27 @@ docker/deploy.sh 192.0.2.10    # one unit
 docker/deploy.sh all --tarball dist/plum-audio-bfa4812-arm64.tar.gz   # a specific build
 ```
 
+A single Pi does not need any of this. `scripts/plum-init.sh "Kitchen"` runs ON the unit, pulls a
+published image, and needs no workstation, no checkout and no `units.conf` — see the README. The two
+paths write the same `/opt/plum-audio/plum-audio.env`, so a unit commissioned either way is the same
+unit, and either script can redeploy it afterwards.
+
+### The unit table
+
+`docker/units.conf` is `host | name | [audio output]`. The name is the only required choice.
+
+- **The ids are derived, not chosen.** `entrypoint.sh` defaults the unit id from the Pi's hostname
+  and the player id from the unit id. `deploy.sh` reads the unit's existing `plum-audio.env` FIRST
+  and keeps whatever id it is already running under, so a redeploy never renames a live unit into a
+  stranger its peers have never met. Only a unit with no `/opt/plum-audio` gets a fresh id.
+- **The audio output is optional.** Left blank, `deploy.sh` reads `/proc/asound/cards` on the unit
+  and picks one, preferring a HAT or USB DAC over the onboard jack over HDMI. It is safe to guess
+  because `PLUM_DAC_DEVICE` is only what a unit BOOTS with — Settings → Audio outranks it
+  permanently the first time anyone picks a device.
+- **A six-column table still works**, with a warning naming the new format. The two layouts are
+  indistinguishable by shape, and reading an old row as a new one would take `unit-133` for the unit
+  NAME — so the column count is detected rather than assumed.
+
 There is no registry. `docker save | gzip -1` + scp + `docker load` beats standing one up for four
 Pis on two VLANs, and `gzip -1` is the right trade for a LAN copy. The default tag is the short
 commit, `-dirty` appended when the tree is not clean — so `docker images` on a unit answers "which
@@ -44,17 +65,18 @@ A re-imaged Pi has no dev stack, so the import is skipped and the container writ
   exist but are `enabled: false` — so a fresh unit is an AirPlay receiver and nothing else until
   someone opens Settings → Integrations.
 - **`audio.output.device` is `null`**, which deliberately means "whatever `PLUM_DAC_DEVICE` says", so
-  the player opens the DAC column from `units.conf` (`bcm2835` → PortAudio 0 → `hw:0,0`) and echoes
-  the resolved card back as `Headphones:0`. Nothing needs choosing in the GUI for audio to work.
-- **`deviceName` and every source endpoint's name come from `PLUM_UNIT_NAME`** (the unit-name column
-  of `units.conf`) — but only since `2f9c1d9`/`f381ce3`. Before that every fresh unit came up as
+  the player opens whatever the deploy detected — or the audio-output override column of
+  `units.conf`, when one is set (`bcm2835` → PortAudio 0 → `hw:0,0`) — and echoes the resolved card
+  back as `Headphones:0`. Nothing needs choosing in the GUI for audio to work.
+- **`deviceName` and every source endpoint's name come from `PLUM_UNIT_NAME`** (the name column
+  of `units.conf`, or the argument to `scripts/plum-init.sh`) — but only since `2f9c1d9`/`f381ce3`. Before that every fresh unit came up as
   "Plum Sendspin" offering a "Plum Audio" AirPlay receiver, so a two-unit greenfield mesh showed one
   name twice in the mesh view, the unit cards, mDNS and to a sender. On an older image, rename each
   unit in Settings → General and each endpoint in Settings → Integrations.
 
 ### Naming across multiple units — how a clash resolves itself
 
-`units.conf`'s unit-name column reaches further than it looks: `deploy.sh` writes it as
+`units.conf`'s name column reaches further than it looks: `deploy.sh` writes it as
 `PLUM_UNIT_NAME`, and a unit with no `settings.json` yet adopts it as its own display name **and** as
 the name of every source endpoint it offers. So a duplicate there is a duplicate in the mesh view, on
 the unit cards, in mDNS, and in an AirPlay sender's speaker list.
@@ -67,9 +89,12 @@ Nothing refuses. **A clash gets a stable per-unit token appended**, at two layer
 
    ```
    !! units.conf has duplicate values; they will be suffixed per unit:
-        unit_name    Pi4-02
-       !! unit_name Pi4-02 is duplicated in units.conf -> using Pi4-02-EE12
+        name         Pi4-02
+       !! name Pi4-02 is duplicated in units.conf -> using Pi4-02-EE12
    ```
+
+   Only the host and name columns can clash now. The unit and player ids used to be operator-chosen
+   and are derived — see "The unit table" below.
 
 2. **The container itself, when `PLUM_UNIT_NAME` is unset entirely** — a hand-run `docker compose up`,
    or any path that is not `deploy.sh`. `unit_identity.default_device_name()` makes the floor
@@ -134,7 +159,7 @@ Compose is reached two ways and that is deliberate: `.100.20` runs Docker CE fro
 `docker-compose` 2.26. Same compose file; `deploy.sh` detects the invocation. Trixie has no
 `docker-compose-v2` package — the name is `docker-compose` and it *is* v2.
 
-### The two conflicts that fail deceptively
+### The three failures that look like success
 
 1. **The host's nginx.** It served the pre-container GUI from `/var/www/plum-audio` with the same
    proxy config the image now ships. Under host networking the container's nginx crash-loops on
@@ -145,10 +170,25 @@ Compose is reached two ways and that is deliberate: `.100.20` runs Docker CE fro
    SIGTERM and hangs in shutdown: `pkill` reports success, the process survives, and it still holds
    RAOP 5050. Endpoint ports are configurable so the port sweep cannot enumerate them — the deploy
    escalates every dev-stack pattern to `SIGKILL` unconditionally, then treats a survivor as fatal.
+3. **A player that is negotiated but not ACTIVATED.** Since aiosendspin 9.x a client can complete
+   the handshake, negotiate `player@v1`, join the group and sit at the right volume while the server
+   has activated **no roles** for it. Everything you would check is green: supervisord reports all
+   four programs RUNNING, 8927 and 8928 are listening, all three APIs answer, the GUI shows the
+   speaker attached to the right stream — and the room is silent, with nothing in either log.
+
+   Two causes, both silent: the client did not set `unpaired_access_enabled`, or this server never
+   called `trust_unpaired()` for that peer id. Trust is **per-server and per-peer**, so a unit
+   trusting its own player says nothing about a peer's. Cleartext clients (ESP32 speakers, Music
+   Assistant, the web GUI) skip this gate entirely and are never affected.
+
+   The signature is `negotiated_role_ids` diverging from `active_role_ids`, published as
+   `players[].active_roles` in `/api/mesh/view`. `deploy.sh` now fails a deploy that cannot see a
+   `player@` entry there, so this should never reach you silently again — but if you are debugging by
+   hand, that field is the first thing to read, not the logs.
 
 Readiness is checked on **supervisord's own view**, not on a port: under host networking a port can
 be answered by something that is not this container, which is exactly how a stale host nginx passed
-a GUI check.
+a GUI check. Since 9.x that is necessary but no longer sufficient — see failure 3.
 
 ## Debugging cookbook
 
@@ -162,6 +202,53 @@ docker exec plum-audio tail -f /config/logs/nginx.log
 docker exec plum-audio aplay -l
 docker exec plum-audio python3 /app/scripts/audio_devices.py   # id / hw_id / availability / active
 ```
+
+**Identity and trust** — the first three things to run when a speaker is attached and silent:
+
+```bash
+# 1. Does this unit have an identity at all? Expect server.key, player.key and two pairing JSONs,
+#    all 0600 and root-owned. A missing player.key on a unit that HAS a speaker is the fault.
+docker exec plum-audio ls -la /config/identity
+
+# 2. ACTIVATED vs negotiated. `active_roles: []` on a connected player is the silent-failure
+#    signature; `["player@v1"]` means the trust chain is intact and the fault is elsewhere.
+curl -s localhost:5001/api/mesh/view |
+  python3 -c 'import json,sys; [print(p["player_id"][:16], p["connected"], p.get("active_roles")) for u in json.load(sys.stdin)["units"] for p in u["players"]]'
+
+# 3. What the server decided at startup, and about whom.
+docker exec plum-audio grep -E 'identity|trusted|unpaired' /config/logs/sendspin_server.log
+```
+
+A peer's player is trusted lazily, at the moment we decide to take it (`reclaim_remote_player`), so
+"no trust line for unit B's player" is normal until the first cross-route to it.
+
+**Rooms out of step with each other** — every unit measures its own distance from the deadline and
+publishes it, so ask the units rather than a microphone. Run this against each unit in turn while
+they all play one source:
+
+```bash
+curl -s localhost:5001/api/mesh/snapshot |
+  python3 -c 'import json,sys; print((json.load(sys.stdin).get("local_player") or {}).get("sync"))'
+# {'locked': True, 'aligned': True, 'sync_err_ms': -0.31, 'sync_avg_ms': -0.94,
+#  'locks': 1, 'steps': 0, 'trims': 118}
+```
+
+Read it in this order:
+
+- **`locked: false` while audio flows** — this unit is free-running and nothing else here applies to
+  it. Either `PLUM_SYNC_LOCK=0`, or the time filter has not converged (a few hundred ms after a
+  connect), or PortAudio gave no usable DAC time — which logs a warning once, so
+  `grep 'no usable DAC time' /config/logs/sendspin_player.log`.
+- **`sync_avg_ms` beyond about 2 ms** — the trim is not holding this unit. Compare it across units:
+  a value that is the same every session is this endpoint's own output latency, which belongs in the
+  per-endpoint delay (`POST /api/mesh/player-delay`), not in a code change.
+- **`steps > 0`** — something moved a unit that was already in phase. The acquisition itself is a
+  `lock`, not a step, so `locks: 1, steps: 0` is a healthy session. Repeated steps mean the deadline
+  keeps moving: look for xruns in the same log.
+- **`trims`** rising steadily is normal and inaudible — it is the DAC crystal being corrected one
+  frame at a time.
+
+`tests/Integration/t3_phase_lock.sh` runs exactly these checks across a set of units.
 
 `/config/supervisord.log` is supervisord's own log and the first place to look when a program will
 not stay up. Per-endpoint daemon logs live under `/data`, one directory per endpoint id:
@@ -200,6 +287,26 @@ A device-to-device switch is unaffected and still applies live.
 **Deploy the image to EVERY unit before making any unit playerless.** A peer running an older image
 sends no `has_player` in its snapshot, which defaults to True — it would read the playerless leader as
 idle and unroute its own followers, which is precisely the bug this feature fixes.
+
+**A mesh migrates across an aiosendspin major as a WHOLE, or it splits into two meshes.** A 9.x
+client sends `client/init` and a 6.0.5 server rejects it as an unexpected first frame; a 6.0.5 client
+sends `client/hello`, which a 9.x server accepts only in transition mode. Broken in both directions,
+so there is no rolling upgrade. `deploy.sh` is strictly serial — one unit fully up and verified
+before the next is contacted — so a `deploy.sh all` across this boundary leaves the rig mixed for
+several minutes. Expect, and do not report as regressions: peers reading each other's speakers as
+foreign (the 6.0.5 side publishes no `server_id`), failed roams, and `follow` unrouting. It is
+self-healing once every unit is on the same major. To migrate a subset deliberately, give the units
+you are NOT moving a different `PLUM_BEACON_PORT` so they form their own mesh rather than a broken
+shared one.
+
+**A rebuild is not a re-pairing.** `/config/identity/` holds this unit's X25519 keypairs and its
+pairing/trust store — treat it as a device certificate. Lose `server.key` and the unit is a stranger
+to every peer; lose `player.key` and its speaker is untrusted by every server, including its own.
+Both `/config` and `/data` are bind mounts under `/opt/plum-audio/`, so `docker compose down`,
+`down -v`, `rm -f` and every redeploy preserve them. The three ways to actually lose one: re-imaging
+the Pi, a manual `rm`, or running the image **without** the compose bind mounts, where the
+Dockerfile's `VOLUME` declaration makes `/config` an anonymous volume that `docker volume prune`
+will collect.
 
 **The source daemons are NOT supervisord programs.** shairport-sync, go-librespot, bluealsa, obexd
 and their private `dbus-daemon`s are spawned and reconciled by the source managers
@@ -244,6 +351,66 @@ which reads as a failed deploy. Either compare a unit's ids against *its own*
 ```bash
 curl -s http://<unit>/ | grep -o 'assets/index-[^"]*\.js'
 ```
+
+The update agent sidesteps this entirely: it records the image's **RepoDigest**, which is the
+registry's own identity for the image and is the same string on every unit. `plum-updater.sh state`
+prints it, and so does `GET /api/mesh/update`.
+
+## Updating a running unit
+
+Settings → Updates in the GUI, or on the unit:
+
+```bash
+sudo plum-updater.sh check      # refresh what is available; installs nothing
+sudo plum-updater.sh update     # pull, then restart only if something was pulled
+sudo plum-updater.sh state      # what it last did, as JSON
+journalctl -u plum-updater.service -n 50    # what happened, in full
+```
+
+`docker compose pull && docker compose up -d` in `/opt/plum-audio` still works and always will. The
+agent exists so the GUI can do it, not to replace it.
+
+### How the two halves fit
+
+A container cannot replace itself, and no Docker socket is mounted into it — deliberately, because
+these APIs are unauthenticated on `0.0.0.0`. The container writes a request across the `/config`
+bind mount and a systemd path unit on the host acts on it:
+
+| Path | Written by | Read by |
+|---|---|---|
+| `/opt/plum-audio/config/update.request` | the container (`POST /api/mesh/update`) | `plum-updater.sh`, which deletes it |
+| `/opt/plum-audio/config/update.state` | `plum-updater.sh` | the container, for `GET /api/mesh/update` |
+
+`plum-updater.path` watches the request file. `plum-updater-check.timer` runs the daily check, which
+never installs anything.
+
+### The four failures worth knowing
+
+1. **"No update agent on this host."** `provision.sh` has not run on that Pi since the agent landed.
+   It is once per image. The unit is fine and updates by hand.
+2. **The agent is installed but the request is never consumed.** `systemctl is-active
+   plum-updater.path` — if it is not active, nothing watches the file. `provision.sh --check`
+   reports exactly this case.
+3. **`available` is null.** The registry could not be reached. Normal on an isolated AV VLAN, and it
+   reads as `Unknown` in the GUI rather than as up to date, on purpose: green there would hide a
+   unit stuck on an old image.
+4. **`digest` is null.** The image came from a tarball (`deploy.sh`'s default path) and has no
+   registry digest at all. There is nothing to compare against, so the GUI says `Unknown`.
+
+### Rolling back
+
+The agent records `previousDigest` before every pull. `deploy.sh` also keeps the previous image tags
+on the unit. To go back:
+
+```bash
+docker image ls ghcr.io/anothermike-exe/plum-audio    # find the tag you want
+cd /opt/plum-audio
+sed -i 's/^PLUM_TAG=.*/PLUM_TAG=<old-tag>/' .env
+docker compose up -d
+```
+
+There is no automatic rollback. A unit that fails to start is visible and recoverable; a unit that
+silently reverted itself is neither.
 
 ## Ports
 

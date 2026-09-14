@@ -26,7 +26,9 @@ Both the follower's own status and any leader's status are read from `UnitSnapsh
 onto a different unit's server (or a leader's player has roamed onto a THIRD unit). If a leader's
 speaker is attached to a server outside our mesh (Music Assistant, any foreign Sendspin server),
 there is no `source_id` to route onto — follow is a no-op until it comes back, same graceful
-degradation as when the leader unit is simply offline.
+degradation as when the leader unit is simply offline. Our OWN player held by a foreign server is
+NOT the same case: there is still no target, but it is only busy while that server is actually
+feeding it, or `localActivity` could never take our own speaker back (see `_player_status`).
 
 A `source_id` is only unique WITHIN a unit (every unit's own AirPlay endpoint is happily also
 "airplay-1"), so a "target" is tracked as an `(owning_unit_id, source_id)` pair EVERYWHERE in this
@@ -54,6 +56,7 @@ import contextlib
 import json
 import logging
 import os
+from collections.abc import Callable
 
 from mesh.aggregator import DataAggregator
 from mesh.model import MeshView
@@ -77,6 +80,7 @@ class FollowReconciler:
         unroute_delegate: RemoteDelegate | None = None,
         settings_file: str | None = None,
         poll_interval: float = POLL_INTERVAL_S,
+        on_master_change: Callable[[str | None], None] | None = None,
     ) -> None:
         self._aggregator = aggregator
         self._router = router
@@ -87,6 +91,16 @@ class FollowReconciler:
         self._unroute_delegate = unroute_delegate
         self.settings_file = settings_file or os.environ.get("PLUM_SETTINGS_FILE", "/data/settings.json")
         self.poll_interval = poll_interval
+        # Published into the unit snapshot as `follows_unit_id`. Follow config lives on the
+        # FOLLOWER, so a leader — or any third unit — otherwise cannot tell a room locked to it from
+        # a room that merely joined the same stream by hand. Loudness matching's default scope turns
+        # on exactly that distinction. Reported from here because this is already the one place that
+        # reads the setting every tick, so it stays live without a second file poll.
+        self._on_master_change = on_master_change
+        self._reported_master: str | None = None
+        # Whether we are currently standing down because our follow config closes a cycle. Held so
+        # the explanation is logged on the transition rather than every two seconds.
+        self._yielded_to_cycle = False
         # (owning_unit_id, source_id) this reconciler itself last routed to.
         self._last_auto_target: tuple[str, str] | None = None
         # Local sources that were active on the previous tick, so localActivity fires only on a
@@ -133,6 +147,39 @@ class FollowReconciler:
         except (OSError, ValueError):
             return None
 
+    def _follow_cycle(self, view: MeshView, master_unit_id: str) -> list[str] | None:
+        """The follow cycle our config closes, as a unit-id chain, or None if there is none.
+
+        Walks `follows_unit_id` from our master. That field is published in every unit's snapshot
+        (it was added so a leader could tell a room locked to it from one that merely joined the
+        same stream), which is what makes this answerable locally with no extra plumbing.
+
+        Handles chains, not just mutual follow: A -> B -> C -> A is the same bug. A cycle that does
+        NOT contain us is somebody else's to break — we would otherwise stand down for a loop we are
+        not part of.
+        """
+        chain = [self._local_unit_id]
+        seen = {self._local_unit_id}
+        current: str | None = master_unit_id
+        while current:
+            if current == self._local_unit_id:
+                return chain  # the chain came back to us: we are in the cycle
+            if current in seen:
+                return None  # a cycle further along that does not include us
+            seen.add(current)
+            chain.append(current)
+            unit = view.unit(current)
+            current = unit.follows_unit_id if unit is not None else None
+        return None
+
+    def _report_master(self, master_unit_id: str | None) -> None:
+        """Publish the follow target for the snapshot, but only when it actually changes."""
+        if master_unit_id == self._reported_master:
+            return
+        self._reported_master = master_unit_id
+        if self._on_master_change is not None:
+            self._on_master_change(master_unit_id)
+
     async def tick(self) -> None:
         """One reconcile cycle. Public (not `_tick`) so unit tests can drive it directly."""
         if self._local_player_id is None:
@@ -177,8 +224,42 @@ class FollowReconciler:
         slave = auto.get("slave") or {}
         master_unit_id = slave.get("masterUnitId")
         if not (slave.get("enabled") and master_unit_id):
+            self._report_master(None)
             self._overridden = False  # follow off: nothing to override
             return
+
+        # A follow CYCLE — most simply, two units set to follow each other — makes every unit in it
+        # route its own player onto the next one's stream, forever. Measured on the .7 pair: the
+        # speaker changed stream roughly once a minute with nothing to explain it. `masterUnitId` is
+        # a free per-unit choice with no cross-unit validation, so this is reachable straight from
+        # the GUI. One member has to stand down, and it has to be decidable with no coordination.
+        cycle = self._follow_cycle(view, master_unit_id)
+        if cycle is not None and min(cycle) == self._local_unit_id:
+            # Lowest unit id yields. Arbitrary between peers, but DETERMINISTIC — every unit in the
+            # cycle computes the same answer from the same snapshot, so exactly one stands down and
+            # the rest keep following it. A state-dependent rule ("whoever is playing wins") would
+            # hand leadership back and forth as playback moves, which is the oscillation this
+            # exists to stop.
+            #
+            # Publishing None is what actually breaks the cycle for the others: once we report that
+            # we follow nobody, their own walk finds no loop and they follow us normally.
+            self._report_master(None)
+            self._overridden = False
+            if not self._yielded_to_cycle:
+                self._yielded_to_cycle = True
+                logger.warning(
+                    "follow: %s and %s are set to follow each other; standing down here (lowest "
+                    "unit id in the cycle %s). Change one unit's master in Playback -> Follow.",
+                    self._local_unit_id,
+                    master_unit_id,
+                    " -> ".join(cycle),
+                )
+            return
+        if self._yielded_to_cycle:
+            self._yielded_to_cycle = False
+            logger.info("follow: the cycle is gone; following %s again", master_unit_id)
+
+        self._report_master(master_unit_id)
 
         leader_target = self._leader_status(view, master_unit_id)
 
@@ -278,19 +359,40 @@ class FollowReconciler:
         `_player_state`), so it stays correct even when that player has roamed onto a different
         unit's server (or, for a leader, a third unit's — `owning_unit_id` in the result is
         wherever it ACTUALLY is, not necessarily `unit_id`). "Idle" here means not actually playing
-        anything right now — ungrouped, or grouped to a source that has since gone quiet — not
-        merely "never been routed," so a player is freed to be auto-managed again the moment its
-        current source stops, matching the idle contract elsewhere in the mesh.
+        anything right now — ungrouped, grouped to a source that has since gone quiet, or parked
+        silent on a FOREIGN server — not merely "never been routed," so a player is freed to be
+        auto-managed again the moment its current source stops, matching the idle contract
+        elsewhere in the mesh.
         """
         unit = view.unit(unit_id)
         lp = unit.local_player if unit else None
         if not lp or not lp.get("attached") or not lp.get("group_id"):
             return True, None
-        server_unit = view.unit(lp.get("server_id"))
+        # `server_id` here is a SENDSPIN id, which under 9.x is an X25519 public key — not a unit_id.
+        # This was `view.unit(...)` and worked only because we used to pass `server_id=unit_id` to
+        # SendspinServer; once ids became keypairs that lookup missed every time, so every unit's own
+        # player read as attached to a foreign server and follow stopped following. It failed
+        # silently, which is why the lookup is now named for the namespace it searches.
+        server_unit = view.unit_by_server_id(lp.get("server_id"))
         if server_unit is None:
-            # Attached to a server outside our mesh (Music Assistant, any foreign Sendspin server):
-            # busy, but nothing we can route onto.
-            return False, None
+            # Attached to a server OUTSIDE our mesh (Music Assistant, any foreign Sendspin server).
+            # There is nothing of ours to route onto either way, so the target stays None. But
+            # "attached" is not "busy": since b1c1fe0 an idle unit RELEASES its own speaker, and MA
+            # re-dials within seconds and then parks a SILENT websocket on it indefinitely (measured
+            # on .7.200: one connection held 24 h with audio_flowing=False). Foreign-held is
+            # therefore the steady state of every unit on a VLAN that runs MA, not an exception —
+            # and reading it as busy disarmed `localActivity` permanently, because the "local intent
+            # always wins the speaker back" half of that policy was only ever written for an
+            # UNATTACHED player, a state MA never lets one reach.
+            #
+            # `playing` is the player's own audio-flow truth (driven by stream start/end, with a
+            # 1.5 s stall net) and NOT the foreign server's playback_state, which MA reports
+            # unreliably. While it is True that server really is feeding this speaker, so we leave
+            # it alone: that is what lets a user push an MA stream to this endpoint mid-AirPlay and
+            # keep it. The rising-edge guard in tick() is the other half of that — a source already
+            # active when MA took the speaker never counts as a new local connection, so we do not
+            # grab it back and the two do not fight over the socket.
+            return not lp.get("playing"), None
         src = next((s for s in server_unit.sources if s.group_id == lp["group_id"]), None)
         if src is None or not src.active:
             return True, None

@@ -108,7 +108,14 @@ class AirplayMetadataReader:
 
     def _emit_progress(self, pos_ms: int, speed: int) -> None:
         role = self._metadata_role()
-        if role is None or role.metadata is None or self._duration_ms <= 0:
+        if role is None or role.metadata is None:
+            return
+        # An unknown duration suppresses the POSITION, never the SPEED. This was one guard covering
+        # two unrelated things, and it is the chokepoint that made a sender which omits `prgr` read
+        # as paused forever while audibly playing: _set_playing emitted, and this dropped it on the
+        # floor. A track of unknown length is still either playing or not.
+        if self._duration_ms <= 0:
+            role.set_metadata(replace(role.metadata, playback_speed=speed, timestamp_us=None))
             return
         # Force a FRESH server timestamp. role.update()/set_metadata otherwise INHERIT the previous
         # metadata's timestamp_us (a library quirk: replace() copies it, and set_metadata only stamps
@@ -149,8 +156,6 @@ class AirplayMetadataReader:
         suppress shairport's lagging "still playing" reports until it confirms (see _handle_ssnc /
         _handle_progress). Without this, one GUI's pause would revert to playing for the seconds the
         AirPlay buffer takes to drain, disagreeing with any other GUI watching the same group."""
-        if self._duration_ms <= 0:
-            return
         if command == "pause":
             self._command_state = "paused"
             self._command_deadline = time.monotonic() + PAUSE_CONFIRM_TIMEOUT_S
@@ -343,9 +348,38 @@ class AirplayMetadataReader:
         self._is_playing = True
         self._emit_progress(position_ms, 1000)
 
+    def note_external_state(self, playing: bool) -> None:
+        """Play/pause observed OUT OF BAND (shairport's MPRIS PlaybackStatus), for senders that
+        never emit the ssnc state codes.
+
+        Music Assistant's AirPlay sender is one: measured over 19 minutes and 7 track changes it sent
+        metadata and artwork on every track and never a single `prgr`, `pbeg`, `prsm` or `paus`. With
+        only the ssnc path, nothing ever called _set_playing, so the transport read paused for the
+        whole session while audio played.
+
+        Idempotent, and it defers to the two authorities that already exist: a pending GUI command
+        (so an optimistic pause is not immediately overwritten by a lagging Playing), and the ssnc
+        codes themselves, which arrive from senders that do emit them and agree with this anyway.
+        """
+        if self._command_state is not None:
+            return  # a GUI command is awaiting confirmation; let the ssnc path settle it
+        if playing == self._is_playing:
+            return
+        if playing:
+            self._set_playing()
+        else:
+            self._set_paused()
+
     def _set_playing(self) -> None:
-        """Resume: re-anchor the clock at the frozen position and let the ticker advance again."""
-        if self._metadata_role() is None or self._duration_ms <= 0:
+        """Resume: re-anchor the clock at the frozen position and let the ticker advance again.
+
+        Deliberately NOT gated on knowing the duration. Whether a source is playing and how long its
+        track is are independent facts, and requiring the second to report the first means any sender
+        that omits `prgr` shows as paused forever while audible — the transport button then reads
+        wrong until someone presses it. Progress still needs a duration to mean anything, so the
+        ticker keeps that guard; the play/pause STATE does not.
+        """
+        if self._metadata_role() is None:
             return
         self._anchor_at = time.monotonic()  # elapsed measured from now, position unchanged
         self._is_playing = True
@@ -355,8 +389,11 @@ class AirplayMetadataReader:
     def _set_paused(self) -> None:
         """Freeze at the position we're actually showing right now (speed → 0), without clearing
         metadata/artwork. Uses the live anchor position, not the last raw prgr, so it neither jumps
-        back to a stale frame nor forward past where the bar sits."""
-        if self._metadata_role() is None or self._duration_ms <= 0:
+        back to a stale frame nor forward past where the bar sits.
+
+        Ungated for the same reason as _set_playing: a paused source is paused whether or not we ever
+        learned how long its track is."""
+        if self._metadata_role() is None:
             return
         self._anchor_pos_ms = self._current_pos_ms()
         self._anchor_at = time.monotonic()

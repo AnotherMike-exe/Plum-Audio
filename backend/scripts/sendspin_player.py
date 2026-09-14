@@ -22,10 +22,13 @@ Render path:
                                                           --> PortAudio callback --> hw:<card>
   We advertise PCM support so the server resamples/sends ready-to-play PCM (no client decode).
 
-Sync note (the *why* of the current renderer): a jitter-buffer renderer is sample-correct for a
-SINGLE unit (nothing to phase-align against) and reports ALSA xruns cleanly. True multi-room
-phase-lock (schedule each chunk at compute_play_time(server_ts) against the DAC clock, with
-drift resampling) is Phase-2 work and is isolated in AlsaRenderer — see TODO there.
+Sync note: playback is PHASE-LOCKED. Every chunk carries a server timestamp; the player converts it
+to client-clock microseconds with `compute_play_time()` and AlsaRenderer serves the frame that is
+due when the block it is filling reaches the DAC. Before 2026-09-13 the renderer free-ran — it
+played audio the moment it arrived — so a unit's phase was whatever its first chunk landed on, four
+units sat a quarter to half a second apart, and the offset moved every session. Nothing about that
+was a regression or a buffer-size problem: it had never been implemented. AlsaRenderer holds all of
+it; `PLUM_SYNC_LOCK=0` returns the old free-running drain.
 
 Runs under supervisord as the `sendspin_player` program.
 """
@@ -33,23 +36,26 @@ Runs under supervisord as the `sendspin_player` program.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import logging
 import os
 import threading
 import time
+from dataclasses import dataclass
+from enum import StrEnum
 
 import numpy as np
 from aiosendspin.client.client import SendspinClient
 from aiosendspin.client.listener import ClientListener
+from aiosendspin.client.models import PairingSupport
+from aiosendspin.clock import RawMonotonicClock
 from aiosendspin.models.artwork import ArtworkChannel, ClientHelloArtworkSupport
-from aiosendspin.models.core import ClientStateMessage, ClientStatePayload, DeviceInfo
-from aiosendspin.models.player import ClientHelloPlayerSupport, PlayerStatePayload, SupportedAudioFormat
+from aiosendspin.models.core import DeviceInfo
+from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
 from aiosendspin.models.types import (
     ArtworkSource,
     AudioCodec,
-    ClientStateType,
-    GoodbyeReason,
     MediaCommand,
     PictureFormat,
     PlayerCommand,
@@ -63,6 +69,7 @@ except Exception:  # noqa: BLE001 - allows --probe-config / import without PortA
     sd = None
 
 import audio_devices
+import sendspin_identity
 import unit_identity
 from lifecycle import install_shutdown_handlers
 from mesh.avahi import CLIENT_SERVICE, AvahiClient
@@ -72,6 +79,7 @@ from player_state import (
     load_render_state,
     save_active_output,
     save_last_playing_server,
+    save_player_health,
     save_render_state,
     state_file_path,
 )
@@ -82,11 +90,17 @@ DEFAULT_PORT = 8928
 # Advertised to servers/controllers in client/hello device_info, so a foreign controller (Music
 # Assistant) shows a real identity for this speaker rather than a bare id.
 PLUM_SOFTWARE_VERSION = os.environ.get("PLUM_VERSION", "phase3-dev")
+
+# Where an operator finds our static PIN, from aiosendspin's CLOSED vocabulary
+# (client.models.SECRET_LOCATIONS = device | leaflet | operator), enforced in PairingSupport's
+# __post_init__. A module constant so the canary test can assert the real value rather than a copy.
+PAIR_SECRET_LOCATIONS = ("device", "operator")
+
 DEFAULT_RATE = 44100  # AirPlay-native; the server resamples other sources to this
 DEFAULT_CHANNELS = 2
 DEFAULT_BITS = 16
 DAC_BLOCK_FRAMES = 480  # PortAudio callback block (~10 ms @ 48k); small → tight xruns
-DEFAULT_TARGET_BUFFER_MS = 300  # jitter buffer depth we aim to hold ahead of the DAC
+DEFAULT_TARGET_BUFFER_MS = 300  # nominal jitter depth — see AlsaRenderer.target_buffer_ms
 MAX_BUFFER_MS = 2000  # hard cap; drop oldest beyond this if the DAC falls behind
 XRUN_LOG_EVERY = 50  # throttle xrun warnings
 OVERRUN_LOG_EVERY = 50  # ditto for buffer overruns — enqueue() runs once per ~20ms chunk
@@ -97,62 +111,116 @@ OVERRUN_LOG_EVERY = 50  # ditto for buffer overruns — enqueue() runs once per 
 # a server learns to send more lead time. See _health for why this is not pad_frames.
 ERROR_STARVED_FRAMES = DEFAULT_RATE // 20
 HEALTH_POLL_S = 3.0  # how often we re-evaluate whether to report client/state error
+# How long one attached session may run before it is worth a line in the log. Comfortably longer
+# than any normal roam or listening session boundary, so a healthy player never trips it — this is
+# only meant to make a connection nobody is on the other end of visible after the fact.
+STUCK_SESSION_WARN_S = 900.0
 
 
-def build_client_state_message(
-    state: ClientStateType,
-    *,
-    volume: int,
-    muted: bool,
-    static_delay_ms: int,
-    required_lead_time_ms: int,
-    min_buffer_ms: int,
-    supported_commands: list | None = None,
-) -> ClientStateMessage:
-    """A spec-conformant client/state, with `state` at the TOP level.
+# -- multi-room phase lock -------------------------------------------------------------------------
+# Off returns the renderer to the free-running drain it had from Phase 1 to 2026-09-13: audio is
+# played the moment it arrives and this unit's phase is whatever its first chunk happened to land
+# on. Kept as a kill switch because this is the audio path — if locked playback misbehaves on a rig,
+# one env var and a restart gets the old behaviour back without a rebuild.
+SYNC_LOCK = os.environ.get("PLUM_SYNC_LOCK", "1") != "0"
+# Error past which we STEP (pad silence, or drop frames) instead of trimming. 30 ms is about 10 m of
+# path difference — well past anything a room's geometry explains, and the point where a listener
+# hears two speakers rather than one. Every normal session crosses it exactly once, at the first
+# chunk, which is the alignment this whole mechanism exists to perform.
+SYNC_HARD_US = int(float(os.environ.get("PLUM_SYNC_HARD_MS", "30")) * 1000)
+# Smoothed error we tolerate without correcting. 1.5 ms is ~0.5 m of path difference: inaudible as
+# an echo, and comfortably above the jitter in PortAudio's own DAC-time report, so a unit sitting
+# still does not trim forever.
+SYNC_DEADBAND_US = int(float(os.environ.get("PLUM_SYNC_DEADBAND_MS", "1.5")) * 1000)
+# Callbacks between single-frame trims. One frame per 4 blocks is ~520 ppm at 480 frames/10 ms —
+# roughly 5x the worst crystal error between two Pis, and slow enough that the correction never
+# outruns the EMA that drives it (which is what makes a trim loop oscillate).
+SYNC_TRIM_EVERY = int(os.environ.get("PLUM_SYNC_TRIM_EVERY", "4"))
+# Smoothing on the measured error. 0.01 per ~10 ms block is a ~1 s time constant: long enough to
+# ignore the block-to-block jitter in snd_pcm_delay, short enough that real drift is acted on before
+# it becomes audible.
+SYNC_EMA_ALPHA = 0.01
+SYNC_STEP_LOG_GAP_S = 2.0  # throttle on the step log line, NOT on the step itself
+# Largest DAC lead we will believe from PortAudio. A host API that does not fill the time info
+# reports 0, and a bogus huge value would schedule audio minutes out; both fall back to the latency
+# the stream reported at open, and only if THAT is unusable do we free-run.
+MAX_DAC_LEAD_US = 1_000_000
 
-    aiosendspin 6.0.5's send_player_state() sets state only inside the `player` object — the field
-    its own models mark "DEPRECATED(before-spec-pr-50): Remove once all clients send state at client
-    level" — and leaves ClientStatePayload.state at None, which omit_none then drops from the wire
-    entirely. Its own server reads payload.state at the top level, so it always reads None and never
-    transitions the client. Plum-to-Plum that is benign purely by luck, because both ends default to
-    SYNCHRONIZED; a spec-strict third-party server sees a REQUIRED field missing on every state
-    message we send, including the mandatory one at connect.
 
-    Both fields are set: the top-level one because the spec requires it, the nested one because a
-    peer mid-migration may still read it and extra fields are tolerated.
+@dataclass(slots=True)
+class _Chunk:
+    """One received PCM chunk, and when its first UNPLAYED frame is due.
 
-    Free-standing (rather than a method) so the wire format can be asserted without standing up a
-    player. Delete it and go back to send_player_state() once the pin bumps past the upstream fix —
-    see docs/UPSTREAM-AIOSENDSPIN.md.
+    `play_us` is client-clock microseconds — already through `compute_play_time()`, so it stays
+    valid across a server change: the server's clock domain is converted away at enqueue, which is
+    what keeps a cross-server roam inaudible (the buffer drains on the old timeline while the new
+    connection's time filter converges).
+
+    None means "no schedule": the time filter had not converged yet, or locking is off. Such a chunk
+    plays contiguously with whatever precedes it, exactly as every chunk did before phase lock.
     """
-    return ClientStateMessage(
-        payload=ClientStatePayload(
-            state=state,
-            player=PlayerStatePayload(
-                state=state,
-                volume=volume,
-                muted=muted,
-                static_delay_ms=static_delay_ms,
-                required_lead_time_ms=required_lead_time_ms,
-                min_buffer_ms=min_buffer_ms,
-                supported_commands=supported_commands,
-            ),
-        )
-    )
+
+    pcm: bytes
+    play_us: int | None
+    pos: int = 0  # bytes already handed to the DAC
+
+
+class PlayerHealth(StrEnum):
+    """Whether this renderer is keeping up. OURS, deliberately — no longer a protocol state.
+
+    Until aiosendspin 9.x the spec had `client/state.state` as a REQUIRED enum, and `error` was its
+    documented way for a client that "cannot maintain sync" (buffer underrun is the spec's own
+    example) to tell a server to give it more lead time. We implemented that, and worked around the
+    library dropping the field (UPSTREAM §0).
+
+    **9.x deleted the concept.** `ClientStateType` is gone tree-wide and `ClientStatePayload.state`
+    became `available: bool`, which is NOT a substitute: `send_available`'s own docstring says "an
+    active source stream ends before the client reports unavailable", so reporting a transient xrun
+    as `available=False` would tear the stream down — converting a brief dropout into a real one.
+    There is no remaining wire field that means "struggling but still playing".
+
+    So the detection stays and the reporting moves. The logic below was expensive to get right (two
+    hardware-caught false positives: idle padding, and a paused source) and it is still the only
+    thing that knows this speaker is dropping out — it now goes to the log and to player_state.json,
+    where the mesh API can surface it, instead of onto the wire. That is strictly more queryable
+    than before and strictly less conformant; the loss is the server-side reaction, which no server
+    can perform any more anyway.
+    """
+
+    SYNCHRONIZED = "synchronized"
+    ERROR = "error"
 
 
 class AlsaRenderer:
-    """Owns the PortAudio output stream and a thread-safe PCM jitter buffer.
+    """Owns the PortAudio output stream and a thread-safe queue of TIMESTAMPED PCM chunks.
 
-    The PortAudio callback (a separate thread) drains the buffer at the DAC rate, padding with
-    silence on underrun. The asyncio loop thread fills the buffer from received audio chunks.
-    Volume/mute are applied here as software gain (the client receives raw PCM, so the endpoint
-    must attenuate before the DAC).
+    The PortAudio callback (a separate thread) drains the queue at the DAC rate, padding with
+    silence on underrun. The asyncio loop thread fills it from received audio chunks. Volume/mute
+    are applied here as software gain (the client receives raw PCM, so the endpoint must attenuate
+    before the DAC).
 
-    TODO(Phase 2 — multi-room sync): replace the free-running drain with timestamp-locked
-    playback — map PortAudio's outputBufferDacTime to the client clock and pull the sample whose
-    compute_play_time() matches, inserting silence / resampling to correct clock drift.
+    **Phase lock.** Each chunk carries the client-clock time its first frame is due
+    (`compute_play_time(server_ts)`, converted in the loop thread). Every callback asks PortAudio
+    when the block it is filling will actually reach the DAC — `outputBufferDacTime - currentTime`,
+    which is snd_pcm_delay — adds that to the client clock, and serves the frame that is due then:
+    silence while the head chunk is still in the future, dropped frames while it is in the past.
+
+    Only the DIFFERENCE between PortAudio's two timestamps is used, never either one on its own.
+    PortAudio's clock on Linux is not the client's (it is the ALSA status tstamp; ours is
+    CLOCK_MONOTONIC_RAW), so the two domains must never be compared — but the gap between them is
+    a duration, and a duration is domain-free.
+
+    What this replaced, and why it could never work: the drain was free-running. Audio played the
+    moment it arrived, so a unit's phase was set by when its first chunk landed, and every padded
+    underrun after that pushed it permanently later. `target_buffer_ms` did not gate it — that value
+    only ever reached a log line. Two units 300 ms apart stayed 300 ms apart for the whole session.
+
+    Correction of DAC-vs-client clock drift is a single dropped or duplicated frame every
+    `SYNC_TRIM_EVERY` callbacks while the smoothed error sits outside `SYNC_DEADBAND_US`. One frame
+    at 44.1 kHz is 23 us — below the threshold of hearing, and cheaper than a resampler on every
+    block of every unit forever. A step correction (`SYNC_HARD_US`) is audible and deliberate: it
+    happens at the first chunk of a session, which is the alignment, and otherwise says something
+    changed that drift cannot explain.
     """
 
     def __init__(self, rate: int, channels: int, bits: int, *, device: str | None, target_buffer_ms: int) -> None:
@@ -162,12 +230,31 @@ class AlsaRenderer:
         self.device = device  # what we were ASKED for (settings/env spec)
         self.open_device: str | None = None  # what we actually OPENED, as a stable card id
         self._bpf = channels * (bits // 8)
-        self._target_bytes = self._bpf * rate * target_buffer_ms // 1000
+        # Nominal, and nothing gates on it. Under phase lock the depth we actually hold is set by
+        # the server's send-ahead (min_buffer + static_delay), not by us; before phase lock nothing
+        # gated on it either — it reached one log line, which is why a "buffer sizing" explanation
+        # for the offsets was never going to hold. Kept as the figure we would declare if we ever
+        # stop taking the library's 250 ms min_buffer default.
+        self.target_buffer_ms = target_buffer_ms
         self._max_bytes = self._bpf * rate * MAX_BUFFER_MS // 1000
 
-        self._buf = bytearray()
+        # The jitter buffer: chunks in arrival order, each with the play time of its first
+        # unplayed frame. `_buffered` is the sum of what is left in them, kept incrementally so the
+        # callback never walks the queue to size it.
+        self._chunks: collections.deque[_Chunk] = collections.deque()
+        self._buffered = 0
         self._lock = threading.Lock()
         self._stream = None
+        # Output latency PortAudio reported at open, as the fallback DAC lead. Used only when the
+        # per-callback time info is missing or implausible: a constant estimate still phase-locks
+        # this unit to the rest (the error is fixed, so the per-endpoint delay knob absorbs it),
+        # where free-running does not.
+        self._latency_us = 0
+
+        # Client clock. MUST be the same one aiosendspin converts play times into, or the two ends
+        # of `compute_play_time` are in different domains — SendspinPlayer hands us the client's own
+        # `now_us`. The default keeps a hand-built renderer (tests, the dev rig) working.
+        self._now_us = RawMonotonicClock().now_us
 
         # volume as software gain (0..100) + mute
         self._gain = 1.0
@@ -182,10 +269,29 @@ class AlsaRenderer:
         self.overruns = 0  # buffer pinned at MAX_BUFFER_MS — the DAC is behind, we dropped oldest
         self._overrun_since_log = 0
         self.dropped_bytes = 0
+        # Phase-lock telemetry. `sync_err_us` is the last measured error (+ = we are early, the
+        # audio is due later than the block we are filling); `sync_ema_us` is the smoothed value the
+        # trim acts on; None for either means "not locked right now".
+        self.sync_err_us: int | None = None
+        self.sync_ema_us: float | None = None
+        self.locks = 0  # times this renderer reached the deadline — one per session is normal
+        self.steps = 0  # steps that BROKE an alignment: the acquisition itself is not counted
+        self.trims = 0  # single-frame drift corrections
+        self.locked = False  # last callback scheduled against a timestamp
+        self._trim_tick = 0
+        self._last_step_log = 0.0
+        self._dac_time_warned = False
+        # Whether we have actually reached the deadline yet. False means the next scheduled block
+        # aligns exactly rather than settling for "within SYNC_HARD_US" — see _take.
+        self._aligned = False
         # Unconditional silence accounting: every frame we had to pad, whether or not we thought
         # we were "playing". starved_frames alone hides a gap where stream_end/clear flipped us
         # idle (e.g. a cross-server roam) — this is the honest measure of audible dropout.
         self.pad_frames = 0
+        # Silence emitted ON PURPOSE, because the head chunk was not due yet. Separate from
+        # pad_frames so that "how much dropout has this speaker had" stays answerable: a session
+        # start now legitimately emits a few hundred ms of it while the DAC waits for the deadline.
+        self.hold_frames = 0
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -230,6 +336,21 @@ class AlsaRenderer:
             callback=self._callback,
         )
         self._stream.start()
+        # Fallback DAC lead for a callback whose time info PortAudio did not fill. `latency` is what
+        # the host API settled on, in seconds; sounddevice reports it per stream after start.
+        try:
+            self._latency_us = max(0, int(float(self._stream.latency) * 1_000_000))
+        except Exception:  # noqa: BLE001 - a host API that reports no latency just loses the fallback
+            self._latency_us = 0
+        # A different card has a different output latency, so the error we measured against the old
+        # one says nothing about this one. Start the average again rather than trim toward a number
+        # that belonged to another device.
+        with self._lock:
+            self.sync_ema_us = None
+            self.sync_err_us = None
+            self.locked = False
+            self._aligned = False
+            self._dac_time_warned = False
         self.device = spec
         # What we actually OPENED, as the stable <card_name>:<device> identity — distinct from the
         # spec we were ASKED for. `pending` upstream is "choice vs echo"; echoing the request back
@@ -239,13 +360,14 @@ class AlsaRenderer:
         # genuinely do not know which card we are on, and saying so beats inventing an answer.
         self.open_device = resolved.id if (spec and resolved is not None) else None
         logger.info(
-            "DAC open: device=%s %d:%d:%d block=%d target=%dms",
+            "DAC open: device=%s %d:%d:%d block=%d latency=%dms lock=%s",
             spec or "default",
             self.rate,
             self.bits,
             self.channels,
             DAC_BLOCK_FRAMES,
-            self._target_bytes * 1000 // (self._bpf * self.rate),
+            self._latency_us // 1000,
+            "on" if SYNC_LOCK else "OFF (free-running)",
         )
 
     def reopen(self, spec: str | None) -> bool:
@@ -297,13 +419,29 @@ class AlsaRenderer:
 
     # -- fill (asyncio thread) ----------------------------------------------
 
-    def enqueue(self, pcm: bytes) -> None:
+    def set_clock(self, now_us) -> None:  # noqa: ANN001 - a zero-arg callable returning int us
+        """Use `now_us` as the client clock. MUST be the clock aiosendspin converts play times into.
+
+        Passing the client's own bound `now_us` rather than making a second RawMonotonicClock is not
+        pedantry: `SendspinClient` takes an injectable clock, and a renderer holding a different one
+        would compare two domains and schedule against a constant offset nobody can see.
+        """
+        self._now_us = now_us
+
+    def enqueue(self, pcm: bytes, play_us: int | None = None) -> None:
+        """Queue a received chunk. `play_us` is when its first frame is due, on the client clock.
+
+        None means unscheduled — the time filter has not converged, or locking is off — and such a
+        chunk plays contiguously with what precedes it, which is what every chunk did before phase
+        lock. A mixed queue is normal and correct: the head chunk decides, one block at a time.
+        """
         with self._lock:
             self._playing = True
-            self._buf.extend(pcm)
-            if len(self._buf) > self._max_bytes:  # DAC behind → drop oldest to bound latency
-                drop = len(self._buf) - self._max_bytes
-                del self._buf[:drop]
+            self._chunks.append(_Chunk(pcm, play_us))
+            self._buffered += len(pcm)
+            if self._buffered > self._max_bytes:  # DAC behind → drop oldest to bound latency
+                drop = self._buffered - self._max_bytes
+                self._discard_oldest(drop)
                 self.overruns += 1
                 self.dropped_bytes += drop
                 # Throttled like the xrun path above, and for the same reason: enqueue runs once
@@ -320,15 +458,41 @@ class AlsaRenderer:
                     )
                     self._overrun_since_log = 0
 
+    def _discard_oldest(self, nbytes: int) -> None:
+        """Drop `nbytes` from the head of the queue. Caller holds the lock."""
+        while nbytes > 0 and self._chunks:
+            head = self._chunks[0]
+            remaining = len(head.pcm) - head.pos
+            if remaining > nbytes:
+                head.pos += nbytes
+                self._buffered -= nbytes
+                return
+            self._chunks.popleft()
+            self._buffered -= remaining
+            nbytes -= remaining
+
     def flush(self) -> None:
         """Drop buffered audio (server sent stream_clear — discard pending)."""
         with self._lock:
-            self._buf.clear()
+            self._chunks.clear()
+            self._buffered = 0
+            # The timeline we were tracking is gone with the audio. Clearing the smoothed error
+            # stops the next stream inheriting a trim direction from the last one, and clearing the
+            # alignment makes the next one line up exactly rather than settle for SYNC_HARD_US.
+            self.sync_ema_us = None
+            self.sync_err_us = None
+            self.locked = False
+            self._aligned = False
 
     def mark_idle(self) -> None:
         """Stream ended; once the buffer drains we're idle (stop counting starvation)."""
         with self._lock:
             self._playing = False
+            # The next stream aligns from scratch. Its first chunk is a fresh deadline, not a
+            # continuation of this one, and treating it as one would let a whole session start up to
+            # SYNC_HARD_US out of phase.
+            self._aligned = False
+            self.locked = False  # nothing is being scheduled any more; do not report that it is
 
     def set_volume(self, volume: int | None = None, muted: bool | None = None) -> None:
         if volume is not None:
@@ -339,14 +503,247 @@ class AlsaRenderer:
     def stats(self) -> str:
         """Buffer + dropout counters. pad_ms is the true audible silence emitted so far."""
         with self._lock:
-            buffered = len(self._buf)
+            buffered = self._buffered
+            ema = self.sync_ema_us
+        sync = "free" if ema is None else f"{ema / 1000:+.1f}ms"
         return (
             f"[buf={buffered * 1000 // (self._bpf * self.rate)}ms "
             f"xruns={self.xruns} starv={self.starvations} "
-            f"pad_ms={self.pad_frames * 1000 // self.rate}]"
+            f"pad_ms={self.pad_frames * 1000 // self.rate} "
+            f"sync={sync} steps={self.steps} trims={self.trims}]"
         )
 
+    def sync_report(self) -> dict:
+        """Phase-lock state for player_state.json and the mesh self-report.
+
+        This is how four units get compared without a microphone: read `sync_err_ms` off each one
+        while they play the same source. `locked=False` on a unit that should be playing is the
+        first thing to look at — it means that unit is free-running and nothing below it applies.
+        """
+        with self._lock:
+            err = self.sync_err_us
+            ema = self.sync_ema_us
+            return {
+                "locked": self.locked,
+                "aligned": self._aligned,
+                "sync_err_ms": None if err is None else round(err / 1000, 2),
+                "sync_avg_ms": None if ema is None else round(ema / 1000, 2),
+                "locks": self.locks,
+                "steps": self.steps,
+                "trims": self.trims,
+            }
+
     # -- drain (PortAudio thread) -------------------------------------------
+
+    def _frames_to_us(self, frames: int) -> int:
+        return frames * 1_000_000 // self.rate
+
+    def _us_to_frames(self, us: int) -> int:
+        return us * self.rate // 1_000_000
+
+    def _block_play_time(self, time_info) -> int | None:  # noqa: ANN001 - PaStreamCallbackTimeInfo
+        """When the first frame of the block we are filling will reach the DAC, on the client clock.
+
+        `outputBufferDacTime - currentTime` is the only thing read from PortAudio, and it is a
+        DURATION (snd_pcm_delay, plus whatever the host API adds). Neither timestamp is comparable
+        with ours — PortAudio's Linux clock is the ALSA status tstamp, the client's is
+        CLOCK_MONOTONIC_RAW — but the gap between them belongs to no clock domain at all.
+
+        None means "do not schedule this block": locking is off, or we have no idea where the DAC
+        is. The caller then serves audio the instant it has it, which is the pre-2026-09-13
+        behaviour and is never worse than guessing.
+        """
+        if not SYNC_LOCK:
+            return None
+        try:
+            ahead_us = int((time_info.outputBufferDacTime - time_info.currentTime) * 1_000_000)
+        except Exception:  # noqa: BLE001 - a host API that fills no time info must not kill audio
+            ahead_us = 0
+        if not 0 < ahead_us <= MAX_DAC_LEAD_US:
+            if not self._dac_time_warned:
+                self._dac_time_warned = True
+                logger.warning(
+                    "PortAudio reported no usable DAC time (lead=%d us) — scheduling against the "
+                    "stream's own latency of %d ms instead; this unit stays phase-locked but with a "
+                    "FIXED offset, so trim it out with the per-endpoint delay",
+                    ahead_us,
+                    self._latency_us // 1000,
+                )
+            ahead_us = self._latency_us
+        return self._now_us() + ahead_us if ahead_us > 0 else None
+
+    def _observe(self, err_us: int) -> None:
+        """Record the block's timing error and fold it into the average the trim acts on."""
+        self.sync_err_us = err_us
+        if abs(err_us) > SYNC_HARD_US:
+            # A step is about to remove this error. Seeding the average with it would leave the trim
+            # chasing something that no longer exists, for the ~1 s the filter takes to forget it.
+            self.sync_ema_us = 0.0
+        elif self.sync_ema_us is None:
+            self.sync_ema_us = float(err_us)
+        else:
+            self.sync_ema_us += SYNC_EMA_ALPHA * (err_us - self.sync_ema_us)
+
+    def _trim_decision(self) -> int:
+        """+1 duplicate one frame (we are early), -1 drop one frame (we are late), 0 leave it."""
+        ema = self.sync_ema_us
+        if ema is None:
+            return 0
+        self._trim_tick += 1
+        if self._trim_tick < SYNC_TRIM_EVERY:
+            return 0
+        self._trim_tick = 0
+        if ema > SYNC_DEADBAND_US:
+            return 1
+        if ema < -SYNC_DEADBAND_US:
+            return -1
+        return 0
+
+    def _note_step(self, err_us: int) -> None:
+        """Count and log a step. Counted ONLY when it breaks an alignment we had already reached.
+
+        Acquiring the lock at the start of a session is a run of steps — one per callback for as
+        long as the hold lasts, which is however far ahead the server sends. Counting those would
+        put ~50 on the board before a note is played and make `steps` useless as the signal it
+        exists to be: something moved a unit that was already in phase.
+
+        So a step also ENDS the alignment, which is both true and what makes the count honest: the
+        rest of that correction runs at the deadband threshold and is not counted again, and the
+        `locks` counter picks it up when the unit lands. Measured on the rig 2026-09-13 before this:
+        one 150 ms re-alignment after a membership change read as 16 steps on two units.
+        """
+        if self._aligned:
+            self.steps += 1
+            self._aligned = False
+        now = time.monotonic()
+        if now - self._last_step_log >= SYNC_STEP_LOG_GAP_S:
+            self._last_step_log = now
+            logger.info(
+                "phase step %+.1f ms — %s",
+                err_us / 1000,
+                "holding the DAC until the audio is due" if err_us > 0 else "skipping overdue audio",
+            )
+
+    def _pad(self, nbytes: int, *, starved: bool) -> None:
+        """Account for silence. Caller holds the lock.
+
+        `starved` separates the two reasons we emit silence, and they mean opposite things. A
+        DEADLINE hold is the mechanism working — the audio is not due yet — and counting it as a
+        dropout would report every session start as a fault. Running dry while playing is the
+        dropout, and that is what `_health` reads.
+        """
+        frames = nbytes // self._bpf
+        if starved:
+            if self._playing:
+                self.starvations += 1
+                self.starved_frames += frames
+            self.pad_frames += frames
+        else:
+            self.hold_frames += frames
+
+    def _take(self, need: int, block_play_us: int | None) -> bytes:
+        """Serve exactly `need` bytes for the block that plays at `block_play_us`. Holds the lock.
+
+        The loop is the phase lock. For each head chunk it asks "is the frame I am about to hand the
+        DAC the frame that is due when this block reaches it?" and answers with silence, a skip, or
+        the audio itself. Everything else in this class exists to make that question answerable.
+        """
+        out = bytearray()
+        written = 0
+        measured = False
+        stepped = False
+        while written < need and self._chunks:
+            head = self._chunks[0]
+            remaining = len(head.pcm) - head.pos
+            if remaining <= 0:
+                self._chunks.popleft()
+                continue
+
+            if head.play_us is None or block_play_us is None:
+                self.locked = False
+                take = min(need - written, remaining)
+                out += head.pcm[head.pos : head.pos + take]
+                head.pos += take
+                self._buffered -= take
+                written += take
+                continue
+
+            self.locked = True
+            cursor_us = block_play_us + self._frames_to_us(written // self._bpf)
+            due_us = head.play_us + self._frames_to_us(head.pos // self._bpf)
+            err_us = due_us - cursor_us  # + we are early (due later), - we are late (overdue)
+            if not measured:
+                self._observe(err_us)
+                measured = True
+
+            # How close is close enough, and it is not one number.
+            #
+            # While ALIGNING — the first audio of a session, or the far side of a step already begun
+            # in this block — the target is the deadband. Stopping at SYNC_HARD_US instead would
+            # leave up to 30 ms of error, and the trim removes 30 ms in about a minute of playback:
+            # every track would start out of phase and only settle halfway through. A skip is capped
+            # by the chunk it skips into, so a 300 ms correction takes dozens of iterations here.
+            #
+            # Once ALIGNED the target is SYNC_HARD_US, because the question changes. A few ms of
+            # error is drift, which the trim removes inaudibly; 30 ms is not drift, and stepping is
+            # the only honest answer to it.
+            threshold = SYNC_HARD_US if (self._aligned and not stepped) else SYNC_DEADBAND_US
+
+            # Both corrections below move by WHOLE frames, so an error smaller than one frame
+            # (23 us) is not correctable and falls through to the copy. Checking that here rather
+            # than clamping inside each branch is what guarantees the loop always advances.
+            off_by = self._us_to_frames(abs(err_us)) * self._bpf
+
+            if err_us > threshold and off_by >= self._bpf:  # due later — hold the DAC with silence
+                pad = min(need - written, off_by)
+                out += bytes(pad)
+                written += pad
+                self._pad(pad, starved=False)
+                if not stepped:
+                    self._note_step(err_us)
+                    stepped = True
+                continue
+
+            if err_us < -threshold and off_by >= self._bpf:  # overdue — skip to the frame due now
+                skip = min(remaining, off_by)
+                head.pos += skip
+                self._buffered -= skip
+                if not stepped:
+                    self._note_step(err_us)
+                    stepped = True
+                continue
+
+            if abs(err_us) <= SYNC_DEADBAND_US and not self._aligned:
+                self._aligned = True
+                self.locks += 1
+                logger.info("phase locked: %+.2f ms off the deadline", err_us / 1000)
+
+            trim = self._trim_decision()
+            if trim < 0 and remaining > self._bpf:  # late — lose one frame (23 us at 44.1 kHz)
+                head.pos += self._bpf
+                self._buffered -= self._bpf
+                remaining -= self._bpf
+                self.trims += 1
+            elif trim > 0:  # early — serve one frame twice
+                out += head.pcm[head.pos : head.pos + self._bpf]
+                written += self._bpf
+                self.trims += 1
+                if written >= need:
+                    break
+
+            take = min(need - written, remaining)
+            out += head.pcm[head.pos : head.pos + take]
+            head.pos += take
+            self._buffered -= take
+            written += take
+
+        if written < need:
+            self._pad(need - written, starved=True)
+            out += bytes(need - written)
+        # Defensive, and cheap: the callback assigns this straight into PortAudio's buffer, where a
+        # length mismatch raises inside the audio thread and takes the stream down. Every path above
+        # moves in whole frames, so this can only bite on a server chunk that is not frame-aligned.
+        return bytes(out[:need])
 
     def _callback(self, outdata, frames, time_info, status) -> None:  # noqa: ANN001
         if status and getattr(status, "output_underflow", False):
@@ -359,18 +756,13 @@ class AlsaRenderer:
                     logger.warning("ALSA xruns: %d total", self.xruns)
                     self._xrun_since_log = 0
         need = frames * self._bpf
+        # Read the DAC clock BEFORE taking the lock: the fill thread holds it for the length of an
+        # enqueue, and a play time measured on the far side of that wait is a play time that has
+        # already moved.
+        block_play_us = self._block_play_time(time_info)
         with self._lock:
-            take = min(need, len(self._buf))
-            chunk = bytes(self._buf[:take])
-            del self._buf[:take]
-            playing = self._playing
+            chunk = self._take(need, block_play_us)
             gain, muted = self._gain, self._muted
-        if take < need:
-            if playing:
-                self.starvations += 1
-                self.starved_frames += (need - take) // self._bpf
-            self.pad_frames += (need - take) // self._bpf
-            chunk += b"\x00" * (need - take)
         if muted or gain == 0.0:
             outdata[:] = b"\x00" * need
         elif gain != 1.0:
@@ -398,7 +790,13 @@ class SendspinPlayer:
         initial_volume: int,
         initial_muted: bool = False,
         state_file: str | None = None,
+        identity=None,
+        pairing_store=None,
     ) -> None:
+        # `player_id` is the LISTENER id — what we advertise over mDNS and what a server dials. It is
+        # NOT the id a server knows us by after the handshake: 9.x derives that from `identity`
+        # (identity.peer_id, the X25519 public key) and the client hello no longer carries a chosen
+        # id at all. Two ids, and as with the two NAMES, the listener URL is the join between them.
         self.player_id = player_id
         self.player_name = player_name  # friendly name; also the mDNS TXT `name`
         self.port = port
@@ -411,7 +809,7 @@ class SendspinPlayer:
         # Health reporting: pad_frames at the last client/state, so _health measures the delta
         # rather than a lifetime total that would pin us at error forever after one dropout.
         self._last_starved_frames = 0
-        self._last_reported_state = ClientStateType.SYNCHRONIZED
+        self._last_reported_state = PlayerHealth.SYNCHRONIZED
         # Spec: persist the server that most recently had us playing. Loaded so a restart does not
         # re-write the same value, and so the id survives for the arbitration that will use it.
         self._last_playing_server = load_last_playing_server(self._state_file)
@@ -435,8 +833,24 @@ class SendspinPlayer:
             ],
         )
         self.client = SendspinClient(
-            client_id=player_id,
+            identity=identity or sendspin_identity.load_or_create(sendspin_identity.PLAYER_ROLE),
             client_name=player_name,
+            # Required in 9.x. Carries the Pairing PSK this unit's own server pairs with, and the
+            # unpaired_access flag (both set in sendspin_identity).
+            pairing_store=pairing_store,
+            # What makes this speaker pairable BY A HUMAN, and it is the presence of the wiring that
+            # decides which methods we can offer at all: a gesture_prompt enables static PIN, and
+            # either PIN out-channel enables dynamic PIN. A headless Pi has no screen, but every
+            # unit serves a web GUI and Sendspin needs a network regardless — so the GUI IS the
+            # display and the button, and both channels route to it over the consume relay.
+            pairing_support=PairingSupport(
+                gesture_prompt=self._pair_gesture_prompt,
+                pin_display=self._pair_show_pin,
+                offer_static_pin=True,
+                # NOT free text — see PAIR_SECRET_LOCATIONS. A descriptive string raises here, at
+                # construction, and the player crash-loops before it ever opens a card.
+                secret_locations=PAIR_SECRET_LOCATIONS,
+            ),
             device_info=DeviceInfo(
                 product_name="Plum Audio",
                 manufacturer="Plum Solutions",
@@ -454,6 +868,11 @@ class SendspinPlayer:
             initial_muted=self._muted,
         )
         renderer.set_volume(volume=self._volume, muted=self._muted)
+        # One clock for both ends of compute_play_time(). See AlsaRenderer.set_clock.
+        renderer.set_clock(self.client.now_us)
+        # Whether the LAST chunk carried a schedule, so the transition either way gets exactly one
+        # log line instead of one per 20 ms chunk.
+        self._locked = False
 
         self.client.add_audio_chunk_listener(self._on_audio)
         self.client.add_stream_start_listener(self._on_stream_start)
@@ -469,6 +888,15 @@ class SendspinPlayer:
         # elsewhere by definition. Any Sendspin server can take this speaker (that is the point of
         # the standard), so the GUI has to learn about it from the speaker itself.
         self._state: dict = {"attached": False}
+        # Server connections OVERLAP. A single "current session" field was wrong: 9.x brings an
+        # incoming connection up provisionally before deciding whether to keep it, so short-lived
+        # dials open and close while an older connection is still held — and each one clobbered the
+        # start time, producing durations like "-0.0s" and, far worse, hiding the very thing this
+        # was added to catch. Measured on the rig: session 306 stayed open while 307-311 came and
+        # went. Keyed by sequence number so each session carries its own start.
+        self._session_seq = 0
+        self._sessions: dict[int, float] = {}
+        self._sessions_warned: set[int] = set()
         self._report_task: asyncio.Task | None = None
         self._health_task: asyncio.Task | None = None
         self.report_url = os.environ.get("PLUM_PLAYER_STATE_URL", "http://127.0.0.1:5001/api/mesh/player-state")
@@ -487,6 +915,11 @@ class SendspinPlayer:
         self._last_audio_mono = 0.0
         self._audio_flowing = False
         self._relay_task: asyncio.Task | None = None
+        # Pairing frame for the relay (a live PIN and/or a pending gesture request), latest-wins
+        # like ctrl. Not part of the 3 s state POST: a PIN must reach the operator immediately, and
+        # the relay is loopback-only so it never leaves the unit.
+        self._relay_pair: dict | None = None
+        self._relay_pair_dirty = False
         self.relay_url = os.environ.get("PLUM_PLAYER_RELAY_URL", "ws://127.0.0.1:5001/api/mesh/consume?role=player")
         self.client.add_group_update_listener(self._on_group_update)
         self.client.add_metadata_listener(self._on_metadata)
@@ -645,13 +1078,32 @@ class SendspinPlayer:
         info = self.client.server_info
         attached = self.client.connected and info is not None
         state = {
-            "player_id": self.player_id,
+            # The PEER id, not the listener id. This self-report is joined against
+            # `UnitSnapshot.players[]`, which the server keys on `client.client_id` — the id a
+            # client presents at the handshake, and under 9.x that is the X25519 public key.
+            # Reporting the listener id here instead splits one speaker across two namespaces:
+            # the GUI synthesises a SECOND row for it (sendspinDataService's `clients.find`
+            # misses), and `router._idle_player_url` hands the listener id to a reclaim that
+            # resolves clients by peer id — so an idle speaker dials fine and then times out at
+            # 10 s, every time. They were the same string before the 9.x bump.
+            "player_id": self.client.identity.peer_id,
+            # Kept alongside for display and debugging: this is what we advertise over mDNS and
+            # what a server dials. See the note on `player_id` in __init__.
+            "listener_id": self.player_id,
             "name": self.player_name,
             "url": f"ws://{self._host_hint()}:{self.port}/sendspin",
             "attached": bool(attached),
+            # Phase lock, so four units can be compared over the mesh API instead of by ear. Always
+            # reported, attached or not: `locked: false` on a unit that is playing is the whole
+            # answer, and it is invisible from anywhere else.
+            "sync": self.renderer.sync_report(),
         }
         if attached and info is not None:
-            reason = getattr(info.connection_reason, "value", info.connection_reason)
+            # 9.x trimmed ServerInfo to (server_id, name) — `connection_reason` and `version` are
+            # gone. Its successor is the connection's ACTIVITIES, which is also what the library's
+            # new multi-server arbiter ranks on, so it is the more useful thing to surface anyway.
+            # Nothing consumed the old field; this is telemetry for the mesh view and the GUI.
+            activities = sorted(getattr(a, "value", a) for a in (self.client.activities or []))
             # Only advertise a current track while audio is actually flowing. A foreign server (MA)
             # holds our player as a group member even when idle, and its last metadata title lingers
             # in _state — reporting it while stopped makes the "Idle Devices" chip claim a track is
@@ -660,7 +1112,7 @@ class SendspinPlayer:
             state.update(
                 server_id=info.server_id,
                 server_name=info.name,
-                connection_reason=reason,
+                activities=activities,
                 group_id=self._state.get("group_id"),
                 group_name=self._state.get("group_name"),
                 playback_state=("playing" if playing else "stopped"),
@@ -723,6 +1175,10 @@ class SendspinPlayer:
                 self._relay_ctrl_dirty = False
                 with contextlib.suppress(Exception):
                     await ws.send_json(self._relay_ctrl)
+            if self._relay_pair_dirty and self._relay_pair is not None:
+                self._relay_pair_dirty = False
+                with contextlib.suppress(Exception):
+                    await ws.send_json(self._relay_pair)
             if self._relay_art_dirty and self._relay_art is not None:
                 self._relay_art_dirty = False
                 with contextlib.suppress(Exception):
@@ -732,6 +1188,43 @@ class SendspinPlayer:
                 with contextlib.suppress(Exception):
                     await ws.send_json(frame)
             await asyncio.sleep(1 / 30)
+
+    # -- pairing: the GUI is this speaker's display and its button ------------
+
+    async def _pair_show_pin(self, pin: str | None) -> None:
+        """`pin_display`: surface a derived dynamic PIN, or clear it when the exchange ends.
+
+        Called with the PIN when one is derived and with None on success OR failure, so the GUI can
+        take the dialog down either way. Pushed over the consume relay rather than ridden along on
+        the 3 s player-state POST: a PIN the operator is waiting to read must appear immediately,
+        and the relay is loopback-only, so the PIN never leaves the unit.
+        """
+        self._emit_pair(pin=pin)
+        logger.info("pairing: %s", "PIN displayed" if pin else "PIN cleared")
+
+    async def _pair_gesture_prompt(self, needed: bool) -> None:
+        """`gesture_prompt`: ask the operator to confirm, or withdraw the ask.
+
+        Its mere presence is what lets us offer static-PIN pairing, which the spec gesture-gates on
+        EVERY attempt — so this is not a one-off confirmation, it is the thing that makes a static
+        PIN safe to have. The GUI answers it by calling `open_pairing_window()` through the mesh API.
+        """
+        self._emit_pair(gesture=needed)
+        logger.info("pairing: gesture %s", "requested" if needed else "withdrawn")
+
+    def _emit_pair(self, *, pin: str | None = None, gesture: bool | None = None) -> None:
+        """Latest-wins pairing frame for the relay, in the same `t`-tagged shape as ctrl/viz/art.
+
+        Merges rather than replaces: a PIN and a gesture request can be live at once (static-PIN
+        pairing asks for both), and each callback only knows about its own half.
+        """
+        frame = dict(self._relay_pair or {"t": "pair"})
+        if pin is not None or "pin" in frame:
+            frame["pin"] = pin
+        if gesture is not None:
+            frame["gesture"] = gesture
+        self._relay_pair = frame
+        self._relay_pair_dirty = True
 
     async def _relay_command(self, data: dict) -> None:
         """A transport command from the GUI → send it to the server we are a member of."""
@@ -761,12 +1254,50 @@ class SendspinPlayer:
         while True:
             await asyncio.sleep(HEALTH_POLL_S)
             self._remember_playing_server()
+            self._warn_if_session_is_stuck()
             if not self.client.connected:
                 continue
             state = self._health()
             if state is not self._last_reported_state:
                 with contextlib.suppress(Exception):  # never break the render path over a report
                     await self._send_client_state(state)
+
+    def _warn_if_session_is_stuck(self) -> None:
+        """Say so when a server connection has been held implausibly long.
+
+        `attach_websocket` blocks for the whole life of a connection, so "detached from server"
+        only prints when it RETURNS. A wedge observed on the rig showed `stream_end -> idle` and
+        then that line never arriving, while the server had already dropped the client and every
+        later dial timed out — a client holds exactly ONE websocket, so nothing could get in.
+
+        That points at the player still sitting inside `attach_websocket` on a connection the other
+        end has abandoned: a half-open socket we never noticed. This does not fix it and does not
+        guess; it makes the state visible in the log, once per session, so a soak run can be read
+        afterwards. `connected` is reported alongside because the interesting case is the library
+        still believing it has a live peer.
+
+        Checks EVERY open session, not just the newest. Connections overlap — 9.x brings an incoming
+        one up provisionally before deciding whether to keep it — so the stuck one is by definition
+        the old one that newer, short-lived dials would otherwise hide.
+        """
+        now = time.monotonic()
+        for session, started in sorted(self._sessions.items()):
+            if session in self._sessions_warned:
+                continue
+            held = now - started
+            if held < STUCK_SESSION_WARN_S:
+                continue
+            self._sessions_warned.add(session)
+            logger.warning(
+                "session %d has been attached for %.0fs without detaching (%d sessions open, "
+                "client.connected=%s, audio_flowing=%s) — if dials are timing out, this is the "
+                "websocket holding them off",
+                session,
+                held,
+                len(self._sessions),
+                self.client.connected,
+                self._audio_flowing,
+            )
 
     def _remember_playing_server(self) -> None:
         """Persist the server_id of whoever most recently had us actually playing.
@@ -809,41 +1340,50 @@ class SendspinPlayer:
         self.renderer.start()
 
         async def on_connection(ws) -> None:
-            # attach_websocket raises if we're already attached to another server — that means a
-            # reclaim handoff: release the old connection (goodbye ANOTHER_SERVER) then attach
-            # the new one. This is the player half of cross-server roaming.
+            """Serve one incoming server connection for its whole life.
+
+            **Both workarounds this used to carry are gone**, and it is worth being explicit about
+            why, because between them they were the player half of cross-server roaming:
+
+            1. *The reclaim dance.* 6.0.5's `attach_websocket` raised RuntimeError if we already held
+               a server, so we caught it, sent `goodbye: ANOTHER_SERVER`, disconnected, and re-attached
+               — yielding to the newest dialer unconditionally. That was UPSTREAM §1, and it was wrong
+               against a foreign server running a discovery sweep: it handed over a *playing* speaker.
+               9.x brings the incoming connection up provisionally, completes the handshake, and then
+               arbitrates by activity rank with the persisted last-playback server as the tiebreak —
+               the "accept both, then decide" the spec asks for and we could not express. Displacing
+               a holder emits ANOTHER_SERVER itself.
+            2. *The conformant re-send.* We followed the library's connect-time `client/state` with
+               our own because its was missing the spec's REQUIRED top-level field (UPSTREAM §0). 9.x
+               replaced that field with `available` and sets it itself, so the duplicate is now pure
+               noise on the mandatory message.
+
+            `attach_websocket` blocks until the connection closes, which is what drives this handler,
+            so the old disconnect-listener/Event pair is redundant too.
+            """
+            # Don't charge pre-attach idle padding to this session's health. Deliberately before the
+            # attach: everything up to now is idle by definition, and the attach does not return
+            # until the connection is over.
+            self._last_starved_frames = self.renderer.starved_frames
+            self._session_seq += 1
+            session = self._session_seq
+            self._sessions[session] = time.monotonic()
+            logger.info(
+                "server dialed us [session %d, %d open] %s", session, len(self._sessions), self.renderer.stats()
+            )
             try:
                 await self.client.attach_websocket(ws)
-            except RuntimeError:
-                with contextlib.suppress(Exception):
-                    await self.client.send_goodbye(GoodbyeReason.ANOTHER_SERVER)
-                with contextlib.suppress(Exception):
-                    await self.client.disconnect()
-                try:
-                    await self.client.attach_websocket(ws)
-                except Exception:  # noqa: BLE001 - transient during rapid reclaim; server retries
-                    logger.debug("attach race during reclaim", exc_info=True)
-                    return
-            disc = asyncio.Event()
-            self.client.add_disconnect_listener(disc.set)
-            logger.info("attached to a server %s", self.renderer.stats())
-            # Re-send client/state immediately, conformantly.
-            #
-            # attach_websocket's handshake already sent one — through the library's own
-            # send_player_state(), which omits the spec's REQUIRED top-level `state` (UPSTREAM §0).
-            # That is the message the spec singles out ("must be sent immediately after receiving
-            # server/hello"), so overriding only the states WE initiate left the mandatory one
-            # non-conformant. Confirmed on the wire 2026-08-05: our own frames carry the field, the
-            # library's connect-time frame does not.
-            #
-            # A duplicate client/state is harmless — it is a full state report, not a delta — so
-            # following the library's with a correct one is the cheapest way to be conformant
-            # without patching it. Delete when the pin bumps past the fix.
-            self._last_starved_frames = self.renderer.starved_frames  # don't charge pre-attach idle
-            with contextlib.suppress(Exception):
-                await self._send_client_state(ClientStateType.SYNCHRONIZED)
-            await disc.wait()
-            logger.info("detached from server %s", self.renderer.stats())
+            finally:
+                started = self._sessions.pop(session, None)
+                self._sessions_warned.discard(session)
+                held = time.monotonic() - started if started is not None else float("nan")
+                logger.info(
+                    "detached from server [session %d after %.1fs, %d still open] %s",
+                    session,
+                    held,
+                    len(self._sessions),
+                    self.renderer.stats(),
+                )
 
         self._listener = ClientListener(
             client_id=self.player_id, on_connection=on_connection, port=self.port, advertise_mdns=False
@@ -916,7 +1456,20 @@ class SendspinPlayer:
 
     def _on_audio(self, server_ts_us: int, pcm: bytes, fmt) -> None:  # noqa: ANN001
         self._last_audio_mono = time.monotonic()  # for the stall safety-net only (never flips ON)
-        self.renderer.enqueue(pcm)
+        play_us = None
+        if SYNC_LOCK and self.client.is_time_synchronized():
+            # Convert HERE, in the loop thread, not in the PortAudio callback. Two reasons, both
+            # load-bearing: the time filter is only safe to read from the thread that updates it,
+            # and a play time in CLIENT microseconds survives a server change — so the buffer keeps
+            # draining on the right timeline while a roam's new connection re-converges its filter,
+            # which is what keeps a roam inaudible.
+            play_us = self.client.compute_play_time(server_ts_us)
+        if play_us is None and self._locked:
+            logger.info("time sync lost — the renderer is free-running until it converges again")
+        elif play_us is not None and not self._locked:
+            logger.info("time sync converged — phase-locked playback %s", self.renderer.stats())
+        self._locked = play_us is not None
+        self.renderer.enqueue(pcm, play_us)
 
     def _on_stream_clear(self, channels) -> None:  # noqa: ANN001
         logger.info("stream_clear -> flush (buffered audio discarded) %s", self.renderer.stats())
@@ -968,7 +1521,7 @@ class SendspinPlayer:
         if self._save_task is None or self._save_task.done():
             self._save_task = asyncio.ensure_future(self._save_render_state())
 
-    def _health(self) -> ClientStateType:
+    def _health(self) -> PlayerHealth:
         """SYNCHRONIZED, or ERROR while we are demonstrably failing to keep up.
 
         The spec asks a client that cannot maintain sync — buffer underrun is its own example — to
@@ -997,40 +1550,35 @@ class SendspinPlayer:
         # ~12s of "starvation" on two units at once that was just the user pressing pause.
         # The baseline is still advanced above, so the pause's padding is not charged to the resume.
         if self._state.get("playback_speed") == 0:
-            return ClientStateType.SYNCHRONIZED
+            return PlayerHealth.SYNCHRONIZED
 
-        return ClientStateType.ERROR if delta >= ERROR_STARVED_FRAMES else ClientStateType.SYNCHRONIZED
+        return PlayerHealth.ERROR if delta >= ERROR_STARVED_FRAMES else PlayerHealth.SYNCHRONIZED
 
     async def _send_render_state(self) -> None:
         with contextlib.suppress(Exception):  # a state report must never break the render path
             await self._send_client_state(self._health())
 
-    async def _send_client_state(self, state: ClientStateType) -> None:
-        """Send client/state, bypassing the library's non-conformant builder.
+    async def _send_client_state(self, state: PlayerHealth) -> None:
+        """Send client/state, and record health where something can still act on it.
 
-        The player payload mirrors what send_player_state() would have built, which is why it
-        reaches for the same private attributes. See build_client_state_message for the why.
+        `available` is NOT the old `state` field renamed. It means "can participate at all", and the
+        server ends an active stream before honouring `available=False` — so a struggling-but-playing
+        renderer reports `available=True`, always. A running player has an open output device by
+        construction (AlsaRenderer.start() raises otherwise and SendspinPlayer.start() calls it before
+        the listener), so there is currently no path here that should report False.
+
+        The library now builds the whole payload, including the lead-time and buffer fields we used
+        to reach into private attributes for — that workaround, and UPSTREAM §0's builder, are gone.
+
+        The health signal itself survives in the log and in player_state.json. See PlayerHealth.
         """
-        client = self.client
-        message = build_client_state_message(
-            state,
-            volume=self._volume,
-            muted=self._muted,
-            static_delay_ms=round(client._static_delay_us / 1_000),  # noqa: SLF001
-            required_lead_time_ms=round(client._required_lead_time_us / 1_000),  # noqa: SLF001
-            min_buffer_ms=round(client._min_buffer_us / 1_000),  # noqa: SLF001
-            supported_commands=client._state_supported_commands or None,  # noqa: SLF001
-        )
-        payload = message.to_json()
-        # The exact bytes, at DEBUG. This message is the one place we bypass the library's own
-        # builder (it drops the spec's REQUIRED top-level `state` — UPSTREAM §0), so being able to
-        # read what actually went on the wire without a packet capture is worth one log line. The
-        # units have no tcpdump, and aiosendspin's DEBUG does not dump frames.
-        logger.debug("client/state -> %s", payload)
-        await client._send_message(payload)  # noqa: SLF001
+        await self.client.send_player_state(available=True, volume=self._volume, muted=self._muted)
         if state is not self._last_reported_state:
-            logger.warning("reporting client state=%s %s", state.value, self.renderer.stats())
+            # WARNING rather than INFO on the way into ERROR: this is the only remaining surface for
+            # "this speaker is dropping out", now that the wire cannot carry it.
+            logger.warning("player health=%s %s", state.value, self.renderer.stats())
             self._last_reported_state = state
+            save_player_health(self._state_file, state.value)
 
     async def _save_render_state(self) -> None:
         await asyncio.sleep(STATE_SAVE_DEBOUNCE_S)
@@ -1077,9 +1625,22 @@ async def main() -> int | None:
     )
 
     renderer = AlsaRenderer(rate, channels, bits, device=device, target_buffer_ms=target_buffer_ms)
+    # Normally already on disk — the server mints both identities at startup and it has the lower
+    # supervisord priority. load_or_create rather than a plain read so a hand-run player on the dev
+    # rig (no supervisord) still works, and so the two can never disagree about which key is ours.
+    identity = sendspin_identity.load_or_create(sendspin_identity.PLAYER_ROLE)
+    # settings.json > PLUM_UNPAIRED_ACCESS > off. Applied at construction because the flag rides in
+    # `client/hello`, so it is fixed for the life of a connection — a change takes effect on the
+    # player's next restart, the same deliberate trade as a device rename.
+    pairing_store = await sendspin_identity.client_pairing_store(
+        unpaired_access=sendspin_identity.unpaired_access_enabled()
+    )
+    logger.info("player identity: peer_id=%s (listener id %s)", identity.peer_id, player_id)
     player = SendspinPlayer(
         player_id,
         player_name,
+        identity=identity,
+        pairing_store=pairing_store,
         port=port,
         renderer=renderer,
         rate=rate,

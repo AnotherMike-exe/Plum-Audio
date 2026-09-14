@@ -455,3 +455,157 @@ def test_the_legacy_headphones_placeholder_still_takes_its_own_path(manager):
     """It is also `hw:`-prefixed; the two clauses must not fight over it."""
     manager.update_settings({"audio": {"output": {"device": "hw:Headphones"}}})
     assert manager.get_settings()["audio"]["output"]["device"] is None
+
+
+# -- unpaired access: settings.json > env > OFF ------------------------------------------------------
+
+
+def _unpaired(tmp_path, monkeypatch, *, stored=..., env=None):
+    """Resolve unpaired access with a given stored value and environment."""
+    import importlib
+    import json as _json
+
+    import sendspin_identity
+
+    path = tmp_path / "settings.json"
+    if stored is not ...:
+        path.write_text(_json.dumps({"pairing": {"unpairedAccess": stored}}))
+    monkeypatch.setenv("PLUM_SETTINGS_FILE", str(path))
+    if env is None:
+        monkeypatch.delenv("PLUM_UNPAIRED_ACCESS", raising=False)
+    else:
+        monkeypatch.setenv("PLUM_UNPAIRED_ACCESS", env)
+    importlib.reload(sendspin_identity)
+    return sendspin_identity.unpaired_access_enabled()
+
+
+def test_unpaired_access_defaults_off(tmp_path, monkeypatch):
+    """The product default, and the whole point of implementing pairing. On would mean shipping the
+    deviation we removed: encrypted but unauthenticated, which the spec calls MITM-vulnerable."""
+    assert _unpaired(tmp_path, monkeypatch) is False
+
+
+def test_the_env_supplies_the_deploy_time_default(tmp_path, monkeypatch):
+    """Meaningful only while nobody has chosen in the GUI — the same tier PLUM_DAC_DEVICE occupies."""
+    assert _unpaired(tmp_path, monkeypatch, env="1") is True
+    assert _unpaired(tmp_path, monkeypatch, env="0") is False
+
+
+def test_settings_beat_the_env_in_both_directions(tmp_path, monkeypatch):
+    assert _unpaired(tmp_path, monkeypatch, stored=True, env="0") is True
+    assert _unpaired(tmp_path, monkeypatch, stored=False, env="1") is False
+
+
+def test_a_stored_false_is_a_real_choice_not_an_absent_one(tmp_path, monkeypatch):
+    """The reason the stored default is null rather than false. If `False` were read as "unset", a
+    user who turned this OFF in the GUI would have it silently turned back on by the env on the next
+    deploy — the failure mode `audio.output.device` was redesigned to avoid."""
+    assert _unpaired(tmp_path, monkeypatch, stored=False, env="1") is False
+
+
+def test_a_damaged_settings_file_falls_back_rather_than_raising(tmp_path, monkeypatch):
+    """Both audio processes call this unwrapped at boot; a raise here would kill the unit."""
+    import importlib
+
+    import sendspin_identity
+
+    path = tmp_path / "settings.json"
+    path.write_text("{ this is not json")
+    monkeypatch.setenv("PLUM_SETTINGS_FILE", str(path))
+    monkeypatch.setenv("PLUM_UNPAIRED_ACCESS", "1")
+    importlib.reload(sendspin_identity)
+    assert sendspin_identity.unpaired_access_enabled() is True
+
+
+def test_a_settings_file_whose_pairing_key_is_not_a_dict_does_not_raise(tmp_path, monkeypatch):
+    """A hand-edit can put anything there; the chained .get() walk must not explode on it."""
+    import importlib
+    import json as _json
+
+    import sendspin_identity
+
+    path = tmp_path / "settings.json"
+    path.write_text(_json.dumps({"pairing": "nonsense"}))
+    monkeypatch.setenv("PLUM_SETTINGS_FILE", str(path))
+    monkeypatch.delenv("PLUM_UNPAIRED_ACCESS", raising=False)
+    importlib.reload(sendspin_identity)
+    assert sendspin_identity.unpaired_access_enabled() is False
+
+
+def test_a_missing_settings_file_is_silent_not_a_traceback(tmp_path, monkeypatch, caplog):
+    """First boot has no settings.json — the env tier exists precisely for that state. Logging a
+    stack trace for it would put an alarming traceback in every fresh unit's log."""
+    import importlib
+    import logging
+
+    import sendspin_identity
+
+    monkeypatch.setenv("PLUM_SETTINGS_FILE", str(tmp_path / "does-not-exist.json"))
+    monkeypatch.delenv("PLUM_UNPAIRED_ACCESS", raising=False)
+    importlib.reload(sendspin_identity)
+    with caplog.at_level(logging.WARNING):
+        assert sendspin_identity.unpaired_access_enabled() is False
+    assert not caplog.records, f"a missing settings file logged: {[r.message for r in caplog.records]}"
+
+
+# -- the fleet pairing secret ------------------------------------------------------------------------
+
+
+def _fleet(monkeypatch, value):
+    import importlib
+
+    import sendspin_identity
+
+    if value is None:
+        monkeypatch.delenv("PLUM_FLEET_PSK", raising=False)
+    else:
+        monkeypatch.setenv("PLUM_FLEET_PSK", value)
+    importlib.reload(sendspin_identity)
+    return sendspin_identity
+
+
+def test_no_fleet_secret_is_a_valid_stricter_posture(monkeypatch):
+    """Unset means units pair only with their own speaker automatically; everything else is a
+    deliberate act in the GUI. That is a real choice, not a broken configuration."""
+    assert _fleet(monkeypatch, None).fleet_psk() is None
+
+
+def test_a_well_formed_fleet_secret_is_accepted(monkeypatch):
+    from aiosendspin.noise import b64url_encode, generate_psk
+
+    si = _fleet(monkeypatch, b64url_encode(generate_psk()))
+    assert si.fleet_psk() is not None and len(si.fleet_psk()) == 32
+
+
+def test_a_malformed_fleet_secret_is_refused_not_half_applied(monkeypatch):
+    """Refusing loudly matters more than usual here: a PSK that half-applies would leave SOME units
+    able to pair and others not, which reads as an intermittent mesh fault rather than a typo."""
+    assert _fleet(monkeypatch, "not base64 !!").fleet_psk() is None
+
+
+def test_a_correctly_encoded_secret_of_the_wrong_LENGTH_is_refused(monkeypatch):
+    """Valid base64url that decodes to 16 bytes is the plausible mistake — someone generating a
+    secret with the wrong byte count. It must not be silently padded or accepted."""
+    from aiosendspin.noise import b64url_encode
+
+    assert _fleet(monkeypatch, b64url_encode(b"\x01" * 16)).fleet_psk() is None
+
+
+def test_the_fleet_secret_takes_over_the_local_pairing_slot(monkeypatch, tmp_path):
+    """A client accepts exactly ONE Pairing PSK, so the fleet value must displace the per-unit one —
+    otherwise a unit would accept the fleet secret from peers but present its own to its own player,
+    and pair with nobody."""
+    from aiosendspin.noise import b64url_encode, generate_psk
+
+    psk = generate_psk()
+    monkeypatch.setenv("PLUM_IDENTITY_DIR", str(tmp_path))
+    si = _fleet(monkeypatch, b64url_encode(psk))
+    assert si.local_pairing_psk() == psk
+
+
+def test_without_a_fleet_secret_each_unit_mints_its_own(monkeypatch, tmp_path):
+    monkeypatch.setenv("PLUM_IDENTITY_DIR", str(tmp_path))
+    si = _fleet(monkeypatch, None)
+    first = si.local_pairing_psk()
+    assert len(first) == 32
+    assert si.local_pairing_psk() == first, "must be stable, or the unit re-pairs itself every boot"

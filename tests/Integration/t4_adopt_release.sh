@@ -20,10 +20,28 @@ echo "== Tier 4: adopt / release a foreign speaker (unit=$UNIT) =="
 SOURCE="$(ssh_json "$UNIT" /api/mesh/snapshot 'd["sources"][0]["source_id"] if d["sources"] else ""')"
 [[ -n "$SOURCE" ]] || { _no "unit has no source to adopt onto"; finish; exit; }
 
-# The foreign speaker: given, or the first non-own player on the segment.
+# The foreign speaker: given, or the first player on the segment that is not a PLUM one.
+#
+# `is_own` alone stopped being enough once a unit began RELEASING its player when idle: a peer's
+# speaker is then unattached and advertising, so it shows up here as an adoptable "foreign" speaker
+# and this test would silently adopt a sibling unit instead of an ESP32. It even fails differently —
+# releasing a peer's player leaves that peer's own server free to re-dial it, so the
+# ESTABLISHED-socket check trips on behaviour that is correct for a Plum peer and wrong only for a
+# third-party speaker. Pass a URL explicitly to target a specific board.
+#
+# Filtered in bash, not inside the python one-liner: the exclusion list is a set of URLs, and
+# interpolating them into that expression is a quoting trap (it produced a SyntaxError, and the
+# resulting empty pick read as "no foreign speaker on the segment" — a skip that looks like a
+# missing device rather than a broken query).
 if [[ -z "$URL" ]]; then
-    URL="$(ssh_json "$UNIT" /api/mesh/neighbourhood \
-        'next((p["url"] for p in d["players"] if not p["is_own"]), "")')"
+    PLUM_URLS=" $(ssh_json "$UNIT" /api/mesh/view \
+        '" ".join((u.get("local_player") or {}).get("url") or "" for u in d["units"])') "
+    CANDIDATES="$(ssh_json "$UNIT" /api/mesh/neighbourhood \
+        '" ".join(p["url"] for p in d["players"] if not p["is_own"])')"
+    for c in $CANDIDATES; do
+        [[ "$PLUM_URLS" == *" $c "* ]] && continue
+        URL="$c"; break
+    done
 fi
 [[ -n "$URL" ]] || { printf '  \033[33mSKIP\033[0m no foreign speaker on the segment to adopt\n'; finish; exit; }
 echo "  target: $URL  ->  source $SOURCE"

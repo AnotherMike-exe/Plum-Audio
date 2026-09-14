@@ -17,22 +17,47 @@ Endpoints (parity with the old /api/federation/* surface, so the GUI ports with 
   POST /api/mesh/route             {player_id, source_id}          route a player onto a source
   POST /api/mesh/unroute           {player_id, source_id}          remove a player from a source
   POST /api/mesh/volume            {player_id, volume, muted}      per-player (endpoint) volume
+  POST /api/mesh/player-delay      {player_id, delay_ms}           correct an endpoint that plays LATE
   POST /api/mesh/source-volume     {source_id, volume?, muted?}    the SENDING DEVICE's own volume
   POST /api/mesh/source            {source_id, fifo?}              start a local source (a group)
   POST /api/mesh/source/stop       {source_id}                     stop a local source
+  GET  /api/mesh/calibration                                       every unit's curves, merged
+  GET  /api/mesh/calibration/tone                                  is a calibration tone playing?
+  POST /api/mesh/calibration/tone  {player_id, volume, type?, ...} play the tone from ONE endpoint
+  POST /api/mesh/calibration/tone/stop                             stop it and restore the endpoint
+  GET  /api/mesh/pairing           [?client_id]                    what pairing was attempted, and how it went
+  POST /api/mesh/pair              {client_id, method, token?}     begin a pairing attempt
+  POST /api/mesh/pair/pin          {client_id, pin}                answer a PIN prompt (409 if none is waiting)
+  POST /api/mesh/pair/cancel       {client_id}                     abandon an attempt, keep the connection
+  POST /api/mesh/unpair            {client_id}                     drop the record both ends hold
+  POST /api/mesh/pairing-window    {client_id?}                    stand in for the operator's gesture
+  GET  /api/mesh/update                                            what this unit runs, and what is available
+  POST /api/mesh/update            {channel?, check_only?}         ask the HOST agent to update this unit
 
 Sources are local to the unit that ingests them ("servers stay") — /source acts on THIS unit;
 there is no delegation. Multiple sources may run concurrently, each anchoring its own group.
+
+Pairing is likewise local, and for a stronger reason: it is a property of the connection between
+THIS server and that client, so there is nothing meaningful to delegate. The GUI reaches a peer's
+pairing by calling that peer's own API, exactly as it does for volume. An attempt runs as a
+background task — the exchange includes a PAKE round and a wait on a human — so /pair returns
+immediately and the outcome is collected from GET /pairing.
 """
 
 from __future__ import annotations
 
 import contextlib
+import hmac
 import logging
+import os
 from collections.abc import Awaitable, Callable
 
 import cors_policy
+import updater
 from aiohttp import web
+from calibration import describe as describe_calibration
+from calibration import merge_calibrations
+from calibration_tone import CalibrationToneController, ToneError
 from speaker_names import SpeakerNames
 from sync_engine.base import SyncEngine
 
@@ -113,6 +138,17 @@ class MeshApi:
         self._agg = aggregator
         self._router = router
         self._neighbourhood = neighbourhood
+        # The calibration tone runs here rather than on the Flask config API because only this
+        # process can create a source and route a player. Its persistence half is the other side —
+        # apis/calibration_api.py, which stores curves and never makes a sound.
+        self._tone = CalibrationToneController(
+            engine,
+            router,
+            lambda: self._agg.view(),
+            # The router resolves a source through the aggregated view, which is a 2 s cache — so a
+            # tone source must be published into it before anything can be routed onto it.
+            refresh_view=self._agg.refresh,
+        )
         # Read-only here: the audio process learns these while a speaker is attached (see
         # sendspin_server.snapshot). Its own instance, so a reload picks up whatever is on disk.
         self._speaker_names = SpeakerNames()
@@ -124,6 +160,11 @@ class MeshApi:
         # plumbing between our own player and our own GUI; the spec-native part is the player being a
         # conformant group member. See sendspin_player.py / MeshApi._consume.
         self._consumers: set[web.WebSocketResponse] = set()
+        # Reports a user-driven volume to the loudness reconciler the moment it happens, so a group
+        # re-levels immediately instead of waiting for the next 2 s poll to notice. Set in
+        # sendspin_server.main() once the reconciler exists; None on a unit running without it.
+        self.on_user_volume: Callable[[str, int], None] | None = None
+        self._last_pair: dict | None = None  # latest pairing prompt (PIN / gesture), latest-wins
         self._producer: web.WebSocketResponse | None = None
         self._last_ctrl: dict | None = None  # cache so a GUI that connects mid-session gets it
         self._last_art: dict | None = None  # ditto for album art (per-track, low rate)
@@ -153,9 +194,23 @@ class MeshApi:
                 web.post("/api/mesh/route", self._route),
                 web.post("/api/mesh/unroute", self._unroute),
                 web.post("/api/mesh/volume", self._volume),
+                web.post("/api/mesh/player-delay", self._player_delay),
                 web.post("/api/mesh/source-volume", self._source_volume),
                 web.post("/api/mesh/source", self._source_start),
                 web.post("/api/mesh/source/stop", self._source_stop),
+                web.get("/api/mesh/calibration", self._calibration_merged),
+                web.get("/api/mesh/calibration/tone", self._tone_status),
+                web.post("/api/mesh/calibration/tone", self._tone_start),
+                web.post("/api/mesh/calibration/tone/volume", self._tone_volume),
+                web.post("/api/mesh/calibration/tone/stop", self._tone_stop),
+                web.get("/api/mesh/pairing", self._pairing_state),
+                web.post("/api/mesh/pair", self._pair),
+                web.post("/api/mesh/pair/pin", self._pair_pin),
+                web.post("/api/mesh/pair/cancel", self._pair_cancel),
+                web.post("/api/mesh/unpair", self._unpair),
+                web.post("/api/mesh/pairing-window", self._pairing_window),
+                web.get("/api/mesh/update", self._update_status),
+                web.post("/api/mesh/update", self._update_apply),
                 web.route("OPTIONS", "/api/mesh/{tail:.*}", self._options),
             ]
         )
@@ -166,6 +221,12 @@ class MeshApi:
         logger.info("mesh API up on :%d", self.port)
 
     async def stop(self) -> None:
+        # Stop any calibration tone BEFORE tearing the listener down, so the endpoint is restored
+        # while the router and engine still work. Nothing else would ever do it: the tone's own
+        # watchdog is minutes long, and a SIGTERM mid-calibration — a container restart, a deploy —
+        # would otherwise leave the speaker routed to a `cal:` source that is about to die, at the
+        # tone's volume, and an adopted third-party speaker never handed back to its own server.
+        await self._tone.shutdown()
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
@@ -214,11 +275,15 @@ class MeshApi:
         if not url or not source_id:
             return web.json_response({"error": "url and source_id required"}, status=400)
         try:
-            ok = await self._engine.adopt_client(source_id, url, player_id=player_id)
+            adopted = await self._engine.adopt_client(source_id, url, player_id=player_id)
         except Exception as e:  # noqa: BLE001 - report the failure rather than 500-ing
             logger.exception("adopt failed")
             return web.json_response({"error": str(e)}, status=400)
-        return web.json_response({"ok": bool(ok)})
+        # `player_id` echoes the id the HANDSHAKE gave, which is generally not the hint we dialled
+        # with — mDNS names by instance, the handshake by MAC. This is the only moment both are in
+        # hand, so anything that must remember something about this speaker (a calibration curve)
+        # keys on this, never on the URL, which is IP-derived and moves with DHCP.
+        return web.json_response({"ok": adopted is not None, "player_id": adopted})
 
     async def _release(self, request: web.Request) -> web.Response:
         """Let a foreign speaker go: drop it from the group and hang up, so its own server can
@@ -247,7 +312,7 @@ class MeshApi:
             logger.info("consume relay: player producer connected")
         else:
             self._consumers.add(ws)
-            for cached in (self._last_ctrl, self._last_art):  # bring a late GUI up to speed
+            for cached in (self._last_ctrl, self._last_art, self._last_pair):  # bring a late GUI up to speed
                 if cached is not None:
                     with contextlib.suppress(Exception):
                         await ws.send_json(cached)
@@ -264,6 +329,13 @@ class MeshApi:
                         self._last_ctrl = data
                     elif data.get("t") == "art":
                         self._last_art = data
+                    elif data.get("t") == "pair":
+                        # Cached, because a foreign server's pairing attempt is time-boxed and the
+                        # operator may open the GUI only once MA has already asked. An uncached PIN
+                        # would simply never be seen — which is exactly how MA's first pair attempt
+                        # failed: the player derived and emitted it, nothing rendered it, and the
+                        # attempt timed out as `user_cancelled`.
+                        self._last_pair = data
                     await self._broadcast(data)  # ctrl + viz + art → every GUI
                 elif data.get("t") == "cmd" and self._producer is not None:
                     with contextlib.suppress(Exception):
@@ -272,6 +344,7 @@ class MeshApi:
             if is_player and self._producer is ws:
                 self._producer = None
                 self._last_ctrl = None
+                self._last_pair = None
                 self._last_art = None
             else:
                 self._consumers.discard(ws)
@@ -339,11 +412,44 @@ class MeshApi:
         player_id = body.get("player_id")
         if not player_id or "volume" not in body:
             return web.json_response({"error": "player_id and volume required"}, status=400)
+        volume = int(body["volume"])
         try:
-            await self._router.set_volume(player_id, int(body["volume"]), bool(body.get("muted", False)))
+            await self._router.set_volume(player_id, volume, bool(body.get("muted", False)))
         except (KeyError, RuntimeError) as e:
             return web.json_response({"error": str(e)}, status=400)
+        # Tell the matcher what the user asked for rather than making it infer the same fact from a
+        # cached view one poll later. This request IS the event; without it the whole lag between
+        # moving one slider and the group following is the poll interval.
+        if self.on_user_volume is not None:
+            with contextlib.suppress(Exception):
+                self.on_user_volume(player_id, volume)
         return web.json_response({"ok": True})
+
+    async def _player_delay(self, request: web.Request) -> web.Response:
+        """Tell the server how much output latency an endpoint has, so it can send it earlier.
+
+        This is the spec's `static_delay_ms`, and it is the answer for a client that does not report
+        its own — an ESPHome speaker omits the player timing fields entirely, so the library assumes
+        zero and the device plays late by however long its real path takes. Buffering cannot fix
+        that: the figure is a property of the hardware.
+
+        Larger sends EARLIER. An endpoint running half a second behind the room takes ~500.
+
+        Bounded at 5 s. The field is a hardware latency, not a party trick, and an unbounded value
+        would let one slider push an endpoint so far ahead that it can never be fed.
+        """
+        body = await self._json(request)
+        player_id = body.get("player_id")
+        if not player_id:
+            return web.json_response({"error": "player_id required"}, status=400)
+        try:
+            delay_ms = int(body.get("delay_ms", 0))
+        except (TypeError, ValueError):
+            return web.json_response({"error": "delay_ms must be an integer"}, status=400)
+        if not 0 <= delay_ms <= 5000:
+            return web.json_response({"error": "delay_ms must be between 0 and 5000"}, status=400)
+        await self._engine.set_player_delay(player_id, delay_ms)
+        return web.json_response({"ok": True, "player_id": player_id, "delay_ms": delay_ms})
 
     async def _source_volume(self, request: web.Request) -> web.Response:
         """The volume ON THE SENDING DEVICE — the phone's AirPlay/BT slider, Spotify's device volume.
@@ -380,6 +486,240 @@ class MeshApi:
             return web.json_response({"error": "source_id required"}, status=400)
         await self._engine.stop_source(source_id)
         return web.json_response({"ok": True, "source_id": source_id})
+
+    # -- updates -------------------------------------------------------------
+    #
+    # The container cannot replace itself, so both handlers below only move a file across the
+    # /config bind mount; the HOST agent does the pull and the recreate. See updater.py for why
+    # there is no Docker socket in here.
+    #
+    # These live on :5001 rather than the config API on :5002 for one concrete reason: a peer's
+    # :5002 is deliberately unreachable cross-origin (the same rule that makes calibration
+    # write-local), and the GUI must be able to drive a SET of units from one page. It already
+    # calls a peer's :5001 directly for volume and pairing, so the fan-out needs no new server-side
+    # delegation — the page addresses each unit itself, and a partial failure names the unit.
+
+    async def _update_status(self, request: web.Request) -> web.Response:
+        return web.json_response(updater.status())
+
+    async def _update_apply(self, request: web.Request) -> web.Response:
+        """Write an update request for THIS unit and return at once.
+
+        Deliberately not a fan-out. Delegating here would make one unit responsible for the
+        outcome on every other, and the failure it would have to report ("peer 3 never came back")
+        is exactly the thing the caller can see better than we can. The GUI posts to each selected
+        unit and renders a row per unit.
+
+        The response is 202: the work has not happened yet, and on success this process is killed
+        by it. Anything polling for the result must read GET /api/mesh/update afterwards, through
+        the window where this unit refuses connections entirely.
+        """
+        if not self._update_token_ok(request):
+            return web.json_response({"error": "bad or missing update token"}, status=403)
+        body = await self._json(request)
+        try:
+            accepted = updater.request_update(
+                body.get("channel"),
+                check_only=bool(body.get("check_only")),
+            )
+        except updater.UpdateError as exc:
+            # A missing agent is the common case on a unit provisioned before the agent existed,
+            # and it is the operator's to fix — 409, not 500.
+            return web.json_response({"error": str(exc)}, status=409)
+        return web.json_response({"ok": True, "accepted": accepted}, status=202)
+
+    @staticmethod
+    def _update_token_ok(request: web.Request) -> bool:
+        """Gate /update behind a shared token, but only when one is configured.
+
+        Unset is the default and matches every other endpoint here: the APIs are unauthenticated on
+        0.0.0.0 (CLAUDE.md "Open"), and a lone guarded route would be security theatre. Set
+        PLUM_UPDATE_TOKEN in plum-audio.env and this route alone starts requiring it, which is the
+        cheap option for anyone who does not want a reachable "restart my audio" button. The
+        comparison is constant-time so a wrong token cannot be discovered a byte at a time.
+        """
+        expected = os.environ.get("PLUM_UPDATE_TOKEN")
+        if not expected:
+            return True
+        presented = request.headers.get("X-Plum-Update-Token", "")
+        return hmac.compare_digest(presented, expected)
+
+    # -- calibration tone ----------------------------------------------------
+    #
+    # Play a known signal from ONE endpoint so the user can read its SPL from the listening
+    # position. The tone is a real transient source routed to that player alone, so it travels the
+    # same path the music does and the endpoint's own volume actually applies to it — which is the
+    # whole measurement. See calibration_tone.py for why a local ALSA write cannot do this.
+
+    @property
+    def tone_player_id(self) -> str | None:
+        """The endpoint currently playing a calibration tone, if any.
+
+        Read by LoudnessReconciler: a tone drives one endpoint to a level that has nothing to do
+        with its group's, and reading that as a human moving a slider would re-level the whole house
+        in the middle of a measurement.
+        """
+        return self._tone.active_player_id
+
+    async def _calibration_merged(self, _request: web.Request) -> web.Response:
+        """Every unit's calibration records, merged newest-wins.
+
+        The GUI WRITES calibration same-origin to this unit's :5002 (a peer's config API is
+        deliberately not reachable cross-origin), but it must SHOW records made from any unit's
+        page. Reading the merged map here is what makes the tab look the same wherever it is opened.
+        """
+        view = self._agg.view()
+        merged = merge_calibrations([u.calibration for u in view.units])
+        # describe(), not to_dict(): the derived half (calibrated / curve / effectiveMaxVolume /
+        # dbRange) is what the GUI badges and summarises from. Serving the bare stored record made
+        # every cross-unit calibration render as "Not calibrated" while the matcher was driving it.
+        return web.json_response({pid: describe_calibration(pid, cal) for pid, cal in merged.items()})
+
+    async def _tone_status(self, _request: web.Request) -> web.Response:
+        return web.json_response(self._tone.status())
+
+    async def _tone_start(self, request: web.Request) -> web.Response:
+        body = await self._json(request)
+        player_id = body.get("player_id")
+        if not player_id or "volume" not in body:
+            return web.json_response({"error": "player_id and volume required"}, status=400)
+        try:
+            state = await self._tone.start(
+                player_id,
+                int(body["volume"]),
+                # For a third-party speaker only visible over mDNS there is nothing to route: it is
+                # in no unit's players and no unit's local_player. Passing its listener URL lets the
+                # tone adopt it instead, and the reply carries back the id its handshake gave —
+                # which is what the caller must key the calibration record on.
+                url=body.get("url") or None,
+                tone_type=body.get("type") or "pink",
+                seconds=float(body.get("seconds") or 120.0),
+                freq=float(body.get("freq") or 1000.0),
+            )
+        except (ToneError, RouteError, KeyError, ValueError) as e:
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response(state)
+
+    async def _tone_volume(self, request: web.Request) -> web.Response:
+        """Re-level a running tone without restarting it, so the noise does not gap between steps."""
+        body = await self._json(request)
+        if "volume" not in body:
+            return web.json_response({"error": "volume required"}, status=400)
+        try:
+            state = await self._tone.set_volume(int(body["volume"]))
+        except (ToneError, RouteError, KeyError, ValueError) as e:
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response(state)
+
+    async def _tone_stop(self, _request: web.Request) -> web.Response:
+        return web.json_response(await self._tone.stop())
+
+    # -- pairing -------------------------------------------------------------
+    #
+    # These drive the Sendspin pairing methods against a CONNECTED client. Pairing is not a routing
+    # operation and deliberately does not go through the router: it is a property of the connection
+    # between this server and that client, so every one of these is local to this unit. The GUI
+    # reaches a peer's pairing by calling that peer's own API, exactly as it does for volume.
+
+    async def _pairing_state(self, request: web.Request) -> web.Response:
+        """What pairing has been attempted here, and how it went. The GUI polls this while waiting.
+
+        An attempt runs as a background task — the exchange includes a PAKE round and a wait on a
+        human — so this is how its outcome is collected rather than from the POST that started it.
+        """
+        client_id = request.query.get("client_id")
+        try:
+            return web.json_response({"ok": True, "pairing": self._engine.pairing_state(client_id)})
+        except NotImplementedError:
+            return web.json_response({"ok": True, "pairing": {}, "supported": False})
+
+    async def _pair(self, request: web.Request) -> web.Response:
+        body = await self._json(request)
+        client_id, method = body.get("client_id"), body.get("method", "pairing_psk")
+        token = body.get("token")
+        if not client_id:
+            return web.json_response({"error": "client_id required"}, status=400)
+        try:
+            await self._engine.pair_client(client_id, method, token)
+        except Exception as e:  # noqa: BLE001 - report the failure rather than 500-ing
+            logger.exception("pair failed")
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response({"ok": True, "state": "pending"})
+
+    async def _pair_pin(self, request: web.Request) -> web.Response:
+        """Hand the operator's PIN to a waiting attempt.
+
+        A False from the engine is NOT a wrong PIN — it means nothing was waiting, i.e. the attempt
+        already timed out or was cancelled. Said plainly, because retyping into a dead dialog is
+        otherwise indistinguishable from getting the digits wrong.
+        """
+        body = await self._json(request)
+        client_id, pin = body.get("client_id"), body.get("pin")
+        if not client_id or not pin:
+            return web.json_response({"error": "client_id and pin required"}, status=400)
+        try:
+            accepted = self._engine.submit_pin(client_id, str(pin))
+        except Exception as e:  # noqa: BLE001
+            return web.json_response({"error": str(e)}, status=400)
+        if not accepted:
+            return web.json_response({"error": "no pairing attempt is waiting for a PIN"}, status=409)
+        return web.json_response({"ok": True})
+
+    async def _pair_cancel(self, request: web.Request) -> web.Response:
+        body = await self._json(request)
+        client_id = body.get("client_id")
+        if not client_id:
+            return web.json_response({"error": "client_id required"}, status=400)
+        try:
+            await self._engine.cancel_pairing(client_id)
+        except Exception as e:  # noqa: BLE001
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response({"ok": True})
+
+    async def _unpair(self, request: web.Request) -> web.Response:
+        body = await self._json(request)
+        client_id = body.get("client_id")
+        if not client_id:
+            return web.json_response({"error": "client_id required"}, status=400)
+        try:
+            await self._engine.unpair_client(client_id)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("unpair failed")
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response({"ok": True})
+
+    async def _pairing_window(self, request: web.Request) -> web.Response:
+        """Open this unit's own player for pairing, standing in for the physical gesture.
+
+        The protocol's answer to multi-server deployments: a server already paired with a device may
+        open its pairing window over the `management` role. A unit is always paired with its own
+        player, so it can always do this for itself — which is what lets a NEW unit pair with an
+        existing one without anyone touching hardware.
+
+        `client_id` defaults to this unit's own player precisely because that is the only client we
+        are guaranteed to hold management on; passing someone else's is allowed but will fail unless
+        we happen to be paired with them.
+        """
+        body = await self._json(request)
+        client_id = body.get("client_id") or self._own_player_id()
+        if not client_id:
+            return web.json_response({"error": "no local player to open a window on"}, status=400)
+        try:
+            opened = await self._engine.open_pairing_window(client_id)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("pairing window failed")
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response({"ok": bool(opened), "client_id": client_id})
+
+    @staticmethod
+    def _own_player_id() -> str | None:
+        """This unit's own player's peer id, read from the identity on disk."""
+        try:
+            import sendspin_identity
+
+            return sendspin_identity.peer_id_of(sendspin_identity.PLAYER_ROLE)
+        except Exception:  # noqa: BLE001 - a playerless unit, or a unit whose keys are unreadable
+            return None
 
     async def _options(self, _request: web.Request) -> web.Response:
         return web.Response()

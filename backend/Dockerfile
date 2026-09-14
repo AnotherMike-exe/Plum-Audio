@@ -31,6 +31,17 @@ ENV PUID=99 \
     PYTHONUNBUFFERED=1 \
     PLUM_PROC_ASOUND=/host/asound
 
+# Baked in at build time by docker/build.sh (git describe against the nearest tag) — this is the ONLY
+# way the running container can know "its own" version; apis/about_api.py serves it as-is. Everything
+# else that endpoint reports (aiosendspin, shairport-sync, bluez-alsa) is queried live instead, so
+# only the app's own identity needs this rebuild-to-update path.
+ARG PLUM_APP_VERSION=0.0.0-dev
+ARG PLUM_BUILD_TYPE=dev
+ARG PLUM_GIT_DESCRIBE=unknown
+ENV PLUM_APP_VERSION=${PLUM_APP_VERSION} \
+    PLUM_BUILD_TYPE=${PLUM_BUILD_TYPE} \
+    PLUM_GIT_DESCRIBE=${PLUM_GIT_DESCRIBE}
+
 # Runtime, by consumer:
 #   libportaudio2      sendspin_player -> onboard DAC
 #   alsa-utils         arecord (the Bluetooth capture path) + aplay -l for debugging
@@ -68,6 +79,10 @@ RUN shairport-sync -V | grep -q -- '-mpris' \
 # go-librespot (Spotify Connect): one process per endpoint, spawned by sources/spotify_manager.py —
 # deliberately NOT a supervisord program, so endpoint edits apply live. Native binary, no runtime.
 ARG GO_LIBRESPOT_VERSION=0.7.4
+# Fallback only: about_api.py tries `go-librespot --version` first and falls back to this baked ARG
+# only if the binary doesn't answer. Unlike aiosendspin/shairport-sync there's no package metadata to
+# query, so without this the About page would have no way to say what got downloaded.
+ENV PLUM_GO_LIBRESPOT_VERSION=${GO_LIBRESPOT_VERSION}
 RUN set -eux; \
     case "$(dpkg --print-architecture)" in \
         arm64) GLR_ARCH=arm64 ;; \
@@ -84,11 +99,40 @@ WORKDIR /app
 
 # Dependencies before code (layer caching)
 COPY backend/requirements.txt ./requirements.txt
-RUN pip install -r requirements.txt
+# --only-binary=:all: because this image has no compiler — the apt list above installs no
+# build-essential, gcc, rustc or -dev headers, deliberately. aiosendspin 9.x pulled in
+# `cryptography`, which builds from an sdist against Rust + OpenSSL headers if pip cannot find a
+# wheel for the platform. Without this flag that fallback is silent right up until it fails deep in
+# a compiler log; with it, a missing aarch64 wheel says so immediately and legibly.
+RUN pip install --only-binary=:all: -r requirements.txt
+
+# Same reasoning as the apt assertions above, one layer down. 9.x made encryption load-bearing, and
+# a failure here does not surface at build time — it surfaces on the rig as a handshake that never
+# completes, or a crash-loop, with the audio path apparently fine.
+#
+# Deliberately FUNCTIONAL rather than a list of imports. Identity.generate().peer_id executes
+# cryptography's compiled X25519 on the target architecture, which is the actual risk: this image
+# has no compiler, so a missing aarch64 wheel is the thing that would bite. Importing the module
+# only proves pip put a directory somewhere. (`noise` is noiseprotocol's import name — the two
+# differ, which this assertion found the hard way.)
+RUN python3 -c "\
+import importlib.metadata as md, cpace, noise; \
+from aiosendspin.noise import Identity; \
+v = md.version('aiosendspin'); \
+assert v == '9.1.1', f'aiosendspin {v}, expected 9.1.1 — the pin did not take'; \
+assert len(Identity.generate().peer_id) > 20, 'X25519 keygen produced nothing usable'; \
+print(f'noise stack OK (aiosendspin {v}, cryptography works on this arch)')"
 
 # Application code (scripts/, config/, nginx/, supervisord/, entrypoint.sh)
 COPY backend/ /app/
 RUN chmod +x /app/entrypoint.sh
+
+# The on-Pi installer's payload. scripts/plum-init.sh runs ON a fresh Pi with no checkout of this
+# repo, and reads the host-setup scripts and the compose file straight out of the image it just
+# pulled — so there is ONE source of truth for them rather than a second copy to keep in step.
+# Nothing in the running container uses either path.
+COPY scripts/host-setup/ /app/host-setup/
+COPY docker/docker-compose.yml /app/docker-compose.yml
 
 # Web GUI: built assets + the nginx site that serves them and proxies :5001/:5002.
 COPY --from=webui /ui/dist /app/www

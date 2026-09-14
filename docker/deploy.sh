@@ -5,6 +5,18 @@
 #   ./deploy.sh 192.0.2.10                   # one unit
 #   ./deploy.sh all --tarball dist/x.tar.gz  # a specific build (default: newest in dist/)
 #   ./deploy.sh all --no-migrate             # skip importing the ~/plum-test state
+#   ./deploy.sh all --new-fleet-psk          # mint a NEW fleet pairing secret (then redeploy all)
+#   ./deploy.sh all --image ghcr.io/anothermike-exe/plum-audio:1.0.0   # pull a published release
+#   ./deploy.sh all --pull                   # shorthand for the default registry at :latest
+#
+# TWO WAYS TO GET THE IMAGE ONTO A UNIT, and they are a real trade, not a preference:
+#   tarball (default) — build.sh + scp + `docker load`. Works with no internet on the unit and no
+#                       registry auth, and deploys exactly the tree you have in front of you,
+#                       including uncommitted work. ~200 MB over the LAN per unit.
+#   --image / --pull  — the unit pulls from a registry. Deploys a BUILT, TESTED, TAGGED artifact
+#                       rather than whatever is on this laptop, and four units pull in parallel
+#                       instead of taking four sequential scp copies. Needs the unit to reach the
+#                       internet, and the image must be public or the unit must be logged in.
 #
 # What it does per unit, in order: preflight -> ensure Docker -> STOP the pre-container dev stack
 # and any old containers -> create /opt/plum-audio -> import existing rig state on first deploy ->
@@ -26,6 +38,39 @@ HERE="$PWD"
 [[ -f "${HERE}/.deploy.env" ]] && source "${HERE}/.deploy.env"
 USER_="${PLUM_TEST_USER:-plum-admin}"
 PW="${PLUM_TEST_PW:?not set — export it, or create docker/.deploy.env containing PLUM_TEST_PW=<rig password>}"
+
+# --- fleet pairing secret -------------------------------------------------------------------------
+# One Pairing PSK shared by every unit, so a unit's server can pair with any unit's SPEAKER without
+# an operator. Without it a four-unit mesh needs twelve manual pairings, repeated whenever a unit is
+# re-imaged (a new identity is a new device to every peer).
+#
+# Generated ONCE and kept in .deploy.env, which is gitignored, because the whole point is that every
+# unit gets the SAME value — regenerating per deploy would silently unpair the fleet on every run.
+# Losing the workstation copy is NOT losing the secret: every unit holds it in its own
+# plum-audio.env, and the recovery below reads it back from one. Rotating (--new-fleet-psk) is the
+# last resort, and it means redeploying every unit together.
+#
+# It is a shared secret: anyone holding it can pair with any unit. That is a real step down from a
+# per-pair record and a real step up from the sentinel PSK, which is published. Unset it for the
+# stricter posture, where units pair only with their own speaker and everything else is deliberate.
+# LOSING .deploy.env IS THE COMMON CASE, not the exotic one: units get commissioned today and
+# extended months later, from a laptop that has been reinstalled in between. The secret is NOT lost
+# when that happens — deploy.sh wrote it into every unit's /opt/plum-audio/plum-audio.env, so a
+# single already-deployed unit can hand it back.
+#
+# Minting a fresh one instead is the failure this guards. It does not error: the new units come up
+# perfectly, pair with their own speakers, and serve their GUIs, and only CROSS-UNIT routing to the
+# older generation is dead — a speaker that joins the group at the right volume and renders nothing.
+# So recovery is attempted before minting, and minting is refused outright when any unit could not
+# be asked. See "Losing the fleet secret" in docs/SENDSPIN-PAIRING.md.
+NEED_PSK=0
+if [[ -z "${PLUM_FLEET_PSK:-}" ]]; then
+    if [[ -f "${HERE}/.deploy.env" ]] && grep -q '^PLUM_FLEET_PSK=' "${HERE}/.deploy.env"; then
+        PLUM_FLEET_PSK="$(grep '^PLUM_FLEET_PSK=' "${HERE}/.deploy.env" | tail -1 | cut -d= -f2-)"
+    else
+        NEED_PSK=1   # resolved below, once ssh_ and the unit table exist
+    fi
+fi
 # UserKnownHostsFile=/dev/null, not just StrictHostKeyChecking=no: a REIMAGED unit presents a new
 # host key, and a conflicting known_hosts entry makes ssh refuse the connection outright — password
 # auth is disabled in that state, so the deploy fails on the very first ssh of every unit with a
@@ -43,25 +88,60 @@ UNITS_FILE="${HERE}/units.conf"
 }
 
 MIGRATE=1
+FORCE_NEW_PSK=0
 TARBALL=""
+IMAGE_REF=""
+DEFAULT_REGISTRY="ghcr.io/anothermike-exe/plum-audio"
+# How many PREVIOUS image tags to keep on a unit, beyond the one being deployed and `latest`. Two is
+# enough for a rollback without letting a 29 GB SD card fill; the tarballs in dist/ are the real
+# rollback anyway.
+KEEP_IMAGES="${PLUM_KEEP_IMAGES:-2}"
 HOSTS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         all)          HOSTS+=("all"); shift ;;
         --tarball)    TARBALL="$2"; shift 2 ;;
+        --image)      IMAGE_REF="$2"; shift 2 ;;
+        --pull)       IMAGE_REF="${DEFAULT_REGISTRY}:latest"; shift ;;
         --no-migrate) MIGRATE=0; shift ;;
-        -h|--help)    sed -n '2,20p' "$0"; exit 0 ;;
+        --new-fleet-psk) FORCE_NEW_PSK=1; shift ;;
+        -h|--help)    sed -n '2,32p' "$0"; exit 0 ;;
         -*)           echo "unknown flag $1" >&2; exit 2 ;;
         *)            HOSTS+=("$1"); shift ;;
     esac
 done
-[[ ${#HOSTS[@]} -gt 0 ]] || { echo "usage: deploy.sh <all|host...> [--tarball f] [--no-migrate]" >&2; exit 2; }
+[[ ${#HOSTS[@]} -gt 0 ]] || {
+    echo "usage: deploy.sh <all|host...> [--tarball f | --image ref | --pull] [--no-migrate]" >&2
+    exit 2
+}
+[[ -z "$IMAGE_REF" || -z "$TARBALL" ]] || {
+    echo "--tarball and --image/--pull are mutually exclusive: pick where the image comes from" >&2
+    exit 2
+}
+
+# Split the ref once, here, rather than in the per-host function: compose interpolates PLUM_IMAGE and
+# PLUM_TAG separately, and a ref with a port (registry:5000/x:tag) makes the naive rsplit wrong.
+if [[ -n "$IMAGE_REF" ]]; then
+    if [[ "${IMAGE_REF##*/}" == *:* ]]; then
+        PLUM_IMAGE_NAME="${IMAGE_REF%:*}"
+        PLUM_IMAGE_TAG="${IMAGE_REF##*:}"
+    else
+        PLUM_IMAGE_NAME="$IMAGE_REF"
+        PLUM_IMAGE_TAG="latest"
+    fi
+else
+    PLUM_IMAGE_NAME="plum-audio"
+    PLUM_IMAGE_TAG="latest"
+fi
 
 command -v sshpass >/dev/null || { echo "sshpass required (brew install sshpass)" >&2; exit 1; }
 
-# Newest tarball wins when none was named — the common case is "I just ran build.sh".
-if [[ -z "$TARBALL" ]]; then
+# Newest tarball wins when none was named — the common case is "I just ran build.sh". Skipped
+# entirely in registry mode, where there is no tarball to find and demanding one would be absurd.
+if [[ -n "$IMAGE_REF" ]]; then
+    TARBALL=""
+elif [[ -z "$TARBALL" ]]; then
     TARBALL="$(ls -t ../dist/plum-audio-*.tar.gz 2>/dev/null | head -1 || true)"
 elif [[ "$TARBALL" != /* ]]; then
     # A relative --tarball has to be resolved against the caller's cwd, not this script's. We have
@@ -72,12 +152,22 @@ elif [[ "$TARBALL" != /* ]]; then
         [[ -f "$cand" ]] && { TARBALL="$cand"; break; }
     done
 fi
-[[ -f "$TARBALL" ]] || { echo "no image tarball at '${TARBALL:-<none>}' (run docker/build.sh first)" >&2; exit 1; }
-TARBALL="$(cd "$(dirname "$TARBALL")" && pwd)/$(basename "$TARBALL")"
+if [[ -z "$IMAGE_REF" ]]; then
+    [[ -f "$TARBALL" ]] || { echo "no image tarball at '${TARBALL:-<none>}' (run docker/build.sh first)" >&2; exit 1; }
+    TARBALL="$(cd "$(dirname "$TARBALL")" && pwd)/$(basename "$TARBALL")"
+fi
 
 # A deploy opens a dozen authenticated connections per unit in quick succession, and sshd will
 # occasionally refuse one ("Permission denied" on a password that is demonstrably correct). Retry
 # rather than fail a whole unit on a transient auth refusal.
+#
+# But retry the TRANSPORT ONLY. `retry_` re-runs the whole remote block, so a state-changing step
+# that fails once and then "succeeds" on a second attempt — because the first attempt already left
+# the file half-written — reports success for a step that did not do what it says. That is the
+# likeliest way a full disk truncated docker-compose.yml and the deploy carried on regardless.
+# ssh exits 255 for its own failures and otherwise passes the remote command's status straight
+# through, so keying on 255 retries a refused connection and never masks a genuine failure.
+# (tests/Integration/lib.sh carries the same rule for the same reason.)
 retry_() {
     local n=0
     until "$@"; do
@@ -86,11 +176,23 @@ retry_() {
         sleep 3
     done
 }
-ssh_()  { retry_ sshpass -p "$PW" ssh $SSH_OPTS "${USER_}@$1" "${@:2}"; }
+retry_ssh_() {
+    local n=0 rc
+    while :; do
+        "$@"; rc=$?
+        [[ $rc -ne 255 ]] && return $rc
+        n=$((n + 1))
+        [[ $n -ge 3 ]] && return $rc
+        sleep 3
+    done
+}
+ssh_()  { retry_ssh_ sshpass -p "$PW" ssh $SSH_OPTS "${USER_}@$1" "${@:2}"; }
+# scp keeps the blanket retry: it moves 200 MB and an interrupted transfer is genuinely worth
+# re-running, with no remote state to leave half-changed.
 scp_()  { retry_ sshpass -p "$PW" scp $SSH_OPTS "$1" "${USER_}@$2:$3"; }
 # Send a local file over an existing-style ssh session instead of a second scp auth. Used for the
 # small config files; the image tarball still goes by scp (scp is far faster for 200 MB).
-put_()  { retry_ sshpass -p "$PW" ssh $SSH_OPTS "${USER_}@$1" "cat > '$3'" < "$2"; }
+put_()  { retry_ssh_ sshpass -p "$PW" ssh $SSH_OPTS "${USER_}@$1" "cat > '$3'" < "$2"; }
 say()   { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 warn()  { printf '\033[33m    !! %s\033[0m\n' "$*"; }
 
@@ -124,16 +226,34 @@ dup_in_column() {  # dup_in_column <1-based field>
         | awk -F'|' -v f="$1" '{v=$f; gsub(/^[ \t]+|[ \t]+$/,"",v); if (v!="") print v}' \
         | sort | uniq -d
 }
-DUP_HOST="$(dup_in_column 1)"
-DUP_UNIT_ID="$(dup_in_column 2)"
-DUP_UNIT_NAME="$(dup_in_column 3)"
-DUP_PLAYER_ID="$(dup_in_column 4)"
-DUP_PLAYER_NAME="$(dup_in_column 5)"
+# LEGACY TABLES. units.conf used to be six columns —
+#   host | unit id | unit name | player id | player name | DAC
+# — and is now two, with an optional third:
+#   host | name | [DAC]
+# The ids went away because nothing needed an operator to choose them: entrypoint.sh derives them
+# from the hostname, and this script preserves whatever a unit is ALREADY running under. But the
+# two formats are indistinguishable by shape alone, and reading a six-column row as a two-column
+# one takes `unit-133` for the unit NAME — which would rename a live unit to its own id. So detect
+# the column count and map the old layout, loudly, rather than quietly getting it wrong.
+LEGACY_TABLE=0
+if grep -vE '^\s*(#|$)' "$UNITS_FILE" | awk -F'|' 'NF>=5{f=1} END{exit !f}'; then
+    LEGACY_TABLE=1
+    printf '\033[33m!! %s is in the old six-column format. Reading it, but the ids are now derived —\033[0m\n' "${UNITS_FILE##*/}"
+    printf '\033[33m   see docker/units.conf.example for the two-column layout.\033[0m\n'
+fi
+# Which field holds what, in each layout.
+if [[ "$LEGACY_TABLE" == 1 ]]; then
+    F_NAME=3; F_DAC=6
+else
+    F_NAME=2; F_DAC=3
+fi
 
-if [[ -n "$DUP_HOST$DUP_UNIT_ID$DUP_UNIT_NAME$DUP_PLAYER_ID$DUP_PLAYER_NAME" ]]; then
+DUP_HOST="$(dup_in_column 1)"
+DUP_UNIT_NAME="$(dup_in_column "$F_NAME")"
+
+if [[ -n "$DUP_HOST$DUP_UNIT_NAME" ]]; then
     printf '\033[33m!! %s has duplicate values; they will be suffixed per unit:\033[0m\n' "${UNITS_FILE##*/}"
-    for pair in "host:$DUP_HOST" "unit_id:$DUP_UNIT_ID" "unit_name:$DUP_UNIT_NAME" \
-                "player_id:$DUP_PLAYER_ID" "player_name:$DUP_PLAYER_NAME"; do
+    for pair in "host:$DUP_HOST" "name:$DUP_UNIT_NAME"; do
         [[ -n "${pair#*:}" ]] && printf '     %-12s %s\n' "${pair%%:*}" "$(echo "${pair#*:}" | tr '\n' ' ')"
     done
     # A duplicated HOST is the one case a suffix cannot help — it is the same box twice, so the second
@@ -168,6 +288,44 @@ printf '%s' "$t" | tr -cd '0-9A-Fa-f' | tail -c 4 | tr '[:lower:]' '[:upper:]'
 EOS
 }
 
+# The unit's audio output, read from the cards it actually has.
+#
+# This is the column an operator used to have to fill in, and it is the one they were least able to
+# answer from the workstation: the spec is a PortAudio NAME FRAGMENT, matched as a substring against
+# PortAudio's own device names, and it is not the same list as `aplay -l`. The long name at the tail
+# of a /proc/asound/cards line is the form already proven on this rig (`bcm2835`,
+# `snd_rpi_hifiberry_dacplus`), so take that.
+#
+# Ranking, lowest wins. A HAT or USB DAC is something someone fitted ON PURPOSE, so it outranks the
+# onboard jack. HDMI is last: it is present on every Pi, it is almost never the intended output for
+# this, and PortAudio's own default lands on it more often than not. Empty output means no cards at
+# all, which the caller reads as a headless unit.
+#
+# Mirrored in scripts/plum-init.sh, which does the same job from the unit itself. Keep the two in
+# step; a unit must not get a different answer depending on which script commissioned it.
+detect_output_on() {  # detect_output_on <host>
+    ssh_ "$1" "bash -s" <<'EOS'
+set -uo pipefail
+best=""; best_rank=99
+while IFS= read -r line; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    # A glob, not a regex: a bracket inside [[ =~ ]] is a portability trap.
+    case "$trimmed" in [0-9]*"["*) ;; *) continue ;; esac
+    id="${trimmed#*[}"; id="${id%%]*}"; id="$(printf '%s' "$id" | tr -d ' ')"
+    longname="${line##* - }"
+    [ -n "$longname" ] && [ "$longname" != "$line" ] || longname="$id"
+    case "$id$longname" in
+        *vc4hdmi*|*HDMI*|*hdmi*)             rank=3 ;;
+        *bcm2835*|*Headphones*|*headphones*) rank=2 ;;
+        *)                                   rank=1 ;;
+    esac
+    [ "$rank" -lt "$best_rank" ] && { best_rank="$rank"; best="$longname"; }
+    printf '      card %-18s %s\n' "$id" "$longname" >&2
+done < /proc/asound/cards 2>/dev/null
+printf '%s' "$best"
+EOS
+}
+
 # Echo $1, suffixed with the unit's token when $2 (a newline-separated duplicate list) contains it.
 # Warnings go to STDERR: this runs inside a command substitution, so anything on stdout becomes part
 # of the value and would end up in plum-audio.env.
@@ -195,38 +353,76 @@ if [[ " ${HOSTS[*]} " == *" all "* ]]; then
     done < <(units_all)
 fi
 
+# --- fleet pairing secret, part two: recover it before inventing one -------------------------------
+
+if [[ "$NEED_PSK" == 1 ]]; then
+    say "no fleet pairing secret on this workstation — asking the units"
+    # EVERY unit in the table, not just the ones being deployed. A peer that is not part of this run
+    # still holds the fleet's secret, and it is exactly the unit an operator forgets to mention when
+    # adding two new rooms to a system built months ago.
+    _found=""; _found_on=""; _unreachable=""
+    while IFS= read -r _h; do
+        [[ -n "$_h" ]] || continue
+        _psk="$(ssh_ "$_h" "grep -h '^PLUM_FLEET_PSK=' ${REMOTE_ROOT}/plum-audio.env 2>/dev/null | tail -1 | cut -d= -f2-" 2>/dev/null | tr -d '\r\n' || true)"
+        if [[ -z "$_psk" ]]; then
+            # Tell "answered, has no secret" from "did not answer at all". Only the first is safe to
+            # mint over: it means the unit is genuinely greenfield, not merely switched off.
+            if ssh_ "$_h" true >/dev/null 2>&1; then
+                echo "    $_h — reachable, no secret stored"
+            else
+                echo "    $_h — UNREACHABLE"
+                _unreachable="${_unreachable}${_h} "
+            fi
+            continue
+        fi
+        echo "    $_h — has one"
+        if [[ -z "$_found" ]]; then
+            _found="$_psk"; _found_on="$_h"
+        elif [[ "$_psk" != "$_found" ]]; then
+            warn "$_h disagrees with $_found_on — this fleet is ALREADY split into two pairing groups."
+            warn "Pick one and redeploy every unit with it: deploy.sh all (after fixing .deploy.env)."
+        fi
+    done < <(units_all)
+
+    if [[ -n "$_found" ]]; then
+        PLUM_FLEET_PSK="$_found"
+        printf 'PLUM_FLEET_PSK=%s\n' "$PLUM_FLEET_PSK" >> "${HERE}/.deploy.env"
+        say "recovered the fleet pairing secret from ${_found_on} and restored it to docker/.deploy.env"
+    elif [[ -n "$_unreachable" && "$FORCE_NEW_PSK" != 1 ]]; then
+        # Refusing beats a silent split. A new secret here would leave the units that ARE up unable
+        # to pair with the ones that are down, and nothing would report it as an error.
+        echo
+        warn "no unit could hand back a fleet secret, and these were unreachable: ${_unreachable}"
+        warn "Minting a new one now would split the fleet, and cross-unit routing would go silent."
+        warn "Either bring those units up and re-run, or pass --new-fleet-psk to mint one anyway"
+        warn "and then redeploy EVERY unit together so they all share it."
+        exit 1
+    else
+        PLUM_FLEET_PSK="$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')"
+        printf 'PLUM_FLEET_PSK=%s\n' "$PLUM_FLEET_PSK" >> "${HERE}/.deploy.env"
+        say "minted a fleet pairing secret into docker/.deploy.env (shared by every unit)"
+        [[ "$FORCE_NEW_PSK" == 1 ]] && warn "--new-fleet-psk: redeploy EVERY unit so they all get this value"
+    fi
+fi
+
 # --- per-unit deploy ---------------------------------------------------------------------------
 
 deploy_one() {
     local host="$1"
     local unit_id unit_name player_id player_name dac
-    unit_id="$(unit_field "$host" 2)"
-    unit_name="$(unit_field "$host" 3)"
-    player_id="$(unit_field "$host" 4)"
-    player_name="$(unit_field "$host" 5)"
-    dac="$(unit_field "$host" 6)"
-    [[ -n "$unit_id" ]] || { warn "$host is not in units.conf — skipping"; return 1; }
+    unit_name="$(unit_field "$host" "$F_NAME")"
+    dac="$(unit_field "$host" "$F_DAC")"
+    [[ -n "$unit_name" ]] || { warn "$host is not in units.conf — skipping"; return 1; }
 
-    # Break any units.conf clash before the values reach plum-audio.env. TOKEN is fetched at most once
-    # per unit, and only when there is actually a clash — an unambiguous table costs no extra ssh.
+    # Break any units.conf clash before the value reaches plum-audio.env. TOKEN is fetched at most
+    # once per unit, and only when there is actually a clash — an unambiguous table costs no extra ssh.
     local TOKEN=""
-    unit_id="$(disambiguate "$unit_id" "$DUP_UNIT_ID" unit_id "$host")"
-    unit_name="$(disambiguate "$unit_name" "$DUP_UNIT_NAME" unit_name "$host")"
-    player_id="$(disambiguate "$player_id" "$DUP_PLAYER_ID" player_id "$host")"
-    player_name="$(disambiguate "$player_name" "$DUP_PLAYER_NAME" player_name "$host")"
+    unit_name="$(disambiguate "$unit_name" "$DUP_UNIT_NAME" name "$host")"
+    # A unit and its speaker are one thing to the user, and entrypoint.sh already defaults the player
+    # name to the unit name. Naming them apart only ever produced two names for one box.
+    player_name="$unit_name"
 
-    # A DAC column of `none` means this host has no audio output: no player process, no /dev/snd, and
-    # the headless compose profile (the audio one cannot even be CREATED without /dev/snd).
-    local profile player_enabled expected_programs
-    # `tr`, not ${dac,,}: that is bash 4+, and macOS — where this script is RUN — ships bash 3.2,
-    # so the parameter expansion is a hard syntax error before any unit is contacted.
-    if [[ "$(printf '%s' "$dac" | tr '[:upper:]' '[:lower:]')" == "none" ]]; then
-        profile="headless"; player_enabled=0; expected_programs=3
-    else
-        profile="audio";    player_enabled=1; expected_programs=4
-    fi
-
-    say "$host — ${unit_id} (${unit_name})"
+    say "$host — ${unit_name}"
 
     # 1. Preflight: reachable, arm64, sudo, and the host daemons this container depends on.
     ssh_ "$host" "bash -s -- '$PW'" <<'EOS' || return 1
@@ -245,6 +441,65 @@ systemctl is-active --quiet bluetooth    || echo "    !! bluetoothd is NOT runni
 dpkg -l bluez 2>/dev/null | grep -q '+plum' \
     || echo "    !! host bluez is UNPATCHED (no AVRCP position; see backend/config/bluez/)"
 EOS
+
+    # THE UNIT IDENTITY, in one place, and only after the host has answered.
+    #
+    # A Sendspin id is what the mesh keys routing, group membership and per-player volume off, and
+    # settings.json on the unit already refers to it. So the first question is never "what does the
+    # table say", it is "what is this unit already running under" — redeploying a live unit must
+    # never rename it into a stranger its peers have never met.
+    #
+    # Nothing is lost by deriving the rest. entrypoint.sh has always defaulted the unit id from the
+    # hostname and the player id from the unit id, so the old six-column table only wrote down what
+    # those defaults would have produced anyway. What an operator actually chooses is the NAME.
+    local existing derived_id
+    existing="$(ssh_ "$host" "cat ${REMOTE_ROOT}/plum-audio.env 2>/dev/null" 2>/dev/null || true)"
+    unit_id="$(printf '%s\n' "$existing" | sed -n 's/^PLUM_UNIT_ID=//p' | tail -1)"
+    player_id="$(printf '%s\n' "$existing" | sed -n 's/^PLUM_LOCAL_PLAYER_ID=//p' | tail -1)"
+    if [[ -n "$unit_id" ]]; then
+        echo "    unit id: $unit_id  (already deployed — kept)"
+    else
+        derived_id="$(ssh_ "$host" "hostname -s" 2>/dev/null | tr -d '\r' | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')"
+        # `raspberrypi` is Pi Imager's default, and the one hostname a rig genuinely repeats. Two
+        # units claiming one unit id corrupt each other's routing rather than merely looking alike,
+        # so break that case with the SoC token, exactly as a duplicated name is broken.
+        if [[ -z "$derived_id" || "$derived_id" == "raspberrypi" ]]; then
+            [[ -n "$TOKEN" ]] || TOKEN="$(unit_token "$host")"
+            warn "hostname is '${derived_id:-unknown}' — set a unique one in Pi Imager; using the SoC token"
+            derived_id="${derived_id:-plum}-${TOKEN:-$RANDOM}"
+        fi
+        unit_id="unit-${derived_id}"
+        echo "    unit id: $unit_id  (derived from the hostname)"
+    fi
+    [[ -n "$player_id" ]] || player_id="${unit_id}-player"
+
+    # THE OUTPUT. Optional in the table, because it is derivable AND because getting it wrong is
+    # cheap: PLUM_DAC_DEVICE is only what a unit boots with, and Settings -> Audio overrides it
+    # permanently the first time anyone picks a device. So read the cards the Pi actually has, and
+    # let the column exist as an override for the case where the guess is wrong.
+    if [[ -z "$dac" ]]; then
+        dac="$(detect_output_on "$host")"
+        if [[ -n "$dac" ]]; then
+            echo "    audio output: $dac  (detected — change it in Settings -> Audio)"
+        else
+            dac="none"
+            echo "    audio output: none — this unit will ingest and route only"
+        fi
+    else
+        echo "    audio output: $dac  (from units.conf)"
+    fi
+
+    # A DAC of `none` means this host has no audio output: no player process, no /dev/snd, and the
+    # headless compose profile (the audio one cannot even be CREATED without /dev/snd).
+    local profile player_enabled expected_programs
+    # `tr`, not ${dac,,}: that is bash 4+, and macOS — where this script is RUN — ships bash 3.2,
+    # so the parameter expansion is a hard syntax error before any unit is contacted.
+    if [[ "$(printf '%s' "$dac" | tr '[:upper:]' '[:lower:]')" == "none" ]]; then
+        profile="headless"; player_enabled=0; expected_programs=3
+    else
+        profile="audio";    player_enabled=1; expected_programs=4
+    fi
+
 
     # 2. Docker. .113 shipped without it, and compose reaches the units two different ways: .122
     #    runs Docker CE from Docker's own apt repo (compose as a CLI plugin, `docker compose`),
@@ -362,6 +617,16 @@ s() { echo "$PW" | sudo -S -p '' "$@"; }
 s mkdir -p "$ROOT"/{config,data,media}
 s chown -R "$(id -u):$(id -g)" "$ROOT"
 
+# Register the host update agent, if provision.sh put one here. It writes $ROOT/config/update.state,
+# which is the ONLY way the container learns an agent exists at all — and on a greenfield unit
+# provision.sh ran before this directory existed, so it could not write it then. Silent and
+# best-effort: a unit with no agent is a working unit whose Updates tab says the host is
+# unprovisioned, not a failed deploy.
+if [[ -x /usr/local/bin/plum-updater.sh ]]; then
+    s /usr/local/bin/plum-updater.sh init >/dev/null 2>&1 || true
+    echo "    update agent: registered"
+fi
+
 if [[ "$MIGRATE" == "1" && -d ~/plum-test && ! -f "$ROOT/data/settings.json" ]]; then
     echo "    first deploy — importing ~/plum-test state"
     # settings.json IS the unit's configuration: endpoints, device names, visualiser prefs, audio
@@ -382,25 +647,73 @@ else
 fi
 EOS
 
-    # 5. Image.
-    say "$host — loading $(basename "$TARBALL")"
-    scp_ "$TARBALL" "$host" "/tmp/plum-audio-image.tar.gz" || return 1
-    ssh_ "$host" "bash -s -- '$PW'" <<'EOS' || return 1
+    # 5. Image — either scp+load a local build, or have the unit pull a published one.
+    if [[ -n "$IMAGE_REF" ]]; then
+        say "$host — pulling ${IMAGE_REF}"
+        ssh_ "$host" "bash -s -- '$PW' '$IMAGE_REF'" <<'EOS' || return 1
 set -euo pipefail
-PW="$1"
+PW="$1"; REF="$2"
 s() { echo "$PW" | sudo -S -p '' "$@"; }
+# Pull explicitly rather than letting `compose up` do it implicitly. A registry failure here is
+# reported against the unit that had it, before anything is torn down — whereas compose pulling
+# mid-`up` fails after the old container is already gone.
+s docker pull "$REF" 2>&1 | sed 's/^/    /'
+s docker image inspect "$REF" --format '    {{.Id}}  {{.Architecture}}  {{index .RepoDigests 0}}'
+EOS
+    else
+        say "$host — loading $(basename "$TARBALL")"
+        scp_ "$TARBALL" "$host" "/tmp/plum-audio-image.tar.gz" || return 1
+        # Every deploy leaves another ~600 MB image behind, and nothing ever removed them. On a 29 GB
+        # SD card that is roughly forty deploys to a FULL DISK — reached on both rig units in one
+        # afternoon. The failure is nasty rather than obvious: the image loads, the compose file is
+        # truncated to nothing, and the unit ends up with no container. Keep the tag being deployed
+        # plus KEEP_IMAGES previous ones, and fail loudly if there is still no room afterwards.
+        ssh_ "$host" "bash -s -- '$PW' '$PLUM_IMAGE_NAME' '$PLUM_IMAGE_TAG' '$KEEP_IMAGES'" <<'EOS' || return 1
+set -euo pipefail
+PW="$1"; IMAGE_NAME="$2"; IMAGE_TAG="$3"; KEEP="$4"
+s() { echo "$PW" | sudo -S -p '' "$@"; }
+
+# Ordered newest-first by creation, so "keep the last N" means what it says. `latest` and the tag we
+# are about to deploy are never candidates.
+#
+# `|| true` is load-bearing, and its absence took two rooms off the air on 2026-09-13. `grep -v`
+# exits 1 when it filters EVERYTHING out, which includes the ordinary case of a unit with no
+# locally-tagged image at all — a greenfield Pi, or a unit that has only ever been updated from
+# GHCR, where `docker images plum-audio` matches nothing. Under `set -e` with `pipefail` that exit
+# status ends the whole heredoc, silently: the container was already removed one step earlier, the
+# tarball had already been copied, and the deploy printed nothing but `FAILED`. Housekeeping must
+# never decide whether a unit gets its image.
+stale="$(s docker images "$IMAGE_NAME" --format '{{.Tag}}\t{{.CreatedAt}}' 2>/dev/null \
+    | grep -vE "^(latest|${IMAGE_TAG})\s" | sort -k2 -r | awk -v k="$KEEP" 'NR>k{print $1}' || true)"
+for t in $stale; do
+    echo "    pruning old image ${IMAGE_NAME}:${t}"
+    s docker rmi -f "${IMAGE_NAME}:${t}" >/dev/null 2>&1 || true
+done
+
+free_kb="$(df -Pk / | awk 'NR==2{print $4}')"
+if [[ "$free_kb" -lt 1500000 ]]; then
+    echo "    !! only $((free_kb / 1024)) MB free after pruning — refusing to deploy into a full disk" >&2
+    exit 1
+fi
+
 s docker load -i /tmp/plum-audio-image.tar.gz | sed 's/^/    /'
 rm -f /tmp/plum-audio-image.tar.gz
 EOS
+    fi
 
     # 6. compose + per-unit env. TZ and PUID/PGID are read from the unit itself so files under
     #    /opt/plum-audio stay owned by the account that administers it.
     say "$host — config"
     put_ "$host" "${HERE}/docker-compose.yml" "/tmp/plum-audio-compose.yml" || return 1
-    ssh_ "$host" "bash -s -- '$PW' '$REMOTE_ROOT' '$unit_id' '$unit_name' '$player_id' '$player_name' '$dac' '$profile' '$player_enabled'" <<'EOS' || return 1
+    ssh_ "$host" "bash -s -- '$PW' '$REMOTE_ROOT' '$unit_id' '$unit_name' '$player_id' '$player_name' '$dac' '$profile' '$player_enabled' '$PLUM_IMAGE_NAME' '$PLUM_IMAGE_TAG' '${PLUM_FLEET_PSK:-}'" <<'EOS' || return 1
 set -euo pipefail
 PW="$1"; ROOT="$2"; UNIT_ID="$3"; UNIT_NAME="$4"; PLAYER_ID="$5"; PLAYER_NAME="$6"; DAC="$7"
-PROFILE="$8"; PLAYER_ENABLED="$9"
+PROFILE="$8"; PLAYER_ENABLED="$9"; IMAGE_NAME="${10}"; IMAGE_TAG="${11}"
+# Passed as an ARG, not referenced in the heredoc below. The heredoc is expanded on the REMOTE host,
+# where a local-only variable is unbound — and under `set -u` that aborts AFTER `cat >` has already
+# truncated the file, leaving a unit with an EMPTY plum-audio.env. It then boots on entrypoint
+# defaults with no DAC device and no unit id, which reads as a broken image rather than a bad deploy.
+FLEET_PSK="${12:-}"
 s() { echo "$PW" | sudo -S -p '' "$@"; }
 mv /tmp/plum-audio-compose.yml "$ROOT/docker-compose.yml"
 TZ_HOST="$(timedatectl show -p Timezone --value 2>/dev/null || echo UTC)"
@@ -419,27 +732,81 @@ PLUM_PLAYER_NAME=${PLAYER_NAME}
 
 PLUM_DAC_DEVICE=${DAC}
 PLUM_PLAYER_ENABLED=${PLAYER_ENABLED}
-PLUM_STATIC_DELAY_MS=150
+# This endpoint's own output latency, in ms — the spec's static_delay_ms. The player subtracts it
+# from every scheduled play time, so it means "start my audio this much EARLY, because my output
+# chain is that far behind". NOT a jitter cushion: PortAudio's outputBufferDacTime already accounts
+# for the ALSA buffer, so real analog latency is about 1 ms, not 150.
+#
+# It was 150 until 2026-09-13, when it did nothing — the renderer free-ran and ignored play times
+# entirely. Under phase lock a wrong value is a real offset: 150 here puts this unit 150 ms AHEAD of
+# any ESP32 speaker in the same group, which declares 0. Leave it at 0 and correct a measured
+# per-room offset with the per-endpoint delay in the GUI, which is per endpoint and persisted.
+PLUM_STATIC_DELAY_MS=0
 PLUM_LOG_LEVEL=INFO
 PLUM_MESH_ENABLED=1
 PLEXAMP_ENABLED=0
+
+# Accept cleartext Sendspin clients. aiosendspin 9.x defaults this OFF and calls the cleartext path
+# "non-spec transition mode"; for us it is a standing requirement, not transitional. sendspin-cpp —
+# what ESPHome's Sendspin component, the HA Voice PE and the Esparagus/Satellite1 boards run — has
+# no Noise support in any release, and our own GUI controller is a hand-rolled cleartext WebSocket.
+# Setting this to 0 drops every third-party speaker on the LAN, Music Assistant, AND the web GUI.
+PLUM_ALLOW_UNENCRYPTED=1
+
+# Whether an ENCRYPTED-but-unpaired client may play (the sentinel-PSK path). Off by default now that
+# real pairing exists — it is encrypted but UNAUTHENTICATED, which the spec calls MITM-vulnerable.
+# This is only the deploy-time default: a choice made in the GUI is stored in settings.json and wins
+# from then on, including across upgrades. It does NOT affect cleartext clients (ESP32 speakers,
+# Music Assistant, the web GUI) — they never reach this gate.
+PLUM_UNPAIRED_ACCESS=0
+
+# The fleet's shared Pairing PSK — identical on every unit, which is what lets a unit's server pair
+# with any unit's speaker with no operator step. Generated once into docker/.deploy.env.
+PLUM_FLEET_PSK=${FLEET_PSK}
+
+# Optional 8-digit static pairing PIN, offered as a pairing method for this unit's speaker. Must be
+# EXACTLY 8 digits or it is refused with a log line. The spec gesture-gates every static-PIN attempt,
+# so this is convenience, not unattended pairing — someone still confirms in the GUI.
+#PLUM_STATIC_PIN=
 ENV
 # COMPOSE_PROFILES has to be here, not in plum-audio.env: env_file is container environment, while
 # this is compose INTERPOLATION. Written beside the compose file so a bare `docker compose up -d` or
 # `restart` run by hand in this directory selects the same service deploy.sh does.
+#
+# PLUM_IMAGE/PLUM_TAG ride here for the same reason: which image compose resolves is interpolation,
+# decided before the container exists. Pinning both means a hand-run `docker compose up -d` in this
+# directory starts the image this deploy chose, not whatever `latest` has drifted to since.
 cat > "$ROOT/.env" <<COMPOSEENV
-# Generated by docker/deploy.sh — selects which service in docker-compose.yml applies to this host.
+# Generated by docker/deploy.sh — selects which service in docker-compose.yml applies to this host,
+# and which image it runs.
 COMPOSE_PROFILES=${PROFILE}
+PLUM_IMAGE=${IMAGE_NAME}
+PLUM_TAG=${IMAGE_TAG}
 COMPOSEENV
 echo "    $ROOT/plum-audio.env  (tz=${TZ_HOST}, uid=$(id -u):$(id -g), profile=${PROFILE})"
+echo "    $ROOT/.env            (image=${IMAGE_NAME}:${IMAGE_TAG})"
 EOS
 
     # 7 + 8. Up, then prove it actually serves — a running container says nothing about whether
     # supervisord's tree came up.
+    # Check the POST-CONDITION, not just the exit status. This step's entire purpose is that two
+    # files exist and are non-empty, and the observed failure was exactly that they were not: a full
+    # disk truncated docker-compose.yml to zero bytes while the step still reported success. An exit
+    # status describes what a command believed; this describes what the unit actually has.
+    ssh_ "$host" "test -s '$REMOTE_ROOT/docker-compose.yml' && test -s '$REMOTE_ROOT/plum-audio.env'" || {
+        warn "$host: docker-compose.yml or plum-audio.env is missing/empty after the config step"
+        return 1
+    }
+
     say "$host — up"
-    ssh_ "$host" "bash -s -- '$PW' '$REMOTE_ROOT' '$expected_programs' '$profile'" <<'EOS'
+    # `|| return 1` is load-bearing: this is the step that decides whether the unit is actually
+    # RUNNING, and it was the one ssh_ call without it. A full disk truncated docker-compose.yml,
+    # compose refused it as an "empty compose file", and the run still printed "all units deployed"
+    # while BOTH units were left with no container at all. Any step that can leave a unit down has
+    # to be able to fail that unit.
+    ssh_ "$host" "bash -s -- '$PW' '$REMOTE_ROOT' '$expected_programs' '$profile' '$PLUM_IMAGE_NAME' '$PLUM_IMAGE_TAG'" <<'EOS' || return 1
 set -euo pipefail
-PW="$1"; ROOT="$2"; WANT="$3"; PROFILE="$4"
+PW="$1"; ROOT="$2"; WANT="$3"; PROFILE="$4"; IMAGE_NAME="$5"; IMAGE_TAG="$6"
 # Belt and braces alongside $ROOT/.env: compose v1 (the Debian units) and v2 (the Docker-CE one)
 # differ in how they pick .env up, and selecting no profile silently starts NOTHING rather than
 # failing — a deploy that looks like it worked and left the unit down.
@@ -450,7 +817,9 @@ cd "$ROOT"
 if s docker compose version >/dev/null 2>&1; then DC="docker compose"; else DC="docker-compose"; fi
 # Through `env`, not an export: s() shells out via sudo, which strips the environment, so an exported
 # COMPOSE_PROFILES would never reach compose — and an unset profile starts NOTHING while exiting 0.
-s env COMPOSE_PROFILES="$PROFILE" $DC up -d 2>&1 | sed 's/^/    /'
+# PLUM_IMAGE/PLUM_TAG come along for the same reason. They are also in $ROOT/.env, but compose v1 and
+# v2 disagree about when that file is read, and an unresolved image name is a confusing failure.
+s env COMPOSE_PROFILES="$PROFILE" PLUM_IMAGE="$IMAGE_NAME" PLUM_TAG="$IMAGE_TAG" $DC up -d 2>&1 | sed 's/^/    /'
 
 # Wait on OUR process tree, not on a port. Under host networking a port can be answered by
 # something that is not this container (that is exactly how a stale host nginx passed a GUI check),
@@ -481,9 +850,65 @@ chk() {  # chk <label> <url> [jq-ish grep]
     fi
 }
 chk "config API :5002"  "http://127.0.0.1:5002/api/settings"
+# Polled, unlike the others: the mesh API is served from INSIDE the audio event loop, so it comes up
+# a little after supervisord reports sendspin_server RUNNING. A one-shot curl here raced it and
+# reported a hard FAIL against an API that was answering peers seconds later.
+for i in $(seq 1 10); do
+    curl -fsS -m 5 "http://127.0.0.1:5001/api/mesh/view" >/dev/null 2>&1 && break
+    sleep 2
+done
 chk "mesh API :5001"    "http://127.0.0.1:5001/api/mesh/view"
 chk "web GUI :80"       "http://127.0.0.1/"
 echo "    sendspin server :8927 $(s ss -ltn | grep -q ':8927' && echo listening || echo 'NOT LISTENING')"
+# Every check above passes on a unit that renders SILENCE. Under aiosendspin 9.x a client can be
+# admitted, negotiated, grouped and at the right volume while activated for no roles — supervisord
+# is green, all three APIs answer, both ports listen, and the room is quiet. `active_roles` is the
+# only signal that separates the two, so the deploy asks for it directly. Poll, because the server
+# dials the local player a few seconds after start.
+if [[ "$WANT" -ge 4 ]]; then
+    # Deliberately curl-on-the-host, NOT `s docker exec ... python3 -`: s() pipes the sudo password
+    # into stdin, so anything reading stdin gets the password instead of its script. That cost one
+    # false FAIL on this check's first real run.
+    act=""
+    for i in $(seq 1 15); do
+        act="$(curl -fsS -m 5 http://127.0.0.1:5001/api/mesh/view 2>/dev/null | python3 -c '
+import json, sys
+try:
+    view = json.load(sys.stdin)
+except Exception:
+    print("mesh API not answering yet"); raise SystemExit
+me = view.get("local_unit_id")
+unit = next((u for u in view.get("units", []) if u.get("unit_id") == me), None)
+players = (unit or {}).get("players", [])
+rows = [p for p in players if any(r.startswith("player@") for r in (p.get("active_roles") or []))]
+if rows:
+    print("OK " + ",".join(sorted(rows[0].get("active_roles") or [])))
+elif players:
+    # Attached but NOT activated: the silent-failure signature this check exists for. A speaker in
+    # this state joins the group at the right volume and renders nothing, with no error at either end.
+    print("NONE " + repr([(p.get("player_id", "?")[:12], p.get("active_roles")) for p in players]))
+elif (unit or {}).get("has_player") is False:
+    print("OK no player on this unit (audio.output.device=none)")
+else:
+    # No player attached at all is the NORMAL resting state since we stopped holding our own
+    # player: an idle unit releases it so a foreign server can claim the speaker. Routing dials it
+    # back. Asserting "attached at boot" here would fail every healthy unit.
+    print("OK released (idle, claimable) — routing dials it back")
+' 2>/dev/null || true)"
+        [[ "$act" == OK* ]] && break
+        sleep 2
+    done
+    if [[ "$act" == OK* ]]; then
+        printf '    \033[32mOK\033[0m   %-22s %s\n' "player role ACTIVE" "${act#OK }"
+    else
+        printf '    \033[31mFAIL\033[0m %-22s %s\n' "player role ACTIVE" "$act"
+        echo "      A player that is connected but activated for NO roles renders silence with no"
+        echo "      error at either end. Check /config/identity exists and the server log shows"
+        echo "      'trusted local player'; see docs/OPERATIONS.md."
+        fail=1
+    fi
+    echo "    identity: $(s docker exec plum-audio sh -c 'ls /config/identity 2>/dev/null | tr "\n" " "' || echo MISSING)"
+fi
 if [[ "$WANT" -lt 4 ]]; then
     # No player by design — reporting NOT LISTENING here would cry wolf on every headless deploy.
     echo "    sendspin player :8928 not started (this unit has no audio output)"

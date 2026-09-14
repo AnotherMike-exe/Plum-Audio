@@ -1,0 +1,18 @@
+# Plum-Audio — the periodic "is there a newer image?" check. Notify only: this timer NEVER installs
+# anything. It calls `plum-updater.sh check`, which refreshes the available digest and stops.
+#
+# Applying on a timer is deliberately not offered. CLAUDE.md records that a 9.x client cannot reach a
+# 6.0.5 server, so there is no rolling upgrade — a per-unit timer that applied updates would split
+# the mesh across a protocol major at 3am, and the symptom is a speaker that joins the group at the
+# right volume and renders nothing.
+[Unit]
+Description=Plum-Audio daily update check
+
+[Timer]
+OnCalendar=daily
+# Up to an hour of jitter, so six units on one LAN do not all query the registry in the same second.
+RandomizedDelaySec=3600
+Persistent=true
+
+[Install]
+WantedBy=timers.target

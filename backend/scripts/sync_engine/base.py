@@ -34,7 +34,9 @@ class SyncEngine(ABC):
         """Remove a player from a source group (back to solo)."""
 
     @abstractmethod
-    async def reclaim_remote_player(self, source_id: str, player_id: str, player_url: str) -> bool:
+    async def reclaim_remote_player(
+        self, source_id: str, player_id: str, player_url: str, *, stage_pairing: bool = False
+    ) -> bool:
         """Cross-server roam: pull a player off its peer server onto a local source group.
 
         No DISCOVERY pre-connect counterpart exists: a client holds one websocket, so a playing
@@ -46,6 +48,14 @@ class SyncEngine(ABC):
     async def set_player_volume(self, player_id: str, volume: int, muted: bool) -> None:
         """Set a player's volume/mute (per-client)."""
 
+    async def set_player_delay(self, player_id: str, delay_ms: int) -> None:
+        """Correct an endpoint that plays LATE, by declaring its own output latency.
+
+        Optional, like `set_source_volume`: an engine whose protocol carries no per-endpoint
+        latency has nothing to set.
+        """
+        raise NotImplementedError
+
     async def set_source_volume(self, source_id: str, volume: int | None = None, muted: bool | None = None) -> None:
         """Set the volume/mute ON THE SENDING DEVICE feeding a source (AirPlay/BT/Spotify).
 
@@ -55,12 +65,41 @@ class SyncEngine(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def adopt_client(self, source_id: str, url: str, player_id: str | None = None) -> bool:
+    async def adopt_client(self, source_id: str, url: str, player_id: str | None = None) -> str | None:
         """Dial a foreign Sendspin speaker (discovered by mDNS) onto a source. Optional."""
         raise NotImplementedError
 
     async def release_client(self, source_id: str, player_id: str, url: str | None = None) -> None:
         """Hand a foreign speaker back to whatever server had it. Optional."""
+        raise NotImplementedError
+
+    # -- pairing. Optional: an engine whose protocol has no notion of it implements none of these.
+
+    async def pair_client(self, client_id: str, method: str, token: str | None = None) -> None:
+        """Begin an operator-initiated pairing attempt with a connected client.
+
+        `token` carries the device's pairing token for the no-interaction `pairing_psk` method.
+        """
+        raise NotImplementedError
+
+    def submit_pin(self, client_id: str, pin: str) -> bool:
+        """Hand a waiting attempt the PIN the operator typed. False if nothing is waiting."""
+        raise NotImplementedError
+
+    async def cancel_pairing(self, client_id: str) -> None:
+        """Abandon an attempt without finalising it."""
+        raise NotImplementedError
+
+    async def unpair_client(self, client_id: str) -> None:
+        """Drop the pairing record both ends hold."""
+        raise NotImplementedError
+
+    async def open_pairing_window(self, client_id: str) -> bool:
+        """Stand in for the operator's gesture on a client we are already paired with."""
+        raise NotImplementedError
+
+    def pairing_state(self, client_id: str | None = None) -> dict:
+        """The last pairing outcome per client, for a GUI that is waiting on one."""
         raise NotImplementedError
 
     def snapshot(self) -> UnitSnapshot:  # noqa: B027 - optional hook; an engine with no structural view may leave it

@@ -1,7 +1,16 @@
-"""Unit tests for the player's client/state health signal.
+"""Unit tests for the player's render-health signal.
 
-The spec asks a client that cannot maintain sync to report `state: 'error'`; that is how a server
-learns to give it more lead time. The signal is only useful if it is quiet when nothing is wrong.
+Until aiosendspin 9.x this rode the wire: the spec asked a client that could not maintain sync to
+report `state: 'error'`, and that is how a server learned to give it more lead time. 9.x deleted the
+field, and `available: bool` cannot replace it — the server ends an active stream before honouring
+`available=False`, so reporting an xrun that way would make the dropout permanent.
+
+The detection below is therefore unchanged and still load-bearing; only its destination moved, to the
+log and to player_state.json (see `sendspin_player.PlayerHealth`). Keeping these tests green matters
+MORE after that change, not less: the signal no longer has a server reacting to it, so a false
+positive is now purely noise and a false negative is now purely silence.
+
+The signal is only useful if it is quiet when nothing is wrong.
 
 `test_an_idle_player_is_not_an_error` guards the bug this file was written for. AlsaRenderer keeps
 two padded-silence counters and they are NOT interchangeable:
@@ -29,14 +38,12 @@ sys.path.insert(0, str(REPO / "backend" / "scripts"))
 pytest.importorskip("numpy", reason="sendspin_player imports numpy")
 pytest.importorskip("aiosendspin", reason="aiosendspin is a real runtime dep")
 
-from aiosendspin.models.types import ClientStateType  # noqa: E402
-
 import sendspin_player  # noqa: E402
-from sendspin_player import ERROR_STARVED_FRAMES  # noqa: E402
+from sendspin_player import ERROR_STARVED_FRAMES, PlayerHealth  # noqa: E402
 
 
 class FakeRenderer:
-    """Only the two counters _health reads."""
+    """Only the two counters _health reads, plus the phase-lock report _snapshot_state carries."""
 
     def __init__(self):
         self.pad_frames = 0
@@ -44,6 +51,9 @@ class FakeRenderer:
 
     def stats(self) -> str:
         return f"[pad={self.pad_frames} starv={self.starved_frames}]"
+
+    def sync_report(self) -> dict:
+        return {"locked": True, "aligned": True, "sync_err_ms": 0.1, "sync_avg_ms": 0.0, "locks": 1, "steps": 0, "trims": 0}
 
 
 class FakePlayer:
@@ -70,42 +80,42 @@ def player() -> FakePlayer:
 
 def test_a_quiet_player_reports_synchronized():
     p = player()
-    assert p.health() is ClientStateType.SYNCHRONIZED
+    assert p.health() is PlayerHealth.SYNCHRONIZED
 
 
 def test_an_idle_player_is_not_an_error():
     """The regression. Idle padding accrues on pad_frames only — it must not reach the signal."""
     p = player()
     p.renderer.pad_frames += ERROR_STARVED_FRAMES * 100  # ~5s of idle silence
-    assert p.health() is ClientStateType.SYNCHRONIZED, "idle padding must not read as a fault"
+    assert p.health() is PlayerHealth.SYNCHRONIZED, "idle padding must not read as a fault"
 
 
 def test_sustained_starvation_reports_error():
     p = player()
     p.renderer.starved_frames += ERROR_STARVED_FRAMES
-    assert p.health() is ClientStateType.ERROR
+    assert p.health() is PlayerHealth.ERROR
 
 
 def test_a_single_hiccup_is_tolerated():
     """Below threshold is one scheduling blip, not a client that cannot keep up."""
     p = player()
     p.renderer.starved_frames += ERROR_STARVED_FRAMES - 1
-    assert p.health() is ClientStateType.SYNCHRONIZED
+    assert p.health() is PlayerHealth.SYNCHRONIZED
 
 
 def test_recovery_returns_to_synchronized():
     """The delta must reset, or one dropout pins the player at error for the rest of its life."""
     p = player()
     p.renderer.starved_frames += ERROR_STARVED_FRAMES * 2
-    assert p.health() is ClientStateType.ERROR
-    assert p.health() is ClientStateType.SYNCHRONIZED, "a lifetime total would never recover"
+    assert p.health() is PlayerHealth.ERROR
+    assert p.health() is PlayerHealth.SYNCHRONIZED, "a lifetime total would never recover"
 
 
 def test_starvation_is_measured_per_window_not_cumulatively():
     p = player()
     for _ in range(5):
         p.renderer.starved_frames += ERROR_STARVED_FRAMES // 4  # slow drip, under threshold
-        assert p.health() is ClientStateType.SYNCHRONIZED
+        assert p.health() is PlayerHealth.SYNCHRONIZED
 
 
 def test_a_paused_source_is_not_an_error():
@@ -119,7 +129,7 @@ def test_a_paused_source_is_not_an_error():
     p = player()
     p.pause()
     p.renderer.starved_frames += ERROR_STARVED_FRAMES * 10
-    assert p.health() is ClientStateType.SYNCHRONIZED
+    assert p.health() is PlayerHealth.SYNCHRONIZED
 
 
 def test_a_pause_is_not_charged_to_the_resume():
@@ -127,10 +137,10 @@ def test_a_pause_is_not_charged_to_the_resume():
     p = player()
     p.pause()
     p.renderer.starved_frames += ERROR_STARVED_FRAMES * 10
-    assert p.health() is ClientStateType.SYNCHRONIZED
+    assert p.health() is PlayerHealth.SYNCHRONIZED
 
     p.resume()
-    assert p.health() is ClientStateType.SYNCHRONIZED, "the pause's padding must not resurface"
+    assert p.health() is PlayerHealth.SYNCHRONIZED, "the pause's padding must not resurface"
 
 
 def test_starvation_after_a_resume_still_reports():
@@ -142,4 +152,81 @@ def test_starvation_after_a_resume_still_reports():
 
     p.resume()
     p.renderer.starved_frames += ERROR_STARVED_FRAMES
-    assert p.health() is ClientStateType.ERROR
+    assert p.health() is PlayerHealth.ERROR
+
+
+# -- the self-report must use the PEER id, not the listener id --------------------------------------
+
+
+class FakeIdentity:
+    peer_id = "PEERID-x25519-pubkey"
+
+
+class FakeSendspinClient:
+    identity = FakeIdentity()
+    connected = False
+    server_info = None
+    activities: list = []
+
+
+class FakeReportingPlayer:
+    """_snapshot_state unbound, with only what it reads before the `attached` branch."""
+
+    def __init__(self):
+        self.client = FakeSendspinClient()
+        self.player_id = "player-133"          # the LISTENER id, from PLUM_PLAYER_ID
+        self.player_name = "Player-133"
+        self.port = 8928
+        self._state: dict = {}
+        self._audio_flowing = False
+        # The self-report also carries the phase lock, so four units can be compared over the mesh
+        # API rather than by ear. See test_render_sync.py for the lock itself.
+        self.renderer = FakeRenderer()
+
+    def _host_hint(self):
+        return "10.0.0.5"
+
+    snapshot = sendspin_player.SendspinPlayer._snapshot_state
+
+
+def test_the_self_report_publishes_the_peer_id():
+    """The id namespaces must not split.
+
+    `UnitSnapshot.players[]` is keyed on `client.client_id` — the id presented at the handshake,
+    which under 9.x is the X25519 public key. This self-report is joined against that list by the
+    GUI (to dedupe a speaker into ONE row) and by mesh.router._idle_player_url (to find the URL of
+    a speaker attached to nothing). Publishing the listener id instead splits one speaker across two
+    namespaces: the GUI grows a duplicate row, and routing an idle speaker dials it and then times
+    out at 10 s, every time. They were the same string before the 9.x bump.
+    """
+    state = FakeReportingPlayer().snapshot()
+    assert state["player_id"] == "PEERID-x25519-pubkey"
+    assert state["player_id"] != "player-133", "the listener id is NOT the id a server knows us by"
+
+
+def test_the_listener_id_is_still_reported_separately():
+    """It is what we advertise over mDNS and what a server dials, so it stays visible for display
+    and debugging — just not as the join key."""
+    assert FakeReportingPlayer().snapshot()["listener_id"] == "player-133"
+
+
+def test_the_pairing_secret_locations_are_from_the_librarys_closed_vocabulary():
+    """A canary for a whole class of crash that no other test could reach.
+
+    `PairingSupport.secret_locations` looks like prose and is not: it is validated in
+    `__post_init__` against `aiosendspin.client.models.SECRET_LOCATIONS`, a frozenset of exactly
+    {device, leaflet, operator}. A descriptive string there raises ValueError *at construction*, in
+    `SendspinPlayer.__init__`, before the renderer opens a card and before anything is logged beyond
+    a traceback — so the unit deploys clean, `sendspin_server` runs, and `sendspin_player` sits in
+    supervisord's STARTING forever with no player in the mesh view.
+
+    That is exactly what shipped to .7.122 on 2026-08-13, and it reached hardware because the local
+    protocol probes construct `SendspinClient` directly and nothing in tests/Unit ever constructs a
+    real `SendspinPlayer`. This asserts the constant against the library's own vocabulary, so a
+    future edit to either side fails here instead of on the rig.
+    """
+    from aiosendspin.client.models import SECRET_LOCATIONS, PairingSupport
+
+    assert set(sendspin_player.PAIR_SECRET_LOCATIONS) <= SECRET_LOCATIONS
+    # And prove the value is actually accepted, not merely a subset of a set we mis-read.
+    PairingSupport(secret_locations=sendspin_player.PAIR_SECRET_LOCATIONS)

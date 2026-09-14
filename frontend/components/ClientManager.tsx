@@ -16,6 +16,8 @@ interface ClientManagerProps {
     onStopBrowserAudio?: () => void;
     browserAudioActive?: boolean;
     federationEnabled?: boolean;
+    /** Begin pairing a device that cannot play until it is paired. Absent = pairing unsupported. */
+    onPairClient?: (client: Client) => void;
 }
 
 const ClientDevice: React.FC<{
@@ -64,6 +66,7 @@ export const ClientManager: React.FC<ClientManagerProps> = ({
                                                                 onStreamChange,
                                                                 onGroupVolumeAdjust,
                                                                 onGroupMute,
+                                                                onPairClient,
                                                                 onStartBrowserAudio,
                                                                 onStopBrowserAudio,
                                                                 browserAudioActive,
@@ -173,29 +176,49 @@ export const ClientManager: React.FC<ClientManagerProps> = ({
                                     )}
                                 </span>
                                 <div className="flex items-center gap-2 flex-shrink-0">
-                                    <button
-                                        onClick={() => onStreamChange(client.id, myClientStreamId)}
-                                        disabled={!myClientStreamId}
-                                        className="text-sm bg-[var(--accent-color)] accent-button-text font-bold py-1 px-3 rounded-full hover:bg-[var(--accent-color-hover)] transition-colors disabled:bg-gray-500 disabled:cursor-not-allowed"
-                                        title={myClientStreamId ? 'Join your current stream' : 'Select a stream first'}
-                                    >
-                                        <Icon name="plus" className="mr-1" />
-                                        Join Stream
-                                    </button>
-                                    {/* Join Stream is the one-click case: bring it to what THIS page is
-                                        playing. The picker is the general one — send an idle speaker to
-                                        any source anyone is feeding, including one this unit isn't on.
-                                        The mesh router already supports it: an idle player is in no
-                                        unit's group, so it is reclaimed by the listener URL from its own
-                                        unit's self-report (mesh/router.py route_player). Without this,
-                                        an idle unit's GUI could route nothing at all. */}
-                                    <StreamPickerButton
-                                        streams={streams}
-                                        currentStreamId={null}
-                                        onSelect={(streamId) => onStreamChange(client.id, streamId)}
-                                        federationEnabled={federationEnabled}
-                                        title={`Send ${client.name} to a stream`}
-                                    />
+                                    {/* An unpaired device cannot render a note, so routing it would
+                                        silently do nothing — the exact failure this whole feature
+                                        exists to make visible. Pair REPLACES the routing controls
+                                        until it is done, rather than sitting beside them. Only
+                                        'unpaired' qualifies: cleartext speakers never pair, and
+                                        'unknown' means we have not been told (an older peer, or a
+                                        speaker nobody has connected to) and must not be guessed at. */}
+                                    {client.pairingState === 'unpaired' ? (
+                                        <button
+                                            onClick={() => onPairClient?.(client)}
+                                            className="text-sm bg-[var(--accent-color)] accent-button-text font-bold py-1 px-3 rounded-full hover:bg-[var(--accent-color-hover)] transition-colors"
+                                            title={`${client.name} must be paired before it can play`}
+                                        >
+                                            <Icon name="plus" className="mr-1" />
+                                            Pair
+                                        </button>
+                                    ) : (
+                                        <>
+                                            <button
+                                                onClick={() => onStreamChange(client.id, myClientStreamId)}
+                                                disabled={!myClientStreamId}
+                                                className="text-sm bg-[var(--accent-color)] accent-button-text font-bold py-1 px-3 rounded-full hover:bg-[var(--accent-color-hover)] transition-colors disabled:bg-gray-500 disabled:cursor-not-allowed"
+                                                title={myClientStreamId ? 'Join your current stream' : 'Select a stream first'}
+                                            >
+                                                <Icon name="plus" className="mr-1" />
+                                                Join Stream
+                                            </button>
+                                            {/* Join Stream is the one-click case: bring it to what THIS page is
+                                                playing. The picker is the general one — send an idle speaker to
+                                                any source anyone is feeding, including one this unit isn't on.
+                                                The mesh router already supports it: an idle player is in no
+                                                unit's group, so it is reclaimed by the listener URL from its own
+                                                unit's self-report (mesh/router.py route_player). Without this,
+                                                an idle unit's GUI could route nothing at all. */}
+                                            <StreamPickerButton
+                                                streams={streams}
+                                                currentStreamId={null}
+                                                onSelect={(streamId) => onStreamChange(client.id, streamId)}
+                                                federationEnabled={federationEnabled}
+                                                title={`Send ${client.name} to a stream`}
+                                            />
+                                        </>
+                                    )}
                                 </div>
                             </div>
                         ))}

@@ -14,13 +14,17 @@ case "$MODE" in
         A="${1:?need unit-a}"; B="${2:?need unit-b}"
         run t2_source_lifecycle.sh "$A"
         run t2_endpoint_crud.sh "$A" spotify
+        run t2_calibration_tone.sh "$A"
         run t3_mesh_roam.sh "$A" "$B"
         run t3_autofollow.sh "$A" "$B"
+        run t3_loudness_match.sh "$A" "$B"
+        run t3_phase_lock.sh "$A" "$B"
         ;;
     interop)
         U="${1:?need unit host}"
         run t2_source_lifecycle.sh "$U"
         run t2_endpoint_crud.sh "$U" spotify
+        run t2_calibration_tone.sh "$U"
         run t4_interop_ma.sh "$U"
         run t4_adopt_release.sh "$U"
         ;;

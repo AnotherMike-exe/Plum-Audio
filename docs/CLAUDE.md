@@ -6,9 +6,10 @@
 > hardware-validated on four units. Remaining: DLNA + Plexamp (no backend yet) and the gaps in
 > `docs/SPEC-CONFORMANCE.md`. What landed when → `docs/PHASE-HISTORY.md`.
 >
-> **Not ours, do not re-investigate:** a Home Assistant Voice PE joins a group, ACKs our
-> `stream/start` codec header, reports PLAYING — and renders nothing. It does the same from **Music
-> Assistant**, under FLAC and PCM. Device-side. Play from MA first before blaming us.
+> **Silence from an ESP32 client is NOT settled as device-side.** The long-standing "Voice PE renders
+> nothing" finding was measured on builds that leaked an immortal dialer per adopt; on the fix, one
+> rendered audio. Play from Music Assistant first before blaming us, but do not treat that entry as
+> closed — `docs/HARD-WON-LESSONS.md`.
 
 ## What this is
 
@@ -33,7 +34,7 @@ Solo developer + AI assistance. Priority: correct mesh + audio reliability first
 
 ## Stack and ports
 
-**Backend** — Python 3.13 · `aiosendspin` **pinned 6.0.5** · PyAV · numpy · Flask (:5002) + aiohttp
+**Backend** — Python 3.13 · `aiosendspin` **pinned 9.1.1** · PyAV · numpy · Flask (:5002) + aiohttp
 (:5001) · supervisord · Avahi + D-Bus + host networking.
 Base image **`python:3.13-slim-trixie`** — glibc, not Alpine (deliberate: trivial PyAV/PortAudio/
 numpy wheels). **Trixie specifically** to match the units' Debian 13: bluez-alsa still names its
@@ -67,17 +68,17 @@ backend/
   nginx/               # the per-unit GUI server config
   config/              # daemon config templates + bluez/ patches + D-Bus policies
   scripts/
-    sendspin_server.py # in-process SendspinServer + PushStream feeders
-    sendspin_player.py # the roamable render endpoint
-    lifecycle.py       # SIGTERM handling for both audio processes
-    audio_devices.py · player_state.py · unit_identity.py
+    sendspin_server.py · sendspin_player.py   # the two audio processes
+    sendspin_identity.py                      # X25519 keypairs + pairing stores (/config/identity)
+    lifecycle.py · audio_devices.py · player_state.py · unit_identity.py
     sync_engine/       # engine seam (base + sendspin impl)
     mesh/              # orchestrator, discovery, aggregator, router, follow, neighbourhood, avahi, api
     sources/           # per-integration config/manager/metadata + shared config_render, artwork
     apis/              # settings/integrations/audio Flask blueprints (mesh API is mesh/api.py)
   supervisord/         # four programs: sendspin_server, sendspin_player, config-api, nginx
-scripts/host-setup/    # configure-audio-hat.sh — runs on the HOST
-docker/                # compose + build.sh/deploy.sh + units.conf (the rig's unit table)
+scripts/plum-init.sh   # commission ONE unit, run ON the Pi; needs only the device name
+scripts/host-setup/    # provision.sh + configure-audio-hat.sh + plum-updater.sh (+ its systemd units)
+docker/                # compose + build.sh/deploy.sh + units.conf (host | name | [audio output])
 tests/{Unit,Integration}/
 ```
 
@@ -90,7 +91,8 @@ between servers (that would need the unmerged `Roles.SOURCE`). Two tiers:
 2. **Cross-server** roam → `reclaim_client_for_playback` + `GoodbyeReason.ANOTHER_SERVER`.
 
 A roam is inaudible: the player never flushes, so its ~300 ms jitter buffer drains through the
-~25-55 ms reconnect. **There is no DISCOVERY pre-connect** — a client holds one websocket, so a
+~25-55 ms reconnect. **There is no DISCOVERY pre-connect** — a client holds one websocket *for
+playback* (but see the 9.x caveat under the pairing rules), so a
 playing player cannot be warmed on a second server, and a DISCOVERY dial would steal it. Refuted on
 hardware; do not reintroduce it.
 
@@ -105,9 +107,8 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
 
 - **Git**: `main` protected. Branches `feature/*`, `bugfix/*`, `docs/*`, `refactor/*`. Conventional
   Commits, atomic, `git pull --rebase`. Never force-push main.
-- **Python**: `ruff` + `black`, 4-space, `snake_case.py` modules/functions, `PascalCase` classes
-  (PEP 8 overrides the house PascalCase-files rule). **TS**: ESLint + Prettier, 2-space,
-  `PascalCase.tsx` components, `camelCase.ts` services. Constants/env `UPPER_SNAKE_CASE`. 120 cols.
+- **Python**: `ruff` + `black`, 4-space, PEP 8 naming (overrides the house PascalCase-files rule).
+  **TS**: ESLint + Prettier, 2-space, `PascalCase.tsx` components, `camelCase.ts` services. 120 cols.
 - **Docker**: Binhex conventions (see the global CLAUDE.md). Project deltas: host networking, and
   `/proc/asound` bind-mounted from the host at `/host/asound` because it is masked in the container.
   `/media` is mounted and declared but nothing reads it yet — it is there for Plexamp.
@@ -121,8 +122,52 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
 The *reasoning* behind these, and the failures that produced them, is in
 **`docs/HARD-WON-LESSONS.md`**. Do not re-litigate them from first principles.
 
-- **Pin `aiosendspin`** (6.0.5). On any bump run `_resources/spike/mesh_smoke.py` first, and re-check
-  `docs/UPSTREAM-AIOSENDSPIN.md` — several shipped workarounds should be deleted when it moves.
+- **Pin `aiosendspin`** (9.1.1). On any bump run `tests/Integration/t0_sendspin_protocol.py` first
+  (tier 0 — real protocol, no rig; needs a venv on the candidate version), and re-check
+  `docs/UPSTREAM-AIOSENDSPIN.md`. Port notes: `docs/AIOSENDSPIN-BUMP-SCOPE.md`.
+- **A role is ALWAYS negotiated but only ACTIVATED when the client is PAIRED** (or, with unpaired
+  access on, when the client sets `unpaired_access_enabled` AND the server calls `trust_unpaired()`).
+  Miss it and the endpoint connects, negotiates, joins the group at the right volume and renders
+  **nothing**, with no error at either end — `active_roles` vs `negotiated_role_ids` is the only tell,
+  and it is published on `PlayerState` alongside `security`/`paired`. **`security is None` means
+  CLEARTEXT**, which is how the GUI tells "needs pairing" from "can never pair". Trust and pairing are
+  both per-server AND per-peer. Applies to ENCRYPTED clients only — see the next rule.
+- **Pairing is implemented; unpaired access defaults OFF.** A unit pairs with its own speaker via
+  `/config/identity/local-pair.psk`, peers pair via `PLUM_FLEET_PSK` when set, and everything else is
+  a GUI act. `pairing_psk` needs NO window; the window (300 s, ONE attempt) is for PIN methods and
+  later-added units, opened via the `management` role — which is why a unit pairs with its own player
+  at startup. `docs/SENDSPIN-PAIRING.md`.
+- **A `management` session must be CLOSED, or that player can never roam again.** A declared activity
+  is ranked by the client's arbitration, so a server still holding `management` outranks a peer
+  asking for plain PLAYBACK — the peer's dial is accepted, then rejected, and lands as
+  `(disconnected)`. Nothing expires the session, so a **restart "fixes" it**, which is what makes it
+  look like drift. `open_pairing_window` enables it for the call and disables it in a `finally`.
+- **Pair by STAGING before the dial, never by `initiate_pairing` after it — and never over
+  cleartext.** Both halves cost a working rig on 2026-08-13. Pairing a *connected* client forces a
+  mid-connection Noise re-handshake, and a peer's player is contended, so it loses the race and that
+  player's reclaim then times out forever. `stage_shared_psk` puts the PSK in front of the handshake,
+  so the connection arrives already paired. Stage only ids we already share a secret with. A pairing
+  handshake against a **cleartext** client is aborted by the library, so staging or pairing an ESP32
+  takes it offline — signature: the NEXT adopt succeeds. Detail: `docs/SENDSPIN-PAIRING.md`.
+- **"A client holds exactly ONE websocket" is a 6.0.5 truth, and 9.x is more subtle.** Measured
+  2026-08-24: connections OVERLAP — session 306 stayed open on our player while 307-311 opened and
+  closed — because 9.x brings an incoming connection up provisionally and then arbitrates by
+  activity rank. The old statement still describes the OUTCOME (one server ends up holding a player)
+  and every rule resting on it stands; what is wrong is treating a held connection as a hard refusal
+  of the next dial. Anything reasoning about connection *count* must measure rather than assume.
+  OPEN-ITEMS #23.
+- **Cleartext clients skip the trust gate entirely, and our own player can never be one.** A legacy
+  `client/hello` is activated straight from the negotiated set, so ESP32 speakers, Music Assistant
+  and our hand-rolled GUI controller need no pairing — that is what `PLUM_ALLOW_UNENCRYPTED=1` buys.
+  But there is **no client-side legacy mode**, so a foreign server dialing OUR player must speak
+  Noise too; measured, MA 2.9.x cannot. `docs/SENDSPIN-PAIRING.md`.
+- **A Sendspin id is a public key, and a unit now has THREE ids.** `unit_id` keys the mesh;
+  `server_id`/`player_id` are X25519 peer ids from `/config/identity` and are what the protocol
+  uses; the player also keeps a **listener id** (`PLUM_PLAYER_ID`) for mDNS and for a server to dial.
+  Anything joining across those namespaces must be explicit — `MeshView.unit_by_server_id`, and the
+  player's self-report publishes its **peer** id (publishing the listener id instead duplicated every
+  speaker in the GUI and made idle speakers unroutable). `/config/identity` is a device certificate:
+  losing it makes a unit a stranger to every peer.
 - **`SendspinServer` always binds mDNS (5353)** → collides with the host Avahi. Start with
   `start_server(advertise_addresses=[], discover_clients=False)` and drive connections by URL.
 - **Sendspin mDNS goes through the system Avahi** (`mesh/avahi.py`, D-Bus), never our own responder.
@@ -139,34 +184,107 @@ The *reasoning* behind these, and the failures that produced them, is in
   `SourceFeeder.refresh_stream()` after `add_client`. The cost is a brief discontinuity for everyone
   already listening; that is the deliberate trade. **Roaming hides this** (a reconnect gets the
   stream free), so do not "optimise" the refresh away because a roam test passes.
-- **Re-dial before adopting a foreign speaker.** `connect_to_client(url)` is a NO-OP when a dial
-  registration for that URL already exists, so a second `adopt` silently does nothing and then times
-  out reporting "never connected" about a device whose port is plainly open. Identify a speaker by
-  its **registered URL**, never by "a client id that was not in the set before".
+- **Never re-dial a foreign speaker you already hold — and when you must, wait for the old dial to
+  DIE.** Both halves are load-bearing: `connect_to_client(url)` is a no-op while a registration for
+  that URL exists, so a stale one must be torn down; but redialing unconditionally leaks a dialer per
+  adopt, and they fight over the single websocket a client allows. Go through `_stop_dialing`, fast-
+  path when `_connected_player_at(url)` answers, and identify a speaker by its **registered URL** —
+  never by "a client id that was not in the set before". Evidence: HARD-WON-LESSONS.
+- **Never hand a joining client the stream you are about to replace.** `attach_player` stops, changes
+  membership, then re-acquires (`SourceFeeder.membership_change`, lock-serialised against the pump).
+  The other order puts `stream/start`→`stream/end`→`stream/start` on the wire in ~110 ms. Keep it,
+  but it is **belt-and-braces, not a proven fix** — do not cite it as a cause without an A/B, and note
+  an ESP32 that does wedge is unrecoverable over the protocol (only a power cycle clears it).
+- **A routed player must never have a registry eviction pending.** `_schedule_cleanup` overwrites
+  `_cleanup_handle` without cancelling it, so a release orphans a timer that later evicts whichever
+  client holds that id — a random dropout, now on a **180 s** fuse. `attach_player` and
+  `release_foreign_client` defuse it via `_cancel_pending_cleanup`; UPSTREAM §5, HARD-WON-LESSONS.
+- **Playback is TIMESTAMP-LOCKED, and the renderer is the only place that knows it.** Each chunk's
+  `server_ts_us` becomes a client-clock deadline via `client.compute_play_time()` (converted in the
+  LOOP thread — the time filter is not cross-thread, and a client-domain time survives a roam); the
+  PortAudio callback serves the frame due at `now + (outputBufferDacTime - currentTime)`. Only that
+  DIFFERENCE is usable — PortAudio's Linux clock is not ours. Drift is one dropped or duplicated
+  frame every few callbacks outside a 1.5 ms deadband; past 30 ms it steps, and a step finishes at
+  the deadband, not at the threshold. `PLUM_SYNC_LOCK=0` restores the free-running drain that
+  shipped from Phase 1 to 2026-09-13, under which four units sat 0.25-0.5 s apart every session.
+  `target_buffer_ms` gates NOTHING and never did — it reaches one log line. HARD-WON-LESSONS.
+- **`PLUM_STATIC_DELAY_MS` is this endpoint's real output latency, and it defaults to 0.** The client
+  subtracts it from every play time ("start me early, my chain is behind"). PortAudio's DAC time
+  already covers the ALSA buffer, so the true figure is ~1 ms; the old 150 was inert only while play
+  times were ignored, and now puts a unit 150 ms ahead of an ESP32 declaring 0. A measured per-room
+  offset goes in the per-endpoint delay (`/api/mesh/player-delay`), which is per endpoint and
+  persisted.
 - **Codec choice belongs to the CLIENT.** `supported_formats` is in priority order and the server
   takes the first match it implements. A player that cannot sustain its own choice renegotiates with
   `stream/request-format`. Do not add a server-side override without a live, proven case — one was
   written and reverted (`0d7c6ab`). A heterogeneous group is normal, not a problem.
 - **Announce idle, don't imply it.** On EOF or `PLUM_SOURCE_IDLE_TIMEOUT` silence call
   `group.stop()` (playback_state=**stopped**), never `stop_stream()` (which keeps clients logically
-  PLAYING). The spec has no distinct idle state — `stopped` is it. Groups/anchors persist, so
-  routing survives.
+  PLAYING). The spec has no distinct idle state — `stopped` is it. The group and its anchor persist,
+  so the **source** stays routable — but every attached **player** does not. "None" is a true none
+  (`docs/ROUTING-MODEL.md` rule 1): going idle detaches every player-role client uniformly, and only
+  `autoSwitch.localActivity` (own player, rising edge) or `follow` brings one back. A **reversal** —
+  the old silent auto-resume was the bug.
+- **A unit does NOT hold its own player, and going idle or unrouting RELEASES it.** Detaching from a
+  group is not letting go of the websocket, and a client holds exactly ONE — a resident PLAYBACK
+  connection is why a foreign server could never claim our speaker. `register_player` registers the
+  URL without dialling; `release_local_player` runs from both `_go_idle` and `detach_player`. Nothing
+  needs the resident dial: an unattached player is in no unit's `players` list, so `mesh.router`
+  takes its idle-speaker fallback and dials it back — **local intent always wins the speaker back**.
+  So `open_pairing_window` dials on demand, `set_player_volume` **holds** the level for the next
+  connect (a slider nudge must never steal a room mid-track), and anything reading a unit's own
+  player must fall back to the `local_player` self-report, never `unit.players`.
+- **"Unattached" for that purpose means SILENT, not disconnected.** MA re-dials a released speaker
+  within seconds and then parks a mute websocket on it for as long as it likes, so foreign-held is
+  the steady state on any VLAN running MA — not an exception. `follow._player_status` therefore
+  keys the foreign branch on `local_player.playing` (audio-flow truth, driven by stream start/end)
+  rather than on `attached`, or the release above hands the speaker away permanently and
+  `localActivity` never fires again. While that server really is feeding the speaker we leave it
+  alone, which is what lets an MA stream take this endpoint over mid-AirPlay with no user input;
+  the rising-edge guard is what stops us grabbing it back and starting a fight over the one
+  websocket a client allows. HARD-WON-LESSONS.
+- **An AirPlay sender may send NO play-state or progress at all** (Music Assistant's does not). Play
+  state falls back to shairport's MPRIS `PlaybackStatus` (`airplay_remote` → `note_external_state`),
+  and **playback state is never gated on knowing the duration** — one guard covering both made the
+  transport read *paused* for a whole session while audio played. Position still needs a real `prgr`;
+  an invented one is worse than none.
 - **Three volumes, and only two are the protocol's.** *Per-player* and *group* are Sendspin, and the
   library already does the delta-preserving group redistribution — do not fan out per client.
   *Source volume* is the level on the **sending** device (the phone's slider, Spotify Connect); the
   spec has no such concept, so it rides `POST /api/mesh/source-volume` and is driven per source. It
   stacks with the endpoint levels; never conflate them in the GUI. The main card's slider is **this
-  unit's own endpoint**, not the group.
+  unit's own endpoint**, not the group. **Loudness matching is the one sanctioned per-client fan-out**
+  — a measured per-endpoint correction the protocol cannot express as one group level; it is
+  confined to calibrated, in-scope groups. `docs/VOLUME-CALIBRATION.md`.
+- **A calibration tone must travel the ORDINARY audio path, and a bad curve must never reach a
+  speaker.** The tone is a transient source (`cal:<player_id>`) with the target player alone in its
+  group, precisely so the endpoint's own gain applies to it — that is the quantity being measured.
+  Plum-Snapcast wrote it to local ALSA with `sox`, which bypassed the volume stage, so every reading
+  was identical, the slope was 0 and the inverse was `NaN`; `audio_devices.test_device` cannot
+  substitute because it refuses the card the player already holds. The fit is
+  `dB = a*log10(v) + b` (**log space** — percent-linear is physically wrong and diverges near
+  silence), and a flat, inverted or implausible fit is REJECTED rather than stored: the failure mode
+  of a wrong curve is a real speaker moving on its own. The `cal:` source stays visible in the
+  snapshot — `Router.route_player` resolves sources through the view — and is filtered in the GUI.
+- **Calibration is read MERGED and written LOCAL.** A record can only be written to the unit serving
+  the page (a peer's :5002 is deliberately not reachable cross-origin), but matching runs on
+  whichever unit owns the GROUP. Each unit publishes its map in `UnitSnapshot.calibration` and every
+  unit merges newest-wins. Skip it and *which unit's page you opened* silently decides whether
+  matching works. Same reason `UnitSnapshot.follows_unit_id` exists: follow config lives on the
+  FOLLOWER, so nothing else can tell a locked room from one that joined by hand.
+- **Anything keyed by id must write through `SettingsManager.mutate`, not `update_settings`.** The
+  latter is a blind patch; a get-then-post on a map lets two browsers each read it and the second
+  drop the first — with a bumped version, so no poller ever reconciles the loss.
 - **A player MUST echo back both its level and the output it actually opened** into
   `/data/player_state.json` — not `settings.json`, which a different process owns. `set_volume()`
   only *sends*; the server's view moves solely on `client/state`, of which the library sends exactly
   one, at connect. Skip the echo and every level in the mesh reads 100% forever while the audio is
   demonstrably quieter — it looks like a GUI bug and is not one. The output echo is what lets the
   API report `pending` rather than claiming a switch that never opened.
-- **`client/state` must carry `state` at the TOP level**, via
-  `sendspin_player.build_client_state_message`. The library's own `send_player_state()` puts it only
-  in the deprecated nested `player` object and drops the required field — see UPSTREAM §0. There is
-  a canary test; when it fails, delete the workaround.
+- **`client/state` carries `available: bool`, and it is NOT the old `state` enum renamed.** The
+  server ends an active stream before honouring `available=False`, so a struggling renderer reports
+  `available=True` and its health rides `PlayerHealth` → the log and `player_state.json` instead.
+  9.x deleted the wire field that used to carry it.
 - **The output device's identity is the ALSA CARD NAME, never `hw:C,D`.** Card numbers move — the
   HiFiBerry on `.100.21` was card 2, then 1, then 2, then 0 across four reboots with config
   unchanged. `settings.json` stores `<card_name>:<device>`; `hw:C,D` is re-derived every scan.
@@ -192,37 +310,38 @@ The *reasoning* behind these, and the failures that produced them, is in
   are only what an unnamed unit boots with. A rename applies live to the mesh view and mDNS TXT; the
   Sendspin-level names are fixed at connect and catch up on the next restart, deliberately, because
   restarting the audio process to apply a rename would drop playback.
-- **Every default name must be unique per unit, and a clash NEVER blocks a deploy.** `DEFAULT_SETTINGS`
-  is written to `settings.json` on the first read, so any literal there outranks the env permanently
-  and *identically on every unit* — which is how two greenfield units both became "Plum Sendspin"
-  offering a "Plum Audio" receiver. The unit name and all three endpoint names derive from
-  `PLUM_UNIT_NAME`, and when that is unset from `unit_identity.default_device_name()`, which appends a
-  stable per-unit token. `deploy.sh` appends the same token to whatever `units.conf` duplicates and
-  warns — it must not refuse, because that turns a cosmetic slip into a rig that will not deploy.
-  The token is the **Pi's SoC serial**, not a default-route MAC: a MAC moves when a unit is put on
-  `wlan0` instead of `eth0`, silently renaming it. No token readable → bare name; unknown beats
-  invented. Env-derived defaults are `sanitize_device_name`'d **at import**, since
-  `_sanitize_device_names` only runs on the write path.
+- **Every default name must be unique per unit, and a clash NEVER blocks a deploy.** A literal in
+  `DEFAULT_SETTINGS` reaches `settings.json` on first read and then outranks the env permanently, on
+  every unit identically. Unit and endpoint names derive from `PLUM_UNIT_NAME`, else
+  `unit_identity.default_device_name()`, which appends the **Pi's SoC serial** (not a MAC — a MAC
+  moves with the interface). No token → bare name; unknown beats invented. `deploy.sh` warns and
+  disambiguates, never refuses. Env-derived defaults are `sanitize_device_name`'d **at import**.
 - **mDNS hostname changes go through Avahi's D-Bus `SetHostName`** on the HOST bus — never by writing
   `/etc/avahi` or restarting a service. Setting the name it already has raises "invalid because
   redundant" (a no-op), and a real change drops the D-Bus connection mid-call, so success surfaces as
   failure. Always reconnect and read the name back.
-- **The player is a PROCESS, not a setting.** `audio.output.device = "none"` (`audio_devices.NO_OUTPUT`)
-  means a unit renders nothing and runs **no `sendspin_player` at all** — `output_gate.py` decides
-  before supervisord and omits the program file. It cannot be a running player with nothing open:
-  `AlsaRenderer.start()` raises when PortAudio can't open a device and `SendspinPlayer.start()` calls
-  it *before* the listener and the mDNS publish, so a card-less host crash-loops forever. Hence the
-  restart requirement, and hence `has_player` on the snapshot — **defaulting True**, or a peer on an
-  older image reads as playerless. A playerless unit **leads** follow but never follows; a leader with
-  no `local_player` used to read as "session ended" and unroute its own followers. `find_device` must
-  short-circuit the sentinel *before* its substring pass, and the compose `headless` profile exists
-  because Docker refuses to create a container whose `devices:` names a missing `/dev/snd`.
-- **Host provisioning is not optional, and is once per IMAGE.** The bluez patches,
-  `bluealsa-plum-dbus.conf`, the rfkill unblock and the HAT mixer are not installed by anything the
-  container does, and each absence fails silently or catastrophically. `scripts/host-setup/provision.sh`
-  runs the checklist from the workstation and pushes the payload — **a freshly imaged Pi has no copy
-  of this repo**, which is what every by-hand command in `docs/HOST-PROVISIONING.md` assumes. `all`
-  means all four units across both VLANs; name hosts to scope it.
+- **The player is a PROCESS, not a setting.** `audio.output.device = "none"` means no
+  `sendspin_player` runs at all — `output_gate.py` omits the program file before supervisord. It
+  cannot be a running player with nothing open (`AlsaRenderer.start()` raises, and it runs *before*
+  the listener), hence the restart requirement and `has_player` on the snapshot — **defaulting
+  True**, or a peer on an older image reads as playerless. A playerless unit leads follow, never
+  follows. `find_device` short-circuits the sentinel before its substring pass.
+- **A container cannot replace itself, and there is deliberately NO Docker socket.** Updates go
+  through a HOST agent (`scripts/host-setup/plum-updater.sh`, a systemd path unit): the container
+  writes `/config/update.request` and reads back `/config/update.state`; the agent runs
+  `docker compose pull` and then `up -d` **only if the pull succeeded**, so a failed pull leaves the
+  unit playing. Mounting the socket is the obvious "simplification" and is remote root — these APIs
+  are unauthenticated on `0.0.0.0`. The endpoints are on the mesh API (:5001), never :5002, because
+  a peer's :5002 is unreachable cross-origin and the GUI drives a SET of units. The daily timer
+  CHECKS and never applies: a per-unit timer would split the mesh across a protocol major unattended.
+  Skip the restart when the digest did not move, or an "update" on a current unit costs ~10 s of
+  silence for nothing. `docs/OPERATIONS.md`.
+- **Host provisioning is not optional, and is once per IMAGE.** The bluez patches, the D-Bus policy,
+  the rfkill unblock and the HAT mixer are installed by nothing the container does, and each absence
+  fails silently or catastrophically. Run `scripts/host-setup/provision.sh` from the workstation — a
+  freshly imaged Pi has no copy of this repo. The one exception is `scripts/plum-init.sh`, which
+  runs the same checklist ON the Pi and reads the payload out of the image it pulled (the Dockerfile
+  copies `scripts/host-setup/` and the compose file in for exactly this). `docs/HOST-PROVISIONING.md`.
 - **WiFi/host concerns** (NetworkManager owns `wlan0`) live on the host, not the container.
 
 ## Common tasks
@@ -242,166 +361,48 @@ reach the audio loop, and the dev rig has no supervisord.
 6. Deploy to the rig → verify live add/rename/disable/remove → then build the image.
 
 ### Build, deploy, debug
-`scripts/host-setup/provision.sh all` once per Pi image, then `docker/build.sh` and
-`docker/deploy.sh all` per deploy. Full loop, the deceptive failure modes, and the debugging cookbook
-are in **`docs/OPERATIONS.md`**; commissioning in **`docs/HOST-PROVISIONING.md`**.
+Fleet: `scripts/host-setup/provision.sh all` once per Pi image, then `docker/build.sh` and
+`docker/deploy.sh all` per deploy. One Pi: `sudo scripts/plum-init.sh "<name>"` ON the unit — same
+`plum-audio.env`, so either script can redeploy a unit the other commissioned. Full loop, the
+deceptive failure modes, and the debugging cookbook are in **`docs/OPERATIONS.md`**; commissioning
+in **`docs/HOST-PROVISIONING.md`**.
+
+**A unit's identity is DERIVED and PRESERVED, never chosen in `units.conf`.** The table is
+`host | name | [audio output]`; the ids came out of it because `entrypoint.sh` already defaults the
+unit id from the hostname and the player id from the unit id. Both deploy paths read the unit's
+existing `plum-audio.env` first and keep the id it is running under — a redeploy that renamed a live
+unit would make it a stranger to every peer. The audio output is a detected default (HAT/USB > onboard
+> HDMI), safe to guess because Settings → Audio outranks `PLUM_DAC_DEVICE` permanently. A six-column
+table still parses, detected by column count, because reading an old row as a new one takes the unit
+id for the NAME.
 
 ## Open
 
-1. **DLNA and Plexamp have no backend.** Established by *watching the running GUI* on `.100.21`
-   (2026-08-06) after two wrong descriptions here — a truncated `grep | head -20` produced the
-   second, so **read the whole grep**:
-   - `IntegrationsTab.tsx` **does** contain full DLNA (`:1250`) and Plexamp (`:1433`) sections,
-     ~330 lines with handlers and CRUD.
-   - They do not RENDER: `Settings.tsx:43` passes `enabledSources={['airplay','spotify','bluetooth']}`
-     and `show()` gates both out.
-   - But `loadDlnaEndpoints()` ran on mount regardless of that gate, so every open of the
-     Integrations tab logged two console errors against `/api/integrations/dlna/endpoints` — a route
-     `create_integrations_blueprint` does not register. **Fixed 2026-08-06**: the effect now returns
-     early when the section is hidden.
-   Remaining scaffolding: the two card bodies, `types.ts`'s `DLNAEndpoint`, and `settings_api.py`'s
-   `integrations.dlna`/`.plexamp` defaults (Plexamp's gated on `PLEXAMP_ENABLED`).
-2. **Four frontend test suites assert nothing about production code** (`NowPlaying`,
-   `PlayerControls`, `integrationsService`, `settingsService`). `PlayerControls` now has a real
-   counterpart beside it (`PlayerControlsSourceVolume`); the other three do not. See TESTING.md.
-3. ~~`sendspin_server.py` has no unit coverage~~ — **done 2026-08-06**,
-   `tests/Unit/test_sendspin_server.py` (29 tests). `refresh_stream` and its `attach_player` caller
-   are pinned in call order against fakes; deleting the refresh fails two tests. Also covers the
-   `_primary_source` handoff, controller grouping and source lifecycle.
-4. **`configure-audio-hat.sh`'s no-`dtoverlay` fallback has never run on real hardware** — unit-tested
-   against fixtures only. `--keep-onboard` HAS now run, on `.100.21` (2026-08-05), and had two
-   independent bugs that fixtures could not have caught: it left an out-of-block `dtparam=audio=off`
-   armed, and omitting `audio=off` is not the same as asking for `audio=on` (the firmware default is
-   off). Both fixed and verified across a reboot.
-5. ~~Visualizer, About and Integrations have no visual review under a live stream~~ — **DONE
-   2026-08-06**, in-browser on `.100.21` (idle) and `.2.10` (live Spotify). Everything renders:
-   artwork, metadata, progress, both volume sliders, shuffle/repeat shown only because Spotify
-   advertises them, and a track change updating metadata + artwork live. The **visualizer is
-   audio-reactive under a live stream** — successive frames show different spectra — and **album-art
-   theming works**, re-colouring the whole UI from the artwork with contrast preserved. It is
-   opt-in: Settings → Theme → *Album Art Colors*, off by default, per-browser. Left OFF as found.
-   Two real defects were found and fixed: the About tab was unported from Plum-Snapcast wholesale,
-   and the DLNA console errors in item 1. Console is otherwise clean.
-6. **Multi-server arbitration** is a spec MUST we only half-implement — we persist the last playing
-   `server_id` but cannot yet decide, pending UPSTREAM §1.
-7. **amd64 has never been built.**
-8. **The APIs are unauthenticated with blanket CORS** (`CORS(app)`, `Access-Control-Allow-Origin: *`,
-   both bound to `0.0.0.0`). The injection chain behind it is closed at three layers, but any page on
-   the LAN can still change a unit's settings. Deliberately deferred 2026-08-05: restricting CORS
-   needs a rig test, because peers and the GUI both call peer `:5001` cross-origin.
-9. ~~`_primary_source` is set but never cleared~~ — **fixed 2026-08-06**. Confirmed real by reading:
-   `stop_source` popped `sources` and left the id behind, so `_maybe_group_controller` resolved a
-   dead source and returned early — a controller with no `ctrl:<source>:` hint silently stopped
-   being grouped. It now hands the fallback to the oldest surviving source (`None` when the last one
-   goes). Regression-guarded in `test_sendspin_server.py`. Never reproduced on hardware, but the
-   read is unambiguous.
-10. **A volume change emits two identical `client/state` frames ~2ms apart.** Harmless (it is a full
-    report, not a delta) but it means `_publish_render_state` runs twice per command. Seen on the rig
-    2026-08-05, not chased.
-11. ~~`_is_audio_source` returns True for `A2DP_SINK_UUID`~~ — **resolved 2026-08-06: the comment was
-    right, the code was wrong.** 110d (AudioSink) is what a *speaker* advertises; a device offering
-    only it cannot send us audio, so adopting it started an `arecord` that could never produce a
-    sample and — most-recently-connected wins — took the capture slot from a phone that was already
-    playing. The both-match test came in with the original Bluetooth commit (`0ff2ceb`), carried
-    from Plum-Snapcast. Now requires 110a; a device that advertises both (phones that can also be a
-    speaker) is unaffected, and a skipped sink-only device is logged rather than dropped silently.
-12. **Three duplications worth real lines**, from the 2026-08-05 audit: `integrationsService.ts`
-    (944 → ~250 with the helper that already exists in `audioService.ts`), `IntegrationsTab.tsx`
-    (**1490** as of 2026-08-06, not the ~880 first recorded → ~350 with one endpoint-CRUD card), and
-    the three `*_config.py` (431 → ~190 on a shared base). None touch the audio path. Also a shared
-    progress/metadata helper for the three source handlers — the Spotify timestamp bug was the third
-    implementation of the same plumbing getting it wrong, which is the argument for it.
-13. **A follower stops following when its leader switches source.** Found 2026-08-06 while building
-    headless mode, and **pre-existing** — it is not about playerless units, it happens identically to
-    a leader with a speaker (verified directly). When the leader moves to a second source, the
-    follower's old source goes quiet, so its `current_target` becomes `None`; the override guard in
-    `follow.tick()` reads that as "the user moved us" and sets `_overridden`, so it never follows to
-    the new source. Distinguishing "went idle because the source stopped" from "was deliberately
-    moved" needs a real decision, so it was pinned by a parity test
-    (`test_a_playerless_leader_switching_source_behaves_like_any_other_leader`) rather than
-    quietly changed under a feature branch.
-14. **A playerless leader cannot nominate which source it leads with.** With several concurrent
-    active sources, `follow._leader_status` picks the one with the most endpoints attached,
-    tie-broken by `source_id`. Deterministic and self-reinforcing — the first follower to join raises
-    that source's count — and it has to be, because every follower computes it independently with no
-    coordination. But the leader has no say, and there is no GUI for it.
-15. **A playerless unit's main card has NO endpoint slider** (`hideEndpointVolume`, 2026-08-06).
-    It previously rendered a phantom 100% whose `onChange` found no client, did nothing, and snapped
-    back on the next poll. Hiding it is rule-conformant — *"the main card's slider is this unit's own
-    endpoint, not the group"* — and the group control still exists one panel down in `SyncedDevices`.
-    Repurposing that slider to group volume on playerless units would be more useful, but it needs
-    that rule **amended explicitly**, not silently excepted. Awaiting a call.
+Full list — known gaps, deferred calls, resolved-with-history — is **`docs/OPEN-ITEMS.md`**. Only the
+items that change how you would write code *today* are repeated here:
 
-16. **Card-identity hardening — what is still open** (audit 2026-08-06; the confirmed-dangerous ones
-    are fixed, see HARD-WON-LESSONS). Ranked:
-    - ~~A failed output switch is never retried~~ — **fixed 2026-08-06.** `watch_output_device` now
-      holds its baseline until `on_change` reports success (False or a raise = retry), so a card
-      that is merely late is picked up on the next tick instead of stranding the unit until a human
-      toggles the setting. Logging throttles after the first few attempts. Returning None still
-      counts as success.
-    - ~~`renderer.device` records the REQUEST, not the card actually opened~~ — **fixed 2026-08-06.**
-      `AlsaRenderer.open_device` carries the RESOLVED `<card_name>:<device>` and is what is echoed to
-      `player_state.json`; `device` still holds the requested spec, so `reopen`'s no-op check is
-      unchanged. `pending` can now detect "opened, but on a different card than intended" — exactly
-      what a stale `hw:C,D` produces after a renumber. None when resolution found nothing and
-      PortAudio name-matched the raw spec: unknown beats invented.
-    - **`_open`'s raw-spec fallback can open the wrong card.** When `aplay -l` fails, resolution
-      returns nothing and the raw spec goes to PortAudio, whose names embed `(hw:C,D)` — so an
-      `hw:2,0` substring-matches whatever is at that address now and opens it, with one warning.
-    - **USB card names are enumeration-order-derived.** Two identical DACs give `Device` and
-      `Device_1`, and which is which is decided by the same probe race that moves card numbers, so
-      `card_name` is NOT stable for exactly the device class where hot-plugging is normal. Passes
-      1–3 of `find_device` have no ambiguity guard at all (only the substring pass does).
-    - **`_portaudio_outputs` is last-write-wins** on a duplicate `(card, device)` key, and its 2 s
-      cache is keyed on that volatile pair — a hotplug inside the window can hand back an index for
-      a device that no longer exists. `resolve_portaudio_index` forces a refresh; no `audio_api`
-      caller does.
-    - **`parse_aplay_output` silently drops any line the regex misses** — the device then vanishes
-      everywhere downstream with nothing logged.
-
-17. **Spotify Connect's first transfer after a go-librespot (re)start can fail.** Seen on
-    `.2.10` 2026-08-06 — the first attempt drops immediately, the retry works. It is go-librespot
-    internal, NOT our pipeline: `/data/go-librespot/<n>/go-librespot.log` shows
-    `failed handling dealer request ... failed creating stream ... failed seeking stream: failed
-    reading page: EOF`, i.e. it could not fetch the track from Spotify's CDN. The observed instance
-    was ~30 s after a container restart. That log also carries a `panic: send on closed channel`
-    from an earlier date — a real go-librespot crash, which our source manager respawns. Worth
-    watching for a pattern away from restarts before treating it as ours.
-
-18. **The visualizer's periodic drop-to-zero is CONTROLLER-WS CHURN, not the audio path.** Measured
-    in the running GUI on `.2.10` (2026-08-06) by hooking `WebSocket` and timestamping every
-    binary frame: spectrum arrives at **31 Hz with a 2000 ms gap every 3 s**, like clockwork
-    (1.1 s, 4.1 s, 7.1 s, 10.1 s …). In the same window, **48 controller sockets were created AND
-    closed in 22 s** — six (one per source across both units) every ~3 s, all close code 1000.
-    Ruled OUT: `refresh_stream`. The server re-acquired the stream only 3 times in the whole log,
-    each right after a container restart, so steady playback is not churning the group. The player
-    logs no xruns and no starvation.
-    ~~The amplifier is `sendspinControllerClient.open()`~~ — **fixed 2026-08-06.** `reconnectAttempts`
-    was reset in `onopen`, the instant the socket opened rather than once it had proven stable, so a
-    socket dying shortly after connecting reset the counter every cycle and retried at a flat 1 s
-    forever. Now forgiven only after `RECONNECT_STABLE_MS` (10 s) of survival. This removes the
-    AMPLIFIER, not the cause — a real trigger will now present as a visibly SLOWING retry rather
-    than a fixed 3-second sawtooth, which is more diagnosable, not less.
-    **STATUS 2026-08-06: not reproducing on `5801dfe`.** Michael reports it looks good with that
-    build deployed, after the localActivity/slave ping-pong fix (#13) and the layout fixes landed.
-    That is an observation from watching, NOT a measurement, and the sawtooth above WAS measured on
-    the same build — so treat this as "intermittent / trigger-dependent", not "fixed". If it returns,
-    start from the WebSocket hook rather than from theory; the recipe is in this entry.
-    **The TRIGGER — what closes the socket ~1 s after open — is NOT yet identified.** One strong
-    candidate not yet excluded: the measurement tab was backgrounded (confirmed — a 100 ms sampler
-    was throttled to ~1 Hz), and `client/time` is sent on an adaptive `setTimeout` (0.2–3 s) which
-    background throttling would stretch, possibly past whatever the server tolerates. Re-measure in
-    a FOCUSED, foreground tab before concluding this is user-visible rather than an artifact.
-
-19. ~~Two greenfield units advertise the same AirPlay receiver name~~ — **fixed 2026-08-06**, on
-    Michael's call. Found deploying the alpha to the re-imaged mesh-pair units: `DEFAULT_SETTINGS`'
-    endpoints all defaulted to `deviceName: "Plum Audio"`, and AirPlay's is enabled on RAOP 5050 out
-    of the box, so every fresh unit offered an identical receiver — "Plum Audio" twice on the LAN with
-    nothing to tell them apart. Same defect as the unit name (`2f9c1d9`) one level down. All three
-    source endpoints now derive from `PLUM_UNIT_NAME` via `DEFAULT_ENDPOINT_NAME`; Spotify and
-    Bluetooth were collision-bound the same way once enabled. Both env-derived defaults are
-    `sanitize_device_name`'d **at import**, because `_sanitize_device_names` runs on the write path
-    only — a default otherwise reaches disk, and the config renderers, unscrubbed.
+- **DLNA and Plexamp have no backend.** GUI cards and settings stubs exist and are gated off; no
+  ports are in use. Do not treat their scaffolding as a working integration.
+- **`@sendspin/sendspin-js` is deliberately held at 3.2.1.** 5.0.0 is Noise-only and drops the
+  caller-chosen `playerId` that `MeshApp`'s browser-route reconciler joins on. It becomes forced the
+  day `PLUM_ALLOW_UNENCRYPTED` goes off.
+- **Two units set to follow each other OSCILLATE, and `_overridden` does not catch it.** It covers
+  "the user moved us", not "the config is circular". `masterUnitId` is a free per-unit choice with no
+  cross-unit validation, so a GUI user reaches it: each unit then routes its own player onto the
+  other's stream, about once a minute, forever. `FollowReconciler` walks `follows_unit_id` from its
+  master and, if the chain returns to itself, the LOWEST unit id stands down and publishes
+  `follows_unit_id = None` — which is what dissolves the cycle for the others. Deterministic on
+  purpose: a state-dependent rule ("whoever is playing wins") hands leadership back and forth as
+  playback moves, which is the oscillation it exists to stop. `PlaybackTab` will not offer a master
+  that would close a loop. OPEN-ITEMS #25.
+- **A follower stops following when its leader switches source** (`follow.tick()` reads the
+  resulting `current_target = None` as "the user moved us"). Pinned by a parity test rather than
+  changed; distinguishing "went idle" from "was moved" needs a real decision.
+- **The APIs are unauthenticated with blanket CORS**, both bound to `0.0.0.0`. Deliberately deferred
+  — peers and the GUI both call peer `:5001` cross-origin, so restricting it needs a rig test.
+- **amd64 has never been run** (it has been built twice; `deploy.sh` hard-refuses non-arm64).
+- **Frontend test suites are thin** and several assert nothing about production code; `MeshApp`,
+  the controller client and the browser player have no coverage at all.
 
 ## Resources
 - Sendspin spec: <https://www.sendspin-audio.com/spec/> · Org: <https://github.com/Sendspin>
@@ -410,7 +411,9 @@ are in **`docs/OPERATIONS.md`**; commissioning in **`docs/HOST-PROVISIONING.md`*
 
 ## Maintaining this file
 Update on: architecture changes, new sources, new env vars, new workflows. **Keep it under ~280
-lines** — it loads into every session, and it reached 465 by absorbing things that belong elsewhere.
-War stories → `docs/HARD-WON-LESSONS.md`. Dated narrative → `docs/PHASE-HISTORY.md`. Procedures →
-`docs/OPERATIONS.md`. A rule earns its place here only if an agent would break something without it.
-Document *why*, not just *what*.
+lines** — it loads into every session. It reached 498 by absorbing things that belong elsewhere and
+was cut back on 2026-08-13; the overflow went to `docs/OPEN-ITEMS.md` and `docs/HARD-WON-LESSONS.md`
+rather than being deleted. War stories → HARD-WON-LESSONS. Dated narrative → PHASE-HISTORY.
+Procedures → OPERATIONS. Known gaps → OPEN-ITEMS. **A rule earns its place here only if an agent
+would break something without it** — and it should be the RULE, with the evidence linked, not
+retold. Document *why*, not just *what*.

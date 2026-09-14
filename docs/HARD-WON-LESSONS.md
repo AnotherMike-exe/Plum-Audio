@@ -48,6 +48,19 @@ newest dialer; it now **persists the `server_id` of whoever most recently had it
 (`player_state.json`), which is the storage half of the MUST, but it cannot yet act on it.
 Harmless in a Plum-only mesh, where we only ever dial `playback`. Tracked in `docs/UPSTREAM-AIOSENDSPIN.md`.
 
+**A deploy that fails with no message at all is `grep -v` inside `set -e`.** `deploy.sh` prunes old
+images before loading the new one, and `grep -vE` exits 1 when it filters EVERYTHING out — the
+ordinary state of a unit with no locally-tagged image, such as a greenfield Pi or one that has only
+ever been updated from GHCR. With `set -euo pipefail` that status ended the whole remote heredoc
+silently, AFTER the container had been removed and the tarball copied. Living Room and Kitchen sat
+with no container and no error on 2026-09-13. Fixed with `|| true`: housekeeping must never decide
+whether a unit gets its image.
+
+**`declare -A` does not exist on the workstation.** macOS ships bash 3.2. It does not fail loudly
+either — it reads the host string as an arithmetic index, stores every unit in slot 0, and the test
+then exercises one unit while reporting the rest as broken. Cost a full test cycle in
+`t3_phase_lock.sh`. Use indexed arrays in `tests/Integration/`.
+
 **Alpine.** The base is `python:3.13-slim-trixie` (glibc) deliberately — glibc makes PyAV /
 PortAudio / numpy wheels trivial and removes the Alpine packaging pain Plum-Snapcast had. Trixie
 specifically, because two integrations depend on what that release ships; see
@@ -104,6 +117,74 @@ the GUI shows. Snapcast never hit this because snapclient owned the control via 
 Related: the `dtoverlay` block must go **before** the first existing `dtoverlay=` line — appending it
 after `vc4-kms-v3d` costs an HDMI audio output, measured over 5 boots. Both are host provisioning:
 see `docs/HOST-PROVISIONING.md` and `scripts/host-setup/configure-audio-hat.sh --unity`.
+
+---
+
+## Multi-room sync
+
+**The renderer free-ran for two phases, and nothing in the code said so except a TODO.** Four units
+on one AirPlay source played a quarter to half a second apart, and the offset moved every session.
+`AlsaRenderer` played each chunk the moment it arrived and never read `server_ts_us` at all, so a
+unit's phase was set by **when its first chunk happened to land** — and every padded underrun after
+that pushed that unit permanently later, which is why the offset also moved *within* a session.
+Written that way in the Phase 1 commit `4e1649f` and unchanged until 2026-09-13. `git log -S
+outputBufferDacTime` returns exactly one commit, and only for the TODO text.
+
+Three explanations were investigated and each cost real time before the renderer was read:
+
+- **The aiosendspin bump.** `.7.204` was pinned back to 9.1.0 and tested; all three units were still
+  mutually out of sync. The renderer is identical on both versions — what 9.x changed is *when*
+  buffers fill, not whether they align.
+- **The ESP32 speakers.** They were never the problem. sendspin-cpp already does timestamp-locked
+  playback; we were the ones free-running, and our own units drifted from each other by the same
+  margin.
+- **Buffer sizing.** `min_buffer_ms`, `TARGET_BUFFER_US` and the per-endpoint delay were all tried.
+  They change when a player *starts*, never whether it stays aligned.
+
+**`target_buffer_ms` never gated anything.** `_target_bytes` was computed in `__init__` and read in
+exactly one place: a log line. The renderer started its PortAudio stream at open and padded silence
+until audio arrived. So "the renderer starts when its buffer fills" was never true, and every theory
+resting on buffer depth was refuted by a `grep` that nobody ran.
+
+**Only the DIFFERENCE between PortAudio's two timestamps is usable.** `outputBufferDacTime` and
+`currentTime` are in PortAudio's Linux clock — the ALSA status tstamp — while `compute_play_time()`
+returns `CLOCK_MONOTONIC_RAW`, because `RawMonotonicClock` deliberately avoids NTP slewing. Comparing
+either timestamp with ours would schedule against a constant nobody can see. Their *gap* is a
+duration and belongs to no domain at all, so it is the only thing `_block_play_time` reads.
+
+**`PLUM_STATIC_DELAY_MS` was 150 on every unit, and phase lock is what made that dangerous.** It is
+the spec's `static_delay_ms`: the client subtracts it from every play time, meaning "start my audio
+this much early, because my output chain is that far behind". While the renderer ignored play times
+it did nothing but inflate the server's send-ahead. Under the lock, 150 puts a unit **150 ms ahead
+of any ESP32 speaker in the same group**, which declares 0. PortAudio's DAC time already accounts for
+the ALSA buffer, so the real figure is about 1 ms. Defaulted to 0 on 2026-09-13 in `deploy.sh`,
+`plum-init.sh` and the env example; a measured per-room offset belongs in the per-endpoint delay
+instead, which is per endpoint and persisted.
+
+**A step correction must finish at the deadband, not at the threshold that triggered it.** A skip is
+capped by the chunk it skips into, so a 300 ms correction is dozens of loop iterations; stopping each
+one as soon as the error fell under `SYNC_HARD_US` left up to 30 ms behind, and the single-frame trim
+removes 30 ms in about a minute of playback. Every track would have started out of phase and settled
+halfway through. Caught by `tests/Unit/test_render_sync.py` before it reached a rig.
+
+**Simulated before deployment, with the same code the units run.** Four units, different DAC drifts
+(0 to +/-80 ppm), different DAC leads (5-22 ms), joining 0-400 ms apart, over two minutes: spread
+**0.00 ms at the start and 1.52 ms after two minutes**, bounded by the deadband. The identical run
+with `PLUM_SYNC_LOCK=0` — the old renderer — spreads **478-484 ms** and never converges, which
+reproduces the reported symptom exactly. `_resources/spike/phase_lock_sim.py`.
+
+**The rig then agreed with the simulation to within a millisecond.** All four `.7` units,
+2026-09-13: settled errors `-1.28`, `+1.40`, `+0.23`, `+0.36` ms, zero xruns. PortAudio reports a
+usable `outputBufferDacTime` on bcm2835 AND on the HiFiBerry DAC+ — all four logged
+`latency=43ms lock=on`, none took the fallback. The bcm2835 unit absorbed **236 ppm** of drift
+through the trim, against a ~520 ppm ceiling.
+
+**A step must END the alignment it broke, or the counter lies.** `steps` was incremented on every
+callback that saw an error past `SYNC_HARD_US`. A correction spans as many callbacks as the hold is
+long, so one 150 ms re-alignment after a membership change read as **16 steps** on two units — the
+number is supposed to mean "how many times was this unit moved". Clearing `_aligned` inside
+`_note_step` fixes both halves: the rest of that correction runs at the deadband threshold, and
+`locks` records the landing. Measured on the rig, then pinned by a unit test.
 
 ---
 
@@ -226,6 +307,23 @@ See: `backend/scripts/mesh/avahi.py`, `backend/scripts/mesh/neighbourhood.py`.
 
 ## GUI
 
+**An unproxied `/api/` path answers 200 with index.html, so the GUI fails as "still loading"
+(2026-09-08).** `about_api.py` shipped with a Flask route, a service, a typed response and two
+callers, and never had an nginx `location`. The request therefore fell through to `location /`, whose
+`try_files ... /index.html` is what makes the SPA's client-side routing work — so `response.ok` was
+**true**, `response.json()` threw on the HTML, and both the About panel and the page footer sat in
+their empty state permanently. It reads exactly like a slow or broken backend, and `curl` on `:5002`
+answers perfectly, which sends you looking at the API. **Any new API prefix needs a block in
+`backend/nginx/plum-audio.conf`** — check there first when a panel will not populate, and test the
+proxied port, not the origin.
+
+**CI published every image with the Dockerfile's placeholder version.** `docker/build.sh` derives
+`PLUM_APP_VERSION` from `git describe` and passes it as a build-arg, but neither `dev.yml` nor
+`release.yml` did — so the ARG defaults won and every `:dev` AND every tagged release reported
+`0.0.0-dev` / `gitDescribe: unknown`. Doubly hidden: nginx was swallowing the endpoint anyway (above),
+and `actions/checkout` is shallow by default, so even adding the build-arg without `fetch-depth: 0`
+would have stamped "unknown". A release is the tag; a dev build is the last tag plus `-dev`.
+
 **Themed scrollbars need `color-scheme`, not just `::-webkit-scrollbar` — and the two standards must
 not be combined.** Two independent mechanisms. The pseudo-elements style a *persistent* scrollbar,
 but an **overlay** scrollbar (macOS's default unless "show scroll bars: always" is set) cannot be
@@ -335,3 +433,124 @@ registers** and a loopback default advertises an endpoint no peer can reach.
 **The metadata role stores ONE progress anchor and clients extrapolate from its timestamp.** A bare
 `playback_speed` flip re-stamps a *stale* anchor and the timeline jumps, so play/pause must re-anchor
 to the daemon's real position. Latent since Phase 2; a second source exposed it.
+
+**Releasing the idle player handed our speakers to Music Assistant permanently (2026-09-07).**
+`b1c1fe0` shipped half a policy. It made `_go_idle` and `detach_player` release the unit's own
+player, so a foreign server could finally claim it, on the stated premise that "routing, follow and
+`autoSwitch.localActivity` all reach an unattached player through `mesh.router`'s idle-speaker
+fallback". The premise never held on a VLAN with MA on it: **MA re-dials a released speaker within
+seconds and then parks a silent websocket on it indefinitely**, so the player is never *unattached*
+again. Measured on `.7.200` (fresh deploy, `XLR-Pro`): one MA connection held **87,111 s — 24 h —
+with `audio_flowing=False`**, and when it finally let go a *second* MA instance on the same host
+took the speaker back **17 s later**.
+
+`follow._player_status` read that as `(False, None)` — "busy, but nothing we can route onto" — which
+is right for a *leader* (there is no `source_id` of ours to follow) and wrong for our own player,
+because `idle` is also what gates `localActivity` at `follow.py:204`. So the setting was on, the
+source went active, and nothing happened: `[airplay-1] active: sender feeding us` followed 300 s
+later by `[airplay-1] idle: no audio for 300s (... detached 0 player(s))`, with **no `follow:` line
+in any of four rotated logs**. It looked like a broken toggle and was a disarmed trigger.
+
+Nothing was missing from the mechanism. `Router.route_player` already wins the speaker back:
+`view.find_player` misses (MA is not one of our units), so it takes the idle-speaker fallback, reads
+the URL from our own `local_player`, and calls `reclaim_remote_player(stage_pairing=True)` —
+`GoodbyeReason.ANOTHER_SERVER`, proven live on `.7.200` at 2026-09-06 19:02. A manual GUI route
+therefore always worked, which is exactly why this read as a settings bug.
+
+The fix is the gate, not the mechanism: the foreign branch returns `(not lp["playing"], None)`.
+`playing` is the player's audio-flow truth (driven by `stream_start`/`stream_end` with a 1.5 s stall
+net) and deliberately **not** the foreign server's `playback_state`, which MA reports unreliably to a
+member player. Two properties are load-bearing and both have tests:
+
+- while MA really is feeding the speaker, `playing` is True and we leave it alone — that is what
+  lets a user push an MA stream to this endpoint mid-AirPlay and keep it, with no further input;
+- if MA takes the speaker while our source is already streaming, there is no rising edge, so we do
+  not grab it back. Without that, two servers would trade the one websocket a client allows.
+
+Both limits are accepted, not overlooked: a **paused** MA reads as parked, so a fresh AirPlay
+connection does take the room; and a speaker lost mid-AirPlay stays lost until the next connection.
+
+## Connection lifecycle & identity (2026-08)
+
+Moved here from `docs/CLAUDE.md` on 2026-08-13 when that file was trimmed back toward its own
+~280-line budget. The rules these produced are still stated there; the evidence is here.
+
+**The immortal dialer: `disconnect_from_client()` does not stop the dial.** Found 2026-08-10 bringing
+up an Esparagus HiFi board and a FutureProof Satellite1 on unit-7204 — routing a source at either
+played for a few seconds, dropped back to idle, and got *worse* on retry. The cancel is swallowed:
+`SendspinConnection._handle_client` awaited the message loop as a separate task and
+`_run_message_loop` caught `CancelledError` and returned normally, so the dialer saw a clean session
+end, backed off ~1 s and reconnected. A session lasting ≥10 s reset the backoff, so against a real
+speaker it never reached the ceiling that would end it. Meanwhile the caller's next
+`connect_to_client(url)` had already installed its own task, and the doomed task's `finally` popped
+**the new task's** registry entry — so the next call missed the "already dialling" guard and opened a
+third. Measured with a fake speaker counting sockets, six disconnect/reconnect pairs 3 s apart:
+1, 2, 3, 4, 5, 6 live websockets, registry still reporting one client. A Sendspin client holds
+exactly ONE websocket, so they fought over it: audio for a few seconds, then `close_code=1006`,
+forever. That is the whole 19:05–19:39 window in that unit's server log.
+**9.1.0 fixes the swallow** (the message loop's cancel now propagates via `_connection_done`), but
+`disconnect_from_client` is still synchronous and still clobbers `_connection_tasks[url]`, so
+`_stop_dialing` stays.
+
+> **Correction, 2026-08-24.** "A client holds exactly ONE websocket" is true of 6.0.5 and is what
+> the account above was written against. Under 9.1.0 connections OVERLAP: measured on the rig, our
+> player's session 306 stayed open while sessions 307-311 opened and closed, because 9.x brings an
+> incoming connection up provisionally and then arbitrates by activity rank rather than refusing it
+> outright. The lesson is unaffected — two dialers still fight, and one holder still wins — but do
+> not use "it holds one websocket" to predict that a dial will be REFUSED. It may be accepted and
+> then lose the arbitration, which is a different failure with a different signature. OPEN-ITEMS #23.
+
+**The orphaned eviction timer.** Found the same night, with DEBUG on, chasing "reroute a speaker, it
+plays for a few seconds, then drops back to idle". `SendspinClient._schedule_cleanup` assigns
+`_cleanup_handle` **without cancelling whatever was already there**, so scheduling twice orphans the
+first timer — nothing references it, `attach_connection`'s "cancel pending cleanup" can never reach
+it, and it fires anyway. `_do_cleanup`'s only other guard is `if self._connected` on the object that
+owns the timer, which does not protect a connection that came back on a *different* object, and it
+then evicts whichever client currently holds that id. Two schedules is the normal shape of a release:
+the teardown carries no goodbye reason (→ 30 s delayed) and the `USER_REQUEST` goodbye ~250 ms later
+adds an immediate one on top.
+
+```
+20:53:32,209  Scheduling delayed cleanup in 30s (reason: None)
+20:53:32,507  Received client/hello           <- rerouted, reconnected
+20:53:32,571  attached player 98:A3:16:D0:9E:E8   <- playing
+20:54:02,210  Cleaning up client from registry
+20:54:02,211  removing 98:A3:16:D0:9E:E8 from group   <- evicted mid-playback
+```
+
+Exactly 30 s after the **unroute**, not the reroute — which is why it read as a random 15–60 s
+dropout that scaled with how quickly the speaker was re-routed. That session logged 3 cancelled
+cleanups against 13 executed ones. **Still unfixed in 9.1.0, and the window is now 180 s**, so an
+orphan has six times longer to outlive a re-route.
+
+**Stop the stream before changing membership, not after — but know what that is and is not.**
+`attach_player` stops the stream, changes membership, then re-acquires. The other order (add, then
+refresh) puts `stream/start` → `stream/end` → `stream/start` on the wire inside ~110 ms, because
+`add_client` runs the library's late-join and `refresh_stream` then replaces that stream. The single
+start is strictly less churn and costs nothing, so it stays — but it is **belt-and-braces, not a
+proven fix**. A sendspin-cpp read says that sequence can jam `pending_start_` permanently, yet a
+Voice PE cross-routed mid-stream on the OLD ordering (2026-08-10 ~20:45) did not wedge, and the
+Esparagus wedge it was written for is at least as well explained by the two bugs above, which were
+live at the time. **Do not cite it as the cause without the A/B.** Separately and firmly: an ESP32
+client that *does* wedge is unrecoverable over the protocol — the full ladder (detach, detach+settle,
+release, release+settle; `_resources/spike/unwedge_probe.py`) was run on hardware and none of it
+worked. Only a power cycle clears it.
+
+**"None" became a true none, reversing an earlier design.** The group and its anchor persist when a
+source goes idle, which used to mean attached players stayed attached and silently resumed when the
+sender came back. That auto-resume was the bug: on unit-7204, 2026-08-10, both endpoints stayed
+attached, the sender returned two minutes later, and audio resumed with no re-route — a room playing
+because of something a user did before lunch. Going idle now detaches every player-role client
+uniformly, with no exceptions for our own player, a roamed peer, or an adopted foreign speaker, and
+nothing auto-resumes one except `autoSwitch.localActivity` (own player, rising edge) or `follow`.
+
+**Every default name must be unique per unit, and a clash must never block a deploy.**
+`DEFAULT_SETTINGS` is written to `settings.json` on the first read, so any literal in it outranks the
+environment permanently *and identically on every unit* — which is how two freshly imaged units both
+came up as "Plum Sendspin" offering a "Plum Audio" AirPlay receiver, with nothing on the LAN to tell
+them apart. Unit name and all three endpoint names now derive from `PLUM_UNIT_NAME`, falling back to
+`unit_identity.default_device_name()`, which appends a stable per-unit token. The token is the Pi's
+**SoC serial**, not a default-route MAC: a MAC moves when a unit is put on `wlan0` instead of `eth0`,
+silently renaming it. No token readable → bare name, because unknown beats invented. `deploy.sh`
+appends the same token to whatever `units.conf` duplicates and **warns rather than refuses** — a
+cosmetic slip must not become a rig that will not deploy.

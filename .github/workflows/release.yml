@@ -98,6 +98,13 @@ jobs:
           file: backend/Dockerfile
           platforms: linux/arm64
           push: true
+          # Same reason as dev.yml: without these the Dockerfile ARG defaults win and a RELEASE
+          # image reports 0.0.0-dev on its About page. `gitDescribe` is the tag itself here, because
+          # the checkout above is `ref: <tag>` and a release is by definition exactly on it.
+          build-args: |
+            PLUM_APP_VERSION=${{ needs.version.outputs.version }}
+            PLUM_BUILD_TYPE=release
+            PLUM_GIT_DESCRIBE=${{ needs.version.outputs.tag }}
           tags: |
             ${{ steps.image.outputs.name }}:${{ needs.version.outputs.version }}
             ${{ steps.image.outputs.name }}:latest

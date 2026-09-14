@@ -31,6 +31,30 @@ class PlayerState:
     # the player is the source of truth for its own gain, and it persists it across restarts.
     volume: int = 100
     muted: bool = False
+    # The roles the server has ACTIVATED for this client, which is not the same as the roles it
+    # negotiated. Under aiosendspin 9.x an encrypted-but-unpaired client negotiates its full role
+    # set and is activated for none of it, so it appears here, in the group, at the right volume —
+    # and renders nothing, with no error at either end. `negotiated` vs `active` is the only signal
+    # that separates a working endpoint from a silent one, so it is published rather than left
+    # inside the audio process. Empty on a client that is connected but not cleared to play.
+    #
+    # DEFAULTS to None (not []), so "a peer on an older image that never sends this" is
+    # distinguishable from "a peer saying this client is activated for nothing" — the same reason
+    # has_player defaults True.
+    active_roles: list[str] | None = None
+    # How this connection is secured, and therefore whether pairing is even a question for it.
+    # `None` means **CLEARTEXT** — a legacy `client/hello` connection, which the server activates
+    # straight from the negotiated role set with no pairing and no trust. That is every ESP32
+    # speaker, Music Assistant, and our own web GUI, and it is why they are unaffected by any
+    # pairing policy. `"sentinel"` is encrypted-but-unauthenticated (the published PSK);
+    # `"long_term"` is a real pairing record.
+    #
+    # So: `security is None` -> never needs pairing. `security == "sentinel"` with empty
+    # `active_roles` -> needs pairing. This pair is what the GUI gates its Pair button on, and it
+    # is deliberately two fields rather than one enum, because "unknown" (an older peer sending
+    # neither) must stay distinguishable from both.
+    security: str | None = None
+    paired: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -41,6 +65,9 @@ class PlayerState:
             "url": self.url,
             "volume": self.volume,
             "muted": self.muted,
+            "active_roles": self.active_roles,
+            "security": self.security,
+            "paired": self.paired,
         }
 
     @classmethod
@@ -53,6 +80,9 @@ class PlayerState:
             url=d.get("url"),
             volume=int(d.get("volume", 100)),
             muted=bool(d.get("muted", False)),
+            active_roles=d.get("active_roles"),
+            security=d.get("security"),
+            paired=bool(d.get("paired", False)),
         )
 
 
@@ -142,6 +172,24 @@ class UnitSnapshot:
     # this a peer cannot recognise a page served BY this unit as a legitimate origin. See
     # cors_policy.known_hosts.
     hostname: str | None = None
+    # This unit's SENDSPIN server id, which under aiosendspin 9.x is its X25519 public key and is
+    # NOT `unit_id`. They used to be the same string — we passed `server_id=unit_id` — and a good
+    # deal of the mesh quietly relied on that, most importantly `follow`, which joins the server a
+    # player reports itself attached to against this table. Publishing it is what makes that join
+    # possible again; `MeshView.unit_by_server_id` is the lookup. None for a peer that has not
+    # started its server yet.
+    server_id: str | None = None
+    # The unit this one is slaved to (`autoSwitch.slave.masterUnitId`), or None if it follows
+    # nobody. Published because follow config lives on the FOLLOWER, so without it no other unit can
+    # tell a room that is locked to this one from a room that merely joined the same stream by hand.
+    # Loudness matching's default scope is exactly that distinction — see mesh/loudness.py. Cheap to
+    # carry (one string) and read-only for every consumer but the follower itself.
+    follows_unit_id: str | None = None
+    # This unit's stored `audio.calibration` map, verbatim. Published because the GUI can only write
+    # calibration to the unit serving the page, while matching runs on whichever unit owns the
+    # GROUP — see calibration.merge_calibrations. Small (a few hundred bytes per endpoint) and
+    # read-only for every consumer but the owning unit.
+    calibration: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -153,6 +201,9 @@ class UnitSnapshot:
             "local_player": self.local_player,
             "has_player": self.has_player,
             "hostname": self.hostname,
+            "server_id": self.server_id,
+            "follows_unit_id": self.follows_unit_id,
+            "calibration": self.calibration,
         }
 
     @classmethod
@@ -166,6 +217,9 @@ class UnitSnapshot:
             local_player=d.get("local_player"),
             has_player=bool(d.get("has_player", True)),
             hostname=d.get("hostname"),
+            server_id=d.get("server_id"),
+            follows_unit_id=d.get("follows_unit_id"),
+            calibration=d.get("calibration") or {},
         )
 
 
@@ -180,6 +234,39 @@ class MeshView:
 
     def unit(self, unit_id: str) -> UnitSnapshot | None:
         return next((u for u in self.units if u.unit_id == unit_id), None)
+
+    def unit_by_server_id(self, server_id: str | None) -> UnitSnapshot | None:
+        """The unit whose SENDSPIN server has this id, or None if it is not one of ours.
+
+        Under 9.x a server id is an X25519 public key, so it is a different namespace from `unit_id`
+        and this is the only way back. Deliberately strict — no fall-through to `unit()` — because
+        the answer "not one of our units" is meaningful here rather than an error: it is how a player
+        attached to Music Assistant or any other foreign Sendspin server is recognised as busy but
+        unroutable. Matching a peer id against the unit table by accident would read a foreign server
+        as one of ours and hand its speaker away.
+        """
+        if not server_id:
+            return None
+        return next((u for u in self.units if u.server_id == server_id), None)
+
+    def unit_by_own_player(self, player_id: str | None) -> UnitSnapshot | None:
+        """The unit whose OWN speaker this is, from its `local_player` self-report.
+
+        The self-report is the only authoritative statement of "this speaker belongs to this unit".
+        `players` cannot answer it: that list is every client attached to a unit's server, which
+        after an adopt includes third-party speakers and after a roam includes other units'.
+
+        This is the test for "is this one of ours", and it matters most on the pairing path — our
+        own players are never cleartext (CLAUDE.md), so a hit here is positive evidence that a
+        pairing handshake is safe against this id, where a miss is not evidence of anything.
+        """
+        if not player_id:
+            return None
+        for unit in self.units:
+            local = unit.local_player or {}
+            if local.get("player_id") == player_id:
+                return unit
+        return None
 
     def find_source(self, source_id: str) -> tuple[UnitSnapshot, SourceState] | None:
         """Locate which unit ingests a given source (audio stays on its ingesting unit)."""

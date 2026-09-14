@@ -30,9 +30,43 @@ _DEFERS=()
 # --- ssh / curl helpers -----------------------------------------------------------------------
 
 # ssh_ <host> <command...> — run a command on a Pi, stdout passed through.
+# Retry only a TRANSPORT failure. ssh exits 255 for its own errors and otherwise passes the remote
+# command's status through, so keying on 255 retries a refused connection without touching a remote
+# command that legitimately failed — a blanket retry would add seconds to every `grep` that finds
+# nothing, and would quietly re-run side-effecting commands.
+#
+# deploy.sh has carried a retry for this since the rig was built ("occasionally refuses one"); the
+# tests never had one, and they make hundreds of connections per suite. That is the shape of the
+# intermittent, moving failures seen when suites run back to back.
+retry_ssh_() {
+    local n=0 rc
+    while :; do
+        "$@"; rc=$?
+        [[ $rc -ne 255 ]] && return $rc
+        n=$((n + 1))
+        [[ $n -ge 3 ]] && return $rc
+        sleep 2
+    done
+}
+
 ssh_() {
     local host="$1"; shift
-    sshpass -p "$PW" ssh $SSH_OPTS "${USER_}@${host}" "$@"
+    retry_ssh_ sshpass -p "$PW" ssh $SSH_OPTS "${USER_}@${host}" "$@"
+}
+
+# Evaluate a python expression against JSON on stdin, with the parsed document bound to `d`.
+#
+# LOCAL, not over ssh. This used to pipe the JSON back to the unit for a second `python3 -c`, which
+# doubled the ssh connections behind every assertion and — worse — made ssh_ unsafe to retry at all,
+# because a retry would resend a stdin the first attempt had already consumed. The workstation has
+# python3 and the JSON is already here.
+#
+# The expression travels in the environment rather than the command line so it can contain any
+# quoting without the shell mangling it.
+json_() {
+    PLUM_EXPR="$1" python3 -c 'import json, os, sys
+d = json.load(sys.stdin)
+print(eval(os.environ["PLUM_EXPR"]))'
 }
 
 # curl_ <host> <method> <path-or-url> [json-body] — curl from ON the Pi (loopback APIs).
@@ -52,7 +86,35 @@ ssh_json() {
     local host="$1" url="$2" expr="${3:-}"
     local raw; raw="$(curl_ "$host" GET "$url")"
     if [[ -z "$expr" ]]; then printf '%s' "$raw"; return; fi
-    printf '%s' "$raw" | ssh_ "$host" "python3 -c 'import json,sys; d=json.load(sys.stdin); print($expr)'"
+    printf '%s' "$raw" | json_ "$expr"
+}
+
+# dexec_ <host> <command...> — run a command INSIDE the plum-audio container.
+#
+# The source FIFOs live in the CONTAINER's /tmp, which is not bind-mounted, so a plain `ssh_` writes
+# to a different filesystem entirely: `dd of=/tmp/airplay-1-fifo` on the host silently creates a
+# regular file, the feeder never sees a byte, and the source never goes active. These tests were
+# written against the pre-container dev stack (`~/plum-test`) where host /tmp WAS the right place,
+# and have been quietly failing their feed-driven assertions ever since the cutover to a container —
+# on 6.0.5 as well as 9.x, verified against a control unit 2026-08-13.
+dexec_() {
+    local host="$1"; shift
+    ssh_ "$host" "echo '$PW' | sudo -S -p '' docker exec plum-audio $*"
+}
+
+# feed_fifo_ <host> <fifo> [chunks] — push silence into a source FIFO from inside the container.
+# Backgrounded and detached so the caller can poll while it runs; returns immediately.
+feed_fifo_() {
+    local host="$1" fifo="$2" chunks="${3:-40}"
+    ssh_ "$host" "echo '$PW' | sudo -S -p '' docker exec -d plum-audio \
+        sh -c 'dd if=/dev/zero of=$fifo bs=17640 count=$chunks 2>/dev/null'"
+}
+
+# stop_feed_ <host> <fifo> — kill a feed started by feed_fifo_ (for `defer`).
+stop_feed_() {
+    local host="$1" fifo="$2"
+    ssh_ "$host" "echo '$PW' | sudo -S -p '' docker exec plum-audio \
+        pkill -f 'dd if=/dev/zero of=$fifo' 2>/dev/null; true"
 }
 
 # --- assertions -------------------------------------------------------------------------------

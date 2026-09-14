@@ -26,10 +26,22 @@ here (that is what the unit's own configuration is for).
 from __future__ import annotations
 
 import logging
+from urllib.parse import urlparse
 
 from mesh.avahi import CLIENT_SERVICE, DEFAULT_PATH, SERVER_SERVICE, AvahiClient, DiscoveredService
 
 logger = logging.getLogger("plum.mesh.neighbourhood")
+
+
+def _hostport(url: str | None) -> tuple[str, int] | None:
+    """(host, port) from a ws:// URL, or None. The comparable part of a listener URL — the path and
+    the scheme vary between what a device advertises and what we derived for ourselves."""
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        return None
+    return (parsed.hostname, parsed.port or 0)
 
 
 class Neighbourhood:
@@ -42,13 +54,22 @@ class Neighbourhood:
         *,
         server_port: int,
         own_client_ids: set[str] | None = None,
+        own_player_url: str | None = None,
     ) -> None:
         self.unit_id = unit_id
         self.unit_name = unit_name
         self.server_port = server_port
         # Our own records come back to us from Avahi; knowing which are ours keeps the GUI from
         # offering "send this speaker to itself".
+        #
+        # Matched on the URL first, and only then on the id. A speaker has TWO names — the mDNS
+        # instance name while idle, the handshake name while attached — and since aiosendspin 9.x it
+        # also has two IDS: the mDNS record carries the listener id, while the id a server knows it
+        # by is an X25519 public key. `own_client_ids` holds the latter, so name-matching alone
+        # stopped recognising our own player and the GUI began offering to route it to itself.
+        # The listener URL is the one identifier both views share; that is why it is the join.
         self.own_client_ids = own_client_ids or set()
+        self.own_player_url = own_player_url
         self._avahi = AvahiClient()
         self._players: dict[str, DiscoveredService] = {}  # key -> service
         self._servers: dict[str, DiscoveredService] = {}
@@ -96,9 +117,22 @@ class Neighbourhood:
         """Every Sendspin player on the segment, ours included."""
         return list(self._players.values())
 
+    def is_own_player(self, s: DiscoveredService) -> bool:
+        """Whether a discovered player record is this unit's own speaker.
+
+        Two signals, because neither is sufficient alone. The URL is the identifier the mDNS view
+        and the handshake view actually share, so it is checked first — compared on (host, port)
+        rather than the whole string, since a trailing path or a `127.0.0.1` vs LAN-IP difference
+        would otherwise read as a different device. The id check remains as a fallback for a unit
+        whose advertised URL we could not derive.
+        """
+        if self.own_player_url and _hostport(s.ws_url) == _hostport(self.own_player_url):
+            return True
+        return s.name in self.own_client_ids
+
     def foreign_players(self) -> list[DiscoveredService]:
         """Players that are not this unit's own — candidate render endpoints for our sources."""
-        return [s for s in self._players.values() if s.name not in self.own_client_ids]
+        return [s for s in self._players.values() if not self.is_own_player(s)]
 
     def servers(self) -> list[DiscoveredService]:
         """Every Sendspin server on the segment, including us."""
@@ -122,6 +156,6 @@ class Neighbourhood:
             }
 
         return {
-            "players": [_entry(s, s.name in self.own_client_ids) for s in self._players.values()],
+            "players": [_entry(s, self.is_own_player(s)) for s in self._players.values()],
             "servers": [_entry(s, s.name == self.unit_id) for s in self._servers.values()],
         }

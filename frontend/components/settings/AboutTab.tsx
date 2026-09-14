@@ -3,6 +3,7 @@ import { Icon } from '../Icon';
 import type { Settings as SettingsType } from '../../types';
 import { deviceSettingsService } from '../../services/deviceSettingsService';
 import { settingsService } from '../../services/settingsService';
+import { aboutService, type VersionInfo } from '../../services/aboutService';
 
 interface AboutTabProps {
   settings: SettingsType;
@@ -15,6 +16,11 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
   const [hostnameError, setHostnameError] = useState('');
   const [saving, setSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState('');
+  const [versions, setVersions] = useState<VersionInfo | null>(null);
+
+  useEffect(() => {
+    aboutService.getVersions().then(setVersions).catch(() => setVersions(null));
+  }, []);
 
   // Initialize form from settings
   useEffect(() => {
@@ -180,11 +186,16 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
           <div className="space-y-2 text-sm">
             <div className="flex justify-between">
               <span className="text-[var(--text-muted)]">Plum-Audio</span>
-              <span className="text-[var(--text-primary)] font-mono">1.0.0</span>
+              <span
+                className="text-[var(--text-primary)] font-mono"
+                title={versions?.app.gitDescribe ?? undefined}
+              >
+                {versions ? versions.app.version : 'Loading...'}
+              </span>
             </div>
             <div className="flex justify-between">
               <span className="text-[var(--text-muted)]">Frontend</span>
-              <span className="text-[var(--text-primary)] font-mono">React 19.1.1</span>
+              <span className="text-[var(--text-primary)] font-mono">React {React.version}</span>
             </div>
           </div>
         </div>
@@ -218,6 +229,9 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
                     aiosendspin
                   </a>
                   {' '}(server + client library)
+                  {versions?.sendspin.aiosendspin && (
+                    <span className="font-mono text-xs"> v{versions.sendspin.aiosendspin}</span>
+                  )}
                 </li>
               </ul>
             </div>
@@ -235,6 +249,9 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
                     Shairport-Sync
                   </a>
                   {' '}(AirPlay)
+                  {versions?.airplay.shairportSync && (
+                    <span className="font-mono text-xs"> v{versions.airplay.shairportSync}</span>
+                  )}
                 </li>
                 <li>
                   <a
@@ -246,6 +263,9 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
                     go-librespot
                   </a>
                   {' '}(Spotify Connect)
+                  {versions?.spotify.goLibrespot && (
+                    <span className="font-mono text-xs"> v{versions.spotify.goLibrespot}</span>
+                  )}
                 </li>
                 <li>
                   <a
@@ -257,6 +277,9 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
                     bluez-alsa
                   </a>
                   {' '}(Bluetooth A2DP)
+                  {versions?.bluetooth.bluezAlsa && (
+                    <span className="font-mono text-xs"> v{versions.bluetooth.bluezAlsa}</span>
+                  )}
                 </li>
               </ul>
             </div>

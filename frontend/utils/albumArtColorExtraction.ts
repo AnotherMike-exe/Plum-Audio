@@ -4,7 +4,7 @@
  * Ensures WCAG AA contrast compliance (4.5:1 minimum)
  */
 
-import ColorThief from 'colorthief';
+import { getPaletteSync } from 'colorthief';
 import { getContrastRatio, darkenColor, lightenColor, hexToHSL } from './colorContrast';
 
 export interface DualColorExtractionResult {
@@ -69,16 +69,18 @@ export async function extractDualColorsFromAlbumArt(
     // Load image
     const img = await loadImage(imageUrl);
 
-    // Extract palette using ColorThief
-    const colorThief = new ColorThief();
-    const palette = colorThief.getPalette(img, 10); // Get 10 dominant colors
+    // Extract palette using ColorThief. v3 replaced the `new ColorThief().getPalette()` class with
+    // free functions and returns Color objects rather than raw tuples, so unwrap with `array()`.
+    // The sync browser entry point is the like-for-like swap: the async one adds no value here and
+    // v2 was synchronous. v3 also drops the sharp/file-type Node dependencies this bundle never used.
+    const palette = getPaletteSync(img, { colorCount: 10 }); // Get 10 dominant colors
 
     if (!palette || palette.length === 0) {
       throw new Error('No colors extracted from image');
     }
 
     // Analyze colors to classify them as vibrant or muted
-    const analyzedColors = palette.map((rgb) => analyzeColor(rgb));
+    const analyzedColors = palette.map((color) => analyzeColor(color.array()));
 
     // Select background and accent colors based on theme
     const { backgroundColor, accentColor, source } = selectColors(

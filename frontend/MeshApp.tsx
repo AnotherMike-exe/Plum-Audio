@@ -26,6 +26,8 @@ import { PlayerControls } from './components/PlayerControls';
 import { StreamSelector } from './components/StreamSelector';
 import { SyncedDevices } from './components/SyncedDevices';
 import { ClientManager } from './components/ClientManager';
+import { PairDeviceDialog, type PairMethod } from './components/PairDeviceDialog';
+import { IncomingPairPrompt } from './components/IncomingPairPrompt';
 import { Icon } from './components/Icon';
 import { Settings } from './components/Settings';
 import { Visualizer } from './components/Visualizer';
@@ -33,6 +35,7 @@ import { Client, Settings as SettingsType, Stream } from './types';
 import { Model, SendspinDataService, FOREIGN_PREFIX, parseStreamId } from './services/sendspinDataService';
 import type { ControllerCommand } from './services/sendspinControllerClient';
 import { settingsService } from './services/settingsService';
+import { aboutService } from './services/aboutService';
 import { useThemeSettings } from './hooks/useThemeSettings';
 import { useBrowserPlayer } from './hooks/useBrowserPlayer';
 
@@ -108,7 +111,11 @@ export default function MeshApp(): React.ReactElement {
   const [selectedStreamId, setSelectedStreamId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [visualizerOpen, setVisualizerOpen] = useState(false);
+  // The device currently being paired, if any. Held as the Client rather than an id so the dialog
+  // keeps naming it correctly even if it drops out of the polled model mid-pairing.
+  const [pairingTarget, setPairingTarget] = useState<Client | null>(null);
   const [settings, setSettings] = useState<SettingsType>(settingsService.getMergedSettings());
+  const [appVersion, setAppVersion] = useState<string | null>(null);
   const browser = useBrowserPlayer();
 
   useEffect(() => {
@@ -118,6 +125,10 @@ export default function MeshApp(): React.ReactElement {
       unsub();
       service.stop();
     };
+  }, []);
+
+  useEffect(() => {
+    aboutService.getVersions().then((v) => setAppVersion(v.app.version)).catch(() => setAppVersion(null));
   }, []);
 
   // Settings: fetch from the config API on mount, then track changes.
@@ -257,7 +268,10 @@ export default function MeshApp(): React.ReactElement {
       `${s.id}|${s.name}|${s.serverName ?? ''}|${s.isPlaying}|${s.volume ?? ''}|${s.sourceVolume ?? ''}|${s.active}`)
     .join(';');
   const clientsSig = viewClients
-    .map((c) => `${c.id}|${c.name}|${c.currentStreamId ?? ''}|${c.volume}|${c.connected}`)
+    // pairingState is in here deliberately: ClientManager is memoised on this string, so a device
+    // that finishes pairing would keep rendering its Pair button until some OTHER field happened to
+    // change. Silent, and indistinguishable from pairing having failed.
+    .map((c) => `${c.id}|${c.name}|${c.currentStreamId ?? ''}|${c.volume}|${c.connected}|${c.pairingState ?? ''}`)
     .join(';');
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const stableStreams = useMemo(() => model.streams, [streamsSig]);
@@ -361,6 +375,32 @@ export default function MeshApp(): React.ReactElement {
     const client = modelRef.current.clients.find((c) => c.id === clientId);
     if (client) moveClient(client, streamId);
   }, [moveClient]);
+
+  // -- pairing ------------------------------------------------------------------------------------
+  //
+  // Pairing is a property of the connection between a UNIT and a device, so every call goes to the
+  // unit that holds the device (`client.serverId`), never to whichever unit happens to serve this
+  // page. Same reasoning as volume.
+  const onPairClient = useCallback((client: Client) => setPairingTarget(client), []);
+  const pairStart = useCallback(
+    (method: PairMethod, token?: string) =>
+      service.pairDevice(pairingTarget!.serverId!, pairingTarget!.id, method, token),
+    [pairingTarget],
+  );
+  const pairPin = useCallback(
+    (pin: string) => service.submitPairingPin(pairingTarget!.serverId!, pairingTarget!.id, pin),
+    [pairingTarget],
+  );
+  const pairPoll = useCallback(async () => {
+    const all = await service.pairingState(pairingTarget!.serverId!, pairingTarget!.id);
+    return all[pairingTarget!.id] ?? { state: 'idle' };
+  }, [pairingTarget]);
+  const pairCancel = useCallback(() => {
+    // Tell the unit to abandon the attempt rather than just closing the dialog: an attempt left
+    // running holds the device in a pairing state where it cannot play.
+    if (pairingTarget?.serverId) void service.cancelPairing(pairingTarget.serverId, pairingTarget.id);
+    setPairingTarget(null);
+  }, [pairingTarget]);
 
   // -- Listen in Browser: this tab becomes a Sendspin player of the unit that serves it -------------
   const {
@@ -608,6 +648,7 @@ export default function MeshApp(): React.ReactElement {
               onStopBrowserAudio={onStopBrowserAudio}
               browserAudioActive={browserActive}
               federationEnabled={false}
+              onPairClient={onPairClient}
             />
           </div>
         </div>
@@ -615,7 +656,9 @@ export default function MeshApp(): React.ReactElement {
 
       <footer className="w-full max-w-7xl mx-auto grid grid-cols-3 items-center text-[var(--text-muted)] mt-12 text-sm">
         <div />
-        <p className="text-center">Plum Audio — Mesh</p>
+        <p className="text-center">
+          Plum Audio{appVersion && <span className="opacity-60"> — v{appVersion}</span>}
+        </p>
         <div className="flex justify-end gap-2">
           <button
             onClick={() => setVisualizerOpen(true)}
@@ -635,11 +678,30 @@ export default function MeshApp(): React.ReactElement {
         </div>
       </footer>
 
+      {pairingTarget && (
+        <PairDeviceDialog
+          client={pairingTarget}
+          onStart={pairStart}
+          onSubmitPin={pairPin}
+          onPoll={pairPoll}
+          onCancel={pairCancel}
+          onDone={() => setPairingTarget(null)}
+        />
+      )}
+
+      {/* The INBOUND direction: a foreign server pairing with OUR speaker, where the protocol makes
+          us display the PIN. Driven straight off the model rather than local state — the player
+          raises and clears it, and there is nothing here for the operator to dismiss. */}
+      <IncomingPairPrompt
+        prompt={model.pairPrompt ?? null}
+        unitName={model.servers.find((sv) => sv.id === model.localUnitId)?.name}
+      />
       {settingsOpen && (
         <Settings
           settings={settings}
           onSettingsChange={onSettingsChange}
           onClose={() => setSettingsOpen(false)}
+          onOpenPairingWindows={() => service.openPairingWindowEverywhere()}
         />
       )}
 

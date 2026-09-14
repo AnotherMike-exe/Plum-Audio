@@ -10,10 +10,13 @@
 ```bash
 scripts/host-setup/provision.sh all --check      # report only — what is missing on every unit
 scripts/host-setup/provision.sh all              # steps 2, 3b, 4, 5, 6 below
-scripts/host-setup/provision.sh 192.0.2.10 --overlay hifiberry-amp100   # step 1 (reboots)
+scripts/host-setup/provision.sh 192.0.2.10 --overlay hifiberry-amp100   # step 1 — then reboot BY HAND
 scripts/host-setup/provision.sh 192.0.2.10 --unity                      # step 1, after that reboot
 scripts/host-setup/provision.sh all --with-bluez                            # step 3a (~30 min/unit)
 ```
+
+Its two prerequisites are the same as `deploy.sh`'s, and it will not start without them: `sshpass`
+on the workstation, and `docker/units.conf` plus a `PLUM_TEST_PW` (see the README's step 2).
 
 It runs from the **workstation**, against `docker/units.conf`, and pushes the host-setup payload
 (`configure-audio-hat.sh`, `backend/config/bluez/`, `bluealsa-plum-dbus.conf`) to `~/plum-audio-hostsetup`
@@ -30,8 +33,9 @@ capability that is genuinely optional (§3).
 
 `--check` changes nothing and is the fastest way to answer "is this unit provisioned?".
 
-> **`provision.sh all` means all four units in `units.conf`**, across both VLANs — name the hosts
-> explicitly when you mean a subset. Every step is idempotent, but §3b restarts `bluetoothd`, which
+> **`provision.sh all` means every row in YOUR `units.conf`** — name the hosts explicitly when you
+> mean a subset. (The table shipped in this repo happens to span two VLANs; that is the author's rig,
+> not a property of the tooling.) Every step is idempotent, but §3b restarts `bluetoothd`, which
 > drops a connected phone on a unit that was mid-playback.
 
 ## Why any of this is on the host
@@ -49,6 +53,10 @@ nothing in the container can substitute for any of it:
 - **The host owns the mDNS responder.** A second one is the exact UDP 5353 collision
   `start_server(advertise_addresses=[])` exists to avoid.
 - **NetworkManager owns `wlan0`** — WiFi was a host concern in Plum-Snapcast and stays one.
+- **Only the host can replace the container.** The process that would pull a new image runs inside
+  the thing being replaced. Mounting the Docker socket would solve that and open a far worse hole:
+  these APIs are unauthenticated on `0.0.0.0`, so a socket in the container is root on the host for
+  anyone on the VLAN. Hence the update agent in step 7.
 
 ## 1. Audio HAT — `scripts/host-setup/configure-audio-hat.sh`
 
@@ -56,14 +64,18 @@ nothing in the container can substitute for any of it:
 `dtparam=audio=on`, enumerates `bcm2835 Headphones` as card 0, and leaves its `PCM` control at
 0.00 dB — verified on both mesh-pair units on 2026-08-06, where the whole of this section was correctly
 a no-op. `--unity` is not applicable either: it resolves the **HAT** card and exits with "no HAT card
-found in aplay -l" on such a unit, which is the right answer, not a failure to work around. Give
-`units.conf` a DAC column of `bcm2835` and skip to §2.
+found in aplay -l" on such a unit, which is the right answer, not a failure to work around. Leave the
+`units.conf` audio-output column blank and skip to §2 — the deploy detects `bcm2835` itself.
 
 Raspberry Pi OS does not auto-detect audio HATs, and the boards on this rig expose no ID EEPROM
 (`/proc/device-tree/hat` does not exist on the Amp100), so there is no auto-detect to fall back on —
 choosing the overlay is the operator's job.
 
+These run ON THE UNIT, from where `provision.sh` pushed the payload — not from a repo checkout,
+which a fresh Pi does not have.
+
 ```bash
+cd ~/plum-audio-hostsetup
 sudo ./configure-audio-hat.sh --list          # supported overlays
 sudo ./configure-audio-hat.sh --detect        # what is fitted / configured right now
 sudo ./configure-audio-hat.sh --overlay hifiberry-amp100
@@ -127,7 +139,12 @@ in `/var/lib/systemd/rfkill`, so it survives reboots; re-flashing the card loses
 
 ## 3. Patched `bluetoothd` — `backend/config/bluez/install_patched_bluez.sh`
 
+On the unit, from the pushed payload. Needs working `apt` with source repositories: the script
+derives throwaway `deb-src` entries from `/etc/apt/sources.list.d/*.sources` and hard-fails without
+them — fine on Pi OS 13, which uses deb822, but it fails half an hour into the operator's attention.
+
 ```bash
+cd ~/plum-audio-hostsetup/bluez
 sudo ./install_patched_bluez.sh          # build + install + apt-mark hold
 sudo ./install_patched_bluez.sh --revert # unhold + restore the distro package
 ```
@@ -200,8 +217,11 @@ because we never got to ask. Same class as disabling `bluealsa-aplay.service`.
 
 ## 5. Install the bluealsa D-Bus policy
 
+On the unit. `backend/config/…` is a WORKSTATION path — on the Pi the file is in the pushed payload.
+
 ```bash
-sudo cp backend/config/bluealsa-plum-dbus.conf /etc/dbus-1/system.d/
+cd ~/plum-audio-hostsetup
+sudo cp bluealsa-plum-dbus.conf /etc/dbus-1/system.d/
 sudo systemctl reload dbus     # or reboot
 ```
 
@@ -242,6 +262,34 @@ pre-container GUI. Under host networking the container's nginx crash-loops on `b
 host keeps answering :80 — a GUI that looks perfect and is a stale build. Config and webroot are
 left on disk.
 
+## 7. Install the update agent
+
+```bash
+sudo install -m 0755 plum-updater.sh /usr/local/bin/plum-updater.sh
+sudo install -m 0644 plum-updater.path plum-updater.service \
+                     plum-updater-check.timer plum-updater-check.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now plum-updater.path plum-updater-check.timer
+sudo plum-updater.sh init          # registers the agent, once /opt/plum-audio exists
+```
+
+`provision.sh` does all of this. It is listed here because the failure has no symptom on the unit
+itself: everything runs perfectly, and only the GUI's Updates tab reports the host as unprovisioned
+and refuses to offer a button it cannot honour.
+
+**Enable the `.path` and the `.timer`, never their `.service` pairs.** Those two are oneshots that
+the path and timer trigger. Enabling a oneshot runs it at every boot instead.
+
+`plum-updater.sh init` writes `/opt/plum-audio/config/update.state`, and that file existing is the
+only way the container learns an agent is here at all. On a greenfield Pi `provision.sh` runs before
+`/opt/plum-audio` exists, so it cannot write it then — `deploy.sh` and `plum-init.sh` both run `init`
+once the directory is there. A unit provisioned and never deployed reports no agent, correctly.
+
+The timer runs a daily CHECK and installs nothing. Applying an update is always deliberate: a 9.x
+client cannot reach a 6.0.5 server, so a timer that applied updates per unit would split the mesh
+across a protocol major overnight, and the symptom is a speaker that joins the group at the right
+volume and renders nothing.
+
 ## Verify it took
 
 ```bash
@@ -266,6 +314,11 @@ systemctl --user is-enabled obex.service  # masked
 # Host services the container reaches over mounted sockets
 systemctl is-active avahi-daemon bluetooth
 systemctl is-enabled nginx                # disabled (or not installed)
+
+# Update agent
+systemctl is-active plum-updater.path     # active — nothing consumes a request without it
+systemctl list-timers plum-updater-check.timer
+sudo plum-updater.sh state                # JSON, with agentVersion set
 
 # Then deploy and let it check the rest
 docker/deploy.sh <host>

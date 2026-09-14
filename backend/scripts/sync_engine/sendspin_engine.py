@@ -32,20 +32,43 @@ class SendspinEngine(SyncEngine):
     async def detach_player(self, source_id: str, player_id: str) -> None:
         await self._server.detach_player(source_id, player_id)
 
-    async def reclaim_remote_player(self, source_id: str, player_id: str, player_url: str) -> bool:
-        return await self._server.reclaim_remote_player(source_id, player_id, player_url)
+    async def reclaim_remote_player(
+        self, source_id: str, player_id: str, player_url: str, *, stage_pairing: bool = False
+    ) -> bool:
+        return await self._server.reclaim_remote_player(source_id, player_id, player_url, stage_pairing=stage_pairing)
 
     async def set_player_volume(self, player_id: str, volume: int, muted: bool) -> None:
         self._server.set_player_volume(player_id, volume, muted)
 
+    async def set_player_delay(self, player_id: str, delay_ms: int) -> None:
+        self._server.set_player_delay(player_id, delay_ms)
+
     async def set_source_volume(self, source_id: str, volume: int | None = None, muted: bool | None = None) -> None:
         await self._server.set_source_volume(source_id, volume, muted)
 
-    async def adopt_client(self, source_id: str, url: str, player_id: str | None = None) -> bool:
+    async def adopt_client(self, source_id: str, url: str, player_id: str | None = None) -> str | None:
         return await self._server.adopt_foreign_client(source_id, url, player_id=player_id)
 
     async def release_client(self, source_id: str, player_id: str, url: str | None = None) -> None:
         await self._server.release_foreign_client(source_id, player_id, url=url)
+
+    async def pair_client(self, client_id: str, method: str, token: str | None = None) -> None:
+        await self._server.pair_client(client_id, method, token)
+
+    def submit_pin(self, client_id: str, pin: str) -> bool:
+        return self._server.submit_pin(client_id, pin)
+
+    async def cancel_pairing(self, client_id: str) -> None:
+        await self._server.cancel_pairing(client_id)
+
+    async def unpair_client(self, client_id: str) -> None:
+        await self._server.unpair_client(client_id)
+
+    async def open_pairing_window(self, client_id: str) -> bool:
+        return await self._server.open_pairing_window(client_id)
+
+    def pairing_state(self, client_id: str | None = None) -> dict:
+        return self._server.pairing_state(client_id)
 
     def snapshot(self) -> UnitSnapshot:
         return self._server.snapshot()

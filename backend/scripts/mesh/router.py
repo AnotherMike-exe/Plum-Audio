@@ -58,6 +58,34 @@ def _idle_player_url(view, player_id: str) -> str | None:
     return None
 
 
+def _may_stage_pairing(view: MeshView, player_id: str, state=None) -> bool:
+    """Is there POSITIVE evidence that this id names an encrypted player of ours?
+
+    Staging a pairing PSK turns the next handshake into a pairing one, and a pairing handshake
+    against a CLEARTEXT client is aborted by the library — which takes that speaker offline until
+    the next adopt (CLAUDE.md; docs/SENDSPIN-PAIRING.md). So the reclaim path may only stage when it
+    can show the client is one of ours.
+
+    Two sources of positive evidence, and the asymmetry is deliberate:
+
+    - The id is some unit's OWN speaker (`local_player`). Our own players are never cleartext, so
+      this is conclusive, and it survives a peer running an image that predates `security`.
+    - The unit currently holding the client reported an encrypted connection (`security` non-None).
+
+    `security is None` is NOT taken as evidence of cleartext: the field defaults to None, so an
+    older peer that never sends it is indistinguishable from a genuine cleartext client. Requiring
+    positive evidence to stage makes the ambiguous case fail SAFE — a Plum player that is not yet
+    paired simply is not staged, which is logged, rather than an ESP32 being knocked offline.
+
+    This replaced an assumption that `player_id` "came from a peer snapshot, so this only ever names
+    a Plum player". A peer's `players` list has no ownership filter, so an adopted third-party
+    speaker sits in it exactly like a Plum player. See OPEN-ITEMS #21.
+    """
+    if view.unit_by_own_player(player_id) is not None:
+        return True
+    return state is not None and getattr(state, "security", None) is not None
+
+
 def _reachable_url(url: str | None, unit_host: str | None) -> str | None:
     """Rewrite a peer player's loopback reclaim URL onto the host we reach that unit at.
 
@@ -142,11 +170,23 @@ class Router:
                     raise RouteError(f"{owner.name} has no audio output — there is nothing to route onto")
                 raise RouteError(f"unknown player {player_id!r} (not on any unit)")
             logger.info("reclaiming idle player=%s onto source=%s via %s", player_id, source_id, url)
-            return await self._engine.reclaim_remote_player(source_id, player_id, url)
+            # _idle_player_url found it in a unit's own self-report, so this is conclusively ours.
+            return await self._engine.reclaim_remote_player(source_id, player_id, url, stage_pairing=True)
         url = _reachable_url(pfound[1].url, pfound[0].host)
         if not url:
             raise RouteError(f"no reclaim URL known for player {player_id!r}")
-        return await self._engine.reclaim_remote_player(source_id, player_id, url)
+        stage = _may_stage_pairing(view, player_id, pfound[1])
+        if not stage:
+            # Worth a line either way: if this really is a third-party speaker we have just avoided
+            # taking it offline, and if it is a Plum player on an older image this names the reason
+            # its roam may land silent. Both are otherwise invisible.
+            logger.info(
+                "reclaiming player=%s without staging a PSK: no evidence it is one of ours "
+                "(security=%r) — correct for a third-party speaker, see OPEN-ITEMS #21",
+                player_id,
+                getattr(pfound[1], "security", None),
+            )
+        return await self._engine.reclaim_remote_player(source_id, player_id, url, stage_pairing=stage)
 
     async def unroute_player(self, player_id: str, source_id: str) -> None:
         """Remove a player from a (local) source group."""

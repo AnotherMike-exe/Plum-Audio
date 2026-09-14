@@ -43,6 +43,234 @@ image compares as different across units.
 
 ## Phase 3 — remaining sources, GUI, container (`feature/phase3-sources-gui`, in progress)
 
+### Multi-room phase lock — 2026-09-13 (`bugfix/esp32-min-buffer-starvation`)
+
+**The symptom.** Four units on one AirPlay source played a quarter to half a second apart, and the
+offset changed every session. Reported as a 9.1.1 regression. It is neither a regression nor a
+9.x behaviour: `AlsaRenderer` free-ran from the Phase 1 commit `4e1649f` until this change, played
+each chunk on arrival, and never read `server_ts_us` at all. Phase was set by when a unit's first
+chunk landed, and every padded underrun pushed that unit permanently later — which is also why the
+offset moved inside a session.
+
+**What was ruled out first, and what it cost.** `.7.204` was pinned back to 9.1.0 and retested with
+all three units still mutually out of sync. The ESP32 speakers were suspected and are innocent —
+sendspin-cpp already does timestamp-locked playback. `min_buffer_ms`, `TARGET_BUFFER_US` and the
+per-endpoint delay were all tried; they change when a player starts, never whether it stays aligned.
+`target_buffer_ms` could never have mattered: `_target_bytes` reached exactly one log line.
+
+**What it is now.** The chunk timestamp becomes a client-clock deadline through
+`compute_play_time()`, and the renderer serves the frame due at
+`now + (outputBufferDacTime - currentTime)` — only the DIFFERENCE, because PortAudio's Linux clock is
+the ALSA status tstamp and ours is `CLOCK_MONOTONIC_RAW`. Drift is one frame dropped or duplicated
+every few callbacks outside a 1.5 ms deadband; beyond 30 ms it steps, and the step finishes at the
+deadband rather than at the threshold that triggered it. `PLUM_SYNC_LOCK=0` restores the old drain.
+
+**Simulated against the shipped renderer, before any deploy.** Four units, 0 to +/-80 ppm DAC drift,
+5-22 ms DAC leads, joining 0-400 ms apart, two minutes: spread **0.00 ms at the start, 1.52 ms after
+two minutes**. The same simulation with the lock off spreads **478-484 ms** and never converges —
+the reported symptom, reproduced. Unit suite 755/755.
+
+**`PLUM_STATIC_DELAY_MS` defaulted 150 → 0** in `deploy.sh`, `plum-init.sh` and the env example. It
+was inert while play times were ignored; under the lock it would put every unit 150 ms ahead of an
+ESP32 speaker declaring 0.
+
+**Proven on all four VLAN-7 units the same day.** `t3_phase_lock.sh`, 12/12, twice. Every unit
+locked, and the settled errors were `-1.28`, `+1.40`, `+0.23` and `+0.36` ms — a spread of **2.7 ms**
+across an onboard bcm2835 and three HiFiBerry DAC+ boards, against 250-500 ms before. An earlier run
+of the same test spread 1.5 ms. Zero xruns on every unit.
+
+**PortAudio reports a usable `outputBufferDacTime` on both card types.** This was the one thing only
+a rig could answer, and the answer is yes: all four logged `latency=43ms lock=on` and none logged the
+"no usable DAC time" warning. The fallback path exists and was not needed.
+
+**Acquisition lands where it should.** The Amp100 held 154.5 ms of silence at the first chunk and
+then reported `phase locked: +0.39 ms off the deadline`. Across all four units, every acquisition
+landed between -1.3 and +1.3 ms.
+
+**The trim carries real drift.** The bcm2835 unit trimmed 935 frames in ~90 s, which is **236 ppm**
+of DAC-versus-client clock drift absorbed one 23 us frame at a time. The trim ceiling is ~520 ppm, so
+that unit uses under half the available correction.
+
+**Two bugs found in passing, neither in the renderer.** `deploy.sh` pruned old images inside a
+`set -e` heredoc, and `grep -v` exits 1 when it filters everything out — which is the ordinary state
+of a unit that has only ever been updated from GHCR. The deploy stopped silently AFTER removing the
+container, so Living Room and Kitchen sat with no container at all and no error message. And
+`t3_phase_lock.sh` used `declare -A`, which macOS bash 3.2 does not have; it routed one player and
+reported the other three as broken.
+
+### Volume calibration and loudness matching, on real speakers — 2026-08-21/24
+
+Ported in CONCEPT from Plum-Snapcast, where it was built and never tested. Almost none of the
+implementation survived: its tone wrote straight to local ALSA with `sox`, so it bypassed the volume
+stage entirely and every measurement read the same SPL — slope 0, inverse `NaN`. Its persistence
+was silently dropped by a frontend key whitelist, and `sox` was not even in the image. The design
+and the full post-mortem are in `docs/VOLUME-CALIBRATION.md`.
+
+**What it is.** Play a known signal from ONE endpoint at a few known volumes, have the user read SPL
+from where they listen, and fit `dB = a*log10(volume) + b`. The tone is a real transient Sendspin
+source (`cal:<player_id>`) with the target player alone in its group, so it travels the same path
+the music does and the endpoint's own gain applies to it — the whole measurement. Grouped endpoints
+then hold a matched loudness, scoped by an explicit policy (`off` / `follow` / `stream` / `sets`)
+because "how loud is this endpoint" and "which endpoints are locked together" are different
+questions.
+
+**Proven on the `.7` pair.** First real calibration fitted 20.99 and 17.60 dB/decade with 0.30 and
+0.06 dB residuals against an ideal 20 — the log-space model holds on real hardware, on two very
+different amplifiers. Matching drove one speaker to exactly 60% and 90% as the other moved,
+computed through its own curve.
+
+**What the rig taught that no unit test could.** Routing onto a freshly created source failed
+outright, because the router resolves a source through a 2 s-cached view. Re-levelling lagged
+0.5-1.5 s until the volume request itself nudged the matcher — and then a stale view read the old
+level as a fresh human action and bounced the group backwards. An iPad sends every slider move
+twice, 13 ms apart, because `<input type="range">` double-fires on iOS.
+
+**Two bugs found in passing, neither caused by this work.** `reclaim_remote_player` staged a pairing
+PSK on the strength of a comment claiming its `player_id` "only ever names a Plum player" — false,
+since `snapshot()` has no ownership filter, and staging one takes a cleartext ESP32 offline
+(OPEN-ITEMS #21). And two units set to follow each other oscillated forever with nothing detecting
+the cycle (#25).
+
+**Deployed:** `192.168.7.122` and `192.168.7.204`. Suite: 52/52, twice back-to-back.
+
+**Still open:** the player wedge (#23) — two hypotheses tested and dead, three facts gained, written
+up rather than guessed at.
+
+### aiosendspin 6.0.5 → 9.1.0, proven on the `.7` pair — 2026-08-13
+
+**Three majors, ported on `feature/aiosendspin-9x` and validated on hardware.** The scoping (why the
+first recommendation was to hold, and what overturned it) is in `docs/AIOSENDSPIN-BUMP-SCOPE.md`;
+this is what the rig actually proved.
+
+**Deployed:** `192.168.7.122` (Plum RackPi) and `192.168.7.204` (Plum Amp100) on `163fa35`.
+`.201.133` deliberately left on 6.0.5 as a control — used twice below, and worth keeping until the
+`.201` pair is moved. `.201.113` was down throughout, which is why the `.7` pair was cut instead.
+
+**Measured:**
+
+| | |
+|---|---|
+| tier 0 (`t0_sendspin_protocol.py`) | ALL PASS — incl. a raw cleartext `client/hello` admitted with ACTIVE roles, and refused with `allow_unencrypted=False` |
+| `run.sh mesh .7.122 .7.204` | **16/16**, incl. `t3_mesh_roam` 3/3 and `t3_autofollow` 7/7 |
+| `run.sh interop .7.122` | **ALL PASS**, 1 SKIP (MA-claims-our-speaker needs MA playing) |
+| ESP32 adopt/release | 5/5 against two different boards (`20:F8:3B:09:47:2D`, `08:B6:1F:B7:AF:5C`), socket closed cleanly |
+| Music Assistant | discovered as a foreign server; our server AND player both advertise correctly |
+| unit tests | 467 backend, 133 frontend |
+
+**Cleartext interop is confirmed on real firmware.** This was the gating unknown — the whole bump
+rests on `allow_unencrypted=True` being sufficient for devices that will never speak Noise. Two
+ESP32 boards adopted, joined a group and released cleanly.
+
+**MA can no longer claim our speakers — measured 2026-08-13, and it is a real functional loss.**
+This is the one direction `allow_unencrypted` does not cover, and it is now settled rather than
+suspected. Probed from the workstation with a real aiosendspin 9.1.0 client against MA's server at
+`192.168.7.226:8927` — the identical handshake our player performs:
+
+| Probe | Result |
+|---|---|
+| 9.1.0 client → MA (sends `client/init`) | `HandshakeAbortedError: expected server/init (TEXT), got CLOSE` |
+| 6.0.5-style cleartext `client/hello` → MA | **accepted**, `server/hello` core version 1, `server_id=1d95425e…`, `connection_reason=discovery` |
+
+So **MA is a pre-7.0 cleartext-only Sendspin server**. Our player is an aiosendspin client with no
+legacy mode, so it opens with `client/init` and MA hangs up. `allow_unencrypted` is a SERVER-side
+concession and cannot help here.
+
+What still works: MA as a **client of our server** — the legacy path — so MA continues to discover
+us, poll the mesh API and drive us as a controller. What is lost is MA treating a Plum speaker as one
+of *its own* sync endpoints. The fallback is to send MA → a Plum **AirPlay** endpoint, which keeps
+audio flowing and keeps multi-room *within* Plum, at the cost of the speaker no longer being a member
+of MA's sync group.
+
+**This is temporary, and closer to resolved than it looks.** MA's own pins, read from their repo:
+
+| MA version | `aiosendspin` pin | Interops with our 9.1.0? |
+|---|---|---|
+| **2.9.11** (the rig's, HA add-on) | — | no |
+| **2.9.13** (current stable) | `6.0.5` | no — *the exact version we just left* |
+| **2.10.0b14** (beta) | `9.0.0` | **yes** — same major, Noise both ends |
+| `dev` | `9.1.0` | yes — identical to ours |
+
+So MA and Plum were pinned to the *same* 6.0.5 by coincidence, and our bump broke a lockstep neither
+project knew it was in. MA added encryption in PR #4846 (2026-07-19) and has been iterating on
+pairing since (#5472, #5591). The interop returns when 2.10 goes stable, or immediately by moving MA
+to the beta channel — with the caveat that 9.x pairing then applies in *that* direction too: MA
+becomes a server that must trust our player's peer id, which is what their pairing work is about.
+
+Nothing on our side can bridge a 6.0.5 MA: `SendspinClient` has no cleartext mode (verified — no
+`allow_unencrypted` equivalent anywhere under `client/`), so short of hand-rolling a cleartext
+Sendspin client there is no fix that does not involve moving one end or the other.
+
+**Four bugs the rig found that reading did not**, all the same shape — an id comparison that worked
+only because two namespaces used to hold the same string:
+
+1. the player's self-report published its LISTENER id while the server keys players by PEER id, so
+   the GUI grew a duplicate row per speaker and routing an idle speaker timed out at 10 s;
+2. a peer's player was never trusted, so a cross-unit roam would have completed and rendered
+   silence — trust is per-server AND per-peer;
+3. `Neighbourhood` matched its own mDNS record by id, so a unit stopped recognising its own speaker
+   and offered to route it to itself. Found by `t4_interop_ma` reporting "our player is not
+   advertising" about a player that plainly was;
+4. `deploy.sh`'s new activation check read the sudo password as its own program (`s()` pipes it to
+   stdin) and failed a healthy unit on its first run.
+
+**Two pre-existing harness bugs**, confirmed against the 6.0.5 control before touching anything:
+the integration tests fed FIFOs on the HOST while the feeder's FIFOs are inside the container — so
+every feed-driven assertion, including all of `t3_autofollow`, had been silently failing since
+containerisation — and the `streaming` assertion read once where it now must poll, because under
+true-none a player detaches while idle and re-attaches on the feed, so `streaming` legitimately lags
+`active`.
+
+**Not yet done:** the `.201` pair, and `@sendspin/sendspin-js` stays on 3.2.1 deliberately (5.0.0
+makes encryption mandatory and removes the caller-chosen `playerId` the browser reconciler joins on).
+
+### True none: idle players stop silently auto-resuming — 2026-08-12
+
+**`docs/ROUTING-MODEL.md` rule 1 ("None is a true none"), decided 2026-08-10 after the connection-
+lifecycle bug hunt, implemented and hardware-verified on `unit-7204`/`unit-7122` on `.7.122`/`.7.204`.**
+The bug it closes: `SourceFeeder._go_idle` used to announce `playback_state=stopped` and leave every
+attached player in the group — measured on `unit-7204` 2026-08-10 21:36–21:38, a source died, both
+endpoints stayed attached, the sender returned two minutes later, and audio resumed on both with no
+re-route. `_go_idle` now detaches every player-role client (own player, a roamed peer, an adopted
+foreign speaker — uniformly, no exceptions) via the same `group.remove_client()` primitive a manual
+"set to none" already used; only `autoSwitch.localActivity` (this unit's own player, rising-edge) or
+`follow` bring one back automatically.
+
+Investigated before writing any code, not assumed: three research passes confirmed the "true none"
+state already existed (a manual unroute already produces exactly this — a fresh solo group via
+aiosendspin's real `remove_client`, which the GUI already renders correctly), that `follow.py`'s
+`localActivity` already treated "no group at all" as its normal idle precondition rather than a
+special case, and that `router.py` already had a reclaim-from-self-report fallback for a fully
+unattached player (commit `61cc219`). So the change ended up scoped to `SourceFeeder._go_idle` alone
+— no `follow.py`, `router.py`, or frontend changes were needed.
+
+Hardware-verified on the VLAN-7 pair with two probes rather than a real AirPlay sender (nothing was
+live on either unit at the time, so nothing was disrupted): a throwaway fake Sendspin player role
+client attached to `airplay-1` confirmed the real `aiosendspin` library detaches on idle exactly like
+the unit tests predicted (`detached 1 player(s)` in the server log); then the real local players were
+briefly routed to prove the end-to-end story, producing this log timeline on `unit-7204`:
+
+```
+10:52:58  [airplay-1] active               (session #1: player-7204 AND player-7122 both attached)
+10:52:59  [airplay-1] idle ... detached 2 player(s)     <- uniform: both detached
+10:53:20  [airplay-1] active               (session #2)
+10:53:20  attached player player-7204      <- localActivity fired automatically, same second
+10:53:24  [airplay-1] idle ... detached 1 player(s)     <- only player-7204, the one re-attached
+```
+
+`player-7122` (the cross-routed, foreign-to-this-unit endpoint) never got an "attached" line after
+the reset and stayed true-none for the rest of the test — the exact scenario the 2026-08-10 bug
+report measured, now proven fixed on the same unit it was found on.
+
+Pinned in `tests/Unit/test_sendspin_server.py` (the `_go_idle` section: detaches players, leaves
+controllers/anchor, idempotent on a second call) and, since the hardware proof above is a one-off
+manual test with no automated guard, in a new `tests/Unit/test_true_none_reattach.py` that wires the
+real `_go_idle` output into a real `FollowReconciler.tick()` to pin the handoff itself, not just each
+half in isolation.
+
+Deliberately did NOT implement the rest of `ROUTING-MODEL.md` (the `attach`/`detach(mode=hold|release)`
+vocabulary unification in rules 3-4) — a separate, larger, still-undecided recommendation; see that
+doc's status header.
+
 ### Alpha deployment onto bare Raspberry Pi OS Lite — 2026-08-06 (`dd13071`)
 
 **The first deploy onto units carrying nothing but a stock image.** `.2.10` and `.2.11` were

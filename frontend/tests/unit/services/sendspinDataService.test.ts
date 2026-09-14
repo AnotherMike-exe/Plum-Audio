@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mapViewToModel, streamId, parseStreamId, MeshView, SendspinDataService } from '../../../services/sendspinDataService';
 import { NowPlaying, currentPositionMs, SendspinControllerClient, TimeFilter } from '../../../services/sendspinControllerClient';
 
@@ -342,5 +342,223 @@ describe('a live unit rename reaches its PEERS', () => {
     // @ts-expect-error — private hand-off.
     reloaded.applyView(view('Pi4-02', 'Pi4-02-Renamed'));
     expect(nameOf(reloaded)).toBe('Pi4-02-Renamed');
+  });
+});
+
+describe('a speaker is foreign only when its SERVER id belongs to nobody', () => {
+  // The 9.x regression guard. `local_player.server_id` is a SENDSPIN id — an X25519 public key
+  // under aiosendspin 9.x — while `unit_id` is the mesh's own key. They were the same string until
+  // the bump, because we passed `server_id=unit_id` to SendspinServer, and this comparison joined
+  // them directly. Once ids became keypairs it missed every time: every unit's OWN speaker was
+  // flagged as claimed by an outsider, given a bogus `foreignServer` label, and grown a phantom
+  // `foreign::` stream. Nothing failed; the GUI just quietly lied about who owned every speaker.
+  const URL = 'ws://192.0.2.10:8928/sendspin';
+
+  const view = (unitServerId: string | undefined, reportedServerId: string | undefined): MeshView => ({
+    local_unit_id: 'unit-210',
+    units: [
+      {
+        unit_id: 'unit-210',
+        name: 'Pi4-02',
+        host: '192.0.2.10',
+        server_id: unitServerId,
+        sources: [],
+        players: [],
+        local_player: { player_id: 'player-210', name: 'Player-210', url: URL, attached: true, server_id: reportedServerId },
+      },
+    ],
+  });
+
+  const speaker = (v: MeshView) =>
+    mapViewToModel(v, new Map(), new Map()).clients.find((c) => c.id === 'player-210')!;
+
+  it('is NOT foreign when the reported server id matches a unit', () => {
+    // The everyday case: our own player, attached to our own server, under the new namespace.
+    const c = speaker(view('peer-unit-210', 'peer-unit-210'));
+    expect(c.foreignServer).toBeUndefined();
+    expect(c.isForeign).toBeFalsy();
+  });
+
+  it('IS foreign when the reported server id matches no unit', () => {
+    // Music Assistant, or any third-party Sendspin server, holding our speaker.
+    const c = speaker(view('peer-unit-210', 'music-assistant'));
+    expect(c.foreignServer).toBeDefined();
+    expect(c.foreignServer!.name).toBe('music-assistant');
+  });
+
+  it('does NOT accept a unit_id as a server id', () => {
+    // Guards against "fixing" this by comparing against unit_ids again, which would resurrect the
+    // bug — and would let a foreign server whose id resembled one of our unit ids read as ours.
+    expect(speaker(view('peer-unit-210', 'unit-210')).foreignServer).toBeDefined();
+  });
+
+  it('flags NOTHING when no unit publishes a server id', () => {
+    // A peer mid-start, or one on an older image, publishes no server_id. With an empty set the
+    // naive check calls every speaker foreign — the mirror of the has_player defaults-true rule.
+    const c = speaker(view(undefined, 'peer-unit-210'));
+    expect(c.foreignServer).toBeUndefined();
+  });
+});
+
+describe('pairingState — who gets a Pair button', () => {
+  // The button appears only where pairing is both NEEDED and POSSIBLE. Two ways to get this wrong,
+  // and both are worse than not shipping the feature: offering it to a cleartext ESP32 that can
+  // never pair, or withholding it from an encrypted device that is silent until you do.
+  const view = (p: Partial<Record<string, unknown>>): MeshView => ({
+    local_unit_id: 'unit-210',
+    units: [
+      {
+        unit_id: 'unit-210', name: 'Pi4-02', host: '192.0.2.10', server_id: 'peer-unit-210',
+        sources: [],
+        players: [{
+          player_id: 'spk', name: 'Speaker', connected: true, group_id: null,
+          url: 'ws://192.0.2.10:8928/sendspin', ...p,
+        } as never],
+      },
+    ],
+  });
+
+  const stateOf = (v: MeshView) => mapViewToModel(v, new Map(), new Map()).clients[0].pairingState;
+
+  it('says CLEARTEXT for a legacy device, which can never pair', () => {
+    // security null on a connected client == the legacy path. Every ESP32 speaker on the segment.
+    expect(stateOf(view({ security: null, active_roles: ['player@v1'], paired: false }))).toBe('cleartext');
+  });
+
+  it('says UNPAIRED only when encrypted AND activated for nothing', () => {
+    expect(stateOf(view({ security: 'sentinel', active_roles: [], paired: false }))).toBe('unpaired');
+  });
+
+  it('says PAIRED when a long-term record exists', () => {
+    expect(stateOf(view({ security: 'long_term', active_roles: ['player@v1'], paired: true }))).toBe('paired');
+  });
+
+  it('distinguishes TRUSTED from paired', () => {
+    // Encrypted, playing, but on the sentinel PSK via unpaired access — not a pairing record.
+    // Folding this into 'paired' would have the GUI assert something untrue, and this is exactly
+    // the state that vanishes the moment unpaired access is turned off.
+    expect(stateOf(view({ security: 'sentinel', active_roles: ['player@v1'], paired: false }))).toBe('trusted');
+  });
+
+  it('says UNKNOWN when the peer sends no roles at all', () => {
+    // An older image. Guessing 'unpaired' here would put a Pair button on every device in a
+    // mixed-version mesh — the mirror of the has_player defaulting rule.
+    expect(stateOf(view({}))).toBe('unknown');
+  });
+
+  it('says UNKNOWN rather than cleartext for a device that reported nothing and is disconnected', () => {
+    expect(stateOf(view({ connected: false, security: null }))).toBe('unknown');
+  });
+
+  it('leaves an mDNS-only speaker UNKNOWN, so it never sprouts a Pair button', () => {
+    // The neighbourhood row for an ESP32 nobody has connected to. Most such devices are cleartext
+    // and would fail a pairing attempt outright.
+    const model = mapViewToModel(
+      { local_unit_id: 'unit-210', units: [{ unit_id: 'unit-210', name: 'A', host: '192.0.2.10', sources: [], players: [] }] },
+      new Map(), new Map(), Date.now(),
+      { players: [{ name: 'esparagus', friendly_name: 'Esparagus', url: 'ws://192.0.2.99:8928/sendspin', host: '192.0.2.99', port: 8928, is_own: false }], servers: [] },
+    );
+    expect(model.clients.find((c) => c.url?.includes('192.0.2.99'))!.pairingState).toBe('unknown');
+  });
+});
+
+describe('opening the mesh for pairing', () => {
+  // Fanned out from the GUI rather than unit-to-unit: each unit opens only its OWN speaker's
+  // window, through its own management session over a record it already holds. So a unit that is
+  // down simply stays closed, and that is a partial success worth reporting precisely — the
+  // operator needs to know whether the unit they are adding a speaker to is ready.
+  const svc = () => new SendspinDataService();
+
+  const withUnits = (s: SendspinDataService, hosts: Record<string, string>) => {
+    // @ts-expect-error — private: the host map is normally filled by a poll.
+    s.unitHosts = new Map(Object.entries(hosts));
+    return s;
+  };
+
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it('reports every unit when all of them open', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ ok: true }), { status: 200 })));
+    const res = await withUnits(svc(), { 'unit-a': '192.0.2.10', 'unit-b': '192.0.2.11' }).openPairingWindowEverywhere();
+    expect(res).toEqual({ opened: 2, total: 2, failed: [] });
+  });
+
+  it('names the units that did NOT open, rather than failing as a whole', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) =>
+      url.includes('192.0.2.11')
+        ? Promise.reject(new Error('unreachable'))
+        : new Response(JSON.stringify({ ok: true }), { status: 200 })));
+    const res = await withUnits(svc(), { 'unit-a': '192.0.2.10', 'unit-b': '192.0.2.11' }).openPairingWindowEverywhere();
+    expect(res.opened).toBe(1);
+    expect(res.failed).toEqual(['unit-b']);
+  });
+
+  it('treats a unit that answers ok:false as not opened', async () => {
+    // The unit is reachable but refused — e.g. it holds no pairing record on its own player, so it
+    // has no management session to open a window with. Silently counting it as open would tell the
+    // operator to go ahead with a device that will never pair.
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ ok: false }), { status: 200 })));
+    const res = await withUnits(svc(), { 'unit-a': '192.0.2.10' }).openPairingWindowEverywhere();
+    expect(res).toEqual({ opened: 0, total: 1, failed: ['unit-a'] });
+  });
+
+  it('says nothing is reachable rather than claiming success on an empty mesh', async () => {
+    const res = await withUnits(svc(), {}).openPairingWindowEverywhere();
+    expect(res).toEqual({ opened: 0, total: 0, failed: [] });
+  });
+});
+
+describe('the iOS slider double-fire guard', () => {
+  // `<input type="range">` on iOS fires `change` TWICE for one touch — once on touchend and again
+  // from the synthesised click. Measured in a unit's own request log against Chrome on iPadOS: two
+  // identical POSTs 13 ms apart for every slider move. Idempotent, so nothing broke, but it doubles
+  // request volume — and since a volume request now nudges the loudness matcher, it doubles
+  // reconcile work too.
+
+  const PLAYER_ID = VIEW.units[0].players[0].player_id;
+
+  function serviceWithOneUnit() {
+    const svc = new SendspinDataService();
+    // @ts-expect-error — private hand-off, as the other suites here do. playerUnit() resolves the
+    // player against the last view, so the service needs one before it will post anything.
+    svc.applyView(structuredClone(VIEW));
+    const post = vi
+      .spyOn(svc as unknown as { post: (...a: unknown[]) => Promise<unknown> }, 'post')
+      .mockResolvedValue({});
+    return { svc, post };
+  }
+
+  it('sends an identical repeat only once', async () => {
+    const { svc, post } = serviceWithOneUnit();
+    await svc.setVolume(PLAYER_ID, 40);
+    await svc.setVolume(PLAYER_ID, 40);   // the synthesised click, milliseconds later
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets a real drag through — a drag is a stream of DIFFERENT values', async () => {
+    const { svc, post } = serviceWithOneUnit();
+    for (const v of [40, 41, 42, 43]) await svc.setVolume(PLAYER_ID, v);
+    expect(post).toHaveBeenCalledTimes(4);
+  });
+
+  it('does not suppress the same level set again later', async () => {
+    vi.useFakeTimers();
+    try {
+      const { svc, post } = serviceWithOneUnit();
+      await svc.setVolume(PLAYER_ID, 40);
+      vi.advanceTimersByTime(2000);   // well past the double-fire window
+      await svc.setVolume(PLAYER_ID, 40);
+      expect(post).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('guards each endpoint independently', async () => {
+    const { svc, post } = serviceWithOneUnit();
+    await svc.setVolume(PLAYER_ID, 40);
+    await svc.setVolume(PLAYER_ID, 40);
+    await svc.setVolume(PLAYER_ID, 55);
+    expect(post).toHaveBeenCalledTimes(2);
   });
 });

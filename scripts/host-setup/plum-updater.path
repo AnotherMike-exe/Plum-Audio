@@ -1,0 +1,20 @@
+# Plum-Audio — watch for an update request from the container.
+#
+# The container writes /opt/plum-audio/config/update.request across the /config bind mount, which is
+# the only channel it has: it holds no Docker socket, by design (its APIs are unauthenticated on
+# 0.0.0.0). systemd watching a file is what turns that write into a privileged action, with the
+# privilege staying here on the host.
+#
+# PathExists, not PathChanged: the request is consumed and deleted by the agent, so the file
+# EXISTING is the event. PathChanged would miss a second request that arrives with identical
+# content, which is exactly what "update again" looks like.
+[Unit]
+Description=Plum-Audio update request watcher
+After=docker.service
+
+[Path]
+PathExists=/opt/plum-audio/config/update.request
+Unit=plum-updater.service
+
+[Install]
+WantedBy=multi-user.target
