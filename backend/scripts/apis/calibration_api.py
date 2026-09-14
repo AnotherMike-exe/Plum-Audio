@@ -218,9 +218,11 @@ def create_calibration_blueprint(settings_manager: SettingsManager) -> Blueprint
     def get_all():
         try:
             return jsonify(_snapshot(settings_manager))
-        except Exception as e:  # noqa: BLE001 - a read failure must not 500 the whole tab
-            logger.error(f"Failed to read calibrations: {e}")
-            return jsonify({"error": str(e)}), 500
+        except Exception:  # noqa: BLE001 - a read failure must not 500 the whole tab
+            # The detail goes to the log, never to the client: these APIs are unauthenticated on
+            # 0.0.0.0, and an exception text carries filesystem paths and internal state.
+            logger.exception("Failed to read calibrations")
+            return jsonify({"error": "could not read the calibration records"}), 500
 
     @bp.route("/policy", methods=["PUT"])
     def put_policy():
@@ -238,9 +240,9 @@ def create_calibration_blueprint(settings_manager: SettingsManager) -> Blueprint
 
         try:
             settings_manager.mutate(apply)
-        except Exception as e:  # noqa: BLE001 - surface the write failure, never a stack trace
-            logger.error(f"Failed to save match policy: {e}")
-            return jsonify({"error": str(e)}), 500
+        except Exception:  # noqa: BLE001 - surface the write failure, never a stack trace
+            logger.exception("Failed to save match policy")
+            return jsonify({"error": "could not save the loudness match policy"}), 500
         logger.info(f"Loudness match policy set to {policy.mode} ({len(policy.sets)} set(s))")
         return jsonify(_snapshot(settings_manager))
 
@@ -291,9 +293,9 @@ def create_calibration_blueprint(settings_manager: SettingsManager) -> Blueprint
 
         try:
             settings_manager.mutate(apply)
-        except Exception as e:  # noqa: BLE001 - surface the write failure, never a stack trace
-            logger.error(f"Failed to save calibration for {player_id}: {e}")
-            return jsonify({"error": str(e)}), 500
+        except Exception:  # noqa: BLE001 - surface the write failure, never a stack trace
+            logger.exception(f"Failed to save calibration for {player_id}")
+            return jsonify({"error": "could not save the calibration record"}), 500
 
         logger.info(f"Calibration saved for {player_id} ({len(record.samples)} sample(s))")
         return jsonify(_describe(player_id, record))
@@ -316,9 +318,9 @@ def create_calibration_blueprint(settings_manager: SettingsManager) -> Blueprint
 
         try:
             settings_manager.mutate(apply)
-        except Exception as e:  # noqa: BLE001 - surface the write failure, never a stack trace
-            logger.error(f"Failed to delete calibration for {player_id}: {e}")
-            return jsonify({"error": str(e)}), 500
+        except Exception:  # noqa: BLE001 - surface the write failure, never a stack trace
+            logger.exception(f"Failed to delete calibration for {player_id}")
+            return jsonify({"error": "could not delete the calibration record"}), 500
 
         if not removed:
             return jsonify({"error": "no calibration for that endpoint"}), 404

@@ -135,17 +135,19 @@ def create_audio_blueprint(settings_manager: SettingsManager = None) -> Blueprin
             rows = [d.to_dict() for d in devices]
             rows.append(audio_devices.no_output_device(is_active=audio_devices.is_no_output(spec)))
             return jsonify(rows)
-        except Exception as exc:  # noqa: BLE001 - a discovery failure must not 500 the whole tab
-            logger.error("listing output devices failed: %s", exc, exc_info=True)
-            return jsonify({"error": str(exc)}), 500
+        except Exception:  # noqa: BLE001 - a discovery failure must not 500 the whole tab
+            # The detail goes to the log, never to the client: these APIs are unauthenticated on
+            # 0.0.0.0, and an exception text carries filesystem paths and internal state.
+            logger.exception("listing output devices failed")
+            return jsonify({"error": "could not read the audio output devices"}), 500
 
     @bp.route("/api/audio/output/current", methods=["GET"])
     def get_current_output():
         try:
             return jsonify(_current_output(settings_manager))
-        except Exception as exc:  # noqa: BLE001
-            logger.error("reading the current output failed: %s", exc, exc_info=True)
-            return jsonify({"error": str(exc)}), 500
+        except Exception:  # noqa: BLE001
+            logger.exception("reading the current output failed")
+            return jsonify({"error": "could not read the current audio output"}), 500
 
     @bp.route("/api/audio/output/device", methods=["POST"])
     def set_output_device():
@@ -225,9 +227,9 @@ def create_audio_blueprint(settings_manager: SettingsManager = None) -> Blueprin
                     "device": device.to_dict(),
                 }
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("setting the output device failed: %s", exc, exc_info=True)
-            return jsonify({"success": False, "error": str(exc)}), 500
+        except Exception:  # noqa: BLE001
+            logger.exception("setting the output device failed")
+            return jsonify({"success": False, "error": "could not set the output device"}), 500
 
     @bp.route("/api/audio/output/test", methods=["POST"])
     def test_output_device():
@@ -243,8 +245,8 @@ def create_audio_blueprint(settings_manager: SettingsManager = None) -> Blueprin
         try:
             ok, message = audio_devices.test_device(device_id, active_spec=audio_devices.configured_output_spec())
             return jsonify({"success": ok, "message": message}), (200 if ok else 409)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("testing the output device failed: %s", exc, exc_info=True)
-            return jsonify({"success": False, "message": str(exc)}), 500
+        except Exception:  # noqa: BLE001
+            logger.exception("testing the output device failed")
+            return jsonify({"success": False, "message": "could not play the test tone"}), 500
 
     return bp
