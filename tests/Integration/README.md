@@ -28,6 +28,7 @@ tier 4, which runs against live third-party devices in someone's home.
 | `t4_player_wedge_soak.sh` | two units, both with a player; long-running | `./t4_player_wedge_soak.sh <a> <b> [cycles]` |
 | `t3_mesh_roam.sh` | **two** Plum units on one segment | `./t3_mesh_roam.sh <unit-a> <unit-b>` |
 | `t3_autofollow.sh` | **two** Plum units on one segment | `./t3_autofollow.sh <unit-a> <unit-b>` |
+| `t3_phase_lock.sh` | **two or more** units, each with a player | `./t3_phase_lock.sh <lead> <other>...` |
 | `t2_bt_avrcp_position.sh` | one unit + **a phone connected and playing** | `./t2_bt_avrcp_position.sh <host>` |
 | `t4_interop_ma.sh` | a unit **on Music Assistant's L2 segment** | `./t4_interop_ma.sh <host>` |
 | `t4_adopt_release.sh` | a unit + a foreign Sendspin speaker on-segment | `./t4_adopt_release.sh <host> [speaker-url]` |

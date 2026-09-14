@@ -193,11 +193,14 @@ def test_buffered_audio_survives_a_switch(renderer_cls, monkeypatch):
     fake = FakeSoundDevice()
     renderer = _renderer(renderer_cls, fake, "bcm2835", monkeypatch)
     renderer.start()
-    renderer.enqueue(b"\x00\x01" * 400)
-    before = len(renderer._buf)
+    renderer.enqueue(b"\x00\x01" * 400, 1_000_000)
+    before = renderer._buffered
 
     renderer.reopen("Headphones:0")
-    assert len(renderer._buf) == before
+    assert renderer._buffered == before
+    # The audio survives; the phase lock does not, deliberately. A different card has a different
+    # output latency, so the error measured against the old one says nothing about the new one.
+    assert renderer.sync_report()["sync_avg_ms"] is None
 
 
 def test_the_software_gain_survives_a_switch(renderer_cls, monkeypatch):

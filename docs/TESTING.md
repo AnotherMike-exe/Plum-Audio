@@ -165,9 +165,18 @@ non-negotiable for tier 4's live third-party devices. `run.sh` drives a whole ri
 | `t3_loudness_match.sh` | ✅ passing (mesh pair, 2026-08-22) — cross-unit curve merge, causal rev, and matching driven live |
 | `t4_player_wedge_soak.sh` | ran 2026-08-24, **did not reproduce** in 80 cycles across two churn profiles (OPEN-ITEMS #23) |
 | `t4_player_halfopen.sh` | ✅ passing (mesh pair, 2026-08-24) — freezes a peer mid-connection; the half-open state is real but does not wedge |
+| `t3_phase_lock.sh` | ✅ passing 12/12 (all four `.7` units, 2026-09-13) — settled spread 2.7 ms across bcm2835 + 3x HiFiBerry, 0 xruns |
 
 **Remaining:** add `t2_airplay_mpris.sh` (per-endpoint private-bus MPRIS ownership) and a
 `t3_multigroup.sh`; the tier-5 soak and tier-6 container tiers.
+
+**Phase lock has no acoustic test, deliberately.** `t3_phase_lock.sh` routes every unit's player onto
+one source and then reads each unit's OWN reported error (`local_player.sync`), because the player
+process is the only thing that can measure its distance from the deadline. It answers the two
+questions a rig alone can answer: does PortAudio report a usable `outputBufferDacTime` on this
+unit's actual card (`locked`), and does the unit stay inside the deadband once it has settled
+(`sync_avg_ms`). The mechanism itself is unit-tested in `tests/Unit/test_render_sync.py`, including a
+two-unit convergence case, so a failure here is about the hardware, not about the algorithm.
 
 ### What the calibration and wedge tests are for
 

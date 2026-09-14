@@ -43,6 +43,61 @@ image compares as different across units.
 
 ## Phase 3 — remaining sources, GUI, container (`feature/phase3-sources-gui`, in progress)
 
+### Multi-room phase lock — 2026-09-13 (`bugfix/esp32-min-buffer-starvation`)
+
+**The symptom.** Four units on one AirPlay source played a quarter to half a second apart, and the
+offset changed every session. Reported as a 9.1.1 regression. It is neither a regression nor a
+9.x behaviour: `AlsaRenderer` free-ran from the Phase 1 commit `4e1649f` until this change, played
+each chunk on arrival, and never read `server_ts_us` at all. Phase was set by when a unit's first
+chunk landed, and every padded underrun pushed that unit permanently later — which is also why the
+offset moved inside a session.
+
+**What was ruled out first, and what it cost.** `.7.204` was pinned back to 9.1.0 and retested with
+all three units still mutually out of sync. The ESP32 speakers were suspected and are innocent —
+sendspin-cpp already does timestamp-locked playback. `min_buffer_ms`, `TARGET_BUFFER_US` and the
+per-endpoint delay were all tried; they change when a player starts, never whether it stays aligned.
+`target_buffer_ms` could never have mattered: `_target_bytes` reached exactly one log line.
+
+**What it is now.** The chunk timestamp becomes a client-clock deadline through
+`compute_play_time()`, and the renderer serves the frame due at
+`now + (outputBufferDacTime - currentTime)` — only the DIFFERENCE, because PortAudio's Linux clock is
+the ALSA status tstamp and ours is `CLOCK_MONOTONIC_RAW`. Drift is one frame dropped or duplicated
+every few callbacks outside a 1.5 ms deadband; beyond 30 ms it steps, and the step finishes at the
+deadband rather than at the threshold that triggered it. `PLUM_SYNC_LOCK=0` restores the old drain.
+
+**Simulated against the shipped renderer, before any deploy.** Four units, 0 to +/-80 ppm DAC drift,
+5-22 ms DAC leads, joining 0-400 ms apart, two minutes: spread **0.00 ms at the start, 1.52 ms after
+two minutes**. The same simulation with the lock off spreads **478-484 ms** and never converges —
+the reported symptom, reproduced. Unit suite 755/755.
+
+**`PLUM_STATIC_DELAY_MS` defaulted 150 → 0** in `deploy.sh`, `plum-init.sh` and the env example. It
+was inert while play times were ignored; under the lock it would put every unit 150 ms ahead of an
+ESP32 speaker declaring 0.
+
+**Proven on all four VLAN-7 units the same day.** `t3_phase_lock.sh`, 12/12, twice. Every unit
+locked, and the settled errors were `-1.28`, `+1.40`, `+0.23` and `+0.36` ms — a spread of **2.7 ms**
+across an onboard bcm2835 and three HiFiBerry DAC+ boards, against 250-500 ms before. An earlier run
+of the same test spread 1.5 ms. Zero xruns on every unit.
+
+**PortAudio reports a usable `outputBufferDacTime` on both card types.** This was the one thing only
+a rig could answer, and the answer is yes: all four logged `latency=43ms lock=on` and none logged the
+"no usable DAC time" warning. The fallback path exists and was not needed.
+
+**Acquisition lands where it should.** The Amp100 held 154.5 ms of silence at the first chunk and
+then reported `phase locked: +0.39 ms off the deadline`. Across all four units, every acquisition
+landed between -1.3 and +1.3 ms.
+
+**The trim carries real drift.** The bcm2835 unit trimmed 935 frames in ~90 s, which is **236 ppm**
+of DAC-versus-client clock drift absorbed one 23 us frame at a time. The trim ceiling is ~520 ppm, so
+that unit uses under half the available correction.
+
+**Two bugs found in passing, neither in the renderer.** `deploy.sh` pruned old images inside a
+`set -e` heredoc, and `grep -v` exits 1 when it filters everything out — which is the ordinary state
+of a unit that has only ever been updated from GHCR. The deploy stopped silently AFTER removing the
+container, so Living Room and Kitchen sat with no container at all and no error message. And
+`t3_phase_lock.sh` used `declare -A`, which macOS bash 3.2 does not have; it routed one player and
+reported the other three as broken.
+
 ### Volume calibration and loudness matching, on real speakers — 2026-08-21/24
 
 Ported in CONCEPT from Plum-Snapcast, where it was built and never tested. Almost none of the

@@ -573,7 +573,16 @@ PLUM_PLAYER_NAME=${NAME}
 # unit BOOTS with — Settings -> Audio outranks it permanently once anyone picks an output.
 PLUM_DAC_DEVICE=${OUTPUT_SPEC}
 PLUM_PLAYER_ENABLED=${PLAYER_ENABLED}
-PLUM_STATIC_DELAY_MS=150
+# This endpoint's own output latency, in ms — the spec's static_delay_ms. The player subtracts it
+# from every scheduled play time, so it means "start my audio this much EARLY, because my output
+# chain is that far behind". NOT a jitter cushion: PortAudio's outputBufferDacTime already accounts
+# for the ALSA buffer, so real analog latency is about 1 ms, not 150.
+#
+# It was 150 until 2026-09-13, when it did nothing — the renderer free-ran and ignored play times
+# entirely. Under phase lock a wrong value is a real offset: 150 here puts this unit 150 ms AHEAD of
+# any ESP32 speaker in the same group, which declares 0. Leave it at 0 and correct a measured
+# per-room offset with the per-endpoint delay in the GUI, which is per endpoint and persisted.
+PLUM_STATIC_DELAY_MS=0
 PLUM_LOG_LEVEL=INFO
 PLUM_MESH_ENABLED=1
 PLEXAMP_ENABLED=0

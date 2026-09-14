@@ -26,7 +26,7 @@ is the sole sync engine. Three properties drove it:
 
 ## 2. What the library gives us, and the one thing it does not
 
-`aiosendspin` (pinned **6.0.5**) supplies the server, the client, the roles, and the group/stream
+`aiosendspin` (pinned **9.1.1**) supplies the server, the client, the roles, and the group/stream
 lifecycle. Two carry-over gotchas and one refuted idea:
 
 - **`SendspinServer` always binds mDNS on UDP 5353**, which collides with the host Avahi. It is
@@ -110,8 +110,8 @@ One container per unit. **supervisord runs exactly four programs**: `sendspin_se
   the audio event loop.
 - **`sendspin_player`** (:8928) — the unit's hardware render endpoint, out to `hw:<card>` via
   PortAudio. Attached to exactly one server at a time. Its jitter buffer is what makes a roam
-  seamless, and it echoes its volume and its actually-opened output back into
-  `/data/player_state.json`.
+  seamless and what the phase lock below schedules out of, and it echoes its volume and its
+  actually-opened output back into `/data/player_state.json`.
 - **`config-api`** (:5002, Flask) — settings, integrations, audio. Pure persistence.
 - **`nginx`** (:80) — serves the built React app and proxies both APIs same-origin.
 
@@ -130,6 +130,35 @@ existed only in the abandoned dual-engine plan.
 **The host keeps what only the host can do**: the Bluetooth radio and its AVCTP channel, the D-Bus
 policy, Avahi, WiFi (NetworkManager owns `wlan0`), and the audio HAT's device-tree overlay and
 mixer. See `docs/HOST-PROVISIONING.md`.
+
+### Phase lock — how several units stay in step
+
+Every audio chunk carries a server timestamp. The player converts it once, in the event-loop thread,
+with `client.compute_play_time()` — the library's 2-D Kalman time filter, plus this endpoint's
+`static_delay_ms` — which yields the moment that chunk is due on the **client** clock
+(`CLOCK_MONOTONIC_RAW`). `AlsaRenderer` then schedules against it:
+
+1. Each PortAudio callback reads `outputBufferDacTime - currentTime`. That is snd_pcm_delay: how far
+   ahead of the DAC the block being filled is. **Only the difference is used** — PortAudio's Linux
+   clock is the ALSA status tstamp, not ours, and the two domains must never be compared.
+2. Add it to the client clock and serve the frame due at that instant: silence while the head chunk
+   is still in the future, dropped frames while it is in the past.
+3. Drift between the DAC crystal and the client clock is corrected by dropping or duplicating **one
+   frame** (23 us at 44.1 kHz — inaudible) every few callbacks, while the smoothed error sits
+   outside a 1.5 ms deadband. Error beyond 30 ms is a step instead, which is audible and meant to
+   be: it happens once, at the first chunk of a session, and that is the alignment itself.
+
+Converted at enqueue, a play time is in the client's own domain and so **survives a server change**:
+the buffer keeps draining on the right timeline while a roam's new connection re-converges its time
+filter. Until that filter converges (~0.4 s after connect) chunks arrive unscheduled and play
+contiguously, which is what the renderer did for everything before this existed.
+
+`PLUM_SYNC_LOCK=0` restores the free-running drain. Each unit publishes its own error in the mesh
+self-report (`local_player.sync`), which is how several units are compared without a microphone.
+
+Residual offsets are now FIXED rather than per-session, because what remains is each endpoint's own
+uncompensated output latency — which is exactly what the per-endpoint delay
+(`POST /api/mesh/player-delay`, the spec's `static_delay_ms`) exists to remove.
 
 ## 5. Sources — the source-manager contract
 

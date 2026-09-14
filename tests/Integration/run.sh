@@ -18,6 +18,7 @@ case "$MODE" in
         run t3_mesh_roam.sh "$A" "$B"
         run t3_autofollow.sh "$A" "$B"
         run t3_loudness_match.sh "$A" "$B"
+        run t3_phase_lock.sh "$A" "$B"
         ;;
     interop)
         U="${1:?need unit host}"

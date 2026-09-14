@@ -222,6 +222,34 @@ docker exec plum-audio grep -E 'identity|trusted|unpaired' /config/logs/sendspin
 A peer's player is trusted lazily, at the moment we decide to take it (`reclaim_remote_player`), so
 "no trust line for unit B's player" is normal until the first cross-route to it.
 
+**Rooms out of step with each other** — every unit measures its own distance from the deadline and
+publishes it, so ask the units rather than a microphone. Run this against each unit in turn while
+they all play one source:
+
+```bash
+curl -s localhost:5001/api/mesh/snapshot |
+  python3 -c 'import json,sys; print((json.load(sys.stdin).get("local_player") or {}).get("sync"))'
+# {'locked': True, 'aligned': True, 'sync_err_ms': -0.31, 'sync_avg_ms': -0.94,
+#  'locks': 1, 'steps': 0, 'trims': 118}
+```
+
+Read it in this order:
+
+- **`locked: false` while audio flows** — this unit is free-running and nothing else here applies to
+  it. Either `PLUM_SYNC_LOCK=0`, or the time filter has not converged (a few hundred ms after a
+  connect), or PortAudio gave no usable DAC time — which logs a warning once, so
+  `grep 'no usable DAC time' /config/logs/sendspin_player.log`.
+- **`sync_avg_ms` beyond about 2 ms** — the trim is not holding this unit. Compare it across units:
+  a value that is the same every session is this endpoint's own output latency, which belongs in the
+  per-endpoint delay (`POST /api/mesh/player-delay`), not in a code change.
+- **`steps > 0`** — something moved a unit that was already in phase. The acquisition itself is a
+  `lock`, not a step, so `locks: 1, steps: 0` is a healthy session. Repeated steps mean the deadline
+  keeps moving: look for xruns in the same log.
+- **`trims`** rising steadily is normal and inaudible — it is the DAC crystal being corrected one
+  frame at a time.
+
+`tests/Integration/t3_phase_lock.sh` runs exactly these checks across a set of units.
+
 `/config/supervisord.log` is supervisord's own log and the first place to look when a program will
 not stay up. Per-endpoint daemon logs live under `/data`, one directory per endpoint id:
 

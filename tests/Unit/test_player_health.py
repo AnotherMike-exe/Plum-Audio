@@ -43,7 +43,7 @@ from sendspin_player import ERROR_STARVED_FRAMES, PlayerHealth  # noqa: E402
 
 
 class FakeRenderer:
-    """Only the two counters _health reads."""
+    """Only the two counters _health reads, plus the phase-lock report _snapshot_state carries."""
 
     def __init__(self):
         self.pad_frames = 0
@@ -51,6 +51,9 @@ class FakeRenderer:
 
     def stats(self) -> str:
         return f"[pad={self.pad_frames} starv={self.starved_frames}]"
+
+    def sync_report(self) -> dict:
+        return {"locked": True, "aligned": True, "sync_err_ms": 0.1, "sync_avg_ms": 0.0, "locks": 1, "steps": 0, "trims": 0}
 
 
 class FakePlayer:
@@ -176,6 +179,9 @@ class FakeReportingPlayer:
         self.port = 8928
         self._state: dict = {}
         self._audio_flowing = False
+        # The self-report also carries the phase lock, so four units can be compared over the mesh
+        # API rather than by ear. See test_render_sync.py for the lock itself.
+        self.renderer = FakeRenderer()
 
     def _host_hint(self):
         return "10.0.0.5"

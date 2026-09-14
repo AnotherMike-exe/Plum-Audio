@@ -199,6 +199,21 @@ The *reasoning* behind these, and the failures that produced them, is in
   `_cleanup_handle` without cancelling it, so a release orphans a timer that later evicts whichever
   client holds that id — a random dropout, now on a **180 s** fuse. `attach_player` and
   `release_foreign_client` defuse it via `_cancel_pending_cleanup`; UPSTREAM §5, HARD-WON-LESSONS.
+- **Playback is TIMESTAMP-LOCKED, and the renderer is the only place that knows it.** Each chunk's
+  `server_ts_us` becomes a client-clock deadline via `client.compute_play_time()` (converted in the
+  LOOP thread — the time filter is not cross-thread, and a client-domain time survives a roam); the
+  PortAudio callback serves the frame due at `now + (outputBufferDacTime - currentTime)`. Only that
+  DIFFERENCE is usable — PortAudio's Linux clock is not ours. Drift is one dropped or duplicated
+  frame every few callbacks outside a 1.5 ms deadband; past 30 ms it steps, and a step finishes at
+  the deadband, not at the threshold. `PLUM_SYNC_LOCK=0` restores the free-running drain that
+  shipped from Phase 1 to 2026-09-13, under which four units sat 0.25-0.5 s apart every session.
+  `target_buffer_ms` gates NOTHING and never did — it reaches one log line. HARD-WON-LESSONS.
+- **`PLUM_STATIC_DELAY_MS` is this endpoint's real output latency, and it defaults to 0.** The client
+  subtracts it from every play time ("start me early, my chain is behind"). PortAudio's DAC time
+  already covers the ALSA buffer, so the true figure is ~1 ms; the old 150 was inert only while play
+  times were ignored, and now puts a unit 150 ms ahead of an ESP32 declaring 0. A measured per-room
+  offset goes in the per-endpoint delay (`/api/mesh/player-delay`), which is per endpoint and
+  persisted.
 - **Codec choice belongs to the CLIENT.** `supported_formats` is in priority order and the server
   takes the first match it implements. A player that cannot sustain its own choice renegotiates with
   `stream/request-format`. Do not add a server-side override without a live, proven case — one was

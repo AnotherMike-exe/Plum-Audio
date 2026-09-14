@@ -120,6 +120,74 @@ see `docs/HOST-PROVISIONING.md` and `scripts/host-setup/configure-audio-hat.sh -
 
 ---
 
+## Multi-room sync
+
+**The renderer free-ran for two phases, and nothing in the code said so except a TODO.** Four units
+on one AirPlay source played a quarter to half a second apart, and the offset moved every session.
+`AlsaRenderer` played each chunk the moment it arrived and never read `server_ts_us` at all, so a
+unit's phase was set by **when its first chunk happened to land** — and every padded underrun after
+that pushed that unit permanently later, which is why the offset also moved *within* a session.
+Written that way in the Phase 1 commit `4e1649f` and unchanged until 2026-09-13. `git log -S
+outputBufferDacTime` returns exactly one commit, and only for the TODO text.
+
+Three explanations were investigated and each cost real time before the renderer was read:
+
+- **The aiosendspin bump.** `.7.204` was pinned back to 9.1.0 and tested; all three units were still
+  mutually out of sync. The renderer is identical on both versions — what 9.x changed is *when*
+  buffers fill, not whether they align.
+- **The ESP32 speakers.** They were never the problem. sendspin-cpp already does timestamp-locked
+  playback; we were the ones free-running, and our own units drifted from each other by the same
+  margin.
+- **Buffer sizing.** `min_buffer_ms`, `TARGET_BUFFER_US` and the per-endpoint delay were all tried.
+  They change when a player *starts*, never whether it stays aligned.
+
+**`target_buffer_ms` never gated anything.** `_target_bytes` was computed in `__init__` and read in
+exactly one place: a log line. The renderer started its PortAudio stream at open and padded silence
+until audio arrived. So "the renderer starts when its buffer fills" was never true, and every theory
+resting on buffer depth was refuted by a `grep` that nobody ran.
+
+**Only the DIFFERENCE between PortAudio's two timestamps is usable.** `outputBufferDacTime` and
+`currentTime` are in PortAudio's Linux clock — the ALSA status tstamp — while `compute_play_time()`
+returns `CLOCK_MONOTONIC_RAW`, because `RawMonotonicClock` deliberately avoids NTP slewing. Comparing
+either timestamp with ours would schedule against a constant nobody can see. Their *gap* is a
+duration and belongs to no domain at all, so it is the only thing `_block_play_time` reads.
+
+**`PLUM_STATIC_DELAY_MS` was 150 on every unit, and phase lock is what made that dangerous.** It is
+the spec's `static_delay_ms`: the client subtracts it from every play time, meaning "start my audio
+this much early, because my output chain is that far behind". While the renderer ignored play times
+it did nothing but inflate the server's send-ahead. Under the lock, 150 puts a unit **150 ms ahead
+of any ESP32 speaker in the same group**, which declares 0. PortAudio's DAC time already accounts for
+the ALSA buffer, so the real figure is about 1 ms. Defaulted to 0 on 2026-09-13 in `deploy.sh`,
+`plum-init.sh` and the env example; a measured per-room offset belongs in the per-endpoint delay
+instead, which is per endpoint and persisted.
+
+**A step correction must finish at the deadband, not at the threshold that triggered it.** A skip is
+capped by the chunk it skips into, so a 300 ms correction is dozens of loop iterations; stopping each
+one as soon as the error fell under `SYNC_HARD_US` left up to 30 ms behind, and the single-frame trim
+removes 30 ms in about a minute of playback. Every track would have started out of phase and settled
+halfway through. Caught by `tests/Unit/test_render_sync.py` before it reached a rig.
+
+**Simulated before deployment, with the same code the units run.** Four units, different DAC drifts
+(0 to +/-80 ppm), different DAC leads (5-22 ms), joining 0-400 ms apart, over two minutes: spread
+**0.00 ms at the start and 1.52 ms after two minutes**, bounded by the deadband. The identical run
+with `PLUM_SYNC_LOCK=0` — the old renderer — spreads **478-484 ms** and never converges, which
+reproduces the reported symptom exactly. `_resources/spike/phase_lock_sim.py`.
+
+**The rig then agreed with the simulation to within a millisecond.** All four `.7` units,
+2026-09-13: settled errors `-1.28`, `+1.40`, `+0.23`, `+0.36` ms, zero xruns. PortAudio reports a
+usable `outputBufferDacTime` on bcm2835 AND on the HiFiBerry DAC+ — all four logged
+`latency=43ms lock=on`, none took the fallback. The bcm2835 unit absorbed **236 ppm** of drift
+through the trim, against a ~520 ppm ceiling.
+
+**A step must END the alignment it broke, or the counter lies.** `steps` was incremented on every
+callback that saw an error past `SYNC_HARD_US`. A correction spans as many callbacks as the hold is
+long, so one 150 ms re-alignment after a membership change read as **16 steps** on two units — the
+number is supposed to mean "how many times was this unit moved". Clearing `_aligned` inside
+`_note_step` fixes both halves: the rest of that correction runs at the deadband threshold, and
+`locks` records the landing. Measured on the rig, then pinned by a unit test.
+
+---
+
 ## Bluetooth
 
 **The position/seek ceiling is in `bluetoothd`, not in our relay, the GUI, or the metadata role.**
