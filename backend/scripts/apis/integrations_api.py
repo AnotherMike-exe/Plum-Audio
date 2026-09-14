@@ -335,18 +335,21 @@ def create_integrations_blueprint(settings_manager: SettingsManager | None = Non
         """Paired devices, straight from BlueZ — see apis/bluetooth_bonds.py for why not settings.json."""
         try:
             return jsonify({"success": True, "devices": bluetooth_bonds.list_paired_devices()}), 200
-        except bluetooth_bonds.BlueZUnavailable as e:
+        except bluetooth_bonds.BlueZUnavailable:
             # An empty list would read as "nothing is paired", which is a different and worse lie
-            # than saying the radio could not be reached.
-            return jsonify({"success": False, "devices": [], "message": f"Bluetooth unavailable: {e}"}), 503
+            # than saying the radio could not be reached. The BlueZ error text stays in the log:
+            # this API is unauthenticated on 0.0.0.0, and a D-Bus error names internal paths.
+            logger.exception("Could not read the paired Bluetooth devices")
+            return jsonify({"success": False, "devices": [], "message": "Bluetooth is unavailable"}), 503
 
     @bp.delete("/bluetooth/devices/<address>")
     def bluetooth_forget_device(address: str):
         """Forget one device: drops its link key so the phone can pair cleanly again."""
         try:
             ok, message = bluetooth_bonds.forget_device(address)
-        except bluetooth_bonds.BlueZUnavailable as e:
-            return jsonify({"success": False, "message": f"Bluetooth unavailable: {e}"}), 503
+        except bluetooth_bonds.BlueZUnavailable:
+            logger.exception("Could not forget the Bluetooth device %s", address)
+            return jsonify({"success": False, "message": "Bluetooth is unavailable"}), 503
         return jsonify({"success": ok, "message": message, "address": address}), 200 if ok else 400
 
     @bp.post("/bluetooth/settings")

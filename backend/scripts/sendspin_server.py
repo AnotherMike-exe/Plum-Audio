@@ -51,6 +51,7 @@ import socket
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 
+import fifo_paths
 import sendspin_identity
 import unit_identity
 from aiosendspin.models.types import GoodbyeReason, MediaCommand, has_role_family
@@ -984,8 +985,19 @@ class PlumSendspinServer:
         """Create the source's anchor group and launch its FIFO feeder.
 
         Idempotent: returns the existing handle if the source is already running.
+
+        Validates here rather than only at the API boundary, because this is the single choke point
+        every caller goes through — the mesh API, the source managers and the calibration tone. A
+        bad id or a FIFO outside FIFO_DIR raises rather than creating a node somewhere unexpected.
+
+        Raises:
+            ValueError: the source id is not safe for a path, or the FIFO escapes FIFO_DIR.
         """
         assert self.server is not None, "start() the server before starting sources"
+        if not fifo_paths.valid_source_id(source_id):
+            raise ValueError(f"unsafe source id: {source_id!r}")
+        if not fifo_paths.fifo_path_is_safe(fifo_path):
+            raise ValueError(f"FIFO path must be a file directly inside {fifo_paths.FIFO_DIR}")
         if source_id in self.sources:
             return self.sources[source_id]
 

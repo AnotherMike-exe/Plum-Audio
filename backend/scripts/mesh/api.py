@@ -53,6 +53,7 @@ import os
 from collections.abc import Awaitable, Callable
 
 import cors_policy
+import fifo_paths
 import updater
 from aiohttp import web
 from calibration import describe as describe_calibration
@@ -471,11 +472,25 @@ class MeshApi:
         return web.json_response({"ok": True})
 
     async def _source_start(self, request: web.Request) -> web.Response:
+        """Start a local source. Both fields reach the filesystem, so both are validated here.
+
+        This endpoint is unauthenticated and bound to 0.0.0.0, and `source_id` names the FIFO the
+        server creates with `os.mkfifo`. An unchecked `fifo` let a caller create that node anywhere
+        the process could write, or point a source at any readable file and hear it played out a
+        speaker. `SendspinServerApp.start_source` refuses both as well — this is the same rule stated
+        at the boundary so a bad request reads as 400 rather than as a 500 from deep in the engine.
+        """
         body = await self._json(request)
         source_id = body.get("source_id")
         if not source_id:
             return web.json_response({"error": "source_id required"}, status=400)
-        fifo = body.get("fifo") or f"/tmp/{source_id}-fifo"
+        if not fifo_paths.valid_source_id(source_id):
+            return web.json_response({"error": "source_id contains characters a path may not hold"}, status=400)
+        fifo = body.get("fifo") or fifo_paths.fifo_path_for(source_id)
+        if not fifo_paths.fifo_path_is_safe(fifo):
+            return web.json_response(
+                {"error": f"fifo must name a file directly inside {fifo_paths.FIFO_DIR}"}, status=400
+            )
         self._engine.start_source(source_id, fifo)
         return web.json_response({"ok": True, "source_id": source_id, "fifo": fifo})
 

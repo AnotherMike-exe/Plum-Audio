@@ -670,9 +670,11 @@ class SettingsManager:
 
         try:
             changed, applied = asyncio.run(asyncio.wait_for(_apply(), 20))
-        except Exception as e:  # noqa: BLE001 - any bus/policy/validation failure is the same answer here
-            logger.error(f"Avahi SetHostName failed: {e}")
-            return False, f"Hostname saved, but mDNS was not updated: {e}"
+        except Exception:  # noqa: BLE001 - any bus/policy/validation failure is the same answer here
+            # This message reaches the GUI. The bus error text stays in the log, because the API is
+            # unauthenticated on 0.0.0.0 and a D-Bus failure names internal paths and policy files.
+            logger.exception("Avahi SetHostName failed")
+            return False, "Hostname saved, but mDNS was not updated"
 
         if not changed:
             return True, f"Hostname already '{applied}.local'"
@@ -696,9 +698,9 @@ def create_settings_blueprint(settings_manager: SettingsManager = None) -> Bluep
     def get_settings():
         try:
             return jsonify(settings_manager.get_settings())
-        except Exception as e:
-            logger.error(f"Get settings failed: {e}")
-            return jsonify({"error": str(e)}), 500
+        except Exception:
+            logger.exception("Get settings failed")
+            return jsonify({"error": "could not read the settings"}), 500
 
     @bp.route("/api/settings", methods=["POST"])
     def update_settings():
@@ -712,9 +714,9 @@ def create_settings_blueprint(settings_manager: SettingsManager = None) -> Bluep
             # Must be caught BEFORE the generic handler, or a bad device spec reads as a 500.
             logger.warning(f"Rejected a settings update: {e}")
             return jsonify({"error": str(e)}), 400
-        except Exception as e:
-            logger.error(f"Update settings failed: {e}")
-            return jsonify({"error": str(e)}), 500
+        except Exception:
+            logger.exception("Update settings failed")
+            return jsonify({"error": "could not save the settings"}), 500
 
     @bp.route("/api/settings/device", methods=["POST"])
     def update_device_settings():
@@ -750,9 +752,11 @@ def create_settings_blueprint(settings_manager: SettingsManager = None) -> Bluep
 
             updated = settings_manager.update_settings(updates)
             return jsonify({"success": True, "message": "; ".join(messages), "settings": updated})
-        except Exception as e:
-            logger.error(f"Update device settings failed: {e}")
-            return jsonify({"error": str(e)}), 500
+        except Exception:
+            # The detail goes to the log, never to the client: this API is unauthenticated on
+            # 0.0.0.0, and an exception text carries filesystem paths and internal state.
+            logger.exception("Update device settings failed")
+            return jsonify({"error": "could not save the device settings"}), 500
 
     @bp.route("/api/settings/device/hostname/validate", methods=["POST"])
     def validate_hostname():
@@ -761,9 +765,9 @@ def create_settings_blueprint(settings_manager: SettingsManager = None) -> Bluep
             hostname = data.get("hostname", "")
             is_valid, error_msg = SettingsManager.validate_hostname(hostname)
             return jsonify({"valid": is_valid, "error": error_msg if not is_valid else None})
-        except Exception as e:
-            logger.error(f"Hostname validation failed: {e}")
-            return jsonify({"error": str(e)}), 500
+        except Exception:
+            logger.exception("Hostname validation failed")
+            return jsonify({"error": "could not validate the hostname"}), 500
 
     @bp.route("/api/settings/device/hostname/sanitize", methods=["POST"])
     def sanitize_hostname():
@@ -771,9 +775,9 @@ def create_settings_blueprint(settings_manager: SettingsManager = None) -> Bluep
             data = request.get_json()
             device_name = data.get("deviceName", "")
             return jsonify({"hostname": SettingsManager.sanitize_hostname(device_name)})
-        except Exception as e:
-            logger.error(f"Hostname sanitization failed: {e}")
-            return jsonify({"error": str(e)}), 500
+        except Exception:
+            logger.exception("Hostname sanitization failed")
+            return jsonify({"error": "could not sanitize the device name"}), 500
 
     return bp
 
@@ -788,4 +792,6 @@ if __name__ == "__main__":
     CORS(app)
     app.register_blueprint(create_settings_blueprint())
     print("Settings API running on http://localhost:5002")
-    app.run(host="0.0.0.0", port=5002, debug=True)
+    # No debug=True. The Werkzeug debugger is remote code execution, and this file ships in the
+    # container image, on a port that is unauthenticated on 0.0.0.0.
+    app.run(host="0.0.0.0", port=5002)
