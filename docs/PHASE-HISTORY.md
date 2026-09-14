@@ -43,6 +43,31 @@ image compares as different across units.
 
 ## Phase 3 — remaining sources, GUI, container (`feature/phase3-sources-gui`, in progress)
 
+### main catches up, and the first security sweep — 2026-09-13/14
+
+`main` was 108 commits behind `dev` and carried only the Phase 0 scaffold. Phase 2 and Phase 3
+reached it in one squash (#24), and v1.1.0 is the first release that contains the mesh, the sources,
+the GUI, the container and the phase lock.
+
+**Every open pull request closed: 17 to 0.** All were Dependabot, all raised against the old tree.
+Eleven were already satisfied by what `dev` carried. Five were major version jumps closed with a
+reason — `python:3.14` and Tailwind 4 contradict documented decisions, and vite 8, plugin-react 6
+and node 26 buy nothing, because vite 6.4.3 already clears every alert against it. One was stale.
+
+**Every dependency alert closed: 33 to 0, with no dependency change at all.** The versions on `dev`
+were already past every advisory: vitest 4.1.11 against a critical fixed in 3.2.6, react-router
+7.18.3 against a series fixed by 7.18.0, vite 6.4.3 against 6.4.3. `sharp` and `brace-expansion`
+were gone from the lockfile entirely.
+
+**28 code scanning alerts, of which 23 were real.** The one that mattered: `POST /api/mesh/source`
+passed a caller-supplied path to `os.mkfifo` and `os.open` on an unauthenticated API. Details and
+the five deliberate dismissals are in `docs/HARD-WON-LESSONS.md`.
+
+**Two release-process facts.** A push to `main` auto-cuts a PATCH release, so the merge produced a
+v1.0.2 that had to be deleted before v1.1.0 could be tagged by hand. And the v1.1.0 job published a
+correct image and then died exporting to the Actions cache, before it created the release object —
+`cache-to` now carries `ignore-error=true`.
+
 ### Multi-room phase lock — 2026-09-13 (`bugfix/esp32-min-buffer-starvation`)
 
 **The symptom.** Four units on one AirPlay source played a quarter to half a second apart, and the

@@ -188,6 +188,70 @@ number is supposed to mean "how many times was this unit moved". Clearing `_alig
 
 ---
 
+## Security findings (2026-09-13)
+
+The first CodeQL sweep of the full tree, once Phase 2 and Phase 3 reached `main`. 28 alerts in our
+own code. Dependency alerts are not in this list — all 33 of those closed on the merge itself,
+because the versions `dev` already carried were past every advisory.
+
+**A source id reaches the FILESYSTEM, so it is not free text.** `POST /api/mesh/source` took
+`source_id` and an optional `fifo` straight from the request body and passed them to `os.mkfifo` and
+`os.open`. The API is unauthenticated and bound to `0.0.0.0`, so a caller on the VLAN could create a
+FIFO anywhere the process could write, or point a source at any readable file and hear the contents
+played out a speaker. `backend/scripts/fifo_paths.py` states the rule and both ends enforce it. This
+is the same rule the project already had for a device name (it reaches shairport's libconfig and a
+shell command) — the surface was simply missed.
+
+**The charset has to be what real ids CONTAIN, not the narrowest set that passes a scanner.** A
+`cal:` source id carries a colon and a base64url X25519 key, so `-`, `_` and `:` are all load-bearing.
+A tighter rule would have silently broken every calibration run. The validator was checked against
+the live ids from all four units before it merged, and the unit test carries a real key.
+
+**A guard must check the value the SINK consumes.** This cost three pull requests. The first checked
+at the API and in `start_source`. The second added a guard inside the feeder. Both still read
+`self.fifo_path` at the syscall after checking `self.fifo_path` separately:
+
+```python
+self._guard_fifo_path()          # checks one expression
+os.mkfifo(self.fifo_path, ...)   # reads another
+```
+
+That proves nothing about the value that reaches the kernel, and a reader cannot tell whether the
+path was ever checked. The fix returns the RESOLVED path from the check and hands that to every
+syscall. Resolving first also collapses `/tmp/../etc` and a symlinked `/tmp` before the comparison.
+The macOS `/tmp` symlink caught the test assertion, which is the same ambiguity in miniature.
+
+**CodeQL does not accept this barrier, and the code is right anyway. Stop at three.** The rule
+`py/path-injection` models a small set of sanitizer shapes. `os.path.realpath` propagates taint in
+its model, and a `dirname(resolved) != realpath(FIFO_DIR)` comparison is not a shape it recognises,
+so all three sinks stay flagged through every version of the fix. The recognised shape is a
+`startswith` test against a prefix, which is WEAKER here — a `/tmpfoo` prefix passes it and a
+`dirname` comparison does not. Do not trade a correct check for one a pattern matcher prefers. The
+guarantee rests on the guard, on `fifo_path_is_safe`, and on the test that points a `SourceFeeder`
+at `/etc/passwd` and asserts it raises.
+
+**Eight alerts are dismissed on purpose. Do not "fix" them.** Each has the reason recorded on the
+alert itself:
+
+| what | why it stays |
+|---|---|
+| `py/path-injection`, `sendspin_server.py` x3 | Checked and resolved before every syscall, and unit-tested. CodeQL cannot model the barrier — see above. |
+| `py/bind-socket-all-network-interfaces`, `mesh/discovery.py` | The beacon is a UDP broadcast on 8929. Loopback would stop discovery entirely. |
+| `py/stack-trace-exposure`, `calibration_api.py` x2 | Our own `ValidationError` text, returned as 400. The wizard has to say WHY at the moment the user presses Save, and two unit tests assert on it. |
+| `py/stack-trace-exposure`, `settings_api.py` | Our own `ValueError` from `_validate_audio_output`, describing the caller's own bad device spec. |
+| `py/stack-trace-exposure`, `audio_api.py` | `speaker-test`'s own output on a failed test tone. The Test button exists to make a bad output obvious. |
+
+The other 20 were real: 14 handlers returned `str(e)` to an unauthenticated client. The detail moved
+to the log rather than disappearing, and one Bluetooth handler gained a log line it never had.
+
+**A cache must never decide whether a release exists.** The v1.1.0 release pushed its image to GHCR
+and then died on `error writing layer blob: not_found` while exporting to the Actions cache, which
+aborted the job before the "Create GitHub Release" step. The image was correct and published; only
+the release object was missing, and it had to be created by hand. `cache-to` now carries
+`ignore-error=true` in all three workflows.
+
+---
+
 ## Bluetooth
 
 **The position/seek ceiling is in `bluetoothd`, not in our relay, the GUI, or the metadata role.**

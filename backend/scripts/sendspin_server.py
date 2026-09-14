@@ -322,24 +322,36 @@ class SourceFeeder:
                     self._acquire_stream()
                     logger.info("[%s] stream re-acquired to include a new group member", self.source_id)
 
-    def _guard_fifo_path(self) -> None:
-        """Refuse a FIFO path that does not name a file directly inside FIFO_DIR.
+    def _checked_fifo_path(self) -> str:
+        """Return the RESOLVED FIFO path, once proven to name a file directly inside FIFO_DIR.
 
-        `start_source` already checks this, and checking again here is the point: the syscalls below
-        are the sink, and a guard one frame up protects only the callers that go through it. A
-        `SourceFeeder` built by anything else would trust its caller blindly. The check is a string
-        comparison against a resolved path, so the cost is nothing against a FIFO open.
+        Every syscall below uses this return value, never `self.fifo_path`. That is the whole point
+        and it is not style: a guard that checks one variable while the syscall consumes another
+        proves nothing about the value that reaches the kernel, and it is exactly the shape that
+        leaves a reader — and a scanner — unable to tell whether the path was ever checked.
+
+        Resolving first also removes the ambiguity a plain string check leaves behind. `/tmp/../etc`
+        and a symlinked `/tmp` both collapse here, so the comparison is against the real directory.
+
+        `start_source` checks as well. Checking twice is deliberate: these syscalls are the sink, a
+        guard one frame up protects only the callers that go through it, and a `SourceFeeder` built
+        by anything else would trust its caller blindly. The cost is a string comparison.
+
+        Raises:
+            ValueError: the path does not name a file directly inside FIFO_DIR.
         """
-        if not fifo_paths.fifo_path_is_safe(self.fifo_path):
+        resolved = os.path.realpath(self.fifo_path)
+        if os.path.dirname(resolved) != os.path.realpath(fifo_paths.FIFO_DIR):
             raise ValueError(f"FIFO path must be a file directly inside {fifo_paths.FIFO_DIR}")
+        return resolved
 
     def _ensure_fifo(self) -> None:
         """Create the FIFO if the source service hasn't yet, so we can open the read end and
         wait for the writer rather than racing it."""
-        self._guard_fifo_path()
-        if not os.path.exists(self.fifo_path):
-            os.mkfifo(self.fifo_path, mode=0o660)
-            logger.info("[%s] created FIFO %s", self.source_id, self.fifo_path)
+        path = self._checked_fifo_path()
+        if not os.path.exists(path):
+            os.mkfifo(path, mode=0o660)
+            logger.info("[%s] created FIFO %s", self.source_id, path)
 
     async def _open_reader(self) -> tuple[asyncio.StreamReader, asyncio.ReadTransport]:
         """Open the FIFO read end non-blocking and wrap it in an asyncio StreamReader.
@@ -349,9 +361,11 @@ class SourceFeeder:
         EOF before the first writer. EOF is only seen after a writer has connected and closed.
         """
         self._ensure_fifo()
-        self._guard_fifo_path()  # again: this open is its own sink, and _ensure_fifo may be skipped
+        # Re-checked rather than reused: this open is its own sink, and `_ensure_fifo` returns early
+        # when the FIFO already exists.
+        path = self._checked_fifo_path()
         loop = asyncio.get_running_loop()
-        fd = os.open(self.fifo_path, os.O_RDONLY | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
         pipe = os.fdopen(fd, "rb", buffering=0)
         reader = asyncio.StreamReader()
         protocol = asyncio.StreamReaderProtocol(reader)

@@ -272,6 +272,15 @@ The *reasoning* behind these, and the failures that produced them, is in
   unit merges newest-wins. Skip it and *which unit's page you opened* silently decides whether
   matching works. Same reason `UnitSnapshot.follows_unit_id` exists: follow config lives on the
   FOLLOWER, so nothing else can tell a locked room from one that joined by hand.
+- **A source id reaches the FILESYSTEM, and a guard must check the value the SINK consumes.** It
+  names the FIFO the server creates with `os.mkfifo` and then opens, and `POST /api/mesh/source`
+  takes it from an unauthenticated request body. `fifo_paths` states the rule; the API returns 400
+  and `start_source` refuses. `_checked_fifo_path()` RETURNS the resolved path and every syscall
+  uses that return value — checking `self.fifo_path` and then passing `self.fifo_path` proves
+  nothing about what reaches the kernel, and it cost three PRs to state properly. The charset is
+  what real ids contain (`cal:` carries a colon and a base64url key), not the narrowest set that
+  passes a scanner. Eight CodeQL alerts are dismissed on purpose, including these three: the scanner cannot
+  model the barrier, and its recognised shape is weaker. HARD-WON-LESSONS lists them all.
 - **Anything keyed by id must write through `SettingsManager.mutate`, not `update_settings`.** The
   latter is a blind patch; a get-then-post on a map lets two browsers each read it and the second
   drop the first — with a bumped version, so no poller ever reconciles the loss.
