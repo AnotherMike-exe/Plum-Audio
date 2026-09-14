@@ -322,9 +322,21 @@ class SourceFeeder:
                     self._acquire_stream()
                     logger.info("[%s] stream re-acquired to include a new group member", self.source_id)
 
+    def _guard_fifo_path(self) -> None:
+        """Refuse a FIFO path that does not name a file directly inside FIFO_DIR.
+
+        `start_source` already checks this, and checking again here is the point: the syscalls below
+        are the sink, and a guard one frame up protects only the callers that go through it. A
+        `SourceFeeder` built by anything else would trust its caller blindly. The check is a string
+        comparison against a resolved path, so the cost is nothing against a FIFO open.
+        """
+        if not fifo_paths.fifo_path_is_safe(self.fifo_path):
+            raise ValueError(f"FIFO path must be a file directly inside {fifo_paths.FIFO_DIR}")
+
     def _ensure_fifo(self) -> None:
         """Create the FIFO if the source service hasn't yet, so we can open the read end and
         wait for the writer rather than racing it."""
+        self._guard_fifo_path()
         if not os.path.exists(self.fifo_path):
             os.mkfifo(self.fifo_path, mode=0o660)
             logger.info("[%s] created FIFO %s", self.source_id, self.fifo_path)
@@ -337,6 +349,7 @@ class SourceFeeder:
         EOF before the first writer. EOF is only seen after a writer has connected and closed.
         """
         self._ensure_fifo()
+        self._guard_fifo_path()  # again: this open is its own sink, and _ensure_fifo may be skipped
         loop = asyncio.get_running_loop()
         fd = os.open(self.fifo_path, os.O_RDONLY | os.O_NONBLOCK)
         pipe = os.fdopen(fd, "rb", buffering=0)

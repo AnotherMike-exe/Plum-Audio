@@ -97,3 +97,25 @@ def test_a_traversal_that_lands_back_inside_is_accepted():
 
 def test_a_null_byte_is_refused():
     assert fifo_paths.fifo_path_is_safe(f"{fifo_paths.FIFO_DIR}/x\x00-fifo") is False
+
+
+# -- the guard at the syscall ------------------------------------------------------------------------
+
+
+def test_the_feeder_refuses_a_bad_path_at_the_syscall_itself():
+    """`start_source` checks too, and checking twice is the point.
+
+    `os.mkfifo` and `os.open` are the sink. A guard one frame up in `start_source` protects only the
+    callers that go through it, and a SourceFeeder built by anything else would trust its caller.
+    """
+    pytest.importorskip("numpy", reason="sendspin_server imports numpy at module scope")
+    pytest.importorskip("aiosendspin", reason="sendspin_server imports aiosendspin at module scope")
+    import sendspin_server
+
+    feeder = sendspin_server.SourceFeeder.__new__(sendspin_server.SourceFeeder)
+    feeder.fifo_path = "/etc/passwd"
+    with pytest.raises(ValueError, match="directly inside"):
+        feeder._ensure_fifo()  # noqa: SLF001
+
+    feeder.fifo_path = fifo_paths.fifo_path_for("airplay-1")
+    feeder._guard_fifo_path()  # noqa: SLF001 - a real path must pass
