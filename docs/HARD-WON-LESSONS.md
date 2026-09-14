@@ -48,6 +48,19 @@ newest dialer; it now **persists the `server_id` of whoever most recently had it
 (`player_state.json`), which is the storage half of the MUST, but it cannot yet act on it.
 Harmless in a Plum-only mesh, where we only ever dial `playback`. Tracked in `docs/UPSTREAM-AIOSENDSPIN.md`.
 
+**A deploy that fails with no message at all is `grep -v` inside `set -e`.** `deploy.sh` prunes old
+images before loading the new one, and `grep -vE` exits 1 when it filters EVERYTHING out — the
+ordinary state of a unit with no locally-tagged image, such as a greenfield Pi or one that has only
+ever been updated from GHCR. With `set -euo pipefail` that status ended the whole remote heredoc
+silently, AFTER the container had been removed and the tarball copied. Living Room and Kitchen sat
+with no container and no error on 2026-09-13. Fixed with `|| true`: housekeeping must never decide
+whether a unit gets its image.
+
+**`declare -A` does not exist on the workstation.** macOS ships bash 3.2. It does not fail loudly
+either — it reads the host string as an arithmetic index, stores every unit in slot 0, and the test
+then exercises one unit while reporting the rest as broken. Cost a full test cycle in
+`t3_phase_lock.sh`. Use indexed arrays in `tests/Integration/`.
+
 **Alpine.** The base is `python:3.13-slim-trixie` (glibc) deliberately — glibc makes PyAV /
 PortAudio / numpy wheels trivial and removes the Alpine packaging pain Plum-Snapcast had. Trixie
 specifically, because two integrations depend on what that release ships; see

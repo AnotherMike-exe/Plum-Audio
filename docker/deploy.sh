@@ -675,8 +675,16 @@ s() { echo "$PW" | sudo -S -p '' "$@"; }
 
 # Ordered newest-first by creation, so "keep the last N" means what it says. `latest` and the tag we
 # are about to deploy are never candidates.
+#
+# `|| true` is load-bearing, and its absence took two rooms off the air on 2026-09-13. `grep -v`
+# exits 1 when it filters EVERYTHING out, which includes the ordinary case of a unit with no
+# locally-tagged image at all — a greenfield Pi, or a unit that has only ever been updated from
+# GHCR, where `docker images plum-audio` matches nothing. Under `set -e` with `pipefail` that exit
+# status ends the whole heredoc, silently: the container was already removed one step earlier, the
+# tarball had already been copied, and the deploy printed nothing but `FAILED`. Housekeeping must
+# never decide whether a unit gets its image.
 stale="$(s docker images "$IMAGE_NAME" --format '{{.Tag}}\t{{.CreatedAt}}' 2>/dev/null \
-    | grep -vE "^(latest|${IMAGE_TAG})\s" | sort -k2 -r | awk -v k="$KEEP" 'NR>k{print $1}')"
+    | grep -vE "^(latest|${IMAGE_TAG})\s" | sort -k2 -r | awk -v k="$KEEP" 'NR>k{print $1}' || true)"
 for t in $stale; do
     echo "    pruning old image ${IMAGE_NAME}:${t}"
     s docker rmi -f "${IMAGE_NAME}:${t}" >/dev/null 2>&1 || true
@@ -724,7 +732,16 @@ PLUM_PLAYER_NAME=${PLAYER_NAME}
 
 PLUM_DAC_DEVICE=${DAC}
 PLUM_PLAYER_ENABLED=${PLAYER_ENABLED}
-PLUM_STATIC_DELAY_MS=150
+# This endpoint's own output latency, in ms — the spec's static_delay_ms. The player subtracts it
+# from every scheduled play time, so it means "start my audio this much EARLY, because my output
+# chain is that far behind". NOT a jitter cushion: PortAudio's outputBufferDacTime already accounts
+# for the ALSA buffer, so real analog latency is about 1 ms, not 150.
+#
+# It was 150 until 2026-09-13, when it did nothing — the renderer free-ran and ignored play times
+# entirely. Under phase lock a wrong value is a real offset: 150 here puts this unit 150 ms AHEAD of
+# any ESP32 speaker in the same group, which declares 0. Leave it at 0 and correct a measured
+# per-room offset with the per-endpoint delay in the GUI, which is per endpoint and persisted.
+PLUM_STATIC_DELAY_MS=0
 PLUM_LOG_LEVEL=INFO
 PLUM_MESH_ENABLED=1
 PLEXAMP_ENABLED=0
