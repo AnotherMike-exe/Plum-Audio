@@ -8,6 +8,13 @@ on:
   workflow_call:
   workflow_dispatch:
 
+# Least privilege for the automatic token. These jobs only read the repository — they run linters,
+# tests and a build, and they publish nothing. Without this block the token carries whatever the
+# repository default grants, which is write on many repositories. CodeQL
+# actions/missing-workflow-permissions, 3 alerts, found on main 2026-09-13.
+permissions:
+  contents: read
+
 concurrency:
   group: checks-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -87,4 +94,8 @@ jobs:
           platforms: linux/arm64
           push: false
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # `ignore-error` is load-bearing, not tidiness. The v1.1.0 release published its image
+          # to GHCR and THEN died on `error writing layer blob: not_found` while exporting to the
+          # Actions cache, which aborted the job before it created the release. A cache is an
+          # optimisation. It must never decide whether a release exists. 2026-09-13.
+          cache-to: type=gha,mode=max,ignore-error=true

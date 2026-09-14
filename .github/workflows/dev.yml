@@ -72,7 +72,11 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # `ignore-error` is load-bearing, not tidiness. The v1.1.0 release published its image
+          # to GHCR and THEN died on `error writing layer blob: not_found` while exporting to the
+          # Actions cache, which aborted the job before it created the release. A cache is an
+          # optimisation. It must never decide whether a release exists. 2026-09-13.
+          cache-to: type=gha,mode=max,ignore-error=true
 
       - name: Summary
         run: |
