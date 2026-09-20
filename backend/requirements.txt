@@ -19,7 +19,7 @@ sounddevice>=0.5.6    # PortAudio player output (needs libportaudio2 in the imag
 
 # REST APIs
 Flask>=3,<4
-flask-cors>=4
+flask-cors>=6.0.5
 requests>=2.31
 
 # MPRIS control/metadata over the system D-Bus for AirPlay (shairport-sync). asyncio-native (no glib
