@@ -11,7 +11,9 @@
 # Debian release.
 
 # --- Frontend build: the React GUI nginx serves from /app/www ------------------------------------
-FROM node:22-alpine AS webui
+# Node 24 because it is the ACTIVE LTS, and checks.yml pins the same major — move BOTH together or
+# neither, or CI builds the GUI on a runtime the image never runs. Odd majors (25) are never LTS.
+FROM node:24-alpine AS webui
 WORKDIR /ui
 COPY frontend/package*.json ./
 RUN npm ci
