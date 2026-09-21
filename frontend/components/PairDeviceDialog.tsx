@@ -97,20 +97,20 @@ export const PairDeviceDialog: React.FC<PairDeviceDialogProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs"
       onClick={onCancel}
       role="dialog"
       aria-modal="true"
       aria-labelledby="pair-dialog-title"
     >
       <div
-        className="relative w-[380px] bg-[var(--bg-secondary)] rounded-2xl shadow-2xl border border-[var(--border-color)] p-6"
+        className="relative w-[380px] bg-(--bg-secondary) rounded-2xl shadow-2xl border border-(--border-color) p-6"
         onClick={(e) => e.stopPropagation()}
       >
-        <h3 id="pair-dialog-title" className="text-lg font-semibold text-[var(--text-primary)] mb-1">
+        <h3 id="pair-dialog-title" className="text-lg font-semibold text-(--text-primary) mb-1">
           Pair {client.name}
         </h3>
-        <p className="text-xs text-[var(--text-secondary)] mb-4">
+        <p className="text-xs text-(--text-secondary) mb-4">
           This speaker is encrypted and has not been paired with this unit, so it cannot play yet.
         </p>
 
@@ -126,8 +126,8 @@ export const PairDeviceDialog: React.FC<PairDeviceDialogProps> = ({
                   key={value}
                   className={`flex gap-3 p-2 rounded-lg cursor-pointer border ${
                     method === value
-                      ? 'border-[var(--accent-color)] bg-[var(--bg-tertiary)]'
-                      : 'border-transparent hover:bg-[var(--bg-tertiary-hover)]'
+                      ? 'border-(--accent-color) bg-(--bg-tertiary)'
+                      : 'border-transparent hover:bg-(--bg-tertiary-hover)'
                   }`}
                 >
                   <input
@@ -138,8 +138,8 @@ export const PairDeviceDialog: React.FC<PairDeviceDialogProps> = ({
                     onChange={() => setMethod(value)}
                   />
                   <span>
-                    <span className="block text-sm font-semibold text-[var(--text-primary)]">{label}</span>
-                    <span className="block text-xs text-[var(--text-secondary)]">{hint}</span>
+                    <span className="block text-sm font-semibold text-(--text-primary)">{label}</span>
+                    <span className="block text-xs text-(--text-secondary)">{hint}</span>
                   </span>
                 </label>
               ))}
@@ -152,14 +152,14 @@ export const PairDeviceDialog: React.FC<PairDeviceDialogProps> = ({
                 onChange={(e) => setToken(e.target.value)}
                 placeholder="SP:..."
                 aria-label="Pairing token"
-                className="w-full px-3 py-2 rounded-lg bg-[var(--bg-tertiary)] text-[var(--text-primary)] border border-[var(--border-color)] font-mono text-sm"
+                className="w-full px-3 py-2 rounded-lg bg-(--bg-tertiary) text-(--text-primary) border border-(--border-color) font-mono text-sm"
               />
             )}
           </div>
         )}
 
         {phase === 'running' && (
-          <p className="text-sm text-[var(--text-secondary)] py-6 text-center">
+          <p className="text-sm text-(--text-secondary) py-6 text-center">
             Pairing with {client.name}…
             <span className="block text-xs mt-1">You may need to confirm on the device.</span>
           </p>
@@ -167,7 +167,7 @@ export const PairDeviceDialog: React.FC<PairDeviceDialogProps> = ({
 
         {phase === 'pin' && (
           <div className="space-y-2 py-2">
-            <label htmlFor="pair-pin" className="block text-sm text-[var(--text-primary)]">
+            <label htmlFor="pair-pin" className="block text-sm text-(--text-primary)">
               Enter the PIN {client.name} is showing
             </label>
             <input
@@ -178,14 +178,14 @@ export const PairDeviceDialog: React.FC<PairDeviceDialogProps> = ({
               value={pin}
               onChange={(e) => setPin(e.target.value.replace(/\D/g, ''))}
               onKeyDown={(e) => { if (e.key === 'Enter' && pin.trim()) void sendPin(); }}
-              className="w-full px-3 py-2 rounded-lg bg-[var(--bg-tertiary)] text-[var(--text-primary)] border border-[var(--border-color)] font-mono text-lg tracking-widest text-center"
+              className="w-full px-3 py-2 rounded-lg bg-(--bg-tertiary) text-(--text-primary) border border-(--border-color) font-mono text-lg tracking-widest text-center"
             />
           </div>
         )}
 
         {phase === 'done' && (
-          <p className="text-sm text-[var(--text-primary)] py-6 text-center">
-            <Icon name="plus" className="mr-2 text-[var(--accent-color)]" />
+          <p className="text-sm text-(--text-primary) py-6 text-center">
+            <Icon name="plus" className="mr-2 text-(--accent-color)" />
             {client.name} is paired and can now play.
           </p>
         )}
@@ -196,7 +196,7 @@ export const PairDeviceDialog: React.FC<PairDeviceDialogProps> = ({
           {phase === 'done' ? (
             <button
               onClick={onDone}
-              className="flex-1 px-4 py-2 bg-[var(--accent-color)] accent-button-text rounded-lg hover:bg-[var(--accent-color-hover)] transition-colors"
+              className="flex-1 px-4 py-2 bg-(--accent-color) accent-button-text rounded-lg hover:bg-(--accent-color-hover) transition-colors"
             >
               Done
             </button>
@@ -204,14 +204,14 @@ export const PairDeviceDialog: React.FC<PairDeviceDialogProps> = ({
             <>
               <button
                 onClick={onCancel}
-                className="flex-1 px-4 py-2 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded-lg hover:bg-[var(--bg-tertiary-hover)] transition-colors"
+                className="flex-1 px-4 py-2 bg-(--bg-tertiary) text-(--text-primary) rounded-lg hover:bg-(--bg-tertiary-hover) transition-colors"
               >
                 Cancel
               </button>
               <button
                 onClick={() => (phase === 'pin' ? void sendPin() : void start())}
                 disabled={busy || (phase === 'choose' && !canStart) || (phase === 'pin' && !pin.trim())}
-                className="flex-1 px-4 py-2 bg-[var(--accent-color)] accent-button-text rounded-lg hover:bg-[var(--accent-color-hover)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                className="flex-1 px-4 py-2 bg-(--accent-color) accent-button-text rounded-lg hover:bg-(--accent-color-hover) transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {phase === 'pin' ? 'Submit PIN' : phase === 'failed' ? 'Try again' : 'Pair'}
               </button>

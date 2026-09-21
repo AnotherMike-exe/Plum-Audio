@@ -36,7 +36,7 @@ const ClientDevice: React.FC<{
         <div className="flex items-center gap-3">
             <span className="flex-1 truncate font-semibold">{client.name}</span>
             <div className="flex items-center gap-2 w-40">
-                <Icon name="volume-high" className="w-4 text-[var(--text-secondary)]" style={{ color: 'inherit' }} />
+                <Icon name="volume-high" className="w-4 text-(--text-secondary)" style={{ color: 'inherit' }} />
                 <input
                     type="range"
                     min="0"
@@ -78,7 +78,7 @@ export const ClientManager: React.FC<ClientManagerProps> = ({
         browserAudioActive && onStopBrowserAudio ? (
             <button
                 onClick={onStopBrowserAudio}
-                className="w-full bg-[var(--bg-tertiary)] text-[var(--text-primary)] font-bold py-3 px-4 rounded-lg hover:bg-[var(--bg-tertiary-hover)] transition-colors flex items-center justify-center gap-2"
+                className="w-full bg-(--bg-tertiary) text-(--text-primary) font-bold py-3 px-4 rounded-lg hover:bg-(--bg-tertiary-hover) transition-colors flex items-center justify-center gap-2"
             >
                 <Icon name="headphones" style={{ color: 'inherit' }} />
                 Stop Listening
@@ -86,7 +86,7 @@ export const ClientManager: React.FC<ClientManagerProps> = ({
         ) : onStartBrowserAudio && !browserAudioActive ? (
             <button
                 onClick={onStartBrowserAudio}
-                className="w-full bg-[var(--accent-color)] accent-button-text font-bold py-3 px-4 rounded-lg hover:bg-[var(--accent-color-hover)] transition-colors flex items-center justify-center gap-2"
+                className="w-full bg-(--accent-color) accent-button-text font-bold py-3 px-4 rounded-lg hover:bg-(--accent-color-hover) transition-colors flex items-center justify-center gap-2"
             >
                 <Icon name="headphones" style={{ color: 'inherit' }} />
                 Listen in Browser
@@ -110,8 +110,8 @@ export const ClientManager: React.FC<ClientManagerProps> = ({
         return (
             <div className="space-y-6">
                 <div className="text-center py-4">
-                    <Icon name="desktop" className="text-4xl text-[var(--icon-muted)] mb-3" />
-                    <p className="text-[var(--text-secondary)]">No other active devices.</p>
+                    <Icon name="desktop" className="text-4xl text-(--icon-muted) mb-3" />
+                    <p className="text-(--text-secondary)">No other active devices.</p>
                 </div>
                 {browserAudioButton}
             </div>
@@ -128,11 +128,11 @@ export const ClientManager: React.FC<ClientManagerProps> = ({
                 const typedClientsInGroup = clientsInGroup as Client[];
 
                 return (
-                    <div key={streamId} className="bg-[var(--bg-tertiary)] p-4 rounded-lg">
-                        <div className="border-b border-[var(--border-color)] pb-3 mb-3">
-                            <h3 className="font-bold text-lg truncate text-[var(--text-primary)]">{stream.name}</h3>
-                            <p className="text-sm text-[var(--text-secondary)] truncate">
-                                <Icon name="music" className="mr-2 text-[var(--text-muted)]" />
+                    <div key={streamId} className="bg-(--bg-tertiary) p-4 rounded-lg">
+                        <div className="border-b border-(--border-color) pb-3 mb-3">
+                            <h3 className="font-bold text-lg truncate text-(--text-primary)">{stream.name}</h3>
+                            <p className="text-sm text-(--text-secondary) truncate">
+                                <Icon name="music" className="mr-2 text-(--text-muted)" />
                                 {stream.currentTrack.title}
                             </p>
                         </div>
@@ -154,28 +154,28 @@ export const ClientManager: React.FC<ClientManagerProps> = ({
             })}
 
             {idleClients && idleClients.length > 0 && (
-                <div className="bg-[var(--bg-tertiary)] p-4 rounded-lg">
-                    <h3 className="font-bold text-lg text-[var(--text-primary)] border-b border-[var(--border-color)] pb-3 mb-3">Idle
+                <div className="bg-(--bg-tertiary) p-4 rounded-lg">
+                    <h3 className="font-bold text-lg text-(--text-primary) border-b border-(--border-color) pb-3 mb-3">Idle
                         Devices</h3>
                     <div className="space-y-2">
                         {idleClients.map(client => (
                             <div key={client.id}
-                                 className="flex items-center justify-between gap-3 p-2 rounded-lg hover:bg-[var(--bg-tertiary-hover)]">
+                                 className="flex items-center justify-between gap-3 p-2 rounded-lg hover:bg-(--bg-tertiary-hover)">
                                 {/* A speaker claimed by a server outside our mesh (Music Assistant,
                                     any third-party Sendspin server) is not idle — say where it went
                                     and what it is playing. Join Stream still pulls it back. */}
                                 <span className="truncate flex-1">
                                     <span className="font-semibold">{client.name}</span>
                                     {client.foreignServer && (
-                                        <span className="block text-xs text-[var(--text-secondary)] truncate">
-                                            <Icon name="tower-broadcast" className="mr-1 text-[var(--text-muted)]" />
+                                        <span className="block text-xs text-(--text-secondary) truncate">
+                                            <Icon name="tower-broadcast" className="mr-1 text-(--text-muted)" />
                                             {client.foreignServer.name}
                                             {client.foreignServer.title ? ` · ${client.foreignServer.title}` : ''}
                                             {client.foreignServer.artist ? ` — ${client.foreignServer.artist}` : ''}
                                         </span>
                                     )}
                                 </span>
-                                <div className="flex items-center gap-2 flex-shrink-0">
+                                <div className="flex items-center gap-2 shrink-0">
                                     {/* An unpaired device cannot render a note, so routing it would
                                         silently do nothing — the exact failure this whole feature
                                         exists to make visible. Pair REPLACES the routing controls
@@ -186,7 +186,7 @@ export const ClientManager: React.FC<ClientManagerProps> = ({
                                     {client.pairingState === 'unpaired' ? (
                                         <button
                                             onClick={() => onPairClient?.(client)}
-                                            className="text-sm bg-[var(--accent-color)] accent-button-text font-bold py-1 px-3 rounded-full hover:bg-[var(--accent-color-hover)] transition-colors"
+                                            className="text-sm bg-(--accent-color) accent-button-text font-bold py-1 px-3 rounded-full hover:bg-(--accent-color-hover) transition-colors"
                                             title={`${client.name} must be paired before it can play`}
                                         >
                                             <Icon name="plus" className="mr-1" />
@@ -197,7 +197,7 @@ export const ClientManager: React.FC<ClientManagerProps> = ({
                                             <button
                                                 onClick={() => onStreamChange(client.id, myClientStreamId)}
                                                 disabled={!myClientStreamId}
-                                                className="text-sm bg-[var(--accent-color)] accent-button-text font-bold py-1 px-3 rounded-full hover:bg-[var(--accent-color-hover)] transition-colors disabled:bg-gray-500 disabled:cursor-not-allowed"
+                                                className="text-sm bg-(--accent-color) accent-button-text font-bold py-1 px-3 rounded-full hover:bg-(--accent-color-hover) transition-colors disabled:bg-gray-500 disabled:cursor-not-allowed"
                                                 title={myClientStreamId ? 'Join your current stream' : 'Select a stream first'}
                                             >
                                                 <Icon name="plus" className="mr-1" />

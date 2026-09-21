@@ -170,13 +170,13 @@ export const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-      <div className="w-full max-w-lg max-h-[90vh] overflow-y-auto rounded-xl bg-[var(--bg-secondary)] p-6 shadow-xl">
+      <div className="w-full max-w-lg max-h-[90vh] overflow-y-auto rounded-xl bg-(--bg-secondary) p-6 shadow-xl">
         <div className="mb-1 flex items-start justify-between gap-4">
           <div>
-            <h3 className="text-lg font-semibold text-[var(--text-primary)]">Calibrate {endpoint.name}</h3>
-            <p className="text-sm text-[var(--text-secondary)]">{endpoint.unitName}</p>
+            <h3 className="text-lg font-semibold text-(--text-primary)">Calibrate {endpoint.name}</h3>
+            <p className="text-sm text-(--text-secondary)">{endpoint.unitName}</p>
           </div>
-          <button onClick={onClose} className="text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+          <button onClick={onClose} className="text-(--text-secondary) hover:text-(--text-primary)"
                   aria-label="Close">
             <Icon name="xmark" className="h-5 w-5" />
           </button>
@@ -198,13 +198,13 @@ export const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
           </ul>
         </div>
 
-        <label className="mb-4 flex items-center gap-3 text-sm text-[var(--text-secondary)]">
+        <label className="mb-4 flex items-center gap-3 text-sm text-(--text-secondary)">
           Tone
           <select
             value={toneType}
             onChange={(e) => setToneType(e.target.value as 'pink' | 'sine')}
             disabled={playingRow !== null}
-            className="rounded-md bg-[var(--bg-primary)] px-2 py-1 text-[var(--text-primary)] disabled:opacity-50"
+            className="rounded-md bg-(--bg-primary) px-2 py-1 text-(--text-primary) disabled:opacity-50"
           >
             <option value="pink">Pink noise (recommended)</option>
             <option value="sine">1 kHz sine</option>
@@ -213,37 +213,37 @@ export const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
 
         <div className="space-y-2">
           {rows.map((row, index) => (
-            <div key={index} className="flex items-center gap-2 rounded-lg bg-[var(--bg-primary)] p-2">
+            <div key={index} className="flex items-center gap-2 rounded-lg bg-(--bg-primary) p-2">
               <button
                 onClick={() => void playRow(index)}
                 className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full ${
-                  playingRow === index ? 'bg-red-500 text-white' : 'bg-[var(--accent-color)] text-white'
+                  playingRow === index ? 'bg-red-500 text-white' : 'bg-(--accent-color) text-white'
                 }`}
                 aria-label={playingRow === index ? 'Stop tone' : 'Play tone'}
               >
                 <Icon name={playingRow === index ? 'stop' : 'play'} className="h-4 w-4" />
               </button>
 
-              <label className="flex items-center gap-1 text-sm text-[var(--text-secondary)]">
+              <label className="flex items-center gap-1 text-sm text-(--text-secondary)">
                 <input
                   type="number"
                   min={1}
                   max={100}
                   value={row.volume}
                   onChange={(e) => updateRow(index, {volume: Number(e.target.value)})}
-                  className="w-16 rounded-md bg-[var(--bg-secondary)] px-2 py-1 text-right text-[var(--text-primary)]"
+                  className="w-16 rounded-md bg-(--bg-secondary) px-2 py-1 text-right text-(--text-primary)"
                 />
                 %
               </label>
 
-              <label className="ml-auto flex items-center gap-1 text-sm text-[var(--text-secondary)]">
+              <label className="ml-auto flex items-center gap-1 text-sm text-(--text-secondary)">
                 <input
                   type="number"
                   step="0.1"
                   placeholder="e.g. 62"
                   value={row.db}
                   onChange={(e) => updateRow(index, {db: e.target.value})}
-                  className="w-24 rounded-md bg-[var(--bg-secondary)] px-2 py-1 text-right text-[var(--text-primary)]"
+                  className="w-24 rounded-md bg-(--bg-secondary) px-2 py-1 text-right text-(--text-primary)"
                 />
                 dB
               </label>
@@ -251,7 +251,7 @@ export const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
               <button
                 onClick={() => void removeRow(index)}
                 disabled={rows.length <= minSamples}
-                className="text-[var(--text-secondary)] hover:text-red-400 disabled:opacity-30"
+                className="text-(--text-secondary) hover:text-red-400 disabled:opacity-30"
                 aria-label="Remove measurement"
               >
                 <Icon name="trash" className="h-4 w-4" />
@@ -263,15 +263,15 @@ export const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
         <button
           onClick={addRow}
           disabled={rows.length >= maxSamples}
-          className="mt-2 text-sm text-[var(--accent-color)] disabled:opacity-40"
+          className="mt-2 text-sm text-(--accent-color) disabled:opacity-40"
         >
           + Add a measurement ({rows.length}/{maxSamples})
         </button>
 
         <div className="mt-5 space-y-4 border-t border-white/10 pt-4">
           <div>
-            <p className="text-sm font-medium text-[var(--text-primary)]">Maximum output</p>
-            <p className="mb-2 text-xs text-[var(--text-secondary)]">
+            <p className="text-sm font-medium text-(--text-primary)">Maximum output</p>
+            <p className="mb-2 text-xs text-(--text-secondary)">
               How far matching may push this endpoint. In dB mode the limit is resolved through this
               speaker&apos;s own curve, so one number means the same loudness in every room.
             </p>
@@ -286,8 +286,8 @@ export const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
                     }}
                     className={`px-3 py-1 text-sm ${
                       maxMode === mode
-                        ? 'bg-[var(--accent-color)] text-white'
-                        : 'bg-[var(--bg-primary)] text-[var(--text-secondary)]'
+                        ? 'bg-(--accent-color) text-white'
+                        : 'bg-(--bg-primary) text-(--text-secondary)'
                     }`}
                   >
                     {mode === 'percentage' ? '%' : 'dB'}
@@ -298,15 +298,15 @@ export const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
                 type="number"
                 value={maxValue}
                 onChange={(e) => setMaxValue(Number(e.target.value))}
-                className="w-24 rounded-md bg-[var(--bg-primary)] px-2 py-1 text-right text-[var(--text-primary)]"
+                className="w-24 rounded-md bg-(--bg-primary) px-2 py-1 text-right text-(--text-primary)"
               />
-              <span className="text-sm text-[var(--text-secondary)]">{maxMode === 'percentage' ? '%' : 'dB'}</span>
+              <span className="text-sm text-(--text-secondary)">{maxMode === 'percentage' ? '%' : 'dB'}</span>
             </div>
           </div>
 
           <div>
-            <p className="text-sm font-medium text-[var(--text-primary)]">Level offset</p>
-            <p className="mb-2 text-xs text-[var(--text-secondary)]">
+            <p className="text-sm font-medium text-(--text-primary)">Level offset</p>
+            <p className="mb-2 text-xs text-(--text-secondary)">
               Persistent per-room taste, kept through every re-level — &ldquo;the kitchen is always a
               little quieter&rdquo;. Dragging a volume slider sets the whole group&apos;s target instead.
             </p>
@@ -320,7 +320,7 @@ export const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
                 onChange={(e) => setTrimDb(Number(e.target.value))}
                 className="flex-1"
               />
-              <span className="w-16 text-right text-sm text-[var(--text-primary)]">
+              <span className="w-16 text-right text-sm text-(--text-primary)">
                 {trimDb > 0 ? '+' : ''}{trimDb} dB
               </span>
             </div>
@@ -339,19 +339,19 @@ export const CalibrationWizard: React.FC<CalibrationWizardProps> = ({
         )}
 
         <div className="mt-6 flex items-center justify-end gap-3">
-          <button onClick={onClose} className="text-sm text-[var(--text-secondary)] hover:text-[var(--text-primary)]">
+          <button onClick={onClose} className="text-sm text-(--text-secondary) hover:text-(--text-primary)">
             Cancel
           </button>
           <button
             onClick={() => void handleSave()}
             disabled={!complete || saving || needsAdoption}
-            className="rounded-md bg-[var(--accent-color)] px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
+            className="rounded-md bg-(--accent-color) px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
           >
             {saving ? 'Saving…' : 'Save calibration'}
           </button>
         </div>
         {!complete && (
-          <p className="mt-2 text-right text-xs text-[var(--text-secondary)]">
+          <p className="mt-2 text-right text-xs text-(--text-secondary)">
             Enter a dB reading for every row ({minSamples}–{maxSamples} measurements).
           </p>
         )}

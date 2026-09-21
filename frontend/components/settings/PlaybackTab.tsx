@@ -119,10 +119,10 @@ export const PlaybackTab: React.FC<PlaybackTabProps> = ({settings, onSettingsCha
         <div className="space-y-6">
             {/* Where audio comes FROM. Where it comes OUT is the Audio tab. */}
             <div>
-                <h3 className="text-base font-semibold text-[var(--text-primary)] mb-1">
+                <h3 className="text-base font-semibold text-(--text-primary) mb-1">
                     Playback Routing
                 </h3>
-                <p className="text-sm text-[var(--text-muted)]">
+                <p className="text-sm text-(--text-muted)">
                     Control how this unit responds to new audio sources and other units on the network.
                 </p>
             </div>
@@ -136,7 +136,7 @@ export const PlaybackTab: React.FC<PlaybackTabProps> = ({settings, onSettingsCha
                     icon="tower-broadcast"
                     disabled={playerless}
                 />
-                <p className="text-xs text-[var(--text-muted)] pl-8">
+                <p className="text-xs text-(--text-muted) pl-8">
                     {playerless
                         ? 'This unit has no audio output, so it has nothing to switch. Other units can still follow it — they join whatever it is receiving.'
                         : 'When a source connects to this unit (AirPlay, Bluetooth, Spotify, etc.) and the output is idle, automatically switch to that stream.'}
@@ -144,7 +144,7 @@ export const PlaybackTab: React.FC<PlaybackTabProps> = ({settings, onSettingsCha
             </div>
 
             {/* Slave mode */}
-            <div className="pt-4 border-t border-[var(--border-color)] space-y-2">
+            <div className="pt-4 border-t border-(--border-color) space-y-2">
                 <Switch
                     label="Follow another unit (slave mode)"
                     checked={autoSwitch.slave.enabled && !playerless}
@@ -152,7 +152,7 @@ export const PlaybackTab: React.FC<PlaybackTabProps> = ({settings, onSettingsCha
                     icon="network-wired"
                     disabled={playerless}
                 />
-                <p className="text-xs text-[var(--text-muted)] pl-8">
+                <p className="text-xs text-(--text-muted) pl-8">
                     {playerless
                         ? 'This unit has no speaker to send to another unit\u2019s stream.'
                         : "When a master unit starts playing and this unit is idle, automatically join the master's stream. Local connections always take priority."}
@@ -161,11 +161,11 @@ export const PlaybackTab: React.FC<PlaybackTabProps> = ({settings, onSettingsCha
                 {autoSwitch.slave.enabled && (
                     <div className="pl-8 pt-3 space-y-4">
                         <div>
-                            <p className="text-xs text-[var(--text-muted)] mb-2">
+                            <p className="text-xs text-(--text-muted) mb-2">
                                 Unit to follow:
                             </p>
                             {units.length === 0 ? (
-                                <p className="text-xs text-[var(--text-muted)]">
+                                <p className="text-xs text-(--text-muted)">
                                     No other units visible on the mesh yet.
                                 </p>
                             ) : (
@@ -183,10 +183,10 @@ export const PlaybackTab: React.FC<PlaybackTabProps> = ({settings, onSettingsCha
                                                     : undefined}
                                                 className={`px-3 py-1 rounded-full text-xs border transition ${
                                                     selected
-                                                        ? 'bg-[var(--accent-color)] text-white border-[var(--accent-color)]'
+                                                        ? 'bg-(--accent-color) text-white border-(--accent-color)'
                                                         : loops
-                                                            ? 'text-[var(--text-muted)] border-[var(--border-color)] opacity-40 cursor-not-allowed'
-                                                            : 'text-[var(--text-secondary)] border-[var(--border-color)] hover:border-[var(--accent-color)]'
+                                                            ? 'text-(--text-muted) border-(--border-color) opacity-40 cursor-not-allowed'
+                                                            : 'text-(--text-secondary) border-(--border-color) hover:border-(--accent-color)'
                                                 }`}
                                             >
                                                 {name}{loops ? ' — follows this unit' : ''}
@@ -198,9 +198,9 @@ export const PlaybackTab: React.FC<PlaybackTabProps> = ({settings, onSettingsCha
                         </div>
 
                         {autoSwitch.slave.masterUnitId && (
-                            <p className="text-xs text-[var(--text-muted)]">
+                            <p className="text-xs text-(--text-muted)">
                                 Following:{' '}
-                                <span className="text-[var(--text-primary)]">
+                                <span className="text-(--text-primary)">
                                     {followedUnit?.name ?? autoSwitch.slave.masterUnitId}
                                 </span>
                             </p>

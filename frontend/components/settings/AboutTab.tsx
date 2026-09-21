@@ -99,16 +99,16 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
     <div className="space-y-6">
       {/* Device Settings Section */}
       <div>
-        <h3 className="text-base font-semibold text-[var(--text-primary)] mb-4">
+        <h3 className="text-base font-semibold text-(--text-primary) mb-4">
           Device Settings
         </h3>
 
         <div className="space-y-4">
-          <div className="p-4 bg-[var(--bg-tertiary)] rounded-lg border border-[var(--border-color)]">
+          <div className="p-4 bg-(--bg-tertiary) rounded-lg border border-(--border-color)">
             <div className="space-y-4">
               {/* Device Name */}
               <div>
-                <label className="block text-sm font-medium text-[var(--text-primary)] mb-2">
+                <label className="block text-sm font-medium text-(--text-primary) mb-2">
                   Device Name
                 </label>
                 <input
@@ -116,17 +116,17 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
                   value={deviceName}
                   onChange={(e) => handleDeviceNameChange(e.target.value)}
                   disabled={saving}
-                  className="w-full px-3 py-2 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-md text-[var(--text-primary)] text-sm focus:outline-none focus:ring-2 focus:ring-[var(--accent-color)] disabled:opacity-50"
+                  className="w-full px-3 py-2 bg-(--bg-secondary) border border-(--border-color) rounded-md text-(--text-primary) text-sm focus:outline-hidden focus:ring-2 focus:ring-(--accent-color) disabled:opacity-50"
                   placeholder="Plum Sendspin"
                 />
-                <p className="mt-1 text-xs text-[var(--text-muted)]">
+                <p className="mt-1 text-xs text-(--text-muted)">
                   Display name shown across the mesh and in the browser title
                 </p>
               </div>
 
               {/* Hostname */}
               <div>
-                <label className="block text-sm font-medium text-[var(--text-primary)] mb-2">
+                <label className="block text-sm font-medium text-(--text-primary) mb-2">
                   Hostname
                 </label>
                 <input
@@ -134,15 +134,15 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
                   value={hostname}
                   onChange={(e) => handleHostnameChange(e.target.value)}
                   disabled={saving}
-                  className={`w-full px-3 py-2 bg-[var(--bg-secondary)] border rounded-md text-[var(--text-primary)] text-sm focus:outline-none focus:ring-2 focus:ring-[var(--accent-color)] disabled:opacity-50 ${
-                    hostnameError ? 'border-red-500' : 'border-[var(--border-color)]'
+                  className={`w-full px-3 py-2 bg-(--bg-secondary) border rounded-md text-(--text-primary) text-sm focus:outline-hidden focus:ring-2 focus:ring-(--accent-color) disabled:opacity-50 ${
+                    hostnameError ? 'border-red-500' : 'border-(--border-color)'
                   }`}
                   placeholder="plum-audio"
                 />
                 {hostnameError ? (
                   <p className="mt-1 text-xs text-red-500">{hostnameError}</p>
                 ) : (
-                  <p className="mt-1 text-xs text-[var(--text-muted)]">
+                  <p className="mt-1 text-xs text-(--text-muted)">
                     Access this device at http://{hostname || 'plum-audio'}.local (mDNS/Avahi). Lowercase letters, numbers, and hyphens only.
                   </p>
                 )}
@@ -153,7 +153,7 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
                 <button
                   onClick={handleSave}
                   disabled={!hasChanges || saving || !!hostnameError}
-                  className="px-4 py-2 bg-[var(--accent-color)] accent-button-text rounded-md text-sm font-medium hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
+                  className="px-4 py-2 bg-(--accent-color) accent-button-text rounded-md text-sm font-medium hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
                 >
                   {saving ? 'Saving...' : 'Save Changes'}
                 </button>
@@ -170,50 +170,50 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
 
       {/* About Section */}
       <div>
-        <h3 className="text-base font-semibold text-[var(--text-primary)] mb-4">
+        <h3 className="text-base font-semibold text-(--text-primary) mb-4">
           About Plum-Audio
         </h3>
-        <p className="text-sm text-[var(--text-muted)] mb-6">
+        <p className="text-sm text-(--text-muted) mb-6">
           Multi-room audio streaming, synchronised with Sendspin
         </p>
       </div>
 
       <div className="space-y-6">
-        <div className="p-4 bg-[var(--bg-tertiary)] rounded-lg border border-[var(--border-color)]">
-          <h4 className="text-sm font-semibold text-[var(--text-primary)] mb-3">
+        <div className="p-4 bg-(--bg-tertiary) rounded-lg border border-(--border-color)">
+          <h4 className="text-sm font-semibold text-(--text-primary) mb-3">
             Version Information
           </h4>
           <div className="space-y-2 text-sm">
             <div className="flex justify-between">
-              <span className="text-[var(--text-muted)]">Plum-Audio</span>
+              <span className="text-(--text-muted)">Plum-Audio</span>
               <span
-                className="text-[var(--text-primary)] font-mono"
+                className="text-(--text-primary) font-mono"
                 title={versions?.app.gitDescribe ?? undefined}
               >
                 {versions ? versions.app.version : 'Loading...'}
               </span>
             </div>
             <div className="flex justify-between">
-              <span className="text-[var(--text-muted)]">Frontend</span>
-              <span className="text-[var(--text-primary)] font-mono">React {React.version}</span>
+              <span className="text-(--text-muted)">Frontend</span>
+              <span className="text-(--text-primary) font-mono">React {React.version}</span>
             </div>
           </div>
         </div>
 
-        <div className="p-4 bg-[var(--bg-tertiary)] rounded-lg border border-[var(--border-color)]">
-          <h4 className="text-sm font-semibold text-[var(--text-primary)] mb-3">
+        <div className="p-4 bg-(--bg-tertiary) rounded-lg border border-(--border-color)">
+          <h4 className="text-sm font-semibold text-(--text-primary) mb-3">
             Credits & Attribution
           </h4>
-          <div className="space-y-3 text-sm text-[var(--text-muted)]">
+          <div className="space-y-3 text-sm text-(--text-muted)">
             <div>
-              <p className="font-semibold text-[var(--text-primary)] mb-1">Sync engine</p>
+              <p className="font-semibold text-(--text-primary) mb-1">Sync engine</p>
               <ul className="space-y-1 list-disc list-inside">
                 <li>
                   <a
                     href="https://www.sendspin-audio.com/spec/"
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="text-[var(--accent-color)] hover:underline"
+                    className="text-(--accent-color) hover:underline"
                   >
                     Sendspin
                   </a>
@@ -224,7 +224,7 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
                     href="https://github.com/Sendspin/aiosendspin"
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="text-[var(--accent-color)] hover:underline"
+                    className="text-(--accent-color) hover:underline"
                   >
                     aiosendspin
                   </a>
@@ -237,14 +237,14 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
             </div>
 
             <div>
-              <p className="font-semibold text-[var(--text-primary)] mb-1">Audio Sources</p>
+              <p className="font-semibold text-(--text-primary) mb-1">Audio Sources</p>
               <ul className="space-y-1 list-disc list-inside">
                 <li>
                   <a
                     href="https://github.com/mikebrady/shairport-sync"
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="text-[var(--accent-color)] hover:underline"
+                    className="text-(--accent-color) hover:underline"
                   >
                     Shairport-Sync
                   </a>
@@ -258,7 +258,7 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
                     href="https://github.com/devgianlu/go-librespot"
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="text-[var(--accent-color)] hover:underline"
+                    className="text-(--accent-color) hover:underline"
                   >
                     go-librespot
                   </a>
@@ -272,7 +272,7 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
                     href="https://github.com/arkq/bluez-alsa"
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="text-[var(--accent-color)] hover:underline"
+                    className="text-(--accent-color) hover:underline"
                   >
                     bluez-alsa
                   </a>
@@ -286,8 +286,8 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
           </div>
         </div>
 
-        <div className="p-4 bg-[var(--bg-tertiary)] rounded-lg border border-[var(--border-color)]">
-          <h4 className="text-sm font-semibold text-[var(--text-primary)] mb-3">
+        <div className="p-4 bg-(--bg-tertiary) rounded-lg border border-(--border-color)">
+          <h4 className="text-sm font-semibold text-(--text-primary) mb-3">
             Resources
           </h4>
           <div className="space-y-2 text-sm">
@@ -295,7 +295,7 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
               href="https://github.com/Mprice12337/Plum-Audio"
               target="_blank"
               rel="noopener noreferrer"
-              className="flex items-center gap-2 text-[var(--accent-color)] hover:underline"
+              className="flex items-center gap-2 text-(--accent-color) hover:underline"
             >
               <Icon name="github" className="text-lg" style={{ color: 'inherit' }} />
               <span>View on GitHub</span>
@@ -304,7 +304,7 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
               href="https://www.sendspin-audio.com/spec/"
               target="_blank"
               rel="noopener noreferrer"
-              className="flex items-center gap-2 text-[var(--accent-color)] hover:underline"
+              className="flex items-center gap-2 text-(--accent-color) hover:underline"
             >
               <Icon name="book" className="text-lg" style={{ color: 'inherit' }} />
               <span>Sendspin Protocol Specification</span>
@@ -313,7 +313,7 @@ export const AboutTab: React.FC<AboutTabProps> = ({ settings, onSettingsChange }
         </div>
 
         <div className="text-center pt-4">
-          <p className="text-xs text-[var(--text-muted)]">
+          <p className="text-xs text-(--text-muted)">
             Built with Claude Code
           </p>
         </div>

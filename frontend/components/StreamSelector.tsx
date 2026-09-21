@@ -92,24 +92,24 @@ export const StreamSelector: React.FC<StreamSelectorProps> = ({streams, currentS
                 aria-expanded={isOpen}
                 aria-label="Select audio stream source"
             >
-        <span className="text-3xl font-bold text-[var(--accent-color)] truncate pr-4">
+        <span className="text-3xl font-bold text-(--accent-color) truncate pr-4">
           {isCurrentStreamNone ? 'Select a Source' : (currentStream ? getStreamDisplayName(currentStream, true) : 'Select a Source')}
         </span>
-                <Icon name="chevron-down" className={`text-[var(--text-secondary)] transition-transform duration-200 ${isOpen ? 'rotate-180' : ''}`} style={{ color: 'inherit' }} aria-hidden />
+                <Icon name="chevron-down" className={`text-(--text-secondary) transition-transform duration-200 ${isOpen ? 'rotate-180' : ''}`} style={{ color: 'inherit' }} aria-hidden />
             </button>
 
             {isOpen && (
                 <div
-                    className={`absolute z-10 w-full bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-lg shadow-xl ${
+                    className={`absolute z-10 w-full bg-(--bg-secondary) border border-(--border-color) rounded-lg shadow-xl ${
                         openUpward ? 'bottom-full mb-2' : 'top-full mt-2'
                     }`}
                     role="listbox"
                 >
-                    <ul className="py-2 text-base text-[var(--text-primary)] max-h-60 overflow-auto">
+                    <ul className="py-2 text-base text-(--text-primary) max-h-60 overflow-auto">
                         <li role="option">
                             <button
                                 onClick={handleSelectNone}
-                                className={`block w-full text-left px-4 py-2 text-[var(--text-secondary)] hover:bg-[var(--bg-secondary-hover)] ${isCurrentStreamNone ? 'font-semibold' : ''}`}
+                                className={`block w-full text-left px-4 py-2 text-(--text-secondary) hover:bg-(--bg-secondary-hover) ${isCurrentStreamNone ? 'font-semibold' : ''}`}
                             >
                                 None
                             </button>
@@ -117,14 +117,14 @@ export const StreamSelector: React.FC<StreamSelectorProps> = ({streams, currentS
                         {federationEnabled ? (
                             Object.entries(groupedStreams).map(([serverName, serverStreams]) => (
                                 <React.Fragment key={serverName}>
-                                    <li className="px-4 py-2 text-xs font-semibold text-[var(--text-secondary)] uppercase tracking-wider border-t border-[var(--border-color)] mt-2 first:mt-0 first:border-0">
+                                    <li className="px-4 py-2 text-xs font-semibold text-(--text-secondary) uppercase tracking-wider border-t border-(--border-color) mt-2 first:mt-0 first:border-0">
                                         {serverName}
                                     </li>
                                     {serverStreams.map(s => (
                                         <li key={s.id} role="option" aria-selected={currentStreamId === s.id}>
                                             <button
                                                 onClick={() => handleSelect(s.id)}
-                                                className={`block w-full text-left px-4 py-2 hover:bg-[var(--bg-secondary-hover)] transition-colors ${currentStreamId === s.id ? 'font-semibold text-[var(--accent-color)]' : ''}`}
+                                                className={`block w-full text-left px-4 py-2 hover:bg-(--bg-secondary-hover) transition-colors ${currentStreamId === s.id ? 'font-semibold text-(--accent-color)' : ''}`}
                                             >
                                                 {getStreamDisplayName(s)}
                                             </button>
@@ -138,7 +138,7 @@ export const StreamSelector: React.FC<StreamSelectorProps> = ({streams, currentS
                                     <li key={s.id} role="option" aria-selected={currentStreamId === s.id}>
                                         <button
                                             onClick={() => handleSelect(s.id)}
-                                            className={`block w-full text-left px-4 py-2 hover:bg-[var(--bg-secondary-hover)] transition-colors ${currentStreamId === s.id ? 'font-semibold text-[var(--accent-color)]' : ''}`}
+                                            className={`block w-full text-left px-4 py-2 hover:bg-(--bg-secondary-hover) transition-colors ${currentStreamId === s.id ? 'font-semibold text-(--accent-color)' : ''}`}
                                         >
                                             {getStreamDisplayName(s)}
                                         </button>

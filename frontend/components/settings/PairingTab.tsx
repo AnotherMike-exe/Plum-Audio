@@ -47,8 +47,8 @@ export const PairingTab: React.FC<PairingTabProps> = ({ onOpenPairingWindows }) 
   return (
     <div className="space-y-6">
       <div>
-        <h3 className="text-lg font-semibold text-[var(--text-primary)] mb-1">Add a unit or speaker</h3>
-        <p className="text-sm text-[var(--text-secondary)]">
+        <h3 className="text-lg font-semibold text-(--text-primary) mb-1">Add a unit or speaker</h3>
+        <p className="text-sm text-(--text-secondary)">
           Opens every Plum unit for five minutes to accept <strong>one</strong> new device each, so a
           newly deployed unit can join the mesh. Units deployed together already pair automatically —
           use this when you add one later. Adding two? Run it again for the second.
@@ -58,17 +58,17 @@ export const PairingTab: React.FC<PairingTabProps> = ({ onOpenPairingWindows }) 
       <button
         onClick={() => void openEverywhere()}
         disabled={busy || !onOpenPairingWindows}
-        className="w-full bg-[var(--accent-color)] accent-button-text font-bold py-3 px-4 rounded-lg hover:bg-[var(--accent-color-hover)] transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+        className="w-full bg-(--accent-color) accent-button-text font-bold py-3 px-4 rounded-lg hover:bg-(--accent-color-hover) transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
       >
         <Icon name="network-wired" style={{ color: 'inherit' }} />
         {busy ? 'Opening…' : 'Open the mesh for pairing'}
       </button>
 
-      {result && <p className="text-sm text-[var(--text-secondary)]">{result}</p>}
+      {result && <p className="text-sm text-(--text-secondary)">{result}</p>}
 
-      <div className="border-t border-[var(--border-color)] pt-4 text-xs text-[var(--text-secondary)] space-y-2">
+      <div className="border-t border-(--border-color) pt-4 text-xs text-(--text-secondary) space-y-2">
         <p>
-          <strong className="text-[var(--text-primary)]">Pairing one speaker</strong> is done where you
+          <strong className="text-(--text-primary)">Pairing one speaker</strong> is done where you
           route it: a device that has not been paired shows <em>Pair</em> instead of the stream
           controls, because routing it would silently play nothing.
         </p>

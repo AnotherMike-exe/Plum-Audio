@@ -76,7 +76,7 @@ export const StreamPickerButton: React.FC<StreamPickerButtonProps> = ({
         <li key={s.id} role="option" aria-selected={currentStreamId === s.id}>
             <button
                 onClick={() => handleSelect(s.id)}
-                className={`block w-full text-left px-3 py-2 hover:bg-[var(--bg-secondary-hover)] transition-colors truncate ${currentStreamId === s.id ? 'font-semibold text-[var(--accent-color)]' : ''}`}
+                className={`block w-full text-left px-3 py-2 hover:bg-(--bg-secondary-hover) transition-colors truncate ${currentStreamId === s.id ? 'font-semibold text-(--accent-color)' : ''}`}
             >
                 {s.name}
             </button>
@@ -87,7 +87,7 @@ export const StreamPickerButton: React.FC<StreamPickerButtonProps> = ({
         <div ref={wrapperRef} className="relative">
             <button
                 onClick={() => setIsOpen(!isOpen)}
-                className="w-8 h-8 flex items-center justify-center rounded-full text-[var(--text-secondary)] bg-[var(--border-color)] hover:bg-[var(--bg-secondary-hover)] transition-colors"
+                className="w-8 h-8 flex items-center justify-center rounded-full text-(--text-secondary) bg-(--border-color) hover:bg-(--bg-secondary-hover) transition-colors"
                 title={title}
                 aria-label={title}
                 aria-haspopup="listbox"
@@ -97,27 +97,27 @@ export const StreamPickerButton: React.FC<StreamPickerButtonProps> = ({
             </button>
             {isOpen && (
                 <div
-                    className="absolute z-10 bottom-full right-0 mb-2 w-48 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded-lg shadow-xl"
+                    className="absolute z-10 bottom-full right-0 mb-2 w-48 bg-(--bg-secondary) border border-(--border-color) rounded-lg shadow-xl"
                     role="listbox"
                 >
-                    <ul className="py-1 text-sm text-[var(--text-primary)] max-h-40 overflow-auto">
+                    <ul className="py-1 text-sm text-(--text-primary) max-h-40 overflow-auto">
                         <li role="option" aria-selected={currentStreamId === null}>
                             <button
                                 onClick={() => handleSelect(null)}
-                                className={`block w-full text-left px-3 py-2 text-[var(--text-secondary)] hover:bg-[var(--bg-secondary-hover)] ${currentStreamId === null ? 'font-semibold' : ''}`}
+                                className={`block w-full text-left px-3 py-2 text-(--text-secondary) hover:bg-(--bg-secondary-hover) ${currentStreamId === null ? 'font-semibold' : ''}`}
                             >
                                 None
                             </button>
                         </li>
                         {streams.length === 0 && (
-                            <li className="px-3 py-2 text-xs text-[var(--text-muted)]">
+                            <li className="px-3 py-2 text-xs text-(--text-muted)">
                                 No source is playing.
                             </li>
                         )}
                         {federationEnabled
                             ? Object.entries(groupedStreams).map(([serverName, serverStreams]) => (
                                   <React.Fragment key={serverName}>
-                                      <li className="px-3 py-1 text-xs font-semibold text-[var(--text-secondary)] uppercase tracking-wider border-t border-[var(--border-color)] mt-1 first:mt-0 first:border-0">
+                                      <li className="px-3 py-1 text-xs font-semibold text-(--text-secondary) uppercase tracking-wider border-t border-(--border-color) mt-1 first:mt-0 first:border-0">
                                           {serverName}
                                       </li>
                                       {serverStreams.map(streamButton)}
