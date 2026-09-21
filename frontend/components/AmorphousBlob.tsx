@@ -106,8 +106,9 @@ export const AmorphousBlob: React.FC<AmorphousBlobProps> = ({
             const audioData =
                 frame && Date.now() - frame.at < 250 ? { frequencyData: frame.spectrum } : null;
 
-            // Determine if audio is playing
-            const hasAudio = audioData && audioData.frequencyData.some(v => v > 0);
+            // Determine if audio is playing. The explicit null test keeps this a real boolean:
+            // `audioData && ...` yields `boolean | null`, and every consumer below takes `boolean`.
+            const hasAudio = audioData !== null && audioData.frequencyData.some(v => v > 0);
 
             // Our spectrum is already the log-spaced display bins the server computed, so map it
             // straight to bars (average N source bins per bar) rather than re-slicing it as a raw
