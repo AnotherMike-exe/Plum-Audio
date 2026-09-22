@@ -138,10 +138,10 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
   return (
     <div className="space-y-6">
       <div>
-        <h3 className="text-base font-semibold text-[var(--text-primary)] mb-4">
+        <h3 className="text-base font-semibold text-(--text-primary) mb-4">
           Audio Visualizer
         </h3>
-        <p className="text-sm text-[var(--text-muted)] mb-4">
+        <p className="text-sm text-(--text-muted) mb-4">
           Real-time audio visualization with customizable effects and presets
         </p>
       </div>
@@ -149,11 +149,11 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
       <div className="space-y-4">
         <div className="space-y-6">
             {/* Preset Cycling */}
-            <div className="pb-4 border-b border-[var(--border-color)]">
-              <h4 className="text-sm font-semibold text-[var(--text-primary)] mb-3">
+            <div className="pb-4 border-b border-(--border-color)">
+              <h4 className="text-sm font-semibold text-(--text-primary) mb-3">
                 Preset Cycling
               </h4>
-              <p className="text-xs text-[var(--text-muted)] mb-3">
+              <p className="text-xs text-(--text-muted) mb-3">
                 Automatically cycle through selected presets on track changes
               </p>
 
@@ -166,25 +166,25 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
 
               {viz.cycleEnabled && (
                 <div className="mt-4 pl-8">
-                  <label className="text-xs text-[var(--text-muted)] mb-2 block">
+                  <label className="text-xs text-(--text-muted) mb-2 block">
                     Select Presets to Cycle ({viz.cyclePresetIds.length} selected)
                   </label>
                   <div className="space-y-2">
                     {allPresets.map(preset => (
                       <label
                         key={preset.id}
-                        className="flex items-center gap-2 px-3 py-2 rounded-md bg-[var(--bg-tertiary)] hover:bg-[var(--bg-tertiary-hover)] cursor-pointer transition-colors"
+                        className="flex items-center gap-2 px-3 py-2 rounded-md bg-(--bg-tertiary) hover:bg-(--bg-tertiary-hover) cursor-pointer transition-colors"
                       >
                         <input
                           type="checkbox"
                           checked={viz.cyclePresetIds.includes(preset.id)}
                           onChange={() => handleToggleCyclePreset(preset.id)}
-                          className="w-4 h-4 rounded border-[var(--border-color)] text-[var(--accent-color)] focus:ring-[var(--accent-color)]"
+                          className="w-4 h-4 rounded-sm border-(--border-color) text-(--accent-color) focus:ring-(--accent-color)"
                         />
-                        <span className="flex-1 text-sm text-[var(--text-primary)]">
+                        <span className="flex-1 text-sm text-(--text-primary)">
                           {preset.name}
                           {preset.isBuiltIn && (
-                            <span className="ml-2 text-xs text-[var(--text-muted)]">(Built-in)</span>
+                            <span className="ml-2 text-xs text-(--text-muted)">(Built-in)</span>
                           )}
                         </span>
                       </label>
@@ -195,14 +195,14 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
             </div>
 
             {/* Preset Management */}
-            <div className="pb-4 border-b border-[var(--border-color)]">
-              <h4 className="text-sm font-semibold text-[var(--text-primary)] mb-3">
+            <div className="pb-4 border-b border-(--border-color)">
+              <h4 className="text-sm font-semibold text-(--text-primary) mb-3">
                 Presets
               </h4>
 
               {/* Built-in Presets */}
               <div className="mb-4">
-                <label className="text-xs text-[var(--text-muted)] mb-2 block">
+                <label className="text-xs text-(--text-muted) mb-2 block">
                   Built-in Presets
                 </label>
                 <div className="grid grid-cols-2 gap-2">
@@ -210,7 +210,7 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
                     <button
                       key={preset.id}
                       onClick={() => handleLoadPreset(preset.id)}
-                      className="px-3 py-2 text-sm font-semibold rounded-md bg-[var(--bg-tertiary)] text-[var(--text-primary)] hover:bg-[var(--accent-color)] hover:accent-button-text transition-colors"
+                      className="px-3 py-2 text-sm font-semibold rounded-md bg-(--bg-tertiary) text-(--text-primary) hover:bg-(--accent-color) hover:accent-button-text transition-colors"
                     >
                       {preset.name}
                     </button>
@@ -221,7 +221,7 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
               {/* User Presets */}
               {userPresets.length > 0 && (
                 <div className="mb-4">
-                  <label className="text-xs text-[var(--text-muted)] mb-2 block">
+                  <label className="text-xs text-(--text-muted) mb-2 block">
                     Your Presets
                   </label>
                   <div className="grid grid-cols-2 gap-2">
@@ -229,13 +229,13 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
                       <div key={preset.id} className="flex items-center gap-2">
                         <button
                           onClick={() => handleLoadPreset(preset.id)}
-                          className="flex-1 px-3 py-2 text-sm font-semibold rounded-md bg-[var(--bg-tertiary)] text-[var(--text-primary)] hover:bg-[var(--accent-color)] hover:accent-button-text transition-colors"
+                          className="flex-1 px-3 py-2 text-sm font-semibold rounded-md bg-(--bg-tertiary) text-(--text-primary) hover:bg-(--accent-color) hover:accent-button-text transition-colors"
                         >
                           {preset.name}
                         </button>
                         <button
                           onClick={() => handleDeletePreset(preset.id)}
-                          className="px-2 py-2 text-sm rounded-md bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-red-500 transition-colors"
+                          className="px-2 py-2 text-sm rounded-md bg-(--bg-tertiary) text-(--text-secondary) hover:text-red-500 transition-colors"
                           title="Delete preset"
                         >
                           ✕
@@ -248,7 +248,7 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
 
               {/* Save Preset */}
               <div>
-                <label className="text-xs text-[var(--text-muted)] mb-2 block">
+                <label className="text-xs text-(--text-muted) mb-2 block">
                   Save Current Settings as Preset
                 </label>
                 <div className="flex items-center gap-2">
@@ -257,7 +257,7 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
                     value={presetName}
                     onChange={(e) => setPresetName(e.target.value)}
                     placeholder="Preset name..."
-                    className="flex-1 px-3 py-2 text-sm bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded-md border border-[var(--border-color)] focus:outline-none focus:border-[var(--accent-color)]"
+                    className="flex-1 px-3 py-2 text-sm bg-(--bg-tertiary) text-(--text-primary) rounded-md border border-(--border-color) focus:outline-hidden focus:border-(--accent-color)"
                     onKeyDown={(e) => {
                       // Prevent spacebar and other keys from bubbling up to parent handlers (e.g., play/pause)
                       if (e.key === ' ' || e.key === 'ArrowUp' || e.key === 'ArrowDown') {
@@ -272,7 +272,7 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
                   <button
                     onClick={handleSavePreset}
                     disabled={!presetName.trim()}
-                    className="px-4 py-2 text-sm font-semibold rounded-md bg-[var(--accent-color)] accent-button-text hover:brightness-110 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="px-4 py-2 text-sm font-semibold rounded-md bg-(--accent-color) accent-button-text hover:brightness-110 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     Save
                   </button>
@@ -282,10 +282,10 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
 
             {/* Waveform Type */}
             <div>
-              <h4 className="text-sm font-semibold text-[var(--text-primary)] mb-3">
+              <h4 className="text-sm font-semibold text-(--text-primary) mb-3">
                 Waveform Type
               </h4>
-              <div className="grid grid-cols-5 gap-2 p-1 rounded-lg bg-[var(--bg-tertiary)]">
+              <div className="grid grid-cols-5 gap-2 p-1 rounded-lg bg-(--bg-tertiary)">
                 {[
                   { value: 'bars', label: 'Bars' },
                   { value: 'circular', label: 'Circular' },
@@ -298,8 +298,8 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
                     onClick={() => handleVisualizerChange('type', type.value)}
                     className={`px-3 py-2 text-sm font-semibold rounded-md transition-colors ${
                       viz.type === type.value
-                        ? 'bg-[var(--accent-color)] accent-button-text'
-                        : 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary-hover)]'
+                        ? 'bg-(--accent-color) accent-button-text'
+                        : 'text-(--text-secondary) hover:bg-(--bg-tertiary-hover)'
                     }`}
                   >
                     {type.label}
@@ -310,7 +310,7 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
 
             {/* Bar Count */}
             <div>
-              <label className="text-sm font-semibold text-[var(--text-primary)] mb-2 block">
+              <label className="text-sm font-semibold text-(--text-primary) mb-2 block">
                 Bar Count: {viz.barCount}
               </label>
               <div className="grid grid-cols-4 gap-2">
@@ -320,8 +320,8 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
                     onClick={() => handleVisualizerChange('barCount', count)}
                     className={`px-3 py-2 text-sm font-semibold rounded-md transition-colors ${
                       viz.barCount === count
-                        ? 'bg-[var(--accent-color)] accent-button-text'
-                        : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary-hover)]'
+                        ? 'bg-(--accent-color) accent-button-text'
+                        : 'bg-(--bg-tertiary) text-(--text-secondary) hover:bg-(--bg-tertiary-hover)'
                     }`}
                   >
                     {count}
@@ -337,7 +337,7 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
 
             {/* Sensitivity Slider */}
             <div>
-              <label className="text-sm font-semibold text-[var(--text-primary)] mb-2 block">
+              <label className="text-sm font-semibold text-(--text-primary) mb-2 block">
                 Sensitivity: {viz.sensitivity}
               </label>
               <input
@@ -348,14 +348,14 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
                 onChange={(e) => handleVisualizerChange('sensitivity', parseInt(e.target.value))}
                 className="volume-slider w-full"
               />
-              <p className="text-xs text-[var(--text-muted)] mt-1">
+              <p className="text-xs text-(--text-muted) mt-1">
                 Controls how responsive the visualizer is to audio levels
               </p>
             </div>
 
             {/* Smoothing Slider */}
             <div>
-              <label className="text-sm font-semibold text-[var(--text-primary)] mb-2 block">
+              <label className="text-sm font-semibold text-(--text-primary) mb-2 block">
                 Smoothing: {viz.smoothing}
               </label>
               <input
@@ -366,17 +366,17 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
                 onChange={(e) => handleVisualizerChange('smoothing', parseInt(e.target.value))}
                 className="volume-slider w-full"
               />
-              <p className="text-xs text-[var(--text-muted)] mt-1">
+              <p className="text-xs text-(--text-muted) mt-1">
                 FFT smoothing - higher values create smoother frequency analysis
               </p>
             </div>
 
             {/* Frequency Scale */}
             <div>
-              <h4 className="text-sm font-semibold text-[var(--text-primary)] mb-3">
+              <h4 className="text-sm font-semibold text-(--text-primary) mb-3">
                 Frequency Scale
               </h4>
-              <div className="grid grid-cols-3 gap-2 p-1 rounded-lg bg-[var(--bg-tertiary)]">
+              <div className="grid grid-cols-3 gap-2 p-1 rounded-lg bg-(--bg-tertiary)">
                 {[
                   { value: 'linear', label: 'Linear', description: 'Equal frequency spacing' },
                   { value: 'logarithmic', label: 'Logarithmic', description: 'Natural hearing response' },
@@ -387,8 +387,8 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
                     onClick={() => handleVisualizerChange('frequencyScale', scale.value)}
                     className={`px-3 py-2 text-sm font-semibold rounded-md transition-colors ${
                       viz.frequencyScale === scale.value
-                        ? 'bg-[var(--accent-color)] accent-button-text'
-                        : 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary-hover)]'
+                        ? 'bg-(--accent-color) accent-button-text'
+                        : 'text-(--text-secondary) hover:bg-(--bg-tertiary-hover)'
                     }`}
                     title={scale.description}
                   >
@@ -396,17 +396,17 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
                   </button>
                 ))}
               </div>
-              <p className="text-xs text-[var(--text-muted)] mt-2">
+              <p className="text-xs text-(--text-muted) mt-2">
                 Controls frequency distribution: linear (equal spacing), logarithmic (natural), or smoothed blob
               </p>
             </div>
 
             {/* Smoothing Type */}
             <div>
-              <h4 className="text-sm font-semibold text-[var(--text-primary)] mb-3">
+              <h4 className="text-sm font-semibold text-(--text-primary) mb-3">
                 Curve Smoothing
               </h4>
-              <div className="grid grid-cols-3 gap-2 p-1 rounded-lg bg-[var(--bg-tertiary)]">
+              <div className="grid grid-cols-3 gap-2 p-1 rounded-lg bg-(--bg-tertiary)">
                 {[
                   { value: 'catmull-rom', label: 'Catmull-Rom', description: 'Smooth curves through points' },
                   { value: 'bezier', label: 'Bezier', description: 'Very smooth, organic' },
@@ -417,8 +417,8 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
                     onClick={() => handleVisualizerChange('smoothingType', type.value)}
                     className={`px-3 py-2 text-sm font-semibold rounded-md transition-colors ${
                       viz.smoothingType === type.value
-                        ? 'bg-[var(--accent-color)] accent-button-text'
-                        : 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary-hover)]'
+                        ? 'bg-(--accent-color) accent-button-text'
+                        : 'text-(--text-secondary) hover:bg-(--bg-tertiary-hover)'
                     }`}
                     title={type.description}
                   >
@@ -430,12 +430,12 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
 
             {/* Idle State */}
             <div>
-              <h4 className="text-sm font-semibold text-[var(--text-primary)] mb-3">
+              <h4 className="text-sm font-semibold text-(--text-primary) mb-3">
                 Idle State (No Audio)
               </h4>
-              <div className="grid grid-cols-3 gap-2 p-1 rounded-lg bg-[var(--bg-tertiary)]">
+              <div className="grid grid-cols-3 gap-2 p-1 rounded-lg bg-(--bg-tertiary)">
                 {[
-                  { value: 'circle', label: 'Circle', description: 'Perfect circle outline' },
+                  { value: 'circle', label: 'Circle', description: 'Perfect circle outline-solid' },
                   { value: 'pulse', label: 'Pulse', description: 'Gentle pulsing circle' },
                   { value: 'nothing', label: 'Nothing', description: 'Blank when idle' }
                 ].map(state => (
@@ -444,8 +444,8 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
                     onClick={() => handleVisualizerChange('idleState', state.value)}
                     className={`px-3 py-2 text-sm font-semibold rounded-md transition-colors ${
                       viz.idleState === state.value
-                        ? 'bg-[var(--accent-color)] accent-button-text'
-                        : 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary-hover)]'
+                        ? 'bg-(--accent-color) accent-button-text'
+                        : 'text-(--text-secondary) hover:bg-(--bg-tertiary-hover)'
                     }`}
                     title={state.description}
                   >
@@ -457,10 +457,10 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
 
             {/* Symmetry */}
             <div>
-              <h4 className="text-sm font-semibold text-[var(--text-primary)] mb-3">
+              <h4 className="text-sm font-semibold text-(--text-primary) mb-3">
                 Symmetry
               </h4>
-              <div className="grid grid-cols-4 gap-2 p-1 rounded-lg bg-[var(--bg-tertiary)]">
+              <div className="grid grid-cols-4 gap-2 p-1 rounded-lg bg-(--bg-tertiary)">
                 {[
                   { value: 1, label: '1x', description: 'Full spectrum (all unique)' },
                   { value: 2, label: '2x', description: 'Mirror pattern twice' },
@@ -472,8 +472,8 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
                     onClick={() => handleVisualizerChange('symmetry', sym.value)}
                     className={`px-3 py-2 text-sm font-semibold rounded-md transition-colors ${
                       viz.symmetry === sym.value
-                        ? 'bg-[var(--accent-color)] accent-button-text'
-                        : 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary-hover)]'
+                        ? 'bg-(--accent-color) accent-button-text'
+                        : 'text-(--text-secondary) hover:bg-(--bg-tertiary-hover)'
                     }`}
                     title={sym.description}
                   >
@@ -481,7 +481,7 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
                   </button>
                 ))}
               </div>
-              <p className="text-xs text-[var(--text-muted)] mt-2">
+              <p className="text-xs text-(--text-muted) mt-2">
                 Creates kaleidoscope effect by repeating frequency patterns around the circle
               </p>
             </div>
@@ -489,7 +489,7 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
             {/* Rotation (for circular types only) */}
             {(viz.type === 'circular' || viz.type === 'circular-bars') && (
               <div>
-                <h4 className="text-sm font-semibold text-[var(--text-primary)] mb-3">
+                <h4 className="text-sm font-semibold text-(--text-primary) mb-3">
                   Rotation
                 </h4>
                 <div className="space-y-3">
@@ -502,7 +502,7 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
                   {viz.rotate && (
                     <>
                       <div>
-                        <label className="text-sm text-[var(--text-secondary)] mb-2 block">
+                        <label className="text-sm text-(--text-secondary) mb-2 block">
                           Rotation Speed: {viz.rotationSpeed}
                         </label>
                         <input
@@ -518,10 +518,10 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
                         />
                       </div>
                       <div>
-                        <label className="text-sm text-[var(--text-secondary)] mb-2 block">
+                        <label className="text-sm text-(--text-secondary) mb-2 block">
                           Direction
                         </label>
-                        <div className="grid grid-cols-2 gap-2 p-1 rounded-lg bg-[var(--bg-tertiary)]">
+                        <div className="grid grid-cols-2 gap-2 p-1 rounded-lg bg-(--bg-tertiary)">
                           {[
                             { value: 'clockwise', label: 'Clockwise' },
                             { value: 'counterclockwise', label: 'Counter-CW' }
@@ -531,8 +531,8 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
                               onClick={() => handleVisualizerChange('rotationDirection', dir.value)}
                               className={`px-3 py-2 text-sm font-semibold rounded-md transition-colors ${
                                 viz.rotationDirection === dir.value
-                                  ? 'bg-[var(--accent-color)] accent-button-text'
-                                  : 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary-hover)]'
+                                  ? 'bg-(--accent-color) accent-button-text'
+                                  : 'text-(--text-secondary) hover:bg-(--bg-tertiary-hover)'
                               }`}
                             >
                               {dir.label}
@@ -549,7 +549,7 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
             {/* Mirror & Invert (for circular and radial) */}
             {(viz.type === 'circular' || viz.type === 'circular-bars') && (
               <div>
-                <h4 className="text-sm font-semibold text-[var(--text-primary)] mb-3">
+                <h4 className="text-sm font-semibold text-(--text-primary) mb-3">
                   Pattern Options
                 </h4>
                 <div className="space-y-3">
@@ -574,7 +574,7 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
             {/* Mirror & Taper (for bars/waveform only) */}
             {(viz.type === 'bars' || viz.type === 'waveform') && (
               <div>
-                <h4 className="text-sm font-semibold text-[var(--text-primary)] mb-3">
+                <h4 className="text-sm font-semibold text-(--text-primary) mb-3">
                   Layout Options
                 </h4>
                 <div className="space-y-3">
@@ -605,7 +605,7 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
             {/* Flip Control (for mixed type only) */}
             {viz.type === 'mixed' && (
               <div>
-                <h4 className="text-sm font-semibold text-[var(--text-primary)] mb-3">
+                <h4 className="text-sm font-semibold text-(--text-primary) mb-3">
                   Mixed Layout
                 </h4>
                 <Switch
@@ -618,10 +618,10 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
             )}
 
             {/* Advanced Options (Collapsed) */}
-            <div className="pt-4 border-t border-[var(--border-color)]">
+            <div className="pt-4 border-t border-(--border-color)">
               <button
                 onClick={() => setShowAdvanced(!showAdvanced)}
-                className="flex items-center justify-between w-full text-sm font-semibold text-[var(--text-primary)] hover:text-[var(--accent-color)] transition-colors"
+                className="flex items-center justify-between w-full text-sm font-semibold text-(--text-primary) hover:text-(--accent-color) transition-colors"
               >
                 <span>Advanced Options</span>
                 <span className="text-xs">{showAdvanced ? '▼' : '▶'}</span>
@@ -636,13 +636,13 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
                         type="checkbox"
                         checked={viz.advanced.bassAnalysis}
                         onChange={(e) => handleAdvancedChange('bassAnalysis', e.target.checked)}
-                        className="w-4 h-4 rounded border-[var(--border-color)] bg-[var(--bg-tertiary)] checked:bg-[var(--accent-color)]"
+                        className="w-4 h-4 rounded-sm border-(--border-color) bg-(--bg-tertiary) checked:bg-(--accent-color)"
                       />
-                      <span className="text-sm text-[var(--text-primary)]">
+                      <span className="text-sm text-(--text-primary)">
                         Enable Bass/Treble Separation
                       </span>
                     </label>
-                    <p className="text-xs text-[var(--text-muted)] mt-1 ml-6">
+                    <p className="text-xs text-(--text-muted) mt-1 ml-6">
                       Different visual effects based on frequency range
                     </p>
                   </div>
@@ -654,13 +654,13 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
                         type="checkbox"
                         checked={viz.advanced.particles}
                         onChange={(e) => handleAdvancedChange('particles', e.target.checked)}
-                        className="w-4 h-4 rounded border-[var(--border-color)] bg-[var(--bg-tertiary)] checked:bg-[var(--accent-color)]"
+                        className="w-4 h-4 rounded-sm border-(--border-color) bg-(--bg-tertiary) checked:bg-(--accent-color)"
                       />
-                      <span className="text-sm text-[var(--text-primary)]">
+                      <span className="text-sm text-(--text-primary)">
                         Enable Particle Effects
                       </span>
                     </label>
-                    <p className="text-xs text-[var(--text-muted)] mt-1 ml-6">
+                    <p className="text-xs text-(--text-muted) mt-1 ml-6">
                       Adds particle system to visualization
                     </p>
                   </div>
@@ -670,14 +670,14 @@ export const VisualizerTab: React.FC<VisualizerTabProps> = ({
           </div>
       </div>
 
-      <div className="pt-4 mt-6 border-t border-[var(--border-color)]">
-        <h4 className="text-sm font-semibold text-[var(--text-primary)] mb-2">
+      <div className="pt-4 mt-6 border-t border-(--border-color)">
+        <h4 className="text-sm font-semibold text-(--text-primary) mb-2">
           About the Visualizer
         </h4>
-        <p className="text-xs text-[var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           The audio visualizer creates real-time visual effects synchronized with your music.
           Colors automatically follow your configured theme accent color.
-          Access the visualizer at <span className="font-mono text-[var(--accent-color)]">/visualizer</span> or click
+          Access the visualizer at <span className="font-mono text-(--accent-color)">/visualizer</span> or click
           the "Open Visualizer" button above. Supports fullscreen mode (F key or button) and keyboard
           shortcuts (Space = play/pause, Esc = exit, Arrow keys = volume).
         </p>

@@ -75,7 +75,7 @@ const ControlButton: React.FC<{ onClick?: () => void; icon: IconName; size?: 'sm
     return (
         <button
             onClick={onClick}
-            className={`flex items-center justify-center rounded-full text-[var(--control-icon-color)] bg-[var(--border-color)] hover:bg-[var(--bg-secondary-hover)] transition-colors duration-200 ${sizeClasses[size]}`}
+            className={`flex items-center justify-center rounded-full text-(--control-icon-color) bg-(--border-color) hover:bg-(--bg-secondary-hover) transition-colors duration-200 ${sizeClasses[size]}`}
             aria-label={icon.includes('play') ? 'Play' : icon.includes('pause') ? 'Pause' : icon.includes('backward') ? 'Previous track' : 'Next track'}
         >
             <Icon name={icon} style={{ color: 'inherit' }} />
@@ -121,8 +121,8 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
             {/* Desktop: Controls on left (aligned with artwork), Volume on right (aligned with text) */}
 
             {/* Media Controls - order-2 on mobile, order-1 on desktop */}
-            {/* On desktop: flex-shrink-0 w-56 to match album artwork width (14rem = 224px) */}
-            <div className="flex items-center gap-3 order-2 md:order-1 md:flex-shrink-0 md:w-56 justify-center">
+            {/* On desktop: shrink-0 w-56 to match album artwork width (14rem = 224px) */}
+            <div className="flex items-center gap-3 order-2 md:order-1 md:shrink-0 md:w-56 justify-center">
                 {canShuffle && (
                     <ToggleButton
                         icon="shuffle"
@@ -156,7 +156,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
                         className={`flex items-center gap-3 w-full transition-opacity ${sourceVolumeUnavailable ? 'opacity-40' : ''}`}
                         title={sourceVolumeUnavailable ? 'The sending device is not connected — last known level' : undefined}
                     >
-                        <Icon name="tower-broadcast" className="text-[var(--text-secondary)] w-6 text-center flex-shrink-0" style={{ color: 'inherit' }} aria-hidden />
+                        <Icon name="tower-broadcast" className="text-(--text-secondary) w-6 text-center shrink-0" style={{ color: 'inherit' }} aria-hidden />
                         <input
                             type="range"
                             min="0"
@@ -175,14 +175,14 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
                             aria-label="Source volume control"
                             aria-disabled={sourceVolumeUnavailable}
                         />
-                        <span className="text-xs text-[var(--text-secondary)] w-8 text-right flex-shrink-0">{sourceVolume}%</span>
+                        <span className="text-xs text-(--text-secondary) w-8 text-right shrink-0">{sourceVolume}%</span>
                     </div>
                 )}
 
                 {/* Group volume — the output level of every endpoint rendering this source */}
                 {!hideEndpointVolume && (
                 <div className="flex items-center gap-3 w-full">
-                    <Icon name="volume-low" className="text-[var(--text-secondary)] w-6 text-center flex-shrink-0" style={{ color: 'inherit' }} aria-hidden />
+                    <Icon name="volume-low" className="text-(--text-secondary) w-6 text-center shrink-0" style={{ color: 'inherit' }} aria-hidden />
                     <input
                         type="range"
                         min="0"
@@ -193,7 +193,7 @@ export const PlayerControls: React.FC<PlayerControlsProps> = ({
                         style={sliderStyle}
                         aria-label="Group volume control"
                     />
-                    <Icon name="volume-high" className="text-[var(--text-secondary)] w-6 text-center flex-shrink-0" style={{ color: 'inherit' }} aria-hidden />
+                    <Icon name="volume-high" className="text-(--text-secondary) w-6 text-center shrink-0" style={{ color: 'inherit' }} aria-hidden />
                 </div>
                 )}
             </div>

@@ -40,23 +40,23 @@ export const CustomColorPicker: React.FC<CustomColorPickerProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs"
       onClick={onCancel}
       role="dialog"
       aria-modal="true"
       aria-labelledby="color-picker-title"
     >
       <div
-        className="relative w-[320px] bg-[var(--bg-secondary)] rounded-2xl shadow-2xl border border-[var(--border-color)] p-6"
+        className="relative w-[320px] bg-(--bg-secondary) rounded-2xl shadow-2xl border border-(--border-color) p-6"
         onClick={e => e.stopPropagation()}
       >
         <div className="flex items-center justify-between mb-4">
-          <h3 id="color-picker-title" className="text-lg font-semibold text-[var(--text-primary)]">
+          <h3 id="color-picker-title" className="text-lg font-semibold text-(--text-primary)">
             Custom Color
           </h3>
           <button
             onClick={onCancel}
-            className="w-8 h-8 flex items-center justify-center rounded-full text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]"
+            className="w-8 h-8 flex items-center justify-center rounded-full text-(--text-secondary) hover:bg-(--bg-tertiary)"
             aria-label="Close color picker"
           >
             <Icon name="xmark" />
@@ -71,7 +71,7 @@ export const CustomColorPicker: React.FC<CustomColorPickerProps> = ({
 
           {/* Hex Input */}
           <div>
-            <label className="block text-sm font-medium text-[var(--text-secondary)] mb-2">
+            <label className="block text-sm font-medium text-(--text-secondary) mb-2">
               Hex Code
             </label>
             <input
@@ -79,7 +79,7 @@ export const CustomColorPicker: React.FC<CustomColorPickerProps> = ({
               value={hexInput}
               onChange={handleHexInputChange}
               placeholder="#RRGGBB"
-              className="w-full px-3 py-2 bg-[var(--bg-tertiary)] border border-[var(--border-color)] rounded-lg text-[var(--text-primary)] placeholder-[var(--text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-color)]"
+              className="w-full px-3 py-2 bg-(--bg-tertiary) border border-(--border-color) rounded-lg text-(--text-primary) placeholder-(--text-muted) focus:outline-hidden focus:ring-2 focus:ring-(--accent-color)"
               maxLength={7}
             />
             {!/^#[0-9A-Fa-f]{6}$/.test(hexInput) && hexInput.length > 0 && (
@@ -89,11 +89,11 @@ export const CustomColorPicker: React.FC<CustomColorPickerProps> = ({
 
           {/* Preview Swatch */}
           <div>
-            <label className="block text-sm font-medium text-[var(--text-secondary)] mb-2">
+            <label className="block text-sm font-medium text-(--text-secondary) mb-2">
               Preview
             </label>
             <div
-              className="w-full h-12 rounded-lg border-2 border-[var(--border-color)]"
+              className="w-full h-12 rounded-lg border-2 border-(--border-color)"
               style={{ backgroundColor: color }}
             />
           </div>
@@ -102,14 +102,14 @@ export const CustomColorPicker: React.FC<CustomColorPickerProps> = ({
           <div className="flex gap-3 pt-2">
             <button
               onClick={onCancel}
-              className="flex-1 px-4 py-2 bg-[var(--bg-tertiary)] text-[var(--text-primary)] rounded-lg hover:bg-[var(--bg-tertiary-hover)] transition-colors"
+              className="flex-1 px-4 py-2 bg-(--bg-tertiary) text-(--text-primary) rounded-lg hover:bg-(--bg-tertiary-hover) transition-colors"
             >
               Cancel
             </button>
             <button
               onClick={handleApply}
               disabled={!/^#[0-9A-Fa-f]{6}$/.test(color)}
-              className="flex-1 px-4 py-2 bg-[var(--accent-color)] accent-button-text rounded-lg hover:bg-[var(--accent-color-hover)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              className="flex-1 px-4 py-2 bg-(--accent-color) accent-button-text rounded-lg hover:bg-(--accent-color-hover) transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               Apply
             </button>

@@ -702,10 +702,10 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
   return (
     <div className="space-y-6">
       <div>
-        <h3 className="text-base font-semibold text-[var(--text-primary)] mb-4">
+        <h3 className="text-base font-semibold text-(--text-primary) mb-4">
           Audio Sources
         </h3>
-        <p className="text-sm text-[var(--text-muted)] mb-6">
+        <p className="text-sm text-(--text-muted) mb-6">
           Configure audio sources and their endpoints. Changes apply within a few seconds — no restart needed.
         </p>
       </div>
@@ -713,26 +713,26 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
       <div className="space-y-4">
         {/* AirPlay */}
         {show('airplay') && (
-        <div className="p-4 bg-[var(--bg-tertiary)] rounded-lg border border-[var(--border-color)]">
+        <div className="p-4 bg-(--bg-tertiary) rounded-lg border border-(--border-color)">
           <div className="flex items-start justify-between gap-4">
             {/* Left: Icon */}
-            <div className="w-12 flex justify-center items-center flex-shrink-0">
-              <Icon name="apple" className="text-[2.5rem] text-[var(--text-secondary)]" style={{ color: 'inherit' }} aria-hidden />
+            <div className="w-12 flex justify-center items-center shrink-0">
+              <Icon name="apple" className="text-[2.5rem] text-(--text-secondary)" style={{ color: 'inherit' }} aria-hidden />
             </div>
 
             {/* Middle: Title + Description */}
             <div className="flex flex-col flex-1">
-              <span className="text-base font-semibold text-[var(--text-secondary)]">AirPlay</span>
-              <p className="text-sm text-[var(--text-muted)] mt-1">
+              <span className="text-base font-semibold text-(--text-secondary)">AirPlay</span>
+              <p className="text-sm text-(--text-muted) mt-1">
                 AirPlay audio streaming (AirPlay 1 & 2) - {airplayEndpoints.length} endpoint{airplayEndpoints.length !== 1 ? 's' : ''}
               </p>
             </div>
 
             {/* Right: Chevron */}
-            <div className="flex items-center flex-shrink-0">
+            <div className="flex items-center shrink-0">
               <button
                 onClick={() => toggleSection('airplay')}
-                className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
+                className="text-(--text-muted) hover:text-(--text-primary) transition-colors"
               >
                 <Icon name={expandedSection === 'airplay' ? 'chevron-up' : 'chevron-down'} className="text-lg" style={{ color: 'inherit' }} />
               </button>
@@ -754,9 +754,9 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                 const nameChanged = endpointNames[endpoint.id] !== endpoint.deviceName;
                 const nameEmpty = !(endpointNames[endpoint.id] || endpoint.deviceName)?.trim();
                 return (
-                  <div key={endpoint.id} className="p-3 bg-[var(--bg-secondary)] rounded border border-[var(--border-color)]">
+                  <div key={endpoint.id} className="p-3 bg-(--bg-secondary) rounded-sm border border-(--border-color)">
                     <div className="flex items-center justify-between gap-3 mb-2">
-                      <span className="text-sm font-medium text-[var(--text-secondary)]">
+                      <span className="text-sm font-medium text-(--text-secondary)">
                         Endpoint #{endpoint.id}
                       </span>
                       <div className="flex items-center gap-2">
@@ -771,7 +771,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                           />
                           <label
                             htmlFor={`endpoint-${endpoint.id}-toggle`}
-                            className={`block w-10 h-5 rounded-full transition cursor-pointer ${endpoint.enabled ? 'bg-[var(--accent-color)]' : 'bg-[var(--bg-tertiary-hover)]'} ${isTogglingEndpoint[endpoint.id] ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            className={`block w-10 h-5 rounded-full transition cursor-pointer ${endpoint.enabled ? 'bg-(--accent-color)' : 'bg-(--bg-tertiary-hover)'} ${isTogglingEndpoint[endpoint.id] ? 'opacity-50 cursor-not-allowed' : ''}`}
                           >
                             <div className={`dot absolute left-0.5 top-0.5 bg-white w-4 h-4 rounded-full transition-transform ${endpoint.enabled ? 'translate-x-5' : ''}`}></div>
                           </label>
@@ -788,7 +788,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                       </div>
                     </div>
                     <div>
-                      <label className="block text-xs text-[var(--text-muted)] mb-1">
+                      <label className="block text-xs text-(--text-muted) mb-1">
                         Device Name
                       </label>
                       <div className="relative">
@@ -801,7 +801,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                               handleEndpointNameChange(endpoint.id);
                             }
                           }}
-                          className="w-full px-2 py-1.5 pr-16 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-sm text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-color)]"
+                          className="w-full px-2 py-1.5 pr-16 bg-(--bg-primary) border border-(--border-color) rounded-sm text-sm text-(--text-primary) focus:outline-hidden focus:ring-2 focus:ring-(--accent-color)"
                           placeholder="Plum Audio"
                           disabled={endpointNameStatuses[endpoint.id] === 'applying'}
                         />
@@ -809,7 +809,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                           <button
                             onClick={() => handleEndpointNameChange(endpoint.id)}
                             disabled={nameEmpty || endpointNameStatuses[endpoint.id] === 'applying'}
-                            className="absolute right-1.5 top-1/2 -translate-y-1/2 px-2 py-0.5 text-xs bg-[var(--accent-color)] accent-button-text rounded hover:opacity-80 disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="absolute right-1.5 top-1/2 -translate-y-1/2 px-2 py-0.5 text-xs bg-(--accent-color) accent-button-text rounded-sm hover:opacity-80 disabled:opacity-50 disabled:cursor-not-allowed"
                           >
                             {endpointNameStatuses[endpoint.id] === 'applying' ? 'Applying...' : 'Apply'}
                           </button>
@@ -821,7 +821,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                             ? 'text-green-500'
                             : endpointNameStatuses[endpoint.id] === 'error'
                             ? 'text-red-500'
-                            : 'text-[var(--text-muted)]'
+                            : 'text-(--text-muted)'
                         }`}>
                           {endpointNameMessages[endpoint.id]}
                         </p>
@@ -832,7 +832,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                         </p>
                       )}
                     </div>
-                    <div className="text-xs text-[var(--text-muted)] mt-2">
+                    <div className="text-xs text-(--text-muted) mt-2">
                       Port: {endpoint.port}, UDP: {endpoint.udpPortBase}-{endpoint.udpPortBase + 9}
                     </div>
                   </div>
@@ -844,15 +844,15 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                 <button
                   onClick={() => setShowAddEndpoint(true)}
                   disabled={isAnyEndpointBeingEdited}
-                  className="w-full px-3 py-2 bg-[var(--bg-secondary)] hover:bg-[var(--bg-tertiary-hover)] border border-[var(--border-color)] rounded text-sm text-[var(--text-secondary)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="w-full px-3 py-2 bg-(--bg-secondary) hover:bg-(--bg-tertiary-hover) border border-(--border-color) rounded-sm text-sm text-(--text-secondary) transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   + Add Endpoint
                 </button>
               )}
 
               {showAddEndpoint && (
-                <div className="p-3 bg-[var(--bg-secondary)] rounded border border-[var(--accent-color)]">
-                  <label className="block text-xs text-[var(--text-secondary)] mb-1">
+                <div className="p-3 bg-(--bg-secondary) rounded-sm border border-(--accent-color)">
+                  <label className="block text-xs text-(--text-secondary) mb-1">
                     New Endpoint Name
                   </label>
                   <div className="flex gap-2">
@@ -861,21 +861,21 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                       value={newEndpointName}
                       onChange={(e) => setNewEndpointName(e.target.value)}
                       onKeyDown={(e) => e.key === 'Enter' && newEndpointName.trim() && !isAnyEndpointBeingEdited && handleAddEndpoint()}
-                      className="flex-1 px-2 py-1.5 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-sm text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-color)]"
+                      className="flex-1 px-2 py-1.5 bg-(--bg-primary) border border-(--border-color) rounded-sm text-sm text-(--text-primary) focus:outline-hidden focus:ring-2 focus:ring-(--accent-color)"
                       placeholder="Living Room"
                       disabled={isAnyEndpointBeingEdited || isAddingEndpoint}
                     />
                     <button
                       onClick={handleAddEndpoint}
                       disabled={!newEndpointName.trim() || isAnyEndpointBeingEdited || isAddingEndpoint}
-                      className="px-3 py-1.5 bg-[var(--accent-color)] accent-button-text rounded text-xs hover:opacity-80 disabled:opacity-50 disabled:cursor-not-allowed"
+                      className="px-3 py-1.5 bg-(--accent-color) accent-button-text rounded-sm text-xs hover:opacity-80 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       {isAddingEndpoint ? 'Adding...' : 'Add'}
                     </button>
                     <button
                       onClick={() => {setShowAddEndpoint(false); setNewEndpointName('');}}
                       disabled={isAddingEndpoint}
-                      className="px-3 py-1.5 bg-[var(--bg-tertiary)] hover:bg-[var(--bg-tertiary-hover)] rounded text-xs text-[var(--text-secondary)] disabled:opacity-50 disabled:cursor-not-allowed"
+                      className="px-3 py-1.5 bg-(--bg-tertiary) hover:bg-(--bg-tertiary-hover) rounded-sm text-xs text-(--text-secondary) disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       Cancel
                     </button>
@@ -884,7 +884,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
               )}
 
               {airplayEndpoints.length >= 10 && (
-                <p className="text-xs text-[var(--text-muted)] italic">
+                <p className="text-xs text-(--text-muted) italic">
                   Maximum of 10 endpoints reached
                 </p>
               )}
@@ -898,17 +898,17 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
 
         {/* Bluetooth */}
         {show('bluetooth') && (
-        <div className="p-4 bg-[var(--bg-tertiary)] rounded-lg border border-[var(--border-color)]">
+        <div className="p-4 bg-(--bg-tertiary) rounded-lg border border-(--border-color)">
           <div className="flex items-start justify-between gap-4">
             {/* Left: Icon */}
-            <div className="w-12 flex justify-center items-center flex-shrink-0">
-              <Icon name="bluetooth" className="text-[2.5rem] text-[var(--text-secondary)]" style={{ color: 'inherit' }} aria-hidden />
+            <div className="w-12 flex justify-center items-center shrink-0">
+              <Icon name="bluetooth" className="text-[2.5rem] text-(--text-secondary)" style={{ color: 'inherit' }} aria-hidden />
             </div>
 
             {/* Middle: Title + Description */}
             <div className="flex flex-col flex-1">
-              <span className="text-base font-semibold text-[var(--text-secondary)]">Bluetooth</span>
-              <p className="text-sm text-[var(--text-muted)] mt-1">
+              <span className="text-base font-semibold text-(--text-secondary)">Bluetooth</span>
+              <p className="text-sm text-(--text-muted) mt-1">
                 Bluetooth A2DP audio streaming
               </p>
               {isTogglingBluetooth && (
@@ -919,7 +919,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
             </div>
 
             {/* Right: Toggle + Chevron */}
-            <div className="flex items-center gap-3 flex-shrink-0">
+            <div className="flex items-center gap-3 shrink-0">
               <div className="relative">
                 <input
                   type="checkbox"
@@ -931,14 +931,14 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                 />
                 <label
                   htmlFor="bluetooth-toggle"
-                  className={`block w-12 h-6 rounded-full transition cursor-pointer ${btEnabled ? 'bg-[var(--accent-color)]' : 'bg-[var(--bg-tertiary-hover)]'} ${isTogglingBluetooth ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  className={`block w-12 h-6 rounded-full transition cursor-pointer ${btEnabled ? 'bg-(--accent-color)' : 'bg-(--bg-tertiary-hover)'} ${isTogglingBluetooth ? 'opacity-50 cursor-not-allowed' : ''}`}
                 >
                   <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform ${btEnabled ? 'translate-x-6' : ''}`}></div>
                 </label>
               </div>
               <button
                 onClick={() => toggleSection('bluetooth')}
-                className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
+                className="text-(--text-muted) hover:text-(--text-primary) transition-colors"
               >
                 <Icon name={expandedSection === 'bluetooth' ? 'chevron-up' : 'chevron-down'} className="text-lg" style={{ color: 'inherit' }} />
               </button>
@@ -948,7 +948,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
           {expandedSection === 'bluetooth' && (
             <div className="mt-4 ml-14 space-y-3">
               <div>
-                <label className="block text-sm text-[var(--text-secondary)] mb-1">
+                <label className="block text-sm text-(--text-secondary) mb-1">
                   Device Name
                 </label>
                 <div className="relative">
@@ -958,14 +958,14 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                     onChange={(e) => setBluetoothDeviceName(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && handleApplyBluetoothDeviceName()}
                     disabled={bluetoothNameStatus === 'applying'}
-                    className="w-full px-3 py-2 pr-20 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-color)] disabled:opacity-50"
+                    className="w-full px-3 py-2 pr-20 bg-(--bg-secondary) border border-(--border-color) rounded-sm text-(--text-primary) focus:outline-hidden focus:ring-2 focus:ring-(--accent-color) disabled:opacity-50"
                     placeholder="Plum Audio"
                   />
                   {bluetoothNameChanged && (
                     <button
                       onClick={handleApplyBluetoothDeviceName}
                       disabled={bluetoothNameStatus === 'applying'}
-                      className="absolute right-2 top-1/2 -translate-y-1/2 px-3 py-1 text-xs bg-[var(--accent-color)] accent-button-text rounded hover:opacity-80 disabled:opacity-50 disabled:cursor-not-allowed"
+                      className="absolute right-2 top-1/2 -translate-y-1/2 px-3 py-1 text-xs bg-(--accent-color) accent-button-text rounded-sm hover:opacity-80 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       {bluetoothNameStatus === 'applying' ? 'Applying...' : 'Apply'}
                     </button>
@@ -977,7 +977,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                       ? 'text-green-500'
                       : bluetoothNameStatus === 'error'
                       ? 'text-red-500'
-                      : 'text-[var(--text-muted)]'
+                      : 'text-(--text-muted)'
                   }`}>
                     {bluetoothNameMessage}
                   </p>
@@ -989,7 +989,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                 )}
               </div>
               <div>
-                <label className="block text-sm text-[var(--text-secondary)] mb-1">
+                <label className="block text-sm text-(--text-secondary) mb-1">
                   Adapter
                 </label>
                 <input
@@ -997,7 +997,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                   value={btEndpoint?.adapter ?? 'hci0'}
                   readOnly
                   title="Assigned by the server from the adapters this host actually has"
-                  className="w-full px-3 py-2 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded text-[var(--text-muted)] cursor-not-allowed"
+                  className="w-full px-3 py-2 bg-(--bg-secondary) border border-(--border-color) rounded-sm text-(--text-muted) cursor-not-allowed"
                 />
               </div>
               <div className="flex items-center">
@@ -1008,22 +1008,22 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                   onChange={(e) => handleBluetoothChange('discoverable', e.target.checked)}
                   className="mr-2"
                 />
-                <label htmlFor="bt-discoverable" className="text-sm text-[var(--text-secondary)]">
+                <label htmlFor="bt-discoverable" className="text-sm text-(--text-secondary)">
                   Always discoverable
                 </label>
               </div>
 
               {/* Paired devices. Forgetting one drops its link key on this unit, which is the only
                   way to recover a bond the phone has already forgotten on its side. */}
-              <div className="pt-2 border-t border-[var(--border-color)]">
+              <div className="pt-2 border-t border-(--border-color)">
                 <div className="flex items-center justify-between mb-2">
-                  <label className="block text-sm text-[var(--text-secondary)]">
+                  <label className="block text-sm text-(--text-secondary)">
                     Paired devices
                   </label>
                   <button
                     onClick={() => void refreshPairedDevices()}
                     disabled={pairedLoading}
-                    className="text-xs text-[var(--text-muted)] hover:text-[var(--text-secondary)] disabled:opacity-50"
+                    className="text-xs text-(--text-muted) hover:text-(--text-secondary) disabled:opacity-50"
                   >
                     {pairedLoading ? 'Refreshing…' : 'Refresh'}
                   </button>
@@ -1034,7 +1034,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                 )}
 
                 {pairedDevices.length === 0 && !pairedLoading && !pairedError && (
-                  <p className="text-xs text-[var(--text-muted)]">
+                  <p className="text-xs text-(--text-muted)">
                     No paired devices. Make this unit discoverable and pair from your phone.
                   </p>
                 )}
@@ -1043,24 +1043,24 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                   {pairedDevices.map((device) => (
                     <li
                       key={device.address}
-                      className="flex items-center justify-between gap-3 px-3 py-2 bg-[var(--bg-secondary)] border border-[var(--border-color)] rounded"
+                      className="flex items-center justify-between gap-3 px-3 py-2 bg-(--bg-secondary) border border-(--border-color) rounded-sm"
                     >
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
-                          <span className="text-sm text-[var(--text-secondary)] truncate">{device.name}</span>
+                          <span className="text-sm text-(--text-secondary) truncate">{device.name}</span>
                           {device.connected && (
-                            <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-green-500/15 text-green-500 flex-shrink-0">
+                            <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded-sm bg-green-500/15 text-green-500 shrink-0">
                               Connected
                             </span>
                           )}
                         </div>
-                        <span className="text-xs text-[var(--text-muted)]">{device.address}</span>
+                        <span className="text-xs text-(--text-muted)">{device.address}</span>
                       </div>
                       <button
                         onClick={() => void handleForgetDevice(device)}
                         disabled={forgettingAddress === device.address}
                         title={`Forget ${device.name} — removes its pairing key from this unit`}
-                        className="px-3 py-1 text-xs rounded border border-red-500/40 text-red-500 hover:bg-red-500/10 disabled:opacity-50 flex-shrink-0"
+                        className="px-3 py-1 text-xs rounded-sm border border-red-500/40 text-red-500 hover:bg-red-500/10 disabled:opacity-50 shrink-0"
                       >
                         {forgettingAddress === device.address ? 'Forgetting…' : 'Forget'}
                       </button>
@@ -1074,26 +1074,26 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
         )}
 
         {/* Spotify Connect */}
-        <div className="p-4 bg-[var(--bg-tertiary)] rounded-lg border border-[var(--border-color)]">
+        <div className="p-4 bg-(--bg-tertiary) rounded-lg border border-(--border-color)">
           <div className="flex items-start justify-between gap-4">
             {/* Left: Icon */}
-            <div className="w-12 flex justify-center items-center flex-shrink-0">
-              <Icon name="spotify" className="text-[2.5rem] text-[var(--text-secondary)]" style={{ color: 'inherit' }} aria-hidden />
+            <div className="w-12 flex justify-center items-center shrink-0">
+              <Icon name="spotify" className="text-[2.5rem] text-(--text-secondary)" style={{ color: 'inherit' }} aria-hidden />
             </div>
 
             {/* Middle: Title + Description */}
             <div className="flex flex-col flex-1">
-              <span className="text-base font-semibold text-[var(--text-secondary)]">Spotify Connect</span>
-              <p className="text-sm text-[var(--text-muted)] mt-1">
+              <span className="text-base font-semibold text-(--text-secondary)">Spotify Connect</span>
+              <p className="text-sm text-(--text-muted) mt-1">
                 Stream music directly from Spotify - {spotifyEndpoints.length} endpoint{spotifyEndpoints.length !== 1 ? 's' : ''}
               </p>
             </div>
 
             {/* Right: Chevron */}
-            <div className="flex items-center flex-shrink-0">
+            <div className="flex items-center shrink-0">
               <button
                 onClick={() => toggleSection('spotify')}
-                className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
+                className="text-(--text-muted) hover:text-(--text-primary) transition-colors"
               >
                 <Icon name={expandedSection === 'spotify' ? 'chevron-up' : 'chevron-down'} className="text-lg" style={{ color: 'inherit' }} />
               </button>
@@ -1115,9 +1115,9 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                 const nameChanged = spotifyEndpointNames[endpoint.id] !== endpoint.deviceName;
                 const nameEmpty = !(spotifyEndpointNames[endpoint.id] || endpoint.deviceName)?.trim();
                 return (
-                  <div key={endpoint.id} className="p-3 bg-[var(--bg-secondary)] rounded border border-[var(--border-color)]">
+                  <div key={endpoint.id} className="p-3 bg-(--bg-secondary) rounded-sm border border-(--border-color)">
                     <div className="flex items-center justify-between gap-3 mb-2">
-                      <span className="text-sm font-medium text-[var(--text-secondary)]">
+                      <span className="text-sm font-medium text-(--text-secondary)">
                         Endpoint #{endpoint.id}
                       </span>
                       <div className="flex items-center gap-2">
@@ -1132,7 +1132,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                           />
                           <label
                             htmlFor={`spotify-endpoint-${endpoint.id}-toggle`}
-                            className={`block w-10 h-5 rounded-full transition cursor-pointer ${endpoint.enabled ? 'bg-[var(--accent-color)]' : 'bg-[var(--bg-tertiary-hover)]'} ${isTogglingSpotifyEndpoint[endpoint.id] ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            className={`block w-10 h-5 rounded-full transition cursor-pointer ${endpoint.enabled ? 'bg-(--accent-color)' : 'bg-(--bg-tertiary-hover)'} ${isTogglingSpotifyEndpoint[endpoint.id] ? 'opacity-50 cursor-not-allowed' : ''}`}
                           >
                             <div className={`dot absolute left-0.5 top-0.5 bg-white w-4 h-4 rounded-full transition-transform ${endpoint.enabled ? 'translate-x-5' : ''}`}></div>
                           </label>
@@ -1149,7 +1149,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                       </div>
                     </div>
                     <div>
-                      <label className="block text-xs text-[var(--text-muted)] mb-1">
+                      <label className="block text-xs text-(--text-muted) mb-1">
                         Device Name
                       </label>
                       <div className="relative">
@@ -1162,7 +1162,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                               handleSpotifyEndpointNameChange(endpoint.id);
                             }
                           }}
-                          className="w-full px-2 py-1.5 pr-16 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-sm text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-color)]"
+                          className="w-full px-2 py-1.5 pr-16 bg-(--bg-primary) border border-(--border-color) rounded-sm text-sm text-(--text-primary) focus:outline-hidden focus:ring-2 focus:ring-(--accent-color)"
                           placeholder="Plum Audio"
                           disabled={spotifyEndpointNameStatuses[endpoint.id] === 'applying'}
                         />
@@ -1170,7 +1170,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                           <button
                             onClick={() => handleSpotifyEndpointNameChange(endpoint.id)}
                             disabled={nameEmpty || spotifyEndpointNameStatuses[endpoint.id] === 'applying'}
-                            className="absolute right-1.5 top-1/2 -translate-y-1/2 px-2 py-0.5 text-xs bg-[var(--accent-color)] accent-button-text rounded hover:opacity-80 disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="absolute right-1.5 top-1/2 -translate-y-1/2 px-2 py-0.5 text-xs bg-(--accent-color) accent-button-text rounded-sm hover:opacity-80 disabled:opacity-50 disabled:cursor-not-allowed"
                           >
                             {spotifyEndpointNameStatuses[endpoint.id] === 'applying' ? 'Applying...' : 'Apply'}
                           </button>
@@ -1182,7 +1182,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                             ? 'text-green-500'
                             : spotifyEndpointNameStatuses[endpoint.id] === 'error'
                             ? 'text-red-500'
-                            : 'text-[var(--text-muted)]'
+                            : 'text-(--text-muted)'
                         }`}>
                           {spotifyEndpointNameMessages[endpoint.id]}
                         </p>
@@ -1193,7 +1193,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                         </p>
                       )}
                     </div>
-                    <div className="text-xs text-[var(--text-muted)] mt-2">
+                    <div className="text-xs text-(--text-muted) mt-2">
                       Zeroconf Port: {endpoint.zeroconfPort}
                     </div>
                   </div>
@@ -1205,15 +1205,15 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                 <button
                   onClick={() => setShowAddSpotifyEndpoint(true)}
                   disabled={isAnySpotifyEndpointBeingEdited}
-                  className="w-full px-3 py-2 bg-[var(--bg-secondary)] hover:bg-[var(--bg-tertiary-hover)] border border-[var(--border-color)] rounded text-sm text-[var(--text-secondary)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="w-full px-3 py-2 bg-(--bg-secondary) hover:bg-(--bg-tertiary-hover) border border-(--border-color) rounded-sm text-sm text-(--text-secondary) transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   + Add Endpoint
                 </button>
               )}
 
               {showAddSpotifyEndpoint && (
-                <div className="p-3 bg-[var(--bg-secondary)] rounded border border-[var(--accent-color)]">
-                  <label className="block text-xs text-[var(--text-secondary)] mb-1">
+                <div className="p-3 bg-(--bg-secondary) rounded-sm border border-(--accent-color)">
+                  <label className="block text-xs text-(--text-secondary) mb-1">
                     New Endpoint Name
                   </label>
                   <div className="flex gap-2">
@@ -1222,21 +1222,21 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                       value={newSpotifyEndpointName}
                       onChange={(e) => setNewSpotifyEndpointName(e.target.value)}
                       onKeyDown={(e) => e.key === 'Enter' && newSpotifyEndpointName.trim() && !isAnySpotifyEndpointBeingEdited && handleAddSpotifyEndpoint()}
-                      className="flex-1 px-2 py-1.5 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-sm text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-color)]"
+                      className="flex-1 px-2 py-1.5 bg-(--bg-primary) border border-(--border-color) rounded-sm text-sm text-(--text-primary) focus:outline-hidden focus:ring-2 focus:ring-(--accent-color)"
                       placeholder="Living Room"
                       disabled={isAnySpotifyEndpointBeingEdited || isAddingSpotifyEndpoint}
                     />
                     <button
                       onClick={handleAddSpotifyEndpoint}
                       disabled={!newSpotifyEndpointName.trim() || isAnySpotifyEndpointBeingEdited || isAddingSpotifyEndpoint}
-                      className="px-3 py-1.5 bg-[var(--accent-color)] accent-button-text rounded text-xs hover:opacity-80 disabled:opacity-50 disabled:cursor-not-allowed"
+                      className="px-3 py-1.5 bg-(--accent-color) accent-button-text rounded-sm text-xs hover:opacity-80 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       {isAddingSpotifyEndpoint ? 'Adding...' : 'Add'}
                     </button>
                     <button
                       onClick={() => {setShowAddSpotifyEndpoint(false); setNewSpotifyEndpointName('');}}
                       disabled={isAddingSpotifyEndpoint}
-                      className="px-3 py-1.5 bg-[var(--bg-tertiary)] hover:bg-[var(--bg-tertiary-hover)] rounded text-xs text-[var(--text-secondary)] disabled:opacity-50 disabled:cursor-not-allowed"
+                      className="px-3 py-1.5 bg-(--bg-tertiary) hover:bg-(--bg-tertiary-hover) rounded-sm text-xs text-(--text-secondary) disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       Cancel
                     </button>
@@ -1245,7 +1245,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
               )}
 
               {spotifyEndpoints.length >= 10 && (
-                <p className="text-xs text-[var(--text-muted)] italic">
+                <p className="text-xs text-(--text-muted) italic">
                   Maximum of 10 endpoints reached
                 </p>
               )}
@@ -1258,26 +1258,26 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
 
         {/* DLNA/UPnP */}
         {show('dlna') && (
-        <div className="p-4 bg-[var(--bg-tertiary)] rounded-lg border border-[var(--border-color)]">
+        <div className="p-4 bg-(--bg-tertiary) rounded-lg border border-(--border-color)">
           <div className="flex items-start justify-between gap-4">
             {/* Left: Icon */}
-            <div className="w-12 flex justify-center items-center flex-shrink-0">
-              <Icon name="network-wired" className="text-[2.5rem] text-[var(--text-secondary)]" style={{ color: 'inherit' }} aria-hidden />
+            <div className="w-12 flex justify-center items-center shrink-0">
+              <Icon name="network-wired" className="text-[2.5rem] text-(--text-secondary)" style={{ color: 'inherit' }} aria-hidden />
             </div>
 
             {/* Middle: Title + Description */}
             <div className="flex flex-col flex-1">
-              <span className="text-base font-semibold text-[var(--text-secondary)]">DLNA/UPnP</span>
-              <p className="text-sm text-[var(--text-muted)] mt-1">
+              <span className="text-base font-semibold text-(--text-secondary)">DLNA/UPnP</span>
+              <p className="text-sm text-(--text-muted) mt-1">
                 DLNA/UPnP media renderer - {dlnaEndpoints.length} endpoint{dlnaEndpoints.length !== 1 ? 's' : ''}
               </p>
             </div>
 
             {/* Right: Chevron */}
-            <div className="flex items-center flex-shrink-0">
+            <div className="flex items-center shrink-0">
               <button
                 onClick={() => toggleSection('dlna')}
-                className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
+                className="text-(--text-muted) hover:text-(--text-primary) transition-colors"
               >
                 <Icon name={expandedSection === 'dlna' ? 'chevron-up' : 'chevron-down'} className="text-lg" style={{ color: 'inherit' }} />
               </button>
@@ -1299,9 +1299,9 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                 const nameChanged = dlnaEndpointNames[endpoint.id] !== endpoint.deviceName;
                 const nameEmpty = !(dlnaEndpointNames[endpoint.id] || endpoint.deviceName)?.trim();
                 return (
-                  <div key={endpoint.id} className="p-3 bg-[var(--bg-secondary)] rounded border border-[var(--border-color)]">
+                  <div key={endpoint.id} className="p-3 bg-(--bg-secondary) rounded-sm border border-(--border-color)">
                     <div className="flex items-center justify-between gap-3 mb-2">
-                      <span className="text-sm font-medium text-[var(--text-secondary)]">
+                      <span className="text-sm font-medium text-(--text-secondary)">
                         Endpoint #{endpoint.id}
                       </span>
                       <div className="flex items-center gap-2">
@@ -1316,7 +1316,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                           />
                           <label
                             htmlFor={`dlna-endpoint-${endpoint.id}-toggle`}
-                            className={`block w-10 h-5 rounded-full transition cursor-pointer ${endpoint.enabled ? 'bg-[var(--accent-color)]' : 'bg-[var(--bg-tertiary-hover)]'} ${isTogglingDlnaEndpoint[endpoint.id] ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            className={`block w-10 h-5 rounded-full transition cursor-pointer ${endpoint.enabled ? 'bg-(--accent-color)' : 'bg-(--bg-tertiary-hover)'} ${isTogglingDlnaEndpoint[endpoint.id] ? 'opacity-50 cursor-not-allowed' : ''}`}
                           >
                             <div className={`dot absolute left-0.5 top-0.5 bg-white w-4 h-4 rounded-full transition-transform ${endpoint.enabled ? 'translate-x-5' : ''}`}></div>
                           </label>
@@ -1331,7 +1331,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                       </div>
                     </div>
                     <div>
-                      <label className="block text-xs text-[var(--text-muted)] mb-1">
+                      <label className="block text-xs text-(--text-muted) mb-1">
                         Device Name
                       </label>
                       <div className="relative">
@@ -1344,7 +1344,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                               handleDlnaEndpointNameChange(endpoint.id);
                             }
                           }}
-                          className="w-full px-2 py-1.5 pr-16 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-sm text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-color)]"
+                          className="w-full px-2 py-1.5 pr-16 bg-(--bg-primary) border border-(--border-color) rounded-sm text-sm text-(--text-primary) focus:outline-hidden focus:ring-2 focus:ring-(--accent-color)"
                           placeholder="Plum Audio"
                           disabled={dlnaEndpointNameStatuses[endpoint.id] === 'applying'}
                         />
@@ -1352,7 +1352,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                           <button
                             onClick={() => handleDlnaEndpointNameChange(endpoint.id)}
                             disabled={nameEmpty || dlnaEndpointNameStatuses[endpoint.id] === 'applying'}
-                            className="absolute right-1.5 top-1/2 -translate-y-1/2 px-2 py-0.5 text-xs bg-[var(--accent-color)] accent-button-text rounded hover:opacity-80 disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="absolute right-1.5 top-1/2 -translate-y-1/2 px-2 py-0.5 text-xs bg-(--accent-color) accent-button-text rounded-sm hover:opacity-80 disabled:opacity-50 disabled:cursor-not-allowed"
                           >
                             {dlnaEndpointNameStatuses[endpoint.id] === 'applying' ? 'Applying...' : 'Apply'}
                           </button>
@@ -1364,7 +1364,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                             ? 'text-green-500'
                             : dlnaEndpointNameStatuses[endpoint.id] === 'error'
                             ? 'text-red-500'
-                            : 'text-[var(--text-muted)]'
+                            : 'text-(--text-muted)'
                         }`}>
                           {dlnaEndpointNameMessages[endpoint.id]}
                         </p>
@@ -1375,7 +1375,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                         </p>
                       )}
                     </div>
-                    <div className="text-xs text-[var(--text-muted)] mt-2">
+                    <div className="text-xs text-(--text-muted) mt-2">
                       UPnP Port: {endpoint.port}
                     </div>
                   </div>
@@ -1387,15 +1387,15 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                 <button
                   onClick={() => setShowAddDlnaEndpoint(true)}
                   disabled={isAnyDlnaEndpointBeingEdited}
-                  className="w-full px-3 py-2 bg-[var(--bg-secondary)] hover:bg-[var(--bg-tertiary-hover)] border border-[var(--border-color)] rounded text-sm text-[var(--text-secondary)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="w-full px-3 py-2 bg-(--bg-secondary) hover:bg-(--bg-tertiary-hover) border border-(--border-color) rounded-sm text-sm text-(--text-secondary) transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   + Add Endpoint
                 </button>
               )}
 
               {showAddDlnaEndpoint && (
-                <div className="p-3 bg-[var(--bg-secondary)] rounded border border-[var(--accent-color)]">
-                  <label className="block text-xs text-[var(--text-secondary)] mb-1">
+                <div className="p-3 bg-(--bg-secondary) rounded-sm border border-(--accent-color)">
+                  <label className="block text-xs text-(--text-secondary) mb-1">
                     New Endpoint Name
                   </label>
                   <div className="flex gap-2">
@@ -1404,21 +1404,21 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                       value={newDlnaEndpointName}
                       onChange={(e) => setNewDlnaEndpointName(e.target.value)}
                       onKeyDown={(e) => e.key === 'Enter' && newDlnaEndpointName.trim() && !isAnyDlnaEndpointBeingEdited && handleAddDlnaEndpoint()}
-                      className="flex-1 px-2 py-1.5 bg-[var(--bg-primary)] border border-[var(--border-color)] rounded text-sm text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent-color)]"
+                      className="flex-1 px-2 py-1.5 bg-(--bg-primary) border border-(--border-color) rounded-sm text-sm text-(--text-primary) focus:outline-hidden focus:ring-2 focus:ring-(--accent-color)"
                       placeholder="Living Room"
                       disabled={isAnyDlnaEndpointBeingEdited || isAddingDlnaEndpoint}
                     />
                     <button
                       onClick={handleAddDlnaEndpoint}
                       disabled={!newDlnaEndpointName.trim() || isAnyDlnaEndpointBeingEdited || isAddingDlnaEndpoint}
-                      className="px-3 py-1.5 bg-[var(--accent-color)] accent-button-text rounded text-xs hover:opacity-80 disabled:opacity-50 disabled:cursor-not-allowed"
+                      className="px-3 py-1.5 bg-(--accent-color) accent-button-text rounded-sm text-xs hover:opacity-80 disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       {isAddingDlnaEndpoint ? 'Adding...' : 'Add'}
                     </button>
                     <button
                       onClick={() => {setShowAddDlnaEndpoint(false); setNewDlnaEndpointName('');}}
                       disabled={isAddingDlnaEndpoint}
-                      className="px-3 py-1.5 bg-[var(--bg-tertiary)] hover:bg-[var(--bg-tertiary-hover)] rounded text-xs text-[var(--text-secondary)] disabled:opacity-50 disabled:cursor-not-allowed"
+                      className="px-3 py-1.5 bg-(--bg-tertiary) hover:bg-(--bg-tertiary-hover) rounded-sm text-xs text-(--text-secondary) disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       Cancel
                     </button>
@@ -1427,7 +1427,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
               )}
 
               {dlnaEndpoints.length >= 10 && (
-                <p className="text-xs text-[var(--text-muted)] italic">
+                <p className="text-xs text-(--text-muted) italic">
                   Maximum of 10 endpoints reached
                 </p>
               )}
@@ -1441,17 +1441,17 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
 
         {/* Plexamp */}
         {show('plexamp') && (
-        <div className={`p-4 bg-[var(--bg-tertiary)] rounded-lg border border-[var(--border-color)] ${!settings.integrations.plexamp.available ? 'opacity-50' : ''}`}>
+        <div className={`p-4 bg-(--bg-tertiary) rounded-lg border border-(--border-color) ${!settings.integrations.plexamp.available ? 'opacity-50' : ''}`}>
           <div className="flex items-start justify-between gap-4">
             {/* Left: Icon */}
-            <div className="w-12 flex justify-center items-center flex-shrink-0">
-              <Icon name="plexamp" className="text-[2.5rem] text-[var(--text-secondary)]" style={{ color: 'inherit' }} aria-hidden />
+            <div className="w-12 flex justify-center items-center shrink-0">
+              <Icon name="plexamp" className="text-[2.5rem] text-(--text-secondary)" style={{ color: 'inherit' }} aria-hidden />
             </div>
 
             {/* Middle: Title + Description */}
             <div className="flex flex-col flex-1">
-              <span className="text-base font-semibold text-[var(--text-secondary)]">Plexamp</span>
-              <p className="text-sm text-[var(--text-muted)] mt-1">
+              <span className="text-base font-semibold text-(--text-secondary)">Plexamp</span>
+              <p className="text-sm text-(--text-muted) mt-1">
                 Plex music player integration
               </p>
               {!settings.integrations.plexamp.available && (
@@ -1467,7 +1467,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
             </div>
 
             {/* Right: Toggle */}
-            <div className="flex items-center flex-shrink-0">
+            <div className="flex items-center shrink-0">
               <div className="relative">
                 <input
                   type="checkbox"
@@ -1479,7 +1479,7 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
                 />
                 <label
                   htmlFor="plexamp-toggle"
-                  className={`block w-12 h-6 rounded-full transition ${!settings.integrations.plexamp.available || isTogglingPlexamp ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} ${settings.integrations.plexamp.enabled ? 'bg-[var(--accent-color)]' : 'bg-[var(--bg-tertiary-hover)]'}`}
+                  className={`block w-12 h-6 rounded-full transition ${!settings.integrations.plexamp.available || isTogglingPlexamp ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'} ${settings.integrations.plexamp.enabled ? 'bg-(--accent-color)' : 'bg-(--bg-tertiary-hover)'}`}
                 >
                   <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform ${settings.integrations.plexamp.enabled ? 'translate-x-6' : ''}`}></div>
                 </label>
@@ -1490,8 +1490,8 @@ export const IntegrationsTab: React.FC<IntegrationsTabProps> = ({
         )}
       </div>
 
-      <div className="pt-4 mt-6 border-t border-[var(--border-color)]">
-        <p className="text-xs text-[var(--text-muted)] italic">
+      <div className="pt-4 mt-6 border-t border-(--border-color)">
+        <p className="text-xs text-(--text-muted) italic">
           Note: Endpoint changes are picked up by the unit automatically; the endpoint appears or disappears on your sender within a few seconds.
         </p>
       </div>

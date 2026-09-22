@@ -67,7 +67,7 @@ export const NowPlaying: React.FC<NowPlayingProps> = ({stream, canSeek = false, 
 
     return (
         <div className="flex flex-col md:flex-row items-center gap-6 p-4">
-            <div className="flex-shrink-0">
+            <div className="shrink-0">
                 <img
                     src={artSrc}
                     alt={`Album art for ${currentTrack.album}`}
@@ -80,23 +80,23 @@ export const NowPlaying: React.FC<NowPlayingProps> = ({stream, canSeek = false, 
                 />
             </div>
             <div className="flex-1 text-center md:text-left min-w-0">
-                <ScrollingText text={currentTrack.title} className="text-3xl font-bold text-[var(--accent-color)]" />
-                <ScrollingText text={currentTrack.artist} className="text-lg text-[var(--text-primary)] mt-1" />
-                <ScrollingText text={currentTrack.album} className="text-md text-[var(--text-secondary)] mt-1" />
+                <ScrollingText text={currentTrack.title} className="text-3xl font-bold text-(--accent-color)" />
+                <ScrollingText text={currentTrack.artist} className="text-lg text-(--text-primary) mt-1" />
+                <ScrollingText text={currentTrack.album} className="text-md text-(--text-secondary) mt-1" />
 
                 <div className="mt-6">
                     <div
                         ref={progressBarRef}
-                        className={`bg-[var(--border-color)] rounded-full h-2 w-full overflow-hidden ${canSeek ? 'cursor-pointer hover:h-3 transition-all' : ''}`}
+                        className={`bg-(--border-color) rounded-full h-2 w-full overflow-hidden ${canSeek ? 'cursor-pointer hover:h-3 transition-all' : ''}`}
                         onClick={handleProgressBarClick}
                         title={canSeek ? 'Click to seek' : undefined}
                     >
                         <div
-                            className="bg-[var(--accent-color)] h-full rounded-full transition-all duration-1000 ease-linear max-w-full"
+                            className="bg-(--accent-color) h-full rounded-full transition-all duration-1000 ease-linear max-w-full"
                             style={{width: `${progressPercent}%`}}
                         ></div>
                     </div>
-                    <div className="flex justify-between text-xs text-[var(--text-secondary)] mt-2">
+                    <div className="flex justify-between text-xs text-(--text-secondary) mt-2">
                         <span>{formatTime(progress)}</span>
                         <span>{formatTime(currentTrack.duration)}</span>
                     </div>

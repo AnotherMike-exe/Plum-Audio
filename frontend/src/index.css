@@ -1,5 +1,34 @@
 /* Tailwind entrypoint — imported by index.tsx so Vite compiles it into the bundle.
-   Replaces the old cdn.tailwindcss.com script tag (see tailwind.config.js). */
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+ *
+ * The ported Snapcast GUI originally pulled Tailwind from cdn.tailwindcss.com. That is a dev-only
+ * JIT build AND an internet dependency at page load — untenable for a unit on an isolated AV VLAN,
+ * so Tailwind is compiled in here instead. (This rationale lived in tailwind.config.js, which
+ * Tailwind 4 replaces with CSS-first config.)
+ *
+ * There is no content/`@source` list any more. v4 detects sources automatically, and the old
+ * config's deliberately broad globs are no longer needed — verified by comparing the generated
+ * CSS across the v3 -> v4 bump, which grew rather than shrank and kept every sampled utility.
+ */
+@import 'tailwindcss';
+
+@theme {
+  /* Pin v3's default sans stack. Tailwind 4 changes --font-sans to the -apple-system/Segoe UI
+   * stack, which re-renders every screen in different letterforms and different metrics — enough
+   * to change where headings wrap. That is a design decision, not a dependency one, so the bump
+   * stays visually neutral and adopting v4's stack is left as a separate, deliberate change. */
+  --font-sans: ui-sans-serif, system-ui, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji',
+    'Segoe UI Symbol', 'Noto Color Emoji';
+}
+
+@layer base {
+  /* Tailwind 4 makes the default border color `currentcolor`; v3 used gray-200. The app has 217
+   * bare `border` classes that assume the v3 default, so restore it rather than annotate them all.
+   * Written by the official upgrade codemod and kept deliberately. */
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+}

@@ -29,25 +29,25 @@ export const IncomingPairPrompt: React.FC<IncomingPairPromptProps> = ({ prompt, 
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div className="w-full max-w-md rounded-2xl bg-[var(--bg-secondary)] p-6 shadow-2xl border border-[var(--border-color)]">
-        <h3 className="text-lg font-semibold text-[var(--text-primary)] mb-1">
+      <div className="w-full max-w-md rounded-2xl bg-(--bg-secondary) p-6 shadow-2xl border border-(--border-color)">
+        <h3 className="text-lg font-semibold text-(--text-primary) mb-1">
           Pairing request{unitName ? ` for ${unitName}` : ''}
         </h3>
-        <p className="text-sm text-[var(--text-secondary)] mb-5">
+        <p className="text-sm text-(--text-secondary) mb-5">
           Another Sendspin server wants to use this speaker.{' '}
           {prompt.pin ? 'Enter this code there to allow it.' : 'Confirm on this device to allow it.'}
         </p>
 
         {prompt.pin && (
           <div
-            className="rounded-xl bg-[var(--bg-primary)] py-6 text-center font-mono text-4xl tracking-[0.35em] text-[var(--text-primary)] select-all"
+            className="rounded-xl bg-(--bg-primary) py-6 text-center font-mono text-4xl tracking-[0.35em] text-(--text-primary) select-all"
             aria-label={`Pairing code ${prompt.pin.split('').join(' ')}`}
           >
             {prompt.pin}
           </div>
         )}
 
-        <p className="mt-5 text-xs text-[var(--text-secondary)]">
+        <p className="mt-5 text-xs text-(--text-secondary)">
           This closes on its own once the other server finishes — or when the attempt times out.
         </p>
       </div>

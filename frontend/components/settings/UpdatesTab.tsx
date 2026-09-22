@@ -41,14 +41,14 @@ const STATE_LABEL: Record<UnitUpdateState, string> = {
 };
 
 const STATE_CLASS: Record<UnitUpdateState, string> = {
-  'unreachable': 'text-[var(--text-muted)]',
+  'unreachable': 'text-(--text-muted)',
   'needs-image': 'text-amber-500',
   'no-agent': 'text-amber-500',
-  'unknown': 'text-[var(--text-muted)]',
+  'unknown': 'text-(--text-muted)',
   'up-to-date': 'text-green-500',
-  'update-available': 'text-[var(--accent-color)]',
-  'pulling': 'text-[var(--accent-color)]',
-  'restarting': 'text-[var(--accent-color)]',
+  'update-available': 'text-(--accent-color)',
+  'pulling': 'text-(--accent-color)',
+  'restarting': 'text-(--accent-color)',
   'failed': 'text-red-500',
 };
 
@@ -205,16 +205,16 @@ export const UpdatesTab: React.FC = () => {
   return (
     <div className="space-y-6">
       <div>
-        <h3 className="text-base font-semibold text-[var(--text-primary)] mb-1">Updates</h3>
-        <p className="text-sm text-[var(--text-muted)]">
+        <h3 className="text-base font-semibold text-(--text-primary) mb-1">Updates</h3>
+        <p className="text-sm text-(--text-muted)">
           Pull a new image and restart the selected units. A unit that is already current is left
           playing — nothing restarts unless there is something new to install.
         </p>
       </div>
 
       {/* Channel */}
-      <div className="p-4 bg-[var(--bg-tertiary)] rounded-lg border border-[var(--border-color)]">
-        <label className="block text-sm font-medium text-[var(--text-primary)] mb-2">Channel</label>
+      <div className="p-4 bg-(--bg-tertiary) rounded-lg border border-(--border-color)">
+        <label className="block text-sm font-medium text-(--text-primary) mb-2">Channel</label>
         <div className="flex gap-2">
           {['dev', 'latest'].map((c) => (
             <button
@@ -223,47 +223,47 @@ export const UpdatesTab: React.FC = () => {
               disabled={busy}
               className={`px-3 py-1.5 rounded-md text-sm font-medium transition-opacity disabled:opacity-50 ${
                 channel === c
-                  ? 'bg-[var(--accent-color)] accent-button-text'
-                  : 'bg-[var(--bg-secondary)] text-[var(--text-primary)] border border-[var(--border-color)]'
+                  ? 'bg-(--accent-color) accent-button-text'
+                  : 'bg-(--bg-secondary) text-(--text-primary) border border-(--border-color)'
               }`}
             >
               {c}
             </button>
           ))}
         </div>
-        <p className="mt-2 text-xs text-[var(--text-muted)]">
+        <p className="mt-2 text-xs text-(--text-muted)">
           <span className="font-mono">dev</span> tracks every push to the dev branch.{' '}
           <span className="font-mono">latest</span> is the last release.
         </p>
       </div>
 
       {/* Units */}
-      <div className="p-4 bg-[var(--bg-tertiary)] rounded-lg border border-[var(--border-color)]">
+      <div className="p-4 bg-(--bg-tertiary) rounded-lg border border-(--border-color)">
         <div className="flex items-center justify-between mb-3">
-          <h4 className="text-sm font-semibold text-[var(--text-primary)]">
+          <h4 className="text-sm font-semibold text-(--text-primary)">
             Units ({selected.size} of {units.length} selected)
           </h4>
           <div className="flex gap-2">
             <button
               onClick={selectAll}
               disabled={busy}
-              className="px-2 py-1 text-xs rounded border border-[var(--border-color)] text-[var(--text-primary)] hover:opacity-80 disabled:opacity-50"
+              className="px-2 py-1 text-xs rounded-sm border border-(--border-color) text-(--text-primary) hover:opacity-80 disabled:opacity-50"
             >
               All
             </button>
             <button
               onClick={selectNone}
               disabled={busy}
-              className="px-2 py-1 text-xs rounded border border-[var(--border-color)] text-[var(--text-primary)] hover:opacity-80 disabled:opacity-50"
+              className="px-2 py-1 text-xs rounded-sm border border-(--border-color) text-(--text-primary) hover:opacity-80 disabled:opacity-50"
             >
               None
             </button>
           </div>
         </div>
 
-        {!loaded && <p className="text-sm text-[var(--text-muted)]">Loading units…</p>}
+        {!loaded && <p className="text-sm text-(--text-muted)">Loading units…</p>}
         {loaded && units.length === 0 && (
-          <p className="text-sm text-[var(--text-muted)]">No units in the mesh view.</p>
+          <p className="text-sm text-(--text-muted)">No units in the mesh view.</p>
         )}
 
         <div className="space-y-2">
@@ -276,7 +276,7 @@ export const UpdatesTab: React.FC = () => {
             return (
               <div
                 key={u.unit_id}
-                className="flex items-start gap-3 p-2 rounded-md bg-[var(--bg-secondary)] border border-[var(--border-color)]"
+                className="flex items-start gap-3 p-2 rounded-md bg-(--bg-secondary) border border-(--border-color)"
               >
                 <input
                   type="checkbox"
@@ -284,15 +284,15 @@ export const UpdatesTab: React.FC = () => {
                   onChange={() => toggle(u.unit_id)}
                   disabled={busy}
                   aria-label={`Select ${u.name}`}
-                  className="mt-1 accent-[var(--accent-color)]"
+                  className="mt-1 accent-(--accent-color)"
                 />
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
-                    <span className="text-sm font-medium text-[var(--text-primary)] truncate">
+                    <span className="text-sm font-medium text-(--text-primary) truncate">
                       {u.name}
                     </span>
                     {isLocal && (
-                      <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-[var(--bg-tertiary)] text-[var(--text-muted)]">
+                      <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded-sm bg-(--bg-tertiary) text-(--text-muted)">
                         this unit
                       </span>
                     )}
@@ -300,14 +300,14 @@ export const UpdatesTab: React.FC = () => {
                       {STATE_LABEL[state]}
                     </span>
                   </div>
-                  <div className="text-xs text-[var(--text-muted)] font-mono truncate">
+                  <div className="text-xs text-(--text-muted) font-mono truncate">
                     {u.host}
                     {status?.running?.version ? ` · v${status.running.version}` : ''}
                     {` · ${shortDigest(status?.digest)}`}
                   </div>
                   {message && (
                     <p
-                      className={`text-xs mt-1 ${state === 'failed' ? 'text-red-500' : 'text-[var(--text-muted)]'}`}
+                      className={`text-xs mt-1 ${state === 'failed' ? 'text-red-500' : 'text-(--text-muted)'}`}
                     >
                       {message}
                     </p>
@@ -355,20 +355,20 @@ export const UpdatesTab: React.FC = () => {
         <button
           onClick={() => run(true)}
           disabled={busy || selected.size === 0}
-          className="px-4 py-2 rounded-md text-sm font-medium border border-[var(--border-color)] text-[var(--text-primary)] hover:opacity-80 disabled:opacity-50 disabled:cursor-not-allowed"
+          className="px-4 py-2 rounded-md text-sm font-medium border border-(--border-color) text-(--text-primary) hover:opacity-80 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           Check for updates
         </button>
         <button
           onClick={() => run(false)}
           disabled={busy || selected.size === 0}
-          className="px-4 py-2 bg-[var(--accent-color)] accent-button-text rounded-md text-sm font-medium hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
+          className="px-4 py-2 bg-(--accent-color) accent-button-text rounded-md text-sm font-medium hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
         >
           {busy ? 'Working…' : `Update ${selected.size} unit${selected.size === 1 ? '' : 's'}`}
         </button>
       </div>
 
-      <p className="text-xs text-[var(--text-muted)]">
+      <p className="text-xs text-(--text-muted)">
         Units update one at a time, so a failure leaves the rest of the house playing. A unit is
         unreachable for about ten seconds while its container restarts — that is the update working,
         not a fault.

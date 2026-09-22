@@ -25,11 +25,11 @@ const SyncedDevice: React.FC<{
     };
 
     return (
-        <div className="flex items-center justify-between gap-4 p-2 rounded-lg hover:bg-[var(--bg-tertiary)]">
+        <div className="flex items-center justify-between gap-4 p-2 rounded-lg hover:bg-(--bg-tertiary)">
             <span className="font-semibold truncate">{client.name}</span>
             <div className="flex items-center gap-3">
                 <div className="flex items-center gap-3 w-full max-w-[180px]">
-                    <Icon name="volume-high" className="w-4 text-[var(--text-secondary)]" style={{ color: 'inherit' }} />
+                    <Icon name="volume-high" className="w-4 text-(--text-secondary)" style={{ color: 'inherit' }} />
                     <input
                         type="range"
                         min="0"
@@ -66,8 +66,8 @@ export const SyncedDevices: React.FC<SyncedDevicesProps> = ({
     }
 
     return (
-        <div className="mt-6 pt-6 border-t border-[var(--border-color)]">
-            <h3 className="text-xl font-bold text-[var(--text-secondary)] mb-4">Synced Devices</h3>
+        <div className="mt-6 pt-6 border-t border-(--border-color)">
+            <h3 className="text-xl font-bold text-(--text-secondary) mb-4">Synced Devices</h3>
             <div className="space-y-2">
                 {clients.map(client => (
                     <SyncedDevice key={client.id} client={client} streams={streams} onVolumeChange={onVolumeChange}
