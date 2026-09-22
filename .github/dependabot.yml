@@ -1,11 +1,27 @@
-# Dependabot version updates. Grouped, so one ecosystem opens one pull request a week.
+# Dependabot version updates. Grouped, so one ecosystem opens one pull request a month.
+#
+# Pull requests target `dev`, not `main`. dev is the integration branch and is never behind main,
+# so an update lands where the work happens and reaches main through the normal dev -> main merge
+# rather than needing its own trip through a protected branch.
+#
+# This FILE still has to live on the default branch (main) — that is the only place Dependabot
+# reads it from — even though every pull request it opens goes to dev. Keep the two in sync.
+#
+# Two consequences of `target-branch` worth knowing before anyone "simplifies" it away:
+#
+#   1. It scopes VERSION updates only. Dependabot SECURITY updates always target the default
+#      branch and ignore the options here, so a security pull request arrives against main,
+#      ungrouped and unlabelled. The grouping below will not tidy it.
+#   2. Nothing else reads this. Alerts are raised from the dependency graph, not from this file,
+#      so pointing version updates at dev does not make the repository less watched.
 version: 2
 updates:
   # A pinned action rots, and an unmaintained action is a supply chain problem.
   - package-ecosystem: github-actions
     directory: /
+    target-branch: dev
     schedule:
-      interval: weekly
+      interval: monthly
     labels: [dependencies]
     groups:
       actions:
@@ -13,8 +29,9 @@ updates:
 
   - package-ecosystem: pip
     directory: /backend
+    target-branch: dev
     schedule:
-      interval: weekly
+      interval: monthly
     labels: [dependencies]
     groups:
       python:
@@ -23,8 +40,9 @@ updates:
 
   - package-ecosystem: npm
     directory: /frontend
+    target-branch: dev
     schedule:
-      interval: weekly
+      interval: monthly
     labels: [dependencies]
     groups:
       javascript:
@@ -33,6 +51,7 @@ updates:
 
   - package-ecosystem: docker
     directory: /backend
+    target-branch: dev
     schedule:
-      interval: weekly
+      interval: monthly
     labels: [dependencies]
