@@ -9,7 +9,7 @@
 aiosendspin==9.1.1
 # Pulled in by aiosendspin 9.x's noise/ package. Listed explicitly because they are new mandatory
 # runtime deps, they install whether or not encryption is enabled, and cpace has exactly one release.
-cryptography>=42
+cryptography>=50.0.1
 noiseprotocol>=0.3.1
 cpace>=0.1.0
 av>=18.1.0,<19       # PyAV — audio encode/resample (glibc wheels on Debian base)
@@ -18,9 +18,9 @@ Pillow>=12.3.0        # REQUIRED by aiosendspin's artwork role (server won't imp
 sounddevice>=0.5.6    # PortAudio player output (needs libportaudio2 in the image)
 
 # REST APIs
-Flask>=3,<4
+Flask>=3.1.3,<4
 flask-cors>=6.0.5
-requests>=2.31
+requests>=2.34.2
 
 # MPRIS control/metadata over the system D-Bus for AirPlay (shairport-sync). asyncio-native (no glib
 # main loop) so it lives in the audio event loop. Needs a system dbus-daemon + the run user allowed to
