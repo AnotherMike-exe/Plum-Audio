@@ -102,8 +102,8 @@ export const OutputDeviceSection: React.FC = () => {
   return (
     <div className="space-y-3">
       <div>
-        <h3 className="text-base font-semibold text-[var(--text-primary)] mb-1">Audio Output</h3>
-        <p className="text-sm text-[var(--text-muted)]">
+        <h3 className="text-base font-semibold text-(--text-primary) mb-1">Audio Output</h3>
+        <p className="text-sm text-(--text-muted)">
           The speaker this unit plays through. Switching takes a few seconds and briefly interrupts
           any audio already playing. Choosing <span className="font-medium">No output</span> — or
           moving away from it — needs this unit to be restarted.
@@ -111,12 +111,12 @@ export const OutputDeviceSection: React.FC = () => {
       </div>
 
       {loading && (
-        <p className="text-xs text-[var(--text-muted)]">Looking for audio devices…</p>
+        <p className="text-xs text-(--text-muted)">Looking for audio devices…</p>
       )}
 
       {error && (
         <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg flex items-start gap-2">
-          <Icon name="circle-exclamation" className="text-red-400 mt-0.5 flex-shrink-0" />
+          <Icon name="circle-exclamation" className="text-red-400 mt-0.5 shrink-0" />
           <div className="min-w-0">
             <p className="text-sm text-red-300">{error}</p>
             <button onClick={() => { void refresh(); }} className="mt-1 text-xs text-red-300 underline hover:text-red-200">
@@ -130,7 +130,7 @@ export const OutputDeviceSection: React.FC = () => {
           flight and nothing will resolve this on its own. */}
       {current?.pending && current.restartRequired && (
         <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-lg flex items-start gap-2">
-          <Icon name="triangle-exclamation" className="text-amber-400 mt-0.5 flex-shrink-0" />
+          <Icon name="triangle-exclamation" className="text-amber-400 mt-0.5 shrink-0" />
           <p className="text-sm text-amber-300">
             Saved. Restart this unit to switch to <span className="font-medium">{current.friendlyName}</span> —
             the player is started or skipped when the unit boots. Until then it is{' '}
@@ -143,7 +143,7 @@ export const OutputDeviceSection: React.FC = () => {
           the player fell back. Both must be visible — neither is success. */}
       {current?.pending && !current.restartRequired && (
         <div className="p-3 bg-yellow-500/10 border border-yellow-500/20 rounded-lg flex items-start gap-2">
-          <Icon name="spinner" className="text-yellow-400 mt-0.5 flex-shrink-0 animate-spin" />
+          <Icon name="spinner" className="text-yellow-400 mt-0.5 shrink-0 animate-spin" />
           <p className="text-sm text-yellow-300">
             Switching to <span className="font-medium">{current.friendlyName}</span> — still playing
             through <span className="font-medium">{playingOn}</span>. If this does not clear, that
@@ -154,7 +154,7 @@ export const OutputDeviceSection: React.FC = () => {
 
       {current && !current.resolved && configured && (
         <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg flex items-start gap-2">
-          <Icon name="triangle-exclamation" className="text-red-400 mt-0.5 flex-shrink-0" />
+          <Icon name="triangle-exclamation" className="text-red-400 mt-0.5 shrink-0" />
           <p className="text-sm text-red-300">
             The configured output <span className="font-mono">{configured}</span> is not attached to
             this unit. Pick another device below.
@@ -166,7 +166,7 @@ export const OutputDeviceSection: React.FC = () => {
           is what a host with no sound card looks like. Say what the unit can still do, because it is
           a great deal more than "no devices found" implies. */}
       {!loading && !error && devices.length > 0 && devices.every(d => d.type === DeviceType.NONE) && (
-        <p className="text-xs text-[var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           No playback hardware was detected on this unit. It can still receive AirPlay, Spotify and
           Bluetooth, and send them to other rooms.
         </p>
@@ -183,8 +183,8 @@ export const OutputDeviceSection: React.FC = () => {
               key={device.id}
               className={`rounded-lg border transition-all ${
                 isChosen
-                  ? 'bg-[var(--accent-color)]/10 border-[var(--accent-color)]'
-                  : 'bg-[var(--bg-tertiary)] border-[var(--border-color)]'
+                  ? 'bg-(--accent-color)/10 border-(--accent-color)'
+                  : 'bg-(--bg-tertiary) border-(--border-color)'
               } ${device.isAvailable ? '' : 'opacity-60'}`}
             >
               <button
@@ -193,19 +193,19 @@ export const OutputDeviceSection: React.FC = () => {
                 disabled={disabled}
                 aria-current={isPlaying}
                 className={`w-full flex items-center gap-3 p-3 text-left ${
-                  disabled ? 'cursor-not-allowed' : 'cursor-pointer hover:border-[var(--text-secondary)]'
+                  disabled ? 'cursor-not-allowed' : 'cursor-pointer hover:border-(--text-secondary)'
                 }`}
               >
                 <Icon
                   name={audioService.getDeviceTypeIcon(device.type)}
-                  className="text-[var(--text-secondary)] flex-shrink-0"
+                  className="text-(--text-secondary) shrink-0"
                 />
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
-                    <span className="text-sm font-medium text-[var(--text-primary)] truncate">
+                    <span className="text-sm font-medium text-(--text-primary) truncate">
                       {device.friendlyName}
                     </span>
-                    <span className={`px-2 py-0.5 rounded text-xs font-medium ${TYPE_BADGE[device.type]}`}>
+                    <span className={`px-2 py-0.5 rounded-sm text-xs font-medium ${TYPE_BADGE[device.type]}`}>
                       {audioService.getDeviceTypeLabel(device.type)}
                     </span>
                     {isPlaying && (
@@ -220,13 +220,13 @@ export const OutputDeviceSection: React.FC = () => {
                   {/* hw address is informational: it changes when cards renumber. The "No output"
                       row has none, and an empty mono line reads as a rendering bug. */}
                   {device.hwId && (
-                    <span className="text-xs text-[var(--text-muted)] font-mono">{device.hwId}</span>
+                    <span className="text-xs text-(--text-muted) font-mono">{device.hwId}</span>
                   )}
                   {device.unavailableReason && (
-                    <p className="text-xs text-[var(--text-muted)] mt-1">{device.unavailableReason}</p>
+                    <p className="text-xs text-(--text-muted) mt-1">{device.unavailableReason}</p>
                   )}
                 </div>
-                {busyId === device.id && <Icon name="spinner" className="animate-spin text-[var(--text-secondary)]" />}
+                {busyId === device.id && <Icon name="spinner" className="animate-spin text-(--text-secondary)" />}
               </button>
 
               {/* Testing the device already in use returns EBUSY, so the backend refuses it with an
@@ -237,7 +237,7 @@ export const OutputDeviceSection: React.FC = () => {
                     type="button"
                     onClick={e => { void handleTest(device, e); }}
                     disabled={testing !== null}
-                    className="text-xs text-[var(--text-secondary)] underline hover:text-[var(--text-primary)] disabled:opacity-50"
+                    className="text-xs text-(--text-secondary) underline hover:text-(--text-primary) disabled:opacity-50"
                   >
                     {testing === device.id ? 'Playing test tone…' : 'Play test tone'}
                   </button>
@@ -248,7 +248,7 @@ export const OutputDeviceSection: React.FC = () => {
         })}
       </div>
 
-      {notice && <p className="text-xs text-[var(--text-muted)]">{notice}</p>}
+      {notice && <p className="text-xs text-(--text-muted)">{notice}</p>}
     </div>
   );
 };

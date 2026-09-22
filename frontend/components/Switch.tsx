@@ -21,18 +21,18 @@ export const Switch: React.FC<SwitchProps> = ({checked, onChange, label, icon, d
 
     return (
         <label htmlFor={switchId}
-               className={`flex items-center justify-between p-2 rounded-lg ${hideLabel ? 'shrink-0' : ''} ${disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer hover:bg-[var(--bg-tertiary)]'}`}>
+               className={`flex items-center justify-between p-2 rounded-lg ${hideLabel ? 'shrink-0' : ''} ${disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer hover:bg-(--bg-tertiary)'}`}>
             {!hideLabel && (
             <div className="flex items-center gap-6">
                 {icon && (
                     <div className="w-8 flex justify-center">
-                        <Icon name={icon.replace('fa-', '') as IconName} className="text-lg text-[var(--text-secondary)]" style={{ color: 'inherit' }} aria-hidden />
+                        <Icon name={icon.replace('fa-', '') as IconName} className="text-lg text-(--text-secondary)" style={{ color: 'inherit' }} aria-hidden />
                     </div>
                 )}
                 <div className="flex flex-col">
-                    <span className="text-base text-[var(--text-secondary)]">{label}</span>
+                    <span className="text-base text-(--text-secondary)">{label}</span>
                     {description && (
-                        <span className="text-xs text-[var(--text-muted)] mt-0.5">{description}</span>
+                        <span className="text-xs text-(--text-muted) mt-0.5">{description}</span>
                     )}
                 </div>
             </div>
@@ -48,7 +48,7 @@ export const Switch: React.FC<SwitchProps> = ({checked, onChange, label, icon, d
                     aria-label={hideLabel ? label : undefined}
                 />
                 <div
-                    className={`block w-12 h-6 rounded-full transition ${checked ? 'bg-[var(--accent-color)]' : 'bg-[var(--bg-tertiary-hover)]'}`}></div>
+                    className={`block w-12 h-6 rounded-full transition ${checked ? 'bg-(--accent-color)' : 'bg-(--bg-tertiary-hover)'}`}></div>
                 <div
                     className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform ${checked ? 'translate-x-6' : ''}`}
                 ></div>

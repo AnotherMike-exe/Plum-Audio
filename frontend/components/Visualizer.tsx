@@ -212,24 +212,24 @@ export const Visualizer: React.FC<VisualizerProps> = ({
 
     return (
         <div
-            className="fixed inset-0 bg-[var(--bg-primary)] z-50 animate-fadeIn cursor-pointer"
+            className="fixed inset-0 bg-(--bg-primary) z-50 animate-fadeIn cursor-pointer"
             onClick={handleBackgroundClick}
         >
             {/* Browser Audio Starting Message */}
             {!isBrowserAudioActive && (
-                <div className="absolute inset-0 flex items-center justify-center z-10 bg-[var(--bg-primary)]/80 backdrop-blur-sm">
-                    <div className="text-center max-w-md p-8 bg-[var(--bg-secondary)] rounded-2xl shadow-2xl">
-                        <Icon name="spinner" spin className="text-6xl text-[var(--accent-color)] mb-4" />
-                        <h2 className="text-2xl font-bold text-[var(--text-primary)] mb-4">
+                <div className="absolute inset-0 flex items-center justify-center z-10 bg-(--bg-primary)/80 backdrop-blur-xs">
+                    <div className="text-center max-w-md p-8 bg-(--bg-secondary) rounded-2xl shadow-2xl">
+                        <Icon name="spinner" spin className="text-6xl text-(--accent-color) mb-4" />
+                        <h2 className="text-2xl font-bold text-(--text-primary) mb-4">
                             Starting Browser Audio
                         </h2>
-                        <p className="text-[var(--text-secondary)] mb-6">
+                        <p className="text-(--text-secondary) mb-6">
                             The visualizer is starting browser audio playback to analyze the audio stream.
                             This may take a moment...
                         </p>
                         <button
                             onClick={onClose}
-                            className="px-6 py-3 bg-[var(--bg-secondary)] text-[var(--text-primary)] rounded-full hover:bg-[var(--bg-tertiary)] transition-all font-semibold"
+                            className="px-6 py-3 bg-(--bg-secondary) text-(--text-primary) rounded-full hover:bg-(--bg-tertiary) transition-all font-semibold"
                         >
                             Close Visualizer
                         </button>
@@ -297,13 +297,13 @@ export const Visualizer: React.FC<VisualizerProps> = ({
                 {/* Metadata */}
                 {currentTrack && (
                     <div>
-                        <h1 className="text-2xl font-bold text-[var(--accent-color)] mb-1">
+                        <h1 className="text-2xl font-bold text-(--accent-color) mb-1">
                             {currentTrack.title}
                         </h1>
-                        <h2 className="text-lg font-bold text-[var(--text-primary)]">
+                        <h2 className="text-lg font-bold text-(--text-primary)">
                             {currentTrack.artist}
                         </h2>
-                        <h3 className="text-sm text-[var(--text-secondary)] mt-1">
+                        <h3 className="text-sm text-(--text-secondary) mt-1">
                             {currentTrack.album}
                         </h3>
                     </div>
@@ -314,11 +314,11 @@ export const Visualizer: React.FC<VisualizerProps> = ({
             <div className="absolute top-4 sm:top-8 right-4 sm:right-8 z-10">
                 <button
                     onClick={onClose}
-                    className="w-12 h-12 flex items-center justify-center rounded-full bg-[var(--bg-secondary)]/80 backdrop-blur-sm hover:bg-[var(--bg-tertiary)] transition-colors"
+                    className="w-12 h-12 flex items-center justify-center rounded-full bg-(--bg-secondary)/80 backdrop-blur-xs hover:bg-(--bg-tertiary) transition-colors"
                     aria-label="Close visualizer"
                     title="Close visualizer (Esc)"
                 >
-                    <Icon name="xmark" className="w-6 h-6 text-[var(--accent-color)]" />
+                    <Icon name="xmark" className="w-6 h-6 text-(--accent-color)" />
                 </button>
             </div>
 
@@ -337,7 +337,7 @@ export const Visualizer: React.FC<VisualizerProps> = ({
                             grid-cols-1 justify-items-center sm:grid-cols-[1fr_auto_1fr]">
 
             {/* Bottom Left: Stream Selector */}
-            <div className="w-full min-w-0 max-w-xs sm:justify-self-start order-2 sm:order-none">
+            <div className="w-full min-w-0 max-w-xs sm:justify-self-start order-2 sm:order-0">
                 <StreamSelector
                     streams={streams}
                     currentStreamId={stream?.id || null}
@@ -348,20 +348,20 @@ export const Visualizer: React.FC<VisualizerProps> = ({
             </div>
 
             {/* Bottom Center: Media Controls & Volume */}
-            <div className="flex flex-col items-center gap-4 sm:gap-6 min-w-0 max-w-full order-1 sm:order-none">
+            <div className="flex flex-col items-center gap-4 sm:gap-6 min-w-0 max-w-full order-1 sm:order-0">
                 {/* Media Control Buttons */}
                 <div className="flex items-center gap-6">
                     <button
                         onClick={() => onSkip('previous')}
-                        className="w-14 h-14 flex items-center justify-center rounded-full bg-[var(--bg-secondary)]/80 backdrop-blur-sm hover:bg-[var(--bg-tertiary)] transition-colors"
+                        className="w-14 h-14 flex items-center justify-center rounded-full bg-(--bg-secondary)/80 backdrop-blur-xs hover:bg-(--bg-tertiary) transition-colors"
                         aria-label="Previous track"
                     >
-                        <Icon name="backward-step" className="w-7 h-7 text-[var(--text-primary)]" />
+                        <Icon name="backward-step" className="w-7 h-7 text-(--text-primary)" />
                     </button>
 
                     <button
                         onClick={onPlayPause}
-                        className="w-20 h-20 flex items-center justify-center rounded-full bg-[var(--accent-color)] hover:brightness-110 transition-all shadow-lg"
+                        className="w-20 h-20 flex items-center justify-center rounded-full bg-(--accent-color) hover:brightness-110 transition-all shadow-lg"
                         aria-label="Play/Pause"
                     >
                         <Icon
@@ -372,16 +372,16 @@ export const Visualizer: React.FC<VisualizerProps> = ({
 
                     <button
                         onClick={() => onSkip('next')}
-                        className="w-14 h-14 flex items-center justify-center rounded-full bg-[var(--bg-secondary)]/80 backdrop-blur-sm hover:bg-[var(--bg-tertiary)] transition-colors"
+                        className="w-14 h-14 flex items-center justify-center rounded-full bg-(--bg-secondary)/80 backdrop-blur-xs hover:bg-(--bg-tertiary) transition-colors"
                         aria-label="Next track"
                     >
-                        <Icon name="forward-step" className="w-7 h-7 text-[var(--text-primary)]" />
+                        <Icon name="forward-step" className="w-7 h-7 text-(--text-primary)" />
                     </button>
                 </div>
 
                 {/* Volume Control - same width as media controls */}
-                <div className="flex items-center gap-4 bg-[var(--bg-secondary)]/80 backdrop-blur-sm rounded-full px-4 sm:px-6 py-3 max-w-full">
-                    <Icon name="volume-low" className="w-5 h-5 text-[var(--text-secondary)]" />
+                <div className="flex items-center gap-4 bg-(--bg-secondary)/80 backdrop-blur-xs rounded-full px-4 sm:px-6 py-3 max-w-full">
+                    <Icon name="volume-low" className="w-5 h-5 text-(--text-secondary)" />
                     <input
                         type="range"
                         min="0"
@@ -398,41 +398,41 @@ export const Visualizer: React.FC<VisualizerProps> = ({
                         style={{ ...volumeSliderStyle, width: '240px', maxWidth: '100%' }}
                         aria-label="Volume control"
                     />
-                    <Icon name="volume-high" className="w-5 h-5 text-[var(--text-secondary)]" />
+                    <Icon name="volume-high" className="w-5 h-5 text-(--text-secondary)" />
                 </div>
             </div>
 
             {/* Bottom Right: Fullscreen, Visualizer Settings, Settings, Listen Button */}
-            <div className="flex gap-2 sm:gap-3 shrink-0 sm:justify-self-end order-3 sm:order-none">
+            <div className="flex gap-2 sm:gap-3 shrink-0 sm:justify-self-end order-3 sm:order-0">
 
                 <button
                     onClick={toggleFullscreen}
-                    className="w-12 h-12 flex items-center justify-center rounded-full bg-[var(--bg-secondary)]/80 backdrop-blur-sm hover:bg-[var(--bg-tertiary)] transition-colors"
+                    className="w-12 h-12 flex items-center justify-center rounded-full bg-(--bg-secondary)/80 backdrop-blur-xs hover:bg-(--bg-tertiary) transition-colors"
                     aria-label={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
                     title={isFullscreen ? 'Exit fullscreen (Esc)' : 'Enter fullscreen'}
                 >
                     <Icon
                         name="desktop"
-                        className="w-6 h-6 text-[var(--text-primary)]"
+                        className="w-6 h-6 text-(--text-primary)"
                     />
                 </button>
 
                 <button
                     onClick={onOpenVisualizerSettings}
-                    className="w-12 h-12 flex items-center justify-center rounded-full bg-[var(--bg-secondary)]/80 backdrop-blur-sm hover:bg-[var(--bg-tertiary)] transition-colors"
+                    className="w-12 h-12 flex items-center justify-center rounded-full bg-(--bg-secondary)/80 backdrop-blur-xs hover:bg-(--bg-tertiary) transition-colors"
                     aria-label="Visualizer Settings"
                     title="Visualizer Settings"
                 >
-                    <Icon name="waveform" className="w-6 h-6 text-[var(--text-primary)]" />
+                    <Icon name="waveform" className="w-6 h-6 text-(--text-primary)" />
                 </button>
 
                 <button
                     onClick={onOpenSettings}
-                    className="w-12 h-12 flex items-center justify-center rounded-full bg-[var(--bg-secondary)]/80 backdrop-blur-sm hover:bg-[var(--bg-tertiary)] transition-colors"
+                    className="w-12 h-12 flex items-center justify-center rounded-full bg-(--bg-secondary)/80 backdrop-blur-xs hover:bg-(--bg-tertiary) transition-colors"
                     aria-label="Settings"
                     title="Settings"
                 >
-                    <Icon name="gear" className="w-6 h-6 text-[var(--text-primary)]" />
+                    <Icon name="gear" className="w-6 h-6 text-(--text-primary)" />
                 </button>
             </div>
 

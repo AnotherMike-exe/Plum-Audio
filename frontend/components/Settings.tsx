@@ -68,21 +68,21 @@ export const Settings: React.FC<SettingsProps> = ({settings, onSettingsChange, o
 
     return (
         <div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs"
             onClick={onClose}
             role="dialog"
             aria-modal="true"
             aria-labelledby="settings-title"
         >
             <div
-                className="relative w-[80vw] h-[80vh] m-4 bg-[var(--bg-secondary)] rounded-2xl shadow-2xl border border-[var(--border-color)] flex flex-col"
+                className="relative w-[80vw] h-[80vh] m-4 bg-(--bg-secondary) rounded-2xl shadow-2xl border border-(--border-color) flex flex-col"
                 onClick={e => e.stopPropagation()}
             >
-                <div className="flex items-center justify-between px-6 py-4 border-b border-[var(--border-color)]">
-                    <h2 id="settings-title" className="text-2xl font-bold text-[var(--text-primary)]">Settings</h2>
+                <div className="flex items-center justify-between px-6 py-4 border-b border-(--border-color)">
+                    <h2 id="settings-title" className="text-2xl font-bold text-(--text-primary)">Settings</h2>
                     <button
                         onClick={onClose}
-                        className="w-8 h-8 flex items-center justify-center rounded-full text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary)]"
+                        className="w-8 h-8 flex items-center justify-center rounded-full text-(--text-secondary) hover:bg-(--bg-tertiary)"
                         aria-label="Close settings"
                     >
                         <Icon name="xmark" />

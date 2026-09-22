@@ -15,7 +15,7 @@ interface TabBarProps {
 
 export const TabBar: React.FC<TabBarProps> = ({ tabs, activeTab, onTabChange }) => {
   return (
-    <div className="flex flex-wrap border-b border-[var(--border-color)] bg-[var(--bg-secondary)]">
+    <div className="flex flex-wrap border-b border-(--border-color) bg-(--bg-secondary)">
       {tabs.map((tab) => (
         <button
           key={tab.id}
@@ -25,8 +25,8 @@ export const TabBar: React.FC<TabBarProps> = ({ tabs, activeTab, onTabChange }) 
             border-b-2 -mb-px whitespace-nowrap
             ${
               activeTab === tab.id
-                ? 'border-[var(--accent-color)] text-[var(--accent-color)]'
-                : 'border-transparent text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--border-color)]'
+                ? 'border-(--accent-color) text-(--accent-color)'
+                : 'border-transparent text-(--text-secondary) hover:text-(--text-primary) hover:border-(--border-color)'
             }
           `}
           aria-selected={activeTab === tab.id}

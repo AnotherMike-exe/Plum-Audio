@@ -80,18 +80,18 @@ export const ThemeTab: React.FC<ThemeTabProps> = ({
   return (
     <div className="space-y-6">
       <div>
-        <h3 className="text-base font-semibold text-[var(--text-primary)] mb-4">
+        <h3 className="text-base font-semibold text-(--text-primary) mb-4">
           Appearance
         </h3>
-        <p className="text-sm text-[var(--text-muted)] mb-6">
+        <p className="text-sm text-(--text-muted) mb-6">
           Customize the look and feel of your interface
         </p>
       </div>
 
       <div className="space-y-6">
         <div>
-          <h4 className="text-sm font-semibold text-[var(--text-primary)] mb-3">Theme Mode</h4>
-          <div className="grid grid-cols-5 gap-2 p-1 rounded-lg bg-[var(--bg-tertiary)]">
+          <h4 className="text-sm font-semibold text-(--text-primary) mb-3">Theme Mode</h4>
+          <div className="grid grid-cols-5 gap-2 p-1 rounded-lg bg-(--bg-tertiary)">
             {themeModes.map((mode) => (
               <button
                 key={mode.value}
@@ -100,8 +100,8 @@ export const ThemeTab: React.FC<ThemeTabProps> = ({
                   px-3 py-2 text-sm font-semibold rounded-md flex items-center justify-center gap-2 transition-colors
                   ${
                     settings.theme.mode === mode.value
-                      ? 'bg-[var(--accent-color)] accent-button-text'
-                      : 'text-[var(--text-secondary)] hover:bg-[var(--bg-tertiary-hover)]'
+                      ? 'bg-(--accent-color) accent-button-text'
+                      : 'text-(--text-secondary) hover:bg-(--bg-tertiary-hover)'
                   }
                 `}
                 title={mode.value === 'black' || mode.value === 'white' ? 'Monochrome mode - disables accent color selection' : ''}
@@ -111,7 +111,7 @@ export const ThemeTab: React.FC<ThemeTabProps> = ({
               </button>
             ))}
           </div>
-          <p className="text-xs text-[var(--text-muted)] mt-2">
+          <p className="text-xs text-(--text-muted) mt-2">
             {isMonochromeMode
               ? 'Monochrome modes use pure black or white themes with fixed accents'
               : 'System mode automatically switches between light and dark based on your device settings'
@@ -120,10 +120,10 @@ export const ThemeTab: React.FC<ThemeTabProps> = ({
         </div>
 
         <div>
-          <h4 className="text-sm font-semibold text-[var(--text-primary)] mb-3">
+          <h4 className="text-sm font-semibold text-(--text-primary) mb-3">
             Accent Color
             {isMonochromeMode && (
-              <span className="ml-2 text-xs font-normal text-[var(--text-muted)]">(disabled in monochrome mode)</span>
+              <span className="ml-2 text-xs font-normal text-(--text-muted)">(disabled in monochrome mode)</span>
             )}
           </h4>
           <div className="flex items-center gap-4">
@@ -136,7 +136,7 @@ export const ThemeTab: React.FC<ThemeTabProps> = ({
                   w-10 h-10 rounded-full ${color.className} transition-transform hover:scale-110
                   ${
                     settings.theme.accent === color.name && !isMonochromeMode
-                      ? 'ring-2 ring-offset-2 ring-offset-[var(--bg-secondary)] ring-[var(--accent-color)]'
+                      ? 'ring-2 ring-offset-2 ring-offset-(--bg-secondary) ring-(--accent-color)'
                       : ''
                   }
                   ${isMonochromeMode ? 'opacity-50 cursor-not-allowed' : ''}
@@ -154,7 +154,7 @@ export const ThemeTab: React.FC<ThemeTabProps> = ({
                 w-10 h-10 rounded-full transition-transform hover:scale-110 flex items-center justify-center
                 ${
                   settings.theme.accent === 'custom' && !isMonochromeMode
-                    ? 'ring-2 ring-offset-2 ring-offset-[var(--bg-secondary)]'
+                    ? 'ring-2 ring-offset-2 ring-offset-(--bg-secondary)'
                     : ''
                 }
                 ${isMonochromeMode ? 'opacity-50 cursor-not-allowed' : ''}
@@ -179,7 +179,7 @@ export const ThemeTab: React.FC<ThemeTabProps> = ({
               )}
             </button>
           </div>
-          <p className="text-xs text-[var(--text-muted)] mt-2">
+          <p className="text-xs text-(--text-muted) mt-2">
             Choose a color that highlights active elements and buttons
           </p>
         </div>
@@ -188,10 +188,10 @@ export const ThemeTab: React.FC<ThemeTabProps> = ({
         <div>
           <div className="flex items-center justify-between gap-4">
             <div className="min-w-0">
-              <h4 className="text-sm font-semibold text-[var(--text-primary)]">
+              <h4 className="text-sm font-semibold text-(--text-primary)">
                 Album Art Colors
               </h4>
-              <p className="text-xs text-[var(--text-muted)] mt-1">
+              <p className="text-xs text-(--text-muted) mt-1">
                 Extract background and accent colors from album artwork with guaranteed contrast
               </p>
             </div>
@@ -212,14 +212,14 @@ export const ThemeTab: React.FC<ThemeTabProps> = ({
             />
           </div>
           {settings.theme.useAlbumArtColors && !isMonochromeMode && (
-            <p className="text-xs text-[var(--text-muted)] mt-2 italic">
+            <p className="text-xs text-(--text-muted) mt-2 italic">
               When enabled, UI colors will dynamically match your currently playing artwork.
               Colors are automatically adjusted to meet WCAG accessibility standards.
               Falls back to selected theme when no artwork is available.
             </p>
           )}
           {isMonochromeMode && (
-            <p className="text-xs text-[var(--text-muted)] mt-2 italic opacity-70">
+            <p className="text-xs text-(--text-muted) mt-2 italic opacity-70">
               Not available in monochrome mode.
             </p>
           )}
@@ -227,8 +227,8 @@ export const ThemeTab: React.FC<ThemeTabProps> = ({
 
       </div>
 
-      <div className="pt-4 mt-6 border-t border-[var(--border-color)]">
-        <p className="text-xs text-[var(--text-muted)] italic">
+      <div className="pt-4 mt-6 border-t border-(--border-color)">
+        <p className="text-xs text-(--text-muted) italic">
           Note: Theme and display preferences are saved per-browser. Different devices can have
           different theme settings while sharing the same server configuration.
         </p>

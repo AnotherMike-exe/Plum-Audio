@@ -522,7 +522,7 @@ export default function MeshApp(): React.ReactElement {
   const canRepeat = featCmds.some((c) => c.startsWith('repeat'));
 
   return (
-    <div className="min-h-screen bg-[var(--bg-primary)] text-[var(--text-primary)] font-sans p-4 md:p-8 flex flex-col">
+    <div className="min-h-screen bg-(--bg-primary) text-(--text-primary) font-sans p-4 md:p-8 flex flex-col">
       {!connected && (
         <div className="w-full max-w-7xl mx-auto mb-4 p-4 bg-red-600/20 border border-red-600/30 rounded-lg">
           <div className="flex items-center">
@@ -532,22 +532,22 @@ export default function MeshApp(): React.ReactElement {
         </div>
       )}
 
-      <div className="w-full max-w-7xl mx-auto flex-grow grid grid-cols-1 lg:grid-cols-3 gap-8">
+      <div className="w-full max-w-7xl mx-auto grow grid grid-cols-1 lg:grid-cols-3 gap-8">
         {/* Left: now-playing + controls + this source's devices */}
-        <div className="lg:col-span-2 bg-[var(--bg-secondary)] p-6 rounded-2xl shadow-2xl flex flex-col">
-          <div className="border-b border-[var(--border-color)] pb-4">
+        <div className="lg:col-span-2 bg-(--bg-secondary) p-6 rounded-2xl shadow-2xl flex flex-col">
+          <div className="border-b border-(--border-color) pb-4">
             <div className="flex items-center justify-between mb-4">
               <div className="flex items-center gap-2 min-w-0">
-                <h1 className="text-xl font-semibold text-[var(--accent-color)] truncate">{serverName}</h1>
+                <h1 className="text-xl font-semibold text-(--accent-color) truncate">{serverName}</h1>
                 {/* Say what this page is. Without it a unit that renders nothing looks like one whose
                     speaker is broken — same layout, no explanation. */}
                 {playerless && (
-                  <span className="px-2 py-0.5 rounded text-xs font-medium bg-slate-500/20 text-slate-300 flex-shrink-0">
+                  <span className="px-2 py-0.5 rounded-sm text-xs font-medium bg-slate-500/20 text-slate-300 shrink-0">
                     No output
                   </span>
                 )}
               </div>
-              <div className="flex items-center text-sm text-[var(--text-muted)]">
+              <div className="flex items-center text-sm text-(--text-muted)">
                 <Icon name="tower-broadcast" className="mr-2" />
                 <span>{connected ? 'Connected' : 'Offline'}</span>
               </div>
@@ -561,7 +561,7 @@ export default function MeshApp(): React.ReactElement {
           </div>
 
           {shouldShowControls && featured ? (
-            <div className="flex-grow flex flex-col">
+            <div className="grow flex flex-col">
               <div className="space-y-6">
                 <NowPlaying stream={featured} canSeek={false} onAlbumArtClick={() => setVisualizerOpen(true)} />
                 {/* Source volume: the VALUE is passed whenever one is known, and
@@ -598,10 +598,10 @@ export default function MeshApp(): React.ReactElement {
               />
             </div>
           ) : (
-            <div className="flex-grow flex flex-col items-center justify-center rounded-lg p-8 h-full min-h-[300px]">
-              <Icon name="music" className="text-6xl text-[var(--text-muted)] mb-4" />
-              <h2 className="text-2xl font-semibold text-[var(--text-primary)]">Nothing Playing</h2>
-              <p className="text-[var(--text-secondary)] mt-2">
+            <div className="grow flex flex-col items-center justify-center rounded-lg p-8 h-full min-h-[300px]">
+              <Icon name="music" className="text-6xl text-(--text-muted) mb-4" />
+              <h2 className="text-2xl font-semibold text-(--text-primary)">Nothing Playing</h2>
+              <p className="text-(--text-secondary) mt-2">
                 {playerless
                   ? 'This unit has no audio output. Send it AirPlay, Spotify or Bluetooth and it will play in the rooms you route it to.'
                   : 'Start playing to an endpoint, or choose an active source above.'}
@@ -615,10 +615,10 @@ export default function MeshApp(): React.ReactElement {
               {myPlayers.some((p) => p.foreignServer) && (
                 <div className="mt-8 w-full max-w-md space-y-2">
                   {myPlayers.filter((p) => p.foreignServer).map((p) => (
-                    <div key={p.id} className="flex items-center justify-between gap-3 p-3 rounded-lg bg-[var(--bg-tertiary)]">
+                    <div key={p.id} className="flex items-center justify-between gap-3 p-3 rounded-lg bg-(--bg-tertiary)">
                       <span className="font-semibold truncate">{p.name}</span>
-                      <span className="text-sm text-[var(--text-secondary)] truncate text-right">
-                        <Icon name="tower-broadcast" className="mr-2 text-[var(--text-muted)]" />
+                      <span className="text-sm text-(--text-secondary) truncate text-right">
+                        <Icon name="tower-broadcast" className="mr-2 text-(--text-muted)" />
                         {p.foreignServer!.name}
                         {p.foreignServer!.title ? ` · ${p.foreignServer!.title}` : ''}
                       </span>
@@ -632,8 +632,8 @@ export default function MeshApp(): React.ReactElement {
 
         {/* Right: other sources & devices */}
         <div className="space-y-8">
-          <div className="bg-[var(--bg-secondary)] p-6 rounded-2xl shadow-2xl">
-            <h2 className="text-2xl font-bold text-[var(--accent-color)] border-b border-[var(--border-color)] pb-4 mb-4">
+          <div className="bg-(--bg-secondary) p-6 rounded-2xl shadow-2xl">
+            <h2 className="text-2xl font-bold text-(--accent-color) border-b border-(--border-color) pb-4 mb-4">
               Other Streams &amp; Devices
             </h2>
             <MemoClientManager
@@ -654,7 +654,7 @@ export default function MeshApp(): React.ReactElement {
         </div>
       </div>
 
-      <footer className="w-full max-w-7xl mx-auto grid grid-cols-3 items-center text-[var(--text-muted)] mt-12 text-sm">
+      <footer className="w-full max-w-7xl mx-auto grid grid-cols-3 items-center text-(--text-muted) mt-12 text-sm">
         <div />
         <p className="text-center">
           Plum Audio{appVersion && <span className="opacity-60"> — v{appVersion}</span>}
@@ -662,7 +662,7 @@ export default function MeshApp(): React.ReactElement {
         <div className="flex justify-end gap-2">
           <button
             onClick={() => setVisualizerOpen(true)}
-            className="p-2 rounded-full hover:bg-[var(--bg-secondary)] transition-colors"
+            className="p-2 rounded-full hover:bg-(--bg-secondary) transition-colors"
             aria-label="Open Visualizer"
             disabled={!featured}
           >
@@ -670,7 +670,7 @@ export default function MeshApp(): React.ReactElement {
           </button>
           <button
             onClick={() => setSettingsOpen(true)}
-            className="p-2 rounded-full hover:bg-[var(--bg-secondary)] transition-colors"
+            className="p-2 rounded-full hover:bg-(--bg-secondary) transition-colors"
             aria-label="Open Settings"
           >
             <Icon name="gear" className="text-lg" />

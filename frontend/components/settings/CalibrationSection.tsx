@@ -94,12 +94,12 @@ const MatchSetEditor: React.FC<{
               value={set.name}
               onChange={(e) => patch(set.id, {name: e.target.value})}
               placeholder="Group name"
-              className="flex-1 rounded-md bg-[var(--bg-secondary)] px-2 py-1 text-sm text-[var(--text-primary)]"
+              className="flex-1 rounded-md bg-(--bg-secondary) px-2 py-1 text-sm text-(--text-primary)"
             />
             <button
               onClick={() => onChange(sets.filter((s) => s.id !== set.id))}
               disabled={busy}
-              className="text-[var(--text-secondary)] hover:text-red-400 disabled:opacity-40"
+              className="text-(--text-secondary) hover:text-red-400 disabled:opacity-40"
               aria-label={`Remove ${set.name}`}
             >
               <Icon name="trash" className="h-4 w-4" />
@@ -109,7 +109,7 @@ const MatchSetEditor: React.FC<{
           <div className="mt-2 space-y-1">
             {endpoints.map((endpoint) => (
               <label key={endpoint.playerId}
-                     className="flex items-center gap-2 text-xs text-[var(--text-secondary)]">
+                     className="flex items-center gap-2 text-xs text-(--text-secondary)">
                 <input
                   type="checkbox"
                   checked={set.members.includes(endpoint.playerId)}
@@ -117,7 +117,7 @@ const MatchSetEditor: React.FC<{
                   disabled={busy}
                 />
                 {endpoint.name}
-                <span className="text-[var(--text-secondary)]/60">({endpoint.unitName})</span>
+                <span className="text-(--text-secondary)/60">({endpoint.unitName})</span>
               </label>
             ))}
           </div>
@@ -130,7 +130,7 @@ const MatchSetEditor: React.FC<{
         </div>
       ))}
 
-      <button onClick={addSet} disabled={busy} className="text-sm text-[var(--accent-color)] disabled:opacity-40">
+      <button onClick={addSet} disabled={busy} className="text-sm text-(--accent-color) disabled:opacity-40">
         + Add a group
       </button>
     </div>
@@ -222,14 +222,14 @@ export const CalibrationSection: React.FC = () => {
   );
 
   if (loading) {
-    return <p className="text-sm text-[var(--text-secondary)]">Loading calibration…</p>;
+    return <p className="text-sm text-(--text-secondary)">Loading calibration…</p>;
   }
 
   return (
     <div className="space-y-5">
       <div>
-        <h3 className="text-base font-semibold text-[var(--text-primary)]">Volume Calibration</h3>
-        <p className="text-sm text-[var(--text-secondary)]">
+        <h3 className="text-base font-semibold text-(--text-primary)">Volume Calibration</h3>
+        <p className="text-sm text-(--text-secondary)">
           Measure how loud each endpoint actually is in its room, then hold grouped rooms at the same
           loudness. Two endpoints at the same percentage are rarely the same volume in the air.
         </p>
@@ -238,8 +238,8 @@ export const CalibrationSection: React.FC = () => {
       {error && <div className="rounded-lg bg-red-500/10 p-3 text-sm text-red-300">{error}</div>}
 
       {/* Scope — a separate question from any individual curve. */}
-      <div className="rounded-lg bg-[var(--bg-primary)] p-4">
-        <p className="text-sm font-medium text-[var(--text-primary)]">Which endpoints track each other</p>
+      <div className="rounded-lg bg-(--bg-primary) p-4">
+        <p className="text-sm font-medium text-(--text-primary)">Which endpoints track each other</p>
         <div className="mt-3 space-y-2">
           {(snapshot?.modes ?? []).map((mode) => {
             const copy = SCOPE_LABELS[mode];
@@ -251,17 +251,17 @@ export const CalibrationSection: React.FC = () => {
                 disabled={busy === 'policy'}
                 className={`w-full rounded-lg border p-3 text-left transition ${
                   active
-                    ? 'border-[var(--accent-color)] bg-[var(--accent-color)]/10'
+                    ? 'border-(--accent-color) bg-(--accent-color)/10'
                     : 'border-white/10 hover:border-white/20'
                 }`}
               >
-                <span className="flex items-center gap-2 text-sm font-medium text-[var(--text-primary)]">
+                <span className="flex items-center gap-2 text-sm font-medium text-(--text-primary)">
                   <span className={`h-2 w-2 shrink-0 rounded-full ${
-                    active ? 'bg-[var(--accent-color)]' : 'bg-white/20'
+                    active ? 'bg-(--accent-color)' : 'bg-white/20'
                   }`} />
                   {copy.title}
                 </span>
-                <span className="mt-0.5 block text-xs text-[var(--text-secondary)]">{copy.blurb}</span>
+                <span className="mt-0.5 block text-xs text-(--text-secondary)">{copy.blurb}</span>
               </button>
             );
           })}
@@ -277,7 +277,7 @@ export const CalibrationSection: React.FC = () => {
         )}
 
         {snapshot?.policy.mode !== 'off' && calibratedCount < 2 && (
-          <p className="mt-3 text-xs text-[var(--text-secondary)]">
+          <p className="mt-3 text-xs text-(--text-secondary)">
             Matching needs at least two calibrated endpoints in the same group. {calibratedCount} so far.
           </p>
         )}
@@ -296,16 +296,16 @@ export const CalibrationSection: React.FC = () => {
           const atLimit = calibrationService.isAtLimit(cal, endpoint.volume);
           return (
             <div key={endpoint.playerId}
-                 className="flex items-center gap-3 rounded-lg bg-[var(--bg-primary)] p-3">
+                 className="flex items-center gap-3 rounded-lg bg-(--bg-primary) p-3">
               <Icon
                 name="volume-high"
                 className={`h-5 w-5 shrink-0 ${
-                  endpoint.connected ? 'text-[var(--accent-color)]' : 'text-[var(--text-secondary)]'
+                  endpoint.connected ? 'text-(--accent-color)' : 'text-(--text-secondary)'
                 }`}
               />
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="truncate text-sm font-medium text-[var(--text-primary)]">
+                  <span className="truncate text-sm font-medium text-(--text-primary)">
                     {endpoint.name}
                   </span>
                   {cal?.calibrated ? (
@@ -313,7 +313,7 @@ export const CalibrationSection: React.FC = () => {
                       Calibrated
                     </span>
                   ) : (
-                    <span className="rounded-full bg-white/10 px-2 py-0.5 text-xs text-[var(--text-secondary)]">
+                    <span className="rounded-full bg-white/10 px-2 py-0.5 text-xs text-(--text-secondary)">
                       Not calibrated
                     </span>
                   )}
@@ -342,14 +342,14 @@ export const CalibrationSection: React.FC = () => {
                     </span>
                   )}
                 </div>
-                <p className="truncate text-xs text-[var(--text-secondary)]">
+                <p className="truncate text-xs text-(--text-secondary)">
                   {endpoint.unitName} · {calibrationService.summarize(cal)}
                 </p>
               </div>
 
               <button
                 onClick={() => setEditing(endpoint)}
-                className="rounded-md bg-[var(--accent-color)] px-3 py-1.5 text-sm font-medium text-white"
+                className="rounded-md bg-(--accent-color) px-3 py-1.5 text-sm font-medium text-white"
               >
                 {cal?.calibrated ? 'Edit' : 'Calibrate'}
               </button>
@@ -357,7 +357,7 @@ export const CalibrationSection: React.FC = () => {
                 <button
                   onClick={() => void handleDelete(endpoint)}
                   disabled={busy === endpoint.playerId}
-                  className="text-[var(--text-secondary)] hover:text-red-400 disabled:opacity-40"
+                  className="text-(--text-secondary) hover:text-red-400 disabled:opacity-40"
                   aria-label={`Clear calibration for ${endpoint.name}`}
                 >
                   <Icon name="trash" className="h-4 w-4" />
