@@ -1,11 +1,27 @@
-# Dependabot version updates. Grouped, so one ecosystem opens one pull request a week.
+# Dependabot version updates. Grouped, so one ecosystem opens one pull request a month.
+#
+# Pull requests target `dev`, not `main`. dev is the integration branch and is never behind main,
+# so an update lands where the work happens and reaches main through the normal dev -> main merge
+# rather than needing its own trip through a protected branch.
+#
+# This FILE still has to live on the default branch (main) — that is the only place Dependabot
+# reads it from — even though every pull request it opens goes to dev. Keep the two in sync.
+#
+# Two consequences of `target-branch` worth knowing before anyone "simplifies" it away:
+#
+#   1. It scopes VERSION updates only. Dependabot SECURITY updates always target the default
+#      branch and ignore the options here, so a security pull request arrives against main,
+#      ungrouped and unlabelled. The grouping below will not tidy it.
+#   2. Nothing else reads this. Alerts are raised from the dependency graph, not from this file,
+#      so pointing version updates at dev does not make the repository less watched.
 version: 2
 updates:
   # A pinned action rots, and an unmaintained action is a supply chain problem.
   - package-ecosystem: github-actions
     directory: /
+    target-branch: dev
     schedule:
-      interval: weekly
+      interval: monthly
     labels: [dependencies]
     groups:
       actions:
@@ -13,26 +29,52 @@ updates:
 
   - package-ecosystem: pip
     directory: /backend
+    target-branch: dev
     schedule:
-      interval: weekly
+      interval: monthly
     labels: [dependencies]
     groups:
+      # NO update-types filter, deliberately. requirements.txt declares ranges, so Dependabot
+      # issues requirement updates that carry no semver type for a filter to match — in September
+      # a [minor, patch] filter rejected all five candidates, numpy >=2 -> >=2.5.3 and
+      # ruff 0.16 -> 0.16.8 included, and the group caught nothing at all. Unfiltered catches
+      # everything regardless of how the update is classified.
       python:
         patterns: ["*"]
-        update-types: [minor, patch]
 
   - package-ecosystem: npm
     directory: /frontend
+    target-branch: dev
     schedule:
-      interval: weekly
+      interval: monthly
     labels: [dependencies]
     groups:
+      # Two groups, not one. The filter demonstrably works for npm — in September it grouped
+      # react-router-dom and autoprefixer correctly and ejected four majors into their own pull
+      # requests. Splitting keeps that signal while capping the ecosystem at two pull requests:
+      # one that is usually safe to take, one that needs a look. vite 6 -> 8, typescript 5 -> 7
+      # and tailwind 3 -> 4 all needed real work, and one of them surfaced a live defect.
       javascript:
         patterns: ["*"]
         update-types: [minor, patch]
+      javascript-major:
+        patterns: ["*"]
+        update-types: [major]
 
   - package-ecosystem: docker
     directory: /backend
+    target-branch: dev
     schedule:
-      interval: weekly
+      interval: monthly
     labels: [dependencies]
+    groups:
+      # This entry had no groups at all until now, which is why the node bump arrived alone.
+      # Split rather than merged: a python:3.14 offer must never ride along with a node patch.
+      # The 3.13-slim-trixie base is deliberate — bluez-alsa still names its daemon bluealsa
+      # there and shairport-sync is the MPRIS build — so a base-image major is always a decision.
+      images:
+        patterns: ["*"]
+        update-types: [minor, patch]
+      images-major:
+        patterns: ["*"]
+        update-types: [major]
