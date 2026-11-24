@@ -1907,7 +1907,10 @@ class SendspinPlayer:
         server_id = getattr(info, "server_id", None)
         if server_id and server_id != self._last_playing_server:
             self._last_playing_server = server_id
-            save_last_playing_server(self._state_file, server_id)
+            _spawn(
+                asyncio.get_running_loop().run_in_executor(None, save_last_playing_server, self._state_file, server_id),
+                name="last playing server save",
+            )
             logger.info("now playing for server %s (persisted)", server_id)
 
     async def _report_loop(self) -> None:
@@ -2210,11 +2213,17 @@ class SendspinPlayer:
             # "this speaker is dropping out", now that the wire cannot carry it.
             logger.warning("player health=%s %s", state.value, self.renderer.stats())
             self._last_reported_state = state
-            save_player_health(self._state_file, state.value)
+            # In a worker thread: the write is an fsync, and this path runs exactly when the
+            # renderer is already short of audio — the loop that feeds it must not wait on a disk.
+            await asyncio.get_running_loop().run_in_executor(None, save_player_health, self._state_file, state.value)
 
     async def _save_render_state(self) -> None:
         await asyncio.sleep(STATE_SAVE_DEBOUNCE_S)
-        save_render_state(self._state_file, self._volume, self._muted)
+        # In a worker thread, for the fsync. A stop() during it is covered: _flush_render_state sees
+        # the task as not done and writes the level itself.
+        await asyncio.get_running_loop().run_in_executor(
+            None, save_render_state, self._state_file, self._volume, self._muted
+        )
 
 
 async def main() -> int | None:
