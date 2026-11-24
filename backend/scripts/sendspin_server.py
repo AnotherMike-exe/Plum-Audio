@@ -2071,12 +2071,11 @@ class PlumSendspinServer:
                 controller = _group.group_role("controller")
                 if controller is not None:
                     controller.set_repeat(event.mode)
-        elif isinstance(event, ControllerShuffleEvent):
-            if hasattr(remote, "set_shuffle"):
-                asyncio.ensure_future(remote.set_shuffle(event.shuffle))
-                controller = _group.group_role("controller")
-                if controller is not None:
-                    controller.set_shuffle(event.shuffle)
+        elif isinstance(event, ControllerShuffleEvent) and hasattr(remote, "set_shuffle"):
+            asyncio.ensure_future(remote.set_shuffle(event.shuffle))
+            controller = _group.group_role("controller")
+            if controller is not None:
+                controller.set_shuffle(event.shuffle)
 
     def register_player(self, player_id: str, player_url: str) -> None:
         """Register this unit's player as routable, WITHOUT holding a connection to it.
