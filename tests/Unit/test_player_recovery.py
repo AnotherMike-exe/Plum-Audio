@@ -513,3 +513,326 @@ def test_an_output_switch_in_flight_is_not_a_stall(tmp_path):
     p.renderer.reopening = False
     _ticks(p, 1, advance=False)
     assert p.renderer.recover_calls == 0, "the count starts again after the switch"
+
+
+# -- dead-peer watchdog ----------------------------------------------------------------------------
+
+
+class _Msg:
+    def __init__(self, kind: str):
+        self.type = type("T", (), {"name": kind})()
+
+
+class _FakeWs:
+    """An inbound websocket whose peer answers only when the test says so."""
+
+    def __init__(self, *, close_ends_session: bool = True):
+        self.inbox: asyncio.Queue = asyncio.Queue()
+        self.sent: list = []
+        self.closed = False
+        self.close_args: dict | None = None
+        self.aborted = False
+        self._close_ends_session = close_ends_session
+        self._req = type("Req", (), {"remote": "10.0.0.9", "transport": self})()
+
+    async def receive(self):
+        return await self.inbox.get()
+
+    async def send_bytes(self, data):
+        self.sent.append(data)
+
+    async def send_str(self, data):
+        self.sent.append(data)
+
+    async def close(self, **kwargs):
+        self.close_args = kwargs
+        self.closed = True
+        if self._close_ends_session:
+            self.inbox.put_nowait(_Msg("CLOSING"))
+        return True
+
+    def abort(self):  # the transport
+        self.aborted = True
+        self.inbox.put_nowait(_Msg("CLOSED"))
+
+
+def test_the_watched_websocket_forwards_everything_the_library_uses():
+    async def scenario():
+        ws = _FakeWs()
+        watched = sendspin_player._WatchedWebSocket(ws)
+        await watched.send_str("hello")
+        await watched.send_bytes(b"\x01")
+        ws.inbox.put_nowait(_Msg("BINARY"))
+        assert (await watched.receive()).type.name == "BINARY"
+        assert watched.closed is False
+        await watched.close()
+        return ws, watched
+
+    ws, watched = asyncio.run(scenario())
+    assert ws.sent == ["hello", b"\x01"] and ws.closed and watched.closed is True
+    assert watched.rx_frames == 1 and watched.tx_frames == 2
+
+
+def _watched(*, unanswered: int, first_tx_ago: float, last_rx_ago: float):
+    watched = sendspin_player._WatchedWebSocket(_FakeWs())
+    now = 1000.0
+    watched.opened = now - 600
+    watched.last_rx = now - last_rx_ago
+    watched.unanswered_tx = unanswered
+    watched.first_unanswered_tx = (now - first_tx_ago) if unanswered else None
+    return watched, now
+
+
+def test_a_parked_mute_session_is_not_silent():
+    """THE false positive to avoid. A parked server sends no audio — and still answers time sync."""
+
+    async def scenario():
+        ws = _FakeWs()
+        watched = sendspin_player._WatchedWebSocket(ws)
+        for _ in range(40):  # two minutes of idle time sync at the 3 s cadence
+            await watched.send_bytes(b"client/time")
+            ws.inbox.put_nowait(_Msg("BINARY"))
+            await watched.receive()
+        return watched
+
+    watched = asyncio.run(scenario())
+    assert watched.unanswered_tx == 0 and watched.first_unanswered_tx is None
+    assert watched.silence(watched.last_rx + 3600, 30.0) is None, "nothing unanswered, however long ago"
+
+
+def test_unanswered_frames_past_the_threshold_are_silence():
+    watched, now = _watched(unanswered=12, first_tx_ago=36.0, last_rx_ago=36.2)
+    evidence = watched.silence(now, 30.0)
+    assert evidence is not None
+    assert evidence["unanswered_tx"] == 12 and round(evidence["silent_for"]) == 36
+    assert evidence["remote"] == "10.0.0.9"
+
+
+def test_silence_below_the_threshold_is_not_reported():
+    watched, now = _watched(unanswered=9, first_tx_ago=27.0, last_rx_ago=27.2)
+    assert watched.silence(now, 30.0) is None
+
+
+def test_a_pairing_wait_is_not_silence():
+    """A pairing window waits up to 300 s for an operator with ONE frame outstanding."""
+    watched, now = _watched(unanswered=1, first_tx_ago=280.0, last_rx_ago=281.0)
+    assert watched.silence(now, 30.0) is None
+
+
+def test_a_reply_ends_the_silence():
+    async def scenario():
+        ws = _FakeWs()
+        watched = sendspin_player._WatchedWebSocket(ws)
+        for _ in range(20):
+            await watched.send_bytes(b"client/time")
+        watched.first_unanswered_tx -= 60
+        watched.last_rx -= 60
+        assert watched.silence(watched.last_rx + 60, 30.0) is not None
+        ws.inbox.put_nowait(_Msg("BINARY"))
+        await watched.receive()
+        return watched
+
+    watched = asyncio.run(scenario())
+    assert watched.silence(watched.last_rx + 1, 30.0) is None
+
+
+def test_a_close_frame_is_not_inbound_traffic():
+    async def scenario():
+        ws = _FakeWs()
+        watched = sendspin_player._WatchedWebSocket(ws)
+        before = watched.last_rx
+        await watched.send_bytes(b"x")
+        ws.inbox.put_nowait(_Msg("CLOSING"))
+        await watched.receive()
+        return watched, before
+
+    watched, before = asyncio.run(scenario())
+    assert watched.rx_frames == 0 and watched.last_rx == before and watched.unanswered_tx == 1
+
+
+def test_the_watchdog_can_be_disabled():
+    watched, now = _watched(unanswered=50, first_tx_ago=900.0, last_rx_ago=900.0)
+    assert watched.silence(now, 0.0) is None
+
+
+class _PeerClient:
+    connected = True
+
+
+class _PeerPlayer:
+    def __init__(self):
+        self.client = _PeerClient()
+        self._audio_flowing = False
+        self._last_audio_mono = 0.0
+        self._init_recovery_state()
+
+    for _name in (
+        "_init_recovery_state",
+        "request_exit",
+        "_check_peer_silence",
+        "_close_silent_session",
+        "_peer_close_overdue",
+    ):
+        locals()[_name] = getattr(sendspin_player.SendspinPlayer, _name)
+    del _name
+
+    def hold(self, session: int, ws: _FakeWs, *, silent: bool):
+        watched = sendspin_player._WatchedWebSocket(ws)
+        if silent:
+            watched.unanswered_tx = 15
+            watched.first_unanswered_tx = watched.opened - 45
+            watched.last_rx = watched.opened - 45
+        self._session_ws[session] = watched
+        # on_connection in miniature: the session ends when the reader sees the websocket close.
+        self._attached = getattr(self, "_attached", [])
+        self._attached.append(asyncio.ensure_future(self._serve(session, watched)))
+        return watched
+
+    async def _serve(self, session: int, watched) -> None:
+        while (await watched.receive()).type.name not in ("CLOSING", "CLOSED", "CLOSE"):
+            pass
+        self._session_ws.pop(session, None)
+        self._silence_closing.pop(session, None)
+
+
+def test_a_silent_session_is_closed_and_logged_once(caplog):
+    async def scenario():
+        p = _PeerPlayer()
+        dead, live = _FakeWs(), _FakeWs()
+        p.hold(306, dead, silent=True)
+        p.hold(307, live, silent=False)
+        p._check_peer_silence()
+        await asyncio.sleep(0.01)
+        p._check_peer_silence()  # the next poll must not close or log it again
+        await asyncio.sleep(0.1)
+        assert 306 not in p._session_ws and 307 in p._session_ws
+        return p, dead, live
+
+    with caplog.at_level(logging.WARNING, logger=LOG):
+        p, dead, live = asyncio.run(scenario())
+    assert dead.closed and dead.close_args["code"] == 1001
+    assert not live.closed, "an overlapping live session is left alone"
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "session 306" in warnings[0] and "15 frames we sent went unanswered" in warnings[0]
+    assert "10.0.0.9" in warnings[0]
+    assert p.exit_code is None and p._peer_silence_closes == 1
+
+
+def test_no_session_is_closed_when_the_timeout_is_zero(monkeypatch):
+    monkeypatch.setattr(sendspin_player, "PEER_SILENCE_TIMEOUT_S", 0.0)
+
+    async def scenario():
+        p = _PeerPlayer()
+        dead = _FakeWs()
+        p.hold(1, dead, silent=True)
+        p._check_peer_silence()
+        await asyncio.sleep(0.01)
+        return dead
+
+    assert not asyncio.run(scenario()).closed
+
+
+def test_a_session_that_survives_the_close_gets_its_transport_aborted(monkeypatch):
+    async def scenario():
+        p = _PeerPlayer()
+        stuck = _FakeWs(close_ends_session=False)
+        watched = p.hold(5, stuck, silent=True)
+        await p._close_silent_session(5, watched)
+        await asyncio.sleep(0.01)
+        return p, stuck
+
+    monkeypatch.setattr(sendspin_player, "PEER_DETACH_WAIT_S", 0.1)
+    p, stuck = asyncio.run(scenario())
+    assert stuck.aborted
+    assert 5 not in p._session_ws, "the abort is what ends the session"
+
+
+def test_the_process_exits_when_a_closed_session_stays_attached(monkeypatch):
+    async def scenario():
+        p = _PeerPlayer()
+        p.hold(5, _FakeWs(close_ends_session=False), silent=True)
+        p._check_peer_silence()
+        await asyncio.sleep(0.01)
+        assert p.exit_code is None, "the close gets its grace period first"
+        p._silence_closing[5] -= sendspin_player.PEER_CLOSE_GRACE_S + 1
+        p._check_peer_silence()
+        return p
+
+    p = asyncio.run(scenario())
+    assert p.exit_code == sendspin_player.EXIT_PEER_WEDGED and p.exit_requested.is_set()
+
+
+def test_the_process_does_not_exit_while_audio_is_flowing(caplog):
+    """Another session may be playing. A restart there turns a hidden fault into a dropout."""
+    import time as real_time
+
+    async def scenario():
+        p = _PeerPlayer()
+        p.hold(5, _FakeWs(close_ends_session=False), silent=True)
+        p._check_peer_silence()
+        await asyncio.sleep(0.01)
+        p._silence_closing[5] -= sendspin_player.PEER_CLOSE_GRACE_S + 1
+        p._last_audio_mono = real_time.monotonic()  # a chunk just arrived
+        p._check_peer_silence()
+        p._check_peer_silence()
+        assert p.exit_code is None
+        p._last_audio_mono = 0.0  # the audio stopped
+        p._check_peer_silence()
+        return p
+
+    with caplog.at_level(logging.WARNING, logger=LOG):
+        p = asyncio.run(scenario())
+    assert len([r for r in caplog.records if "audio is flowing" in r.getMessage()]) == 1
+    assert p.exit_code == sendspin_player.EXIT_PEER_WEDGED
+
+
+def test_closing_a_real_aiohttp_websocket_wakes_a_blocked_reader():
+    """The claim the whole watchdog rests on, against the real transport rather than a fake.
+
+    aiosendspin's reader sits in `receive()` on the inbound WebSocketResponse for the life of the
+    session. Closing that websocket from ANOTHER task must wake the reader, or the session cannot
+    be ended from our side at all. The peer here connects and then never reads, sends or closes.
+    """
+    aiohttp = pytest.importorskip("aiohttp")
+    from aiohttp import web
+
+    async def scenario():
+        result: dict = {}
+        blocked = asyncio.Event()
+
+        async def handler(request):
+            ws = web.WebSocketResponse()  # no heartbeat — exactly as aiosendspin's listener builds it
+            await ws.prepare(request)
+            watched = sendspin_player._WatchedWebSocket(ws)
+            result["watched"] = watched
+            blocked.set()
+            result["msg"] = await watched.receive()  # the library's reader loop, in miniature
+            return ws
+
+        app = web.Application()
+        app.router.add_get("/sendspin", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        async with aiohttp.ClientSession() as session:
+            peer = await session.ws_connect(f"http://127.0.0.1:{port}/sendspin", autoclose=False, autoping=False)
+            await asyncio.wait_for(blocked.wait(), 2)
+            await asyncio.sleep(0.05)
+            closer = asyncio.ensure_future(result["watched"].close(code=1001, message=b"peer silent"))
+            for _ in range(100):
+                if "msg" in result:
+                    break
+                await asyncio.sleep(0.01)
+            woke = result.get("msg")
+            result["watched"].abort()
+            closer.cancel()
+            await peer.close()
+        await runner.cleanup()
+        return woke
+
+    woke = asyncio.run(scenario())
+    assert woke is not None, "the reader stayed blocked: the session cannot be closed from our side"
+    assert woke.type.name in ("CLOSING", "CLOSED", "CLOSE")

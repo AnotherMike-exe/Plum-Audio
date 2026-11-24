@@ -45,6 +45,7 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any
 
 import numpy as np
 from aiosendspin.client.client import SendspinClient
@@ -117,6 +118,136 @@ HEALTH_POLL_S = 3.0  # how often we re-evaluate whether to report client/state e
 # than any normal roam or listening session boundary, so a healthy player never trips it — this is
 # only meant to make a connection nobody is on the other end of visible after the fact.
 STUCK_SESSION_WARN_S = 900.0
+
+
+# -- dead-peer watchdog ----------------------------------------------------------------------------
+# A server that vanishes without closing (power cut, cable pulled, `docker pause`) leaves a half-open
+# TCP session. aiosendspin's listener builds the inbound WebSocketResponse with NO heartbeat
+# (client/listener.py:139; the server side has heartbeat=30 — server/connection.py:270,
+# server/server.py:826), so nothing on our side ever notices, and the player sits inside
+# attach_websocket on a peer that is not there: RUNNING, port open, undialable.
+#
+# What "silent" means is taken from what the protocol sends while a session is IDLE, because a
+# parked, mute session is a normal steady state (CLAUDE.md: Music Assistant holds a released
+# speaker for as long as it likes). An admitted connection runs a time-sync loop for its whole life:
+# it sends client/time every 0.2 s until the filter converges and then every 0.5 to 3.0 s
+# (client/connection.py:1506-1527), and a server answers each one with server/time, unconditionally
+# (server/connection.py:1781-1791). So a live session delivers an inbound frame at least every 3 s,
+# audio or no audio, and "no audio" is never the signal.
+#
+# The signal is therefore: we kept SENDING and nothing came back. Both halves are needed. The loop
+# is paused during pairing (client/connection.py:521) and a pairing window legitimately waits up to
+# 300 s for an operator — but then we send nothing either, so the count of unanswered frames stays
+# near zero and the watchdog stays quiet.
+#
+# 30 s is ten consecutive unanswered time requests at the slowest cadence, and one full period of
+# the heartbeat the server runs against us. 0 disables the watchdog.
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+PEER_SILENCE_TIMEOUT_S = _env_seconds("PLUM_PEER_SILENCE_TIMEOUT_S", 30.0)
+# Frames we must have sent, unanswered, before silence counts. Five is 15 s of time requests at the
+# slowest cadence and well above the single frame a pairing step leaves waiting for an operator.
+PEER_SILENCE_MIN_UNANSWERED = 5
+# aiohttp's close() waits up to 10 s for the peer's close frame; give it that, then abort the socket.
+PEER_CLOSE_TIMEOUT_S = 12.0
+# After close() returns, how long the library gets to unwind attach_websocket before we abort the
+# TCP connection as well. The unwind is a few event-loop turns; this is generous.
+PEER_DETACH_WAIT_S = 2.0
+# How long after the close a session may still be attached before we stop trusting the close.
+PEER_CLOSE_GRACE_S = 20.0
+# "Audio is flowing" for the exit decision: a chunk arrived this recently, on any session.
+PEER_AUDIO_RECENT_S = 3.0
+EXIT_PEER_WEDGED = 4
+
+
+class _WatchedWebSocket:
+    """The inbound websocket, with the time of the last frame each way. Not a patch to the library.
+
+    aiosendspin takes the websocket as an argument and uses five things on it: `receive`,
+    `send_str` (the Noise handshake), `send_bytes` (everything after it — noise/wire.py:113),
+    `close` and `closed`. This forwards all of them and notes when a frame passed. It is the one
+    hook that sees EVERY inbound frame — time replies, chunks, metadata, handshake — where the
+    client's listeners see only the message types they were registered for and never server/time.
+
+    Only data frames count as inbound traffic. aiohttp answers a ping inside `receive()` without
+    returning it, and CLOSE/CLOSING/CLOSED/ERROR are the session ending, not the peer talking.
+    """
+
+    def __init__(self, ws) -> None:  # noqa: ANN001 - aiohttp.web.WebSocketResponse
+        self._ws = ws
+        now = time.monotonic()
+        self.opened = now
+        self.last_rx = now
+        self.rx_frames = 0
+        self.tx_frames = 0
+        self.unanswered_tx = 0  # frames sent since the last inbound frame
+        self.first_unanswered_tx: float | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._ws, name)  # closed, close_code, exception, close, ...
+
+    async def receive(self, *args, **kwargs):
+        msg = await self._ws.receive(*args, **kwargs)
+        if getattr(msg.type, "name", "") in ("TEXT", "BINARY"):
+            self.last_rx = time.monotonic()
+            self.rx_frames += 1
+            self.unanswered_tx = 0
+            self.first_unanswered_tx = None
+        return msg
+
+    def _note_tx(self) -> None:
+        # Counted BEFORE the send: a send that raises on a dying socket was still a frame the peer
+        # did not answer.
+        self.tx_frames += 1
+        self.unanswered_tx += 1
+        if self.first_unanswered_tx is None:
+            self.first_unanswered_tx = time.monotonic()
+
+    async def send_bytes(self, data, *args, **kwargs) -> None:
+        self._note_tx()
+        await self._ws.send_bytes(data, *args, **kwargs)
+
+    async def send_str(self, data, *args, **kwargs) -> None:
+        self._note_tx()
+        await self._ws.send_str(data, *args, **kwargs)
+
+    def silence(self, now: float, timeout: float) -> dict | None:
+        """The evidence that this peer is dead, or None while it is not (or cannot be judged)."""
+        if timeout <= 0 or self.first_unanswered_tx is None:
+            return None
+        if self.unanswered_tx < PEER_SILENCE_MIN_UNANSWERED:
+            return None
+        silent_for = now - self.last_rx
+        unanswered_for = now - self.first_unanswered_tx
+        if silent_for < timeout or unanswered_for < timeout:
+            return None
+        return {
+            "silent_for": silent_for,
+            "unanswered_tx": self.unanswered_tx,
+            "unanswered_for": unanswered_for,
+            "rx_frames": self.rx_frames,
+            "held": now - self.opened,
+            "remote": getattr(getattr(self._ws, "_req", None), "remote", None),
+        }
+
+    def abort(self) -> bool:
+        """Drop the TCP connection without waiting for anything. True if there was one to drop.
+
+        The last resort after close(): a transport with unsent bytes for a dead peer does not
+        finish a graceful close, and abort() does not need it to.
+        """
+        transport = getattr(getattr(self._ws, "_req", None), "transport", None)
+        if transport is None:
+            return False
+        transport.abort()
+        return True
+
+
 # Output-stream death. The PortAudio callback runs every ~10 ms for as long as the stream is open,
 # playing or not, so a counter that did not move across this many HEALTH_POLL_S polls means the
 # stream is dead even though PortAudio still calls it active. Two polls, so that at least one full
@@ -1087,6 +1218,12 @@ class SendspinPlayer:
         self._callbacks_seen = -1
         self._callback_stalls = 0
         self._health_report_at = 0.0  # monotonic time of the last periodic report write
+        # Dead-peer watchdog: the watched websocket of every open session, keyed like _sessions, and
+        # when we started closing the ones found silent.
+        self._session_ws: dict[int, _WatchedWebSocket] = {}
+        self._silence_closing: dict[int, float] = {}
+        self._silence_close_waiting: set[int] = set()  # close overdue but audio flowing — logged once
+        self._peer_silence_closes = 0
 
     def request_exit(self, code: int, reason: str) -> None:
         """Ask main() to shut down and exit non-zero, so supervisord replaces this process."""
@@ -1095,6 +1232,87 @@ class SendspinPlayer:
         self.exit_code = code
         logger.error("exiting with code %d so supervisord restarts the player: %s", code, reason)
         self.exit_requested.set()
+
+    def _check_peer_silence(self) -> None:
+        """Close any session whose peer stopped answering. Called on every health poll.
+
+        See the note on PEER_SILENCE_TIMEOUT_S for what is measured and why. Every open session is
+        checked, not the newest: connections overlap under 9.x, and the dead one is by definition
+        the old one that newer dials come and go beside.
+
+        Closing is enough to free the player: the library's reader is blocked in `receive()`, the
+        close wakes it, the connection tears itself down, `attach_websocket` returns and the listener
+        is ready for the next dial. If the session is STILL attached PEER_CLOSE_GRACE_S later, the
+        close did not work and the process exits for supervisord to replace — but only while no
+        audio is arriving, because another session may be playing and a restart would cut it.
+        """
+        if PEER_SILENCE_TIMEOUT_S <= 0:
+            return
+        now = time.monotonic()
+        for session, watched in list(self._session_ws.items()):
+            closing_since = self._silence_closing.get(session)
+            if closing_since is not None:
+                if now - closing_since >= PEER_CLOSE_GRACE_S:
+                    self._peer_close_overdue(session, now - closing_since)
+                continue
+            evidence = watched.silence(now, PEER_SILENCE_TIMEOUT_S)
+            if evidence is None:
+                continue
+            self._silence_closing[session] = now
+            self._peer_silence_closes += 1
+            logger.warning(
+                "session %d is held by a SILENT peer (%s): no inbound frame for %.0fs (threshold %.0fs) while "
+                "%d frames we sent went unanswered over %.0fs; held %.0fs, %d frames received in total, "
+                "%d sessions open, client.connected=%s, audio_flowing=%s — closing it so a new dial can attach",
+                session,
+                evidence["remote"] or "address unknown",
+                evidence["silent_for"],
+                PEER_SILENCE_TIMEOUT_S,
+                evidence["unanswered_tx"],
+                evidence["unanswered_for"],
+                evidence["held"],
+                evidence["rx_frames"],
+                len(self._session_ws),
+                self.client.connected,
+                self._audio_flowing,
+            )
+            _spawn(self._close_silent_session(session, watched), name=f"close silent session {session}")
+
+    async def _close_silent_session(self, session: int, watched: _WatchedWebSocket) -> None:
+        """Close one silent session: a websocket close first, then a TCP abort if it is still held."""
+        try:
+            # 1001 "going away". close() wakes the reader at once; what can take time is its wait
+            # for the dead peer's close frame, which is why this runs as its own task.
+            await asyncio.wait_for(watched.close(code=1001, message=b"peer silent"), PEER_CLOSE_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001 - a close that fails is handled by the abort below
+            logger.warning("session %d: the websocket close did not complete (%r)", session, exc)
+        # close() returning is not yet the session ending: the reader has to wake, the connection
+        # has to tear itself down and attach_websocket has to return. Let that happen before
+        # deciding the close was not enough.
+        deadline = time.monotonic() + PEER_DETACH_WAIT_S
+        while session in self._session_ws and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        if session not in self._session_ws:
+            logger.info("session %d detached after the close; the listener can take a new dial", session)
+        elif watched.abort():
+            logger.warning("session %d was still attached after the close — aborted its TCP connection", session)
+
+    def _peer_close_overdue(self, session: int, waited: float) -> None:
+        """A silent session survived the close. Exit, unless audio is arriving on another session."""
+        if time.monotonic() - self._last_audio_mono < PEER_AUDIO_RECENT_S:
+            if session not in self._silence_close_waiting:
+                self._silence_close_waiting.add(session)
+                logger.warning(
+                    "session %d is still attached %.0fs after the close, but audio is flowing — "
+                    "not restarting; the check repeats when the audio stops",
+                    session,
+                    waited,
+                )
+            return
+        self.request_exit(
+            EXIT_PEER_WEDGED,
+            f"session {session} is held by a silent peer and is still attached {waited:.0f}s after the close",
+        )
 
     async def _check_output(self) -> None:
         """Detect a dead output stream and re-open it. Called on every health poll.
@@ -1181,6 +1399,7 @@ class SendspinPlayer:
                 "failed_reopens": self._output_failed_reopens,
             },
             "sessions_open": len(self._sessions),
+            "peer_silence_closes": self._peer_silence_closes,
         }
 
     def _write_health_report(self) -> None:
@@ -1582,6 +1801,7 @@ class SendspinPlayer:
     async def _health_tick(self) -> None:
         """One pass of everything that watches this player. Order: local faults first."""
         await self._check_output()
+        self._check_peer_silence()
         await self._refresh_health_report()
         self._remember_playing_server()
         self._warn_if_session_is_stuck()
@@ -1703,11 +1923,18 @@ class SendspinPlayer:
             logger.info(
                 "server dialed us [session %d, %d open] %s", session, len(self._sessions), self.renderer.stats()
             )
+            # The library gets the websocket through a wrapper that notes when a frame passed in
+            # each direction — the dead-peer watchdog's only input. See _WatchedWebSocket.
+            watched = _WatchedWebSocket(ws)
+            self._session_ws[session] = watched
             try:
-                await self.client.attach_websocket(ws)
+                await self.client.attach_websocket(watched)
             finally:
                 started = self._sessions.pop(session, None)
                 self._sessions_warned.discard(session)
+                self._session_ws.pop(session, None)
+                self._silence_closing.pop(session, None)
+                self._silence_close_waiting.discard(session)
                 held = time.monotonic() - started if started is not None else float("nan")
                 logger.info(
                     "detached from server [session %d after %.1fs, %d still open] %s",
