@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import functools
 import logging
 import os
 import threading
@@ -145,6 +146,32 @@ SYNC_STEP_LOG_GAP_S = 2.0  # throttle on the step log line, NOT on the step itse
 # reports 0, and a bogus huge value would schedule audio minutes out; both fall back to the latency
 # the stream reported at open, and only if THAT is unusable do we free-run.
 MAX_DAC_LEAD_US = 1_000_000
+
+
+# Every background task this process starts. asyncio keeps only a WEAK reference to a task, so one
+# created with a bare ensure_future and never awaited can be collected mid-flight — and one that
+# raises keeps its exception until it is collected, which for a task held in a local is "never".
+# Both happened here in silence: the settings watchers and the render-state echo.
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn(coro, *, name: str) -> asyncio.Task:
+    """Start `coro` as a task that is referenced until it ends and says so if it dies."""
+    task = asyncio.ensure_future(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(functools.partial(_task_done, name))
+    return task
+
+
+def _task_done(name: str, task: asyncio.Task) -> None:
+    _BACKGROUND_TASKS.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        # ERROR, and with the traceback: a watcher that died stays dead, so from here on a rename or
+        # an output change in Settings does nothing until the process restarts.
+        logger.error("background task %r died: %r — it does not restart", name, exc, exc_info=exc)
 
 
 @dataclass(slots=True)
@@ -1138,7 +1165,7 @@ class SendspinPlayer:
             try:
                 async with aiohttp.ClientSession() as session, session.ws_connect(self.relay_url, heartbeat=30) as ws:
                     logger.info("consume relay connected (%s)", self.relay_url)
-                    sender = asyncio.ensure_future(self._relay_send(ws))
+                    sender = _spawn(self._relay_send(ws), name="consume relay sender")
                     try:
                         async for msg in ws:
                             if msg.type is aiohttp.WSMsgType.TEXT:
@@ -1390,11 +1417,11 @@ class SendspinPlayer:
         )
         await self._listener.start()
         logger.info("player listening on :%d (id=%s)", self.port, self.player_id)
-        self._health_task = asyncio.ensure_future(self._health_loop())
+        self._health_task = _spawn(self._health_loop(), name="health loop")
         if self.report_url:
-            self._report_task = asyncio.ensure_future(self._report_loop())
+            self._report_task = _spawn(self._report_loop(), name="state report")
         if self.relay_url:
-            self._relay_task = asyncio.ensure_future(self._relay_loop())
+            self._relay_task = _spawn(self._relay_loop(), name="consume relay")
 
         # Advertise ourselves the way the spec says a server-dialed client should: _sendspin._tcp,
         # port 8928, TXT path + name. Published through the system Avahi rather than aiosendspin's
@@ -1512,14 +1539,14 @@ class SendspinPlayer:
         library's group-volume redistribution computes its delta from a baseline that is not real.
         """
         if self.client.connected:
-            asyncio.ensure_future(self._send_render_state())
+            _spawn(self._send_render_state(), name="render state echo")
         # Also keep the values the client reports on its NEXT connect in step: after a roam the
         # library re-sends its constructor-time initial_volume, which would otherwise hand the new
         # server a stale level.
         self.client._initial_volume = self._volume  # noqa: SLF001
         self.client._initial_muted = self._muted  # noqa: SLF001
         if self._save_task is None or self._save_task.done():
-            self._save_task = asyncio.ensure_future(self._save_render_state())
+            self._save_task = _spawn(self._save_render_state(), name="render state save")
 
     def _health(self) -> PlayerHealth:
         """SYNCHRONIZED, or ERROR while we are demonstrably failing to keep up.
@@ -1665,7 +1692,9 @@ async def main() -> int | None:
                 player.player_id, CLIENT_SERVICE, player.port, {"path": "/sendspin", "name": new_name}
             )
 
-    rename_watch = asyncio.ensure_future(unit_identity.watch_device_name(_apply_player_name, fallback=env_player_name))
+    rename_watch = _spawn(
+        unit_identity.watch_device_name(_apply_player_name, fallback=env_player_name), name="device name watch"
+    )
 
     # Follow an output change from Settings. The swap runs in a worker thread: PortAudio teardown
     # and the `aplay -l` behind device resolution both block, and stalling the event loop would
@@ -1691,7 +1720,7 @@ async def main() -> int | None:
         return applied  # False keeps watch_output_device retrying this target
 
     save_active_output(state_file, renderer.open_device or renderer.device)
-    output_watch = asyncio.ensure_future(audio_devices.watch_output_device(_apply_output))
+    output_watch = _spawn(audio_devices.watch_output_device(_apply_output), name="output device watch")
 
     stop = install_shutdown_handlers()
     try:
