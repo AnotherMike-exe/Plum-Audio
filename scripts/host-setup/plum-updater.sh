@@ -365,6 +365,9 @@ do_update() {
 #     The container can put a symlink to any host file there, or a FIFO that blocks a reader.
 #
 # A restart needs ALL of these:
+#   - `restart_advised` in the file is not `false`. The healthcheck sets it to `false` when a
+#     restart cannot fix the problem. An absent key counts as true, for an older image. This does
+#     not apply to a stale verdict: there the healthcheck itself stopped.
 #   - the verdict is unhealthy for more than WATCHDOG_UNHEALTHY_S, and `checked_at` is fresh. Or
 #     `checked_at` is older than WATCHDOG_STALE_S while the container runs and Docker's own health
 #     status is not "healthy" (a check that passes and cannot write its file needs no restart).
@@ -480,6 +483,8 @@ def read_health():
         shown += f"; and {len(problems) - 6} more"
     return {
         "healthy": data["healthy"],
+        # Only a literal `false` stops a restart. An older image writes no such key.
+        "advised": data.get("restart_advised") is not False,
         "since_age": max(0.0, now - since),
         "checked_age": max(0.0, now - checked),
         "problems": clean(shown, 1100) or "none listed",
@@ -577,6 +582,10 @@ if report["checked_age"] > stale_s:
               f"(limit {stale_s:.0f}s), the healthcheck stopped")
 elif report["healthy"]:
     finish("none", "healthy", "watchdog: healthy", True)
+elif not report["advised"]:
+    # The healthcheck says a restart cannot fix this (a unit with no speaker, for example).
+    # One line for each change of state, not one for each minute.
+    finish("none", "not-advised", f"watchdog: unhealthy, restart not advised. problems: {problems}", True)
 elif report["since_age"] <= unhealthy_s:
     finish("none", "unhealthy-wait",
            f"watchdog: unhealthy for {report['since_age']:.0f}s (limit {unhealthy_s:.0f}s) - wait. "

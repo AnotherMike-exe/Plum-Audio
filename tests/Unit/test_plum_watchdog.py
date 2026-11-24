@@ -135,6 +135,62 @@ def test_a_healthy_container_is_left_alone(root):
     assert compose_calls(root) == []
 
 
+# -- restart_advised: the healthcheck says whether a restart can fix the problem ----------------
+
+
+def test_no_restart_when_the_healthcheck_does_not_advise_one(root):
+    health(root, problems=["no output device is configured"], restart_advised=False)
+    first = run(root)
+    run(root)
+    third = run(root)
+    assert compose_calls(root) == []
+    assert "unhealthy, restart not advised" in first.stdout
+    assert "no output device is configured" in first.stdout
+    assert "restart not advised" not in third.stdout, "one line for each change of state"
+    assert state(root)["restarts"] == []
+
+
+def test_the_not_advised_line_shows_again_after_a_change_of_state(root):
+    health(root, restart_advised=False)
+    run(root)
+    health(root, healthy=True, problems=[])
+    run(root)
+    health(root, restart_advised=False)
+    assert "unhealthy, restart not advised" in run(root).stdout
+
+
+def test_a_restart_that_is_advised_is_made(root):
+    health(root, restart_advised=True)
+    twice(root)
+    assert compose_calls(root) == ["docker compose restart"]
+
+
+@pytest.mark.parametrize("value", [None, 0, "false", "no", [], {}])
+def test_only_a_literal_false_stops_a_restart(root, value):
+    """An absent key is an older image. A value of the wrong type is not a `false`."""
+    health(root, restart_advised=value)
+    twice(root)
+    assert compose_calls(root) == ["docker compose restart"]
+
+
+def test_a_change_to_not_advised_clears_the_first_sighting(root):
+    health(root)
+    run(root)
+    health(root, restart_advised=False)
+    run(root)
+    health(root)
+    run(root)
+    assert compose_calls(root) == [], "the sighting before the change does not count"
+
+
+def test_a_stale_verdict_is_a_restart_even_when_not_advised(root):
+    """The healthcheck itself stopped, so its advice is old. Only a restart starts it again."""
+    health(root, checked_ago=900, restart_advised=False)
+    result = twice(root)
+    assert compose_calls(root) == ["docker compose restart"]
+    assert "stale" in result.stdout
+
+
 def test_a_missing_file_means_unknown_and_nothing_runs(root):
     result = twice(root)
     assert result.returncode == 0
