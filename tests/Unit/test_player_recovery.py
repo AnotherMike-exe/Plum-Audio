@@ -979,3 +979,48 @@ def test_a_stuck_worker_thread_ends_in_a_hard_exit(monkeypatch):
     P.exit_code = sendspin_player.EXIT_OUTPUT_LOST
     sendspin_player._hard_exit_if_stuck(P)
     assert exits == [0, sendspin_player.EXIT_OUTPUT_LOST]
+
+
+# -- the first health report -------------------------------------------------------------------------
+
+
+class _ReportingPlayer(_OutputPlayer):
+    _refresh_health_report = sendspin_player.SendspinPlayer._refresh_health_report
+    _report_startup_health = getattr(sendspin_player.SendspinPlayer, "_report_startup_health", None)
+
+
+def test_a_new_player_clears_the_lost_report_of_the_old_process(tmp_path):
+    """The old process wrote `lost` and left. The healthcheck must not read that from the new one."""
+    import json
+
+    old = _ReportingPlayer(tmp_path, _WatchedRenderer())
+    old._set_output_state("lost", "device removed")
+    assert json.loads(Path(old._state_file).read_text())["health"]["output"]["state"] == "lost"
+
+    new = _ReportingPlayer(tmp_path, _WatchedRenderer())
+    new._report_startup_health()
+    state = json.loads(Path(new._state_file).read_text())
+    assert state["health"]["output"] == {
+        "state": "ok",
+        "fault": None,
+        "device": "hifiberry:0",
+        "reopens": 0,
+        "failed_reopens": 0,
+    }
+    assert state["player_health"] == "synchronized"
+
+
+def test_start_writes_the_first_report_after_the_output_opens():
+    import inspect
+
+    source = inspect.getsource(sendspin_player.SendspinPlayer.start)
+    assert "self._report_startup_health()" in source
+    assert source.index("self.renderer.start()") < source.index("self._report_startup_health()")
+
+
+def test_the_first_periodic_report_does_not_wait_on_a_young_monotonic_clock(tmp_path, monkeypatch):
+    """`0.0` as "never" skipped the first report on a host that booted under 30 s ago."""
+    p = _ReportingPlayer(tmp_path, _WatchedRenderer())
+    monkeypatch.setattr(sendspin_player.time, "monotonic", lambda: 5.0)
+    asyncio.run(p._refresh_health_report())
+    assert Path(p._state_file).exists()

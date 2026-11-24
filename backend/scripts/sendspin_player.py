@@ -1252,7 +1252,9 @@ class SendspinPlayer:
         self._callback_stalls = 0
         self._output_unproven = 0  # successful re-opens in a row with no healthy poll after them
         self._output_retry_after = 0.0  # monotonic time before which a flapping output is left alone
-        self._health_report_at = 0.0  # monotonic time of the last periodic report write
+        # Monotonic time of the last report write. -inf is "never": the monotonic clock starts near
+        # 0 at boot, so 0.0 read as "written just now" for the first HEALTH_REPORT_S of uptime.
+        self._health_report_at = float("-inf")
         # False when stop() could not release the DAC because a worker thread holds the re-open
         # lock. main() then leaves with os._exit, because asyncio.run() would join that thread.
         self.renderer_released = True
@@ -1477,6 +1479,17 @@ class SendspinPlayer:
             "sessions_open": len(self._sessions),
             "peer_silence_closes": self._peer_silence_closes,
         }
+
+    def _report_startup_health(self) -> None:
+        """Write the first report of this process, at once, after the output opened.
+
+        A process that exits on a lost output leaves `output.state: lost` in the file. Without
+        this write the healthcheck reads that old verdict from the NEW process until its first
+        periodic report, HEALTH_REPORT_S later. `player_health` is written on a transition only,
+        so the old `output_lost` stays there too. Inline: nothing is playing yet.
+        """
+        save_player_health(self._state_file, self._last_reported_state.value)
+        self._write_health_report()
 
     def _write_health_report(self) -> None:
         self._health_report_at = time.monotonic()
@@ -1969,6 +1982,7 @@ class SendspinPlayer:
 
     async def start(self, home_server_url: str | None = None, *, advertise: bool = True) -> None:
         self.renderer.start()
+        self._report_startup_health()
 
         async def on_connection(ws) -> None:
             """Serve one incoming server connection for its whole life.
