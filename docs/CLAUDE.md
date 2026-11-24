@@ -1,7 +1,8 @@
 # CLAUDE.md — Plum-Audio
 
 > **Purpose**: project memory for Claude Code — the rules that stop an agent breaking things.
-> **Status**: Phase 3, on `feature/phase3-sources-gui`. Phase 2 (mesh) is merged to `main`.
+> **Status**: Phase 3 is merged. `main` and `dev` exist. Work goes to `dev` first. `dev` soaks on
+> the units for 1-2 weeks, then a squash merge goes to `main`.
 > AirPlay/Spotify/Bluetooth, the mesh, interop, the container and output selection are all
 > hardware-validated on four units. Remaining: DLNA + Plexamp (no backend yet) and the gaps in
 > `docs/SPEC-CONFORMANCE.md`. What landed when → `docs/PHASE-HISTORY.md`.
@@ -34,15 +35,16 @@ Solo developer + AI assistance. Priority: correct mesh + audio reliability first
 
 ## Stack and ports
 
-**Backend** — Python 3.13 · `aiosendspin` **pinned 9.1.1** · PyAV · numpy · Flask (:5002) + aiohttp
-(:5001) · supervisord · Avahi + D-Bus + host networking.
+**Backend** — Python 3.13 · `aiosendspin` **pinned 9.1.1** · PyAV 19 · numpy 2.5 · Flask (:5002) +
+aiohttp (:5001) · supervisord · Avahi + D-Bus + host networking.
 Base image **`python:3.13-slim-trixie`** — glibc, not Alpine (deliberate: trivial PyAV/PortAudio/
 numpy wheels). **Trixie specifically** to match the units' Debian 13: bluez-alsa still names its
 daemon `bluealsa`, and shairport-sync is the MPRIS build. The Dockerfile asserts the build-time
 dependencies because each failure is invisible at runtime. Built arm64 only; amd64 never built.
 
-**Frontend** — React 19, TypeScript 5, Vite 6. Sendspin controller-role WS client + engine-agnostic
-data service. ColorThief, react-colorful. Tailwind compiled in, no CDN.
+**Frontend** — React 19.3, TypeScript 7, Vite 8, Vitest 5, built in a `node:26-alpine` stage.
+Sendspin controller-role WS client + engine-agnostic data service. ColorThief, react-colorful.
+Tailwind compiled in, no CDN.
 
 | Port | What |
 |---|---|
@@ -108,7 +110,8 @@ Metadata/artwork/visualizer → Sendspin roles (out-of-band, NOT on the audio st
 - **Git**: `main` protected. Branches `feature/*`, `bugfix/*`, `docs/*`, `refactor/*`. Conventional
   Commits, atomic, `git pull --rebase`. Never force-push main.
 - **Python**: `ruff` + `black`, 4-space, PEP 8 naming (overrides the house PascalCase-files rule).
-  **TS**: ESLint + Prettier, 2-space, `PascalCase.tsx` components, `camelCase.ts` services. 120 cols.
+  **TS**: 2-space, `PascalCase.tsx` components, `camelCase.ts` services. 120 cols. ESLint and
+  Prettier are named here, but no config is committed (OPEN-ITEMS #32).
 - **Docker**: Binhex conventions (see the global CLAUDE.md). Project deltas: host networking, and
   `/proc/asound` bind-mounted from the host at `/host/asound` because it is masked in the container.
   `/media` is mounted and declared but nothing reads it yet — it is there for Plexamp.
@@ -352,6 +355,23 @@ The *reasoning* behind these, and the failures that produced them, is in
   runs the same checklist ON the Pi and reads the payload out of the image it pulled (the Dockerfile
   copies `scripts/host-setup/` and the compose file in for exactly this). `docs/HOST-PROVISIONING.md`.
 - **WiFi/host concerns** (NetworkManager owns `wlan0`) live on the host, not the container.
+- **The API guard refuses unknown callers.** `cors_policy.guard` (both APIs) answers 403 for an
+  unknown `Origin` and 415 for a write that is not JSON. A new browser caller needs its origin in
+  `PLUM_ALLOWED_ORIGINS`. A caller with no `Origin` sends an IP or unit name as `Host` (`c3e3828`).
+- **Endpoint `id`, ports and adapter pass one rule.** `sources/endpoint_config.py` holds it. The
+  settings API and every `<source>_config.py` must call it, so a bad value never reaches a path or a
+  daemon (`b905cf7`).
+- **Background work goes through `background_tasks.spawn`, never a bare `asyncio.ensure_future`.**
+  A task with no reference can stop, and its exception goes unlogged (`540a4cb`).
+- **Recovery is a chain. Keep every link.** The player exits 4 on a silent peer and 3 on a dead
+  output. `PLUM_PEER_SILENCE_TIMEOUT_S`, `PLUM_OUTPUT_WATCHDOG` and `PLUM_OUTPUT_REOPEN_MAX` set
+  those. supervisord restarts an exit (`startretries=600`). The healthcheck writes
+  `PLUM_HEALTH_FILE` (`/data/health.json`), stale after `PLUM_HEALTH_STALE_S`. Docker does not
+  restart on unhealthy. `docs/OPERATIONS.md`, "An endpoint is down".
+
+## Gotchas
+
+- `ruff check .` from the repo root also lints `.claude/worktrees/`. CI runs `ruff check backend`.
 
 ## Common tasks
 
@@ -407,11 +427,13 @@ items that change how you would write code *today* are repeated here:
 - **A follower stops following when its leader switches source** (`follow.tick()` reads the
   resulting `current_target = None` as "the user moved us"). Pinned by a parity test rather than
   changed; distinguishing "went idle" from "was moved" needs a real decision.
-- **The APIs are unauthenticated with blanket CORS**, both bound to `0.0.0.0`. Deliberately deferred
-  — peers and the GUI both call peer `:5001` cross-origin, so restricting it needs a rig test.
+- **The APIs are still unauthenticated**, both bound to `0.0.0.0`. The guard above stops a web page,
+  not a LAN client that sends no `Origin` with an IP `Host`. Authentication is deferred
+  (OPEN-ITEMS #8).
 - **amd64 has never been run** (it has been built twice; `deploy.sh` hard-refuses non-arm64).
-- **Frontend test suites are thin** and several assert nothing about production code; `MeshApp`,
-  the controller client and the browser player have no coverage at all.
+- **Frontend test suites are thin** and several assert nothing about production code
+  (OPEN-ITEMS #2). The controller client and the browser player have suites now. `MeshApp` has tests for its pure
+  helpers only.
 
 ## Resources
 - Sendspin spec: <https://www.sendspin-audio.com/spec/> · Org: <https://github.com/Sendspin>
