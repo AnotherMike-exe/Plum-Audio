@@ -221,6 +221,7 @@ class FakeServer:
         self._urls = {}
         self._connection_tasks = {}
         self.dialed = []  # (url, reason) in call order
+        self.dial_options = {}  # url -> the retry options of the last connect_to_client
         self.disconnected = []  # urls passed to disconnect_from_client, in call order
         self.trusted = []  # client ids passed to trust_unpaired
         self.pin_seen = None            # the PIN the library asked for, once supplied
@@ -258,8 +259,12 @@ class FakeServer:
         self.disconnected.append(url)
         self._connection_tasks.pop(url, None)
 
-    def connect_to_client(self, url, *, connection_reason=None, retry_initial_connection=False):
+    def connect_to_client(
+        self, url, *, connection_reason=None, retry_initial_connection=False, retry_indefinitely=False
+    ):
         self.dialed.append((url, connection_reason))
+        self.dial_options[url] = {"retry_indefinitely": retry_indefinitely}
+        # As the library: a call for a URL that already has a dial task only wakes that task.
         self._connection_tasks.setdefault(url, make_dial_task())
 
     async def trust_unpaired(self, client_id):
@@ -1532,5 +1537,181 @@ def test_a_local_attach_retry_stops_when_the_player_goes_away(monkeypatch):
         monkeypatch.setattr(unit, "attach_player", attach_then_lose)
         await unit._attach_local_player_once("airplay-1", "local-player", LOCAL_PLAYER_URL)
         assert len(attempts) == 1
+
+    run_scenario(scenario)
+
+
+# --- an adopted speaker that drops ------------------------------------------
+#
+# The dial task used to end when the library's backoff reached 300 s (about 8.5 minutes), and only a
+# GUI act adopted the speaker again. An ESP32 that rebooted through a long outage was lost.
+
+GoodbyeReason = ss.GoodbyeReason
+
+
+def _adopted_unit():
+    """A unit that adopted the speaker at SPEAKER_URL onto airplay-1, by the fast path."""
+    unit = make_unit("airplay-1")
+    speaker = unit.server.add(FakeClient("08:B6:1F:B7:AF:5C", roles=("player@v1",)), url=SPEAKER_URL)
+    return unit, speaker
+
+
+def test_an_adopt_dial_never_gives_up():
+    async def scenario():
+        unit = make_unit("airplay-1")
+        await unit.adopt_foreign_client("airplay-1", SPEAKER_URL, timeout_s=0.2)
+        assert unit.server.dial_options[SPEAKER_URL] == {"retry_indefinitely": True}
+
+    run_scenario(scenario)
+
+
+def test_a_failed_adopt_leaves_no_dialer_and_no_adoption_behind():
+    """An immortal dial for a speaker we reported as failed would take it hours later, unrouted."""
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        ok = await unit.adopt_foreign_client("airplay-1", SPEAKER_URL, timeout_s=0.2)
+        assert ok is None
+        assert SPEAKER_URL not in unit.server._connection_tasks
+        assert unit._adopted == {}
+
+    run_scenario(scenario)
+
+
+def test_an_adopted_speaker_that_returns_as_a_new_client_is_put_back_on_its_source():
+    """The long-outage case: the registry evicted the old client, so the speaker is in no group."""
+
+    async def scenario():
+        unit, speaker = _adopted_unit()
+        handle = unit.sources["airplay-1"]
+        assert await unit.adopt_foreign_client("airplay-1", SPEAKER_URL) == speaker.client_id
+        # Eviction, then the dial task reconnects: a NEW client object at the same URL.
+        del unit.server._by_id[speaker.client_id]
+        unit.server.add(FakeClient("08:B6:1F:B7:AF:5C", roles=("player@v1",)), url=SPEAKER_URL)
+        handle.group.calls.clear()
+
+        await unit._reattach_adopted("08:B6:1F:B7:AF:5C", settle_s=0.2)
+
+        assert ("add", "08:B6:1F:B7:AF:5C") in handle.group.calls
+
+    run_scenario(scenario)
+
+
+def test_a_short_drop_does_not_regroup_a_speaker_that_is_still_in_its_group():
+    async def scenario():
+        unit, speaker = _adopted_unit()
+        handle = unit.sources["airplay-1"]
+        await unit.adopt_foreign_client("airplay-1", SPEAKER_URL)
+        handle.group.calls.clear()
+        timer = speaker.arm_cleanup()  # the drop armed the eviction timer
+
+        await unit._reattach_adopted(speaker.client_id, settle_s=0.2)
+
+        assert handle.group.calls == []  # no stream churn for the rest of the room
+        assert timer.cancelled is True  # a routed player has no eviction pending
+
+    run_scenario(scenario)
+
+
+def test_a_released_speaker_is_never_dialled_or_attached_again():
+    async def scenario():
+        unit, speaker = _adopted_unit()
+        handle = unit.sources["airplay-1"]
+        await unit.adopt_foreign_client("airplay-1", SPEAKER_URL)
+        await unit.release_foreign_client("airplay-1", speaker.client_id, url=SPEAKER_URL)
+        assert unit._adopted == {}
+        unit.server.dialed.clear()
+        handle.group.calls.clear()
+
+        unit.note_speaker_seen(SPEAKER_URL)  # it shows on mDNS again
+        back = unit.server.add(FakeClient("08:B6:1F:B7:AF:5C", roles=("player@v1",)))
+        unit.server.register_client_url(back.client_id, SPEAKER_URL)
+        await unit._reattach_adopted(back.client_id, settle_s=0.2)
+
+        assert unit.server.dialed == []
+        assert handle.group.calls == []
+
+    run_scenario(scenario)
+
+
+def test_mdns_wakes_the_dial_for_an_adopted_speaker_we_lost_but_never_one_we_hold():
+    async def scenario():
+        unit, speaker = _adopted_unit()
+        await unit.adopt_foreign_client("airplay-1", SPEAKER_URL)
+
+        unit.note_speaker_seen(SPEAKER_URL)
+        assert unit.server.dialed == []  # connected: never re-dial a speaker we already hold
+
+        speaker.is_connected = False
+        tasks_before = dict(unit.server._connection_tasks)
+        unit.note_speaker_seen(SPEAKER_URL)
+        unit.note_speaker_seen(SPEAKER_URL)  # Avahi resolves once per interface
+        assert [url for url, _ in unit.server.dialed] == [SPEAKER_URL, SPEAKER_URL]
+        assert unit.server._connection_tasks == tasks_before  # the SAME one dial task, only woken
+
+    run_scenario(scenario)
+
+
+def test_mdns_never_dials_a_speaker_we_did_not_adopt():
+    async def scenario():
+        unit = make_unit("airplay-1")
+        unit.note_speaker_seen(SPEAKER_URL)
+        assert unit.server.dialed == []
+
+    run_scenario(scenario)
+
+
+@pytest.mark.parametrize(
+    ("reason", "kept"),
+    [
+        (None, True),  # power loss, WiFi flap
+        (GoodbyeReason.RESTART, True),
+        (GoodbyeReason.SHUTDOWN, True),
+        (GoodbyeReason.ANOTHER_SERVER, False),  # Music Assistant took it: do not take it back
+        (GoodbyeReason.USER_REQUEST, False),
+        (GoodbyeReason.CONCURRENT_ATTEMPT, False),
+    ],
+)
+def test_an_adoption_ends_only_when_the_speaker_leaves_on_purpose(reason, kept):
+    async def scenario():
+        unit, speaker = _adopted_unit()
+        await unit.adopt_foreign_client("airplay-1", SPEAKER_URL)
+
+        unit._on_server_event(unit.server, ss.ClientDisconnectedEvent(speaker.client_id, reason))
+        await asyncio.sleep(0)
+
+        assert (SPEAKER_URL in unit._adopted) is kept
+
+    run_scenario(scenario)
+
+
+def test_a_speaker_whose_source_went_idle_is_not_put_back_on_it():
+    """True none (ROUTING-MODEL rule 1): membership does not survive an idle source."""
+
+    async def scenario():
+        unit, speaker = _adopted_unit()
+        handle = unit.sources["airplay-1"]
+        await unit.adopt_foreign_client("airplay-1", SPEAKER_URL)
+        await handle.group.remove_client(speaker)  # what _go_idle does
+        await unit._on_source_idle("airplay-1")
+        assert unit._adopted == {SPEAKER_URL: None}  # still ours, routed to nothing
+        handle.group.calls.clear()
+
+        await unit._reattach_adopted(speaker.client_id, settle_s=0.2)
+
+        assert handle.group.calls == []
+
+    run_scenario(scenario)
+
+
+def test_a_later_route_moves_the_remembered_source():
+    async def scenario():
+        unit = make_unit("airplay-1", "spotify-1")
+        speaker = unit.server.add(FakeClient("08:B6:1F:B7:AF:5C", roles=("player@v1",)), url=SPEAKER_URL)
+        await unit.adopt_foreign_client("airplay-1", SPEAKER_URL)
+        await unit.attach_player("spotify-1", speaker.client_id)
+        assert unit._adopted == {SPEAKER_URL: "spotify-1"}
+        await unit.detach_player("spotify-1", speaker.client_id)
+        assert unit._adopted == {SPEAKER_URL: None}
 
     run_scenario(scenario)

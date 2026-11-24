@@ -155,3 +155,30 @@ def test_a_trailing_path_difference_does_not_make_it_foreign():
     for byte."""
     n = _nbhd(own_client_ids=set(), own_player_url="ws://192.168.7.122:8928")
     assert n.is_own_player(_Svc("player-7122", "ws://192.168.7.122:8928/sendspin")) is True
+
+
+def test_the_neighbourhood_reports_a_foreign_player_but_not_our_own():
+    """`on_player_seen` is how the server learns an adopted speaker is back on the network."""
+    from mesh.avahi import CLIENT_SERVICE, DiscoveredService
+    from mesh.neighbourhood import Neighbourhood
+
+    hood = Neighbourhood("unit-a", "A", server_port=8927, own_player_url="ws://192.168.7.10:8928/sendspin")
+    seen = []
+    hood.on_player_seen = seen.append
+    hood._on_player(DiscoveredService("esp32", CLIENT_SERVICE, 8928, addresses=["192.168.7.201"]))
+    hood._on_player(DiscoveredService("ours", CLIENT_SERVICE, 8928, addresses=["192.168.7.10"]))
+    assert seen == ["ws://192.168.7.201:8928/sendspin"]
+
+
+def test_a_failing_player_listener_does_not_stop_discovery():
+    from mesh.avahi import CLIENT_SERVICE, DiscoveredService
+    from mesh.neighbourhood import Neighbourhood
+
+    hood = Neighbourhood("unit-a", "A", server_port=8927)
+
+    def boom(_url):
+        raise RuntimeError("listener bug")
+
+    hood.on_player_seen = boom
+    hood._on_player(DiscoveredService("esp32", CLIENT_SERVICE, 8928, addresses=["192.168.7.201"]))
+    assert len(hood.players()) == 1
