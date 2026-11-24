@@ -422,6 +422,21 @@ function stableClientNonce(sourceId: string): string {
   }
 }
 
+/**
+ * The names the unit supplies for discovered speakers, by listener URL.
+ *
+ * Only a name that DIFFERS from the mDNS instance name counts. The unit sets `friendly_name` to the
+ * instance name when it knows nothing better, and that technical name must never outrank a real one
+ * this browser remembers. Exported for tests.
+ */
+export function backendFriendlyNames(neighbourhood: Neighbourhood | null | undefined): Map<string, string> {
+  const names = new Map<string, string>();
+  for (const p of neighbourhood?.players ?? []) {
+    if (p.url && p.friendly_name && p.friendly_name !== p.name) names.set(p.url, p.friendly_name);
+  }
+  return names;
+}
+
 type Listener = (model: Model) => void;
 
 /**
@@ -681,10 +696,54 @@ export class SendspinDataService {
     if (changed) saveNameMemo(this.nameByUrl);
   }
 
-  /** Give every speaker we have ever seen attached its protocol name, whatever state it is in. */
+  /** Take a discovery answer, and let the names it carries correct the local memo. */
+  private applyNeighbourhood(neighbourhood: Neighbourhood): void {
+    this.neighbourhood = neighbourhood;
+    // The unit keeps the authoritative URL -> name map (speaker_names.py) and serves it as
+    // `friendly_name`. The localStorage memo is older than that map and is only a fallback now — so
+    // when the unit names a speaker, write that name over whatever this browser remembered. Without
+    // this the memo held its own (older, or technical) name for ever, and showed it again the moment
+    // discovery had a gap.
+    const live = this.liveNamedUrls();
+    let changed = false;
+    for (const [url, name] of backendFriendlyNames(neighbourhood)) {
+      // A speaker the current view names is handled by rememberPlayerNames, where a unit's
+      // self-report follows a rename before the server-side map does.
+      if (live.has(url) || this.nameByUrl.get(url) === name) continue;
+      this.nameByUrl.set(url, name);
+      changed = true;
+    }
+    if (changed) saveNameMemo(this.nameByUrl);
+  }
+
+  /** Listener URLs the CURRENT view gives a name to — a handshake name or a unit's self-report. */
+  private liveNamedUrls(): Set<string> {
+    const urls = new Set<string>();
+    for (const unit of this.lastView.units) {
+      for (const p of unit.players) if (p.url && p.name) urls.add(p.url);
+      if (unit.local_player?.url && unit.local_player.name) urls.add(unit.local_player.url);
+    }
+    return urls;
+  }
+
+  /**
+   * Give every speaker one name, whatever state it is in. Precedence, first match wins:
+   *
+   *   1. the current view (self-report, then handshake) — live, and follows a rename in one poll.
+   *      rememberPlayerNames already folded both into the memo, in that order.
+   *   2. the unit's `friendly_name` from discovery — one answer for every browser.
+   *   3. this browser's memo — a fallback for a unit on an older image, which serves no names.
+   *   4. the bare mDNS instance name (already on the row).
+   *
+   * The memo used to be applied over everything. A name it learned earlier then beat the name the
+   * unit served, so two browsers showed two names for one idle speaker.
+   */
   private applyStableNames(model: Model): void {
+    const live = this.liveNamedUrls();
+    const friendly = backendFriendlyNames(this.neighbourhood);
     for (const c of model.clients) {
-      const known = c.url ? this.nameByUrl.get(c.url) : undefined;
+      if (!c.url) continue;
+      const known = (!live.has(c.url) && friendly.get(c.url)) || this.nameByUrl.get(c.url);
       if (known) c.name = known;
     }
   }
@@ -915,7 +974,7 @@ export class SendspinDataService {
       const neighbourhood: Neighbourhood = await res.json();
       if (this.stopped || seq < this.appliedNeighbourhoodSeq) return;
       this.appliedNeighbourhoodSeq = seq;
-      this.neighbourhood = neighbourhood;
+      this.applyNeighbourhood(neighbourhood);
     } catch {
       // discovery is optional; the mesh still renders without it.
     }
