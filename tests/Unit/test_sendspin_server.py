@@ -1797,3 +1797,50 @@ def test_stop_does_not_swallow_its_own_cancellation():
             await task
 
     run_scenario(scenario)
+
+
+# --- adoption: the table follows the attach, and a release wins over a pending re-attach ----------
+
+
+def test_an_adopt_whose_attach_fails_records_no_adoption():
+    """`_adopted` is what the reconnect handler and mDNS act on. A failed attach must not feed it."""
+
+    async def scenario():
+        unit, _speaker = _adopted_unit()
+
+        async def refuse(_client):
+            raise RuntimeError("the group refused the client")
+
+        unit.sources["airplay-1"].group.add_client = refuse
+        with pytest.raises(RuntimeError):
+            await unit.adopt_foreign_client("airplay-1", SPEAKER_URL)
+        assert unit._adopted == {}
+
+    run_scenario(scenario)
+
+
+def test_a_release_during_a_pending_re_attach_is_not_undone():
+    """The re-attach read the table, then awaited. The release landed in that window."""
+
+    async def scenario():
+        unit, speaker = _adopted_unit()
+        handle = unit.sources["airplay-1"]
+        assert await unit.adopt_foreign_client("airplay-1", SPEAKER_URL) == speaker.client_id
+        # A long outage: the speaker returns as a new client in no group.
+        del unit.server._by_id[speaker.client_id]
+        back = unit.server.add(FakeClient("08:B6:1F:B7:AF:5C", roles=("player@v1",)), url=SPEAKER_URL)
+        real_add = handle.group.add_client
+
+        async def add_after_a_release(client):
+            handle.group.add_client = real_add
+            await unit.release_foreign_client("airplay-1", client.client_id, url=SPEAKER_URL)
+            await real_add(client)
+
+        handle.group.add_client = add_after_a_release
+
+        await unit._reattach_adopted(back.client_id, settle_s=0.2)
+
+        assert unit._adopted == {}
+        assert back not in handle.group.members and back.group is not handle.group
+
+    run_scenario(scenario)

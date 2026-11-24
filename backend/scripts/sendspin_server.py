@@ -1586,8 +1586,9 @@ class PlumSendspinServer:
         # _stop_dialing for why a redial is never free.
         existing = self._connected_player_at(url)
         if existing is not None:
-            self._adopted[url] = source_id
             await self.attach_player(source_id, existing)
+            # Recorded after the attach, as on the dial path below: a failed attach is not an adoption.
+            self._adopted[url] = source_id
             logger.info("[%s] foreign speaker %s (%s) already connected; kept the dial", source_id, existing, url)
             return existing
         # Otherwise the registration is stale, and a stale one must be torn down before we redial:
@@ -1732,6 +1733,17 @@ class PlumSendspinServer:
             self._cancel_pending_cleanup(client_id)
             return
         await self.attach_player(source_id, client_id)
+        if self._adopted.get(url) != source_id:
+            # The adoption ended while the attach awaited (a release, or a goodbye). The release
+            # ran its detach before our add landed, so this attach would undo it: take it back.
+            player = self.server.get_client(client_id)
+            handle = self.sources.get(source_id)
+            if player is not None and handle is not None and player.group is handle.group:
+                await self.detach_player(source_id, client_id)
+            logger.info(
+                "[%s] speaker %s (%s) was released during its re-attach; left detached", source_id, client_id, url
+            )
+            return
         logger.info("[%s] adopted speaker %s (%s) came back; re-attached", source_id, client_id, url)
 
     def note_speaker_seen(self, url: str) -> None:
