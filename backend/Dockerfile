@@ -86,14 +86,24 @@ ARG GO_LIBRESPOT_VERSION=0.7.4
 # only if the binary doesn't answer. Unlike aiosendspin/shairport-sync there's no package metadata to
 # query, so without this the About page would have no way to say what got downloaded.
 ENV PLUM_GO_LIBRESPOT_VERSION=${GO_LIBRESPOT_VERSION}
+# SHA-256 of the release tarball for EACH built arch, pinned beside the version. The download is a
+# root-owned binary that then holds a user's Spotify credentials, and without this a replaced
+# release asset or a tampered transfer installs silently. These belong to v0.7.4 and to nothing
+# else: bump GO_LIBRESPOT_VERSION and both lines MUST be recomputed, or the build fails here — which
+# is the point. Upstream publishes no checksum file for this release, so these were computed from
+# the assets as downloaded on 2026-11-24 (trust on first use):
+#   curl -fsSLO <release url>/go-librespot_linux_{arm64,x86_64}.tar.gz && sha256sum *.tar.gz
+ARG GO_LIBRESPOT_SHA256_ARM64=62b6c7ebee6abb1f59fa3cf20a9374dd5e8c5c1ca5dab329dd312f66b59faa8d
+ARG GO_LIBRESPOT_SHA256_AMD64=ee521eed02100ee4aa9919a147304aed5afc908c5a0c99f515c3da0aed89acf7
 RUN set -eux; \
     case "$(dpkg --print-architecture)" in \
-        arm64) GLR_ARCH=arm64 ;; \
-        amd64) GLR_ARCH=x86_64 ;; \
+        arm64) GLR_ARCH=arm64; GLR_SHA256="${GO_LIBRESPOT_SHA256_ARM64}" ;; \
+        amd64) GLR_ARCH=x86_64; GLR_SHA256="${GO_LIBRESPOT_SHA256_AMD64}" ;; \
         *) echo "unsupported arch" >&2; exit 1 ;; \
     esac; \
     curl -fsSL -o /tmp/glr.tar.gz \
         "https://github.com/devgianlu/go-librespot/releases/download/v${GO_LIBRESPOT_VERSION}/go-librespot_linux_${GLR_ARCH}.tar.gz"; \
+    echo "${GLR_SHA256}  /tmp/glr.tar.gz" | sha256sum -c -; \
     tar -xzf /tmp/glr.tar.gz -C /usr/local/bin go-librespot; \
     rm /tmp/glr.tar.gz; \
     chmod +x /usr/local/bin/go-librespot
