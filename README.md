@@ -429,7 +429,7 @@ is never bridged between servers. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.m
 
 - **Backend** — Python 3.13, [`aiosendspin`](https://github.com/Sendspin/aiosendspin) (pinned 9.1.1),
   PyAV, NumPy, Flask + aiohttp, supervisord
-- **Frontend** — React 19, TypeScript 5, Vite 6, served by nginx inside the container
+- **Frontend** — React 19.3, TypeScript 7, Vite 8, served by nginx inside the container
 - **Base image** — `python:3.13-slim-trixie`. glibc rather than Alpine, deliberately: PyAV, PortAudio
   and NumPy all have trivial wheels there
 
@@ -443,8 +443,9 @@ Known gaps, stated plainly:
 
 - **DLNA and Plexamp have no backend.** Settings stubs and GUI scaffolding exist; nothing is wired up.
 - **amd64 has never been built.**
-- **The APIs are unauthenticated.** Both bind `0.0.0.0` with permissive CORS. Any page on your LAN can
-  change a unit's settings. Run this on a trusted network.
+- **The APIs are unauthenticated.** Both bind `0.0.0.0`. A request guard refuses web pages from
+  unknown origins and non-JSON writes, but any device on your LAN can still call them directly. Run
+  this on a trusted network.
 - Remaining spec gaps are tracked in [SPEC-CONFORMANCE.md](docs/SPEC-CONFORMANCE.md).
 
 ## Acknowledgements
