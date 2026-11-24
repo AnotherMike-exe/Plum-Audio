@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
+import os
 import socket
 import time
 from collections.abc import Awaitable, Callable
@@ -56,6 +58,16 @@ MAX_CONCURRENT_FETCHES = 16
 # A refresh that keeps failing is logged once, then at most this often. The poll runs every 2 s, so
 # an unlimited log is 43 000 tracebacks a day onto an SD card for one persistent bug.
 REFRESH_ERROR_LOG_EVERY_S = 60.0
+# The player process posts its self-report every 3 s, with a 3 s request timeout
+# (sendspin_player._report_loop). So a healthy player is never more than about 6 s late. Five missed
+# reports is well past that and still short enough that a dead player stops reading as attached
+# within one GUI glance.
+LOCAL_PLAYER_REPORT_INTERVAL_S = 3.0
+LOCAL_PLAYER_STALE_S = 5 * LOCAL_PLAYER_REPORT_INTERVAL_S
+# Written by the container healthcheck. Optional: no file means "unknown", never "unhealthy".
+HEALTH_FILE = os.environ.get("PLUM_HEALTH_FILE", "/data/health.json")
+HEALTH_MAX_BYTES = 16 * 1024  # it rides every snapshot to every peer, so it stays small
+HEALTH_REREAD_S = 5.0  # local_snapshot() runs per poll AND per API request; do not stat each time
 
 
 class DataAggregator:
@@ -68,6 +80,7 @@ class DataAggregator:
         *,
         interval_s: float = DEFAULT_INTERVAL_S,
         clock: Callable[[], float] = time.monotonic,
+        health_file: str = HEALTH_FILE,
     ) -> None:
         self.local_unit_id = local_unit_id
         self._local_player_state: dict | None = None  # our speaker's self-report (see model)
@@ -76,6 +89,11 @@ class DataAggregator:
         self._fetch = fetch_snapshot
         self.interval_s = interval_s
         self._clock = clock  # injected so tests can move time
+        self._local_player_seen_at: float | None = None  # clock() of the last self-report
+        self._local_player_offline = False  # last published state, so a change is logged once
+        self.health_file = health_file
+        self._health: tuple[dict | None, float | None] = (None, None)
+        self._health_read_at: float | None = None
         self._local_host = _detect_local_host()
         self._view = MeshView(units=[self.local_snapshot()])
         self._task: asyncio.Task | None = None
@@ -97,8 +115,62 @@ class DataAggregator:
         return self._view
 
     def set_local_player_state(self, state: dict) -> None:
-        """Record our own speaker's self-report (pushed by the player process)."""
+        """Record our own speaker's self-report (pushed by the player process), and when it came."""
+        if not isinstance(state, dict):
+            return  # a malformed body must not replace a good report, nor refresh its timestamp
         self._local_player_state = state
+        self._local_player_seen_at = self._clock()
+
+    def _local_player_report(self) -> tuple[dict | None, float | None, bool]:
+        """(report, age in seconds, offline) for our own speaker.
+
+        The report used to be stored with no timestamp, so the last word of a player that crashed
+        was published for ever — `attached: true`, to a server that had long since lost it.
+
+        Once it is older than LOCAL_PLAYER_STALE_S the report is published with `attached` and
+        `playing` forced False and `offline: True`. It is NOT dropped: the speaker's id, name and URL
+        are what the GUI shows it by and what the router dials it back with, and an idle read is
+        the correct one for every consumer (`follow._player_status` treats it as free). The original
+        dict is left alone, so a player that resumes reporting is whole again on its next post.
+        """
+        state = self._local_player_state
+        if state is None or self._local_player_seen_at is None:
+            return None, None, False  # never reported: unknown, not offline
+        age = max(0.0, self._clock() - self._local_player_seen_at)
+        offline = age > LOCAL_PLAYER_STALE_S
+        if offline != self._local_player_offline:
+            self._local_player_offline = offline
+            if offline:
+                logger.warning("local player stopped reporting %.0fs ago; publishing it as offline", age)
+            else:
+                logger.info("local player is reporting again")
+        if offline:
+            state = {**state, "attached": False, "playing": False, "offline": True}
+        return state, round(age, 1), offline
+
+    def _read_health(self) -> tuple[dict | None, float | None]:
+        """(contents, age in seconds) of the healthcheck file, or (None, None) when unknown.
+
+        Defensive on every axis, because another component owns the file and its keys are not
+        settled: a missing file, an unreadable one, an oversized one, invalid JSON or a non-object
+        all read as unknown. Nothing here interprets a key. Cached for HEALTH_REREAD_S.
+        """
+        now = self._clock()
+        if self._health_read_at is not None and now - self._health_read_at < HEALTH_REREAD_S:
+            return self._health
+        self._health_read_at = now
+        result: tuple[dict | None, float | None] = (None, None)
+        try:
+            stat = os.stat(self.health_file)
+            if stat.st_size <= HEALTH_MAX_BYTES:
+                with open(self.health_file, encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if isinstance(data, dict):
+                    result = (data, round(max(0.0, time.time() - stat.st_mtime), 1))
+        except (OSError, ValueError):
+            pass  # absent or mid-write: unknown this time, read again on the next pass
+        self._health = result
+        return result
 
     def local_snapshot(self) -> UnitSnapshot:
         """The engine's snapshot, with this unit's own host stamped in (the engine can't know it)."""
@@ -108,7 +180,8 @@ class DataAggregator:
         # The engine only knows clients attached to ITS server; our speaker may be attached to
         # someone else's (a peer, Music Assistant, any Sendspin server). Its self-report travels
         # with the snapshot so every unit's GUI can still show where it went and what it's playing.
-        snap.local_player = self._local_player_state
+        snap.local_player, snap.local_player_age_s, snap.local_player_offline = self._local_player_report()
+        snap.health, snap.health_age_s = self._read_health()
         return snap
 
     async def refresh(self) -> MeshView:

@@ -18,6 +18,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
+def _optional_float(value: object) -> float | None:
+    """A number from a peer's snapshot, or None. A peer's JSON is not trusted to hold a number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 @dataclass
 class PlayerState:
     """A render endpoint connected to a unit's server."""
@@ -190,6 +197,24 @@ class UnitSnapshot:
     # GROUP — see calibration.merge_calibrations. Small (a few hundred bytes per endpoint) and
     # read-only for every consumer but the owning unit.
     calibration: dict = field(default_factory=dict)
+    # How old the `local_player` self-report is, in seconds, measured by the unit that received it.
+    # An AGE and not a timestamp on purpose: units have no RTC and their clocks differ, so a peer
+    # cannot compare a wall-clock time of ours against its own. None = unknown: the player never
+    # reported (boot, or a unit with no player), or the peer runs an older image without the field.
+    local_player_age_s: float | None = None
+    # The player process stopped reporting (mesh/aggregator.LOCAL_PLAYER_STALE_S). `local_player`
+    # then still carries the speaker's identity and URL, but with `attached` and `playing` forced
+    # False — a report from a dead player used to read `attached: true` for ever.
+    #
+    # DEFAULTS FALSE, for the same reason `has_player` defaults True: a peer on an older image
+    # sends no such field, and reading that as "offline" would mark every existing speaker dead.
+    local_player_offline: bool = False
+    # The container healthcheck's last result, read from /data/health.json and passed on verbatim.
+    # None = unknown (no file, unreadable, or an older image). The keys belong to the healthcheck
+    # and are not fixed here, so a consumer must treat a key it does not know as "unknown" too.
+    health: dict | None = None
+    # Age of that file in seconds, so a healthcheck that stopped running shows as old, not as OK.
+    health_age_s: float | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -204,10 +229,15 @@ class UnitSnapshot:
             "server_id": self.server_id,
             "follows_unit_id": self.follows_unit_id,
             "calibration": self.calibration,
+            "local_player_age_s": self.local_player_age_s,
+            "local_player_offline": self.local_player_offline,
+            "health": self.health,
+            "health_age_s": self.health_age_s,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> UnitSnapshot:
+        health = d.get("health")
         return cls(
             unit_id=d["unit_id"],
             name=d.get("name", d["unit_id"]),
@@ -220,6 +250,10 @@ class UnitSnapshot:
             server_id=d.get("server_id"),
             follows_unit_id=d.get("follows_unit_id"),
             calibration=d.get("calibration") or {},
+            local_player_age_s=_optional_float(d.get("local_player_age_s")),
+            local_player_offline=bool(d.get("local_player_offline", False)),
+            health=health if isinstance(health, dict) else None,
+            health_age_s=_optional_float(d.get("health_age_s")),
         )
 
 
