@@ -20,3 +20,18 @@ ExecStart=/usr/local/bin/plum-updater.sh health
 TimeoutStartSec=180
 StandardOutput=journal
 StandardError=journal
+# A sandbox for the agent, which is root. Each setting here leaves `docker compose` working: the
+# docker CLI only talks to /run/docker.sock, and the daemon does the privileged work in its own
+# unit. The script writes only below /opt/plum-audio and /var/lib/plum-audio.
+#   - ProtectHome is `read-only`, NOT `yes`: the docker CLI reads /root/.docker/config.json for a
+#     registry login, and `yes` hides that file.
+#   - ProtectSystem=, ProtectControlGroups= and PrivateNetwork= are left out on purpose. They are
+#     not tested on a unit with `docker compose`.
+NoNewPrivileges=yes
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes

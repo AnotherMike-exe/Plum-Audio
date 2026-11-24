@@ -488,6 +488,30 @@ def test_the_timer_runs_about_once_a_minute():
     assert "EnvironmentFile=-/etc/default/plum-updater" in service
 
 
+AGENT_SERVICES = ["plum-updater-health.service", "plum-updater.service", "plum-updater-check.service"]
+
+
+def directives(name):
+    lines = (HOST_SETUP / name).read_text().splitlines()
+    return dict(line.split("=", 1) for line in lines if "=" in line and not line.startswith("#"))
+
+
+@pytest.mark.parametrize("name", AGENT_SERVICES)
+def test_the_agent_services_run_in_a_sandbox(name):
+    found = directives(name)
+    for key in ("NoNewPrivileges", "PrivateTmp", "ProtectKernelTunables", "ProtectKernelModules"):
+        assert found.get(key) == "yes", f"{name}: {key}"
+
+
+@pytest.mark.parametrize("name", AGENT_SERVICES)
+def test_the_sandbox_leaves_docker_compose_working(name):
+    """The docker CLI needs the registry login in /root, the socket in /run and the network."""
+    found = directives(name)
+    assert found.get("ProtectHome") == "read-only", "`yes` hides /root/.docker/config.json"
+    for key in ("PrivateNetwork", "ProtectSystem", "ProtectControlGroups", "User", "DynamicUser"):
+        assert key not in found, f"{name}: {key} is not tested with docker compose"
+
+
 @pytest.mark.parametrize("installer", ["scripts/host-setup/provision.sh", "scripts/plum-init.sh"])
 def test_both_installers_install_and_enable_the_timer(installer):
     text = (REPO / installer).read_text()
