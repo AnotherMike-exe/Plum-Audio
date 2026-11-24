@@ -737,15 +737,19 @@ EOS
     #    /opt/plum-audio stay owned by the account that administers it.
     say "$host — config"
     put_ "$host" "${HERE}/docker-compose.yml" "/tmp/plum-audio-compose.yml" || return 1
-    ssh_sudo_ "$host" "bash -s -- '$REMOTE_ROOT' '$unit_id' '$unit_name' '$player_id' '$player_name' '$dac' '$profile' '$player_enabled' '$PLUM_IMAGE_NAME' '$PLUM_IMAGE_TAG' '${PLUM_FLEET_PSK:-}'" <<'EOS' || return 1
+    # The fleet PSK goes on STDIN, as the first line of the remote script. It used to be the last
+    # remote ARGUMENT, so it was in the process list of this workstation and of the unit. `%q`
+    # quotes it for the remote bash. ssh_sudo_ reads all of stdin first, so a retry sends it again.
+    { printf 'FLEET_PSK=%q\n' "${PLUM_FLEET_PSK:-}"; cat; } <<'EOS' | ssh_sudo_ "$host" "bash -s -- '$REMOTE_ROOT' '$unit_id' '$unit_name' '$player_id' '$player_name' '$dac' '$profile' '$player_enabled' '$PLUM_IMAGE_NAME' '$PLUM_IMAGE_TAG'" || return 1
 set -euo pipefail
 PW="$1"; ROOT="$2"; UNIT_ID="$3"; UNIT_NAME="$4"; PLAYER_ID="$5"; PLAYER_NAME="$6"; DAC="$7"
 PROFILE="$8"; PLAYER_ENABLED="$9"; IMAGE_NAME="${10}"; IMAGE_TAG="${11}"
-# Passed as an ARG, not referenced in the heredoc below. The heredoc is expanded on the REMOTE host,
-# where a local-only variable is unbound — and under `set -u` that aborts AFTER `cat >` has already
-# truncated the file, leaving a unit with an EMPTY plum-audio.env. It then boots on entrypoint
-# defaults with no DAC device and no unit id, which reads as a broken image rather than a bad deploy.
-FLEET_PSK="${12:-}"
+# FLEET_PSK is set by the line the workstation puts BEFORE this script (see the call above). It is
+# never referenced as a local variable here: this heredoc is expanded on the REMOTE host, where a
+# local-only variable is unbound, and under `set -u` that aborts AFTER `cat >` truncated the file.
+# That leaves a unit with an EMPTY plum-audio.env, which boots on entrypoint defaults with no DAC
+# device and no unit id. The default below keeps `set -u` quiet if the first line is ever lost.
+FLEET_PSK="${FLEET_PSK:-}"
 s() { echo "$PW" | sudo -S -p '' "$@"; }
 mv /tmp/plum-audio-compose.yml "$ROOT/docker-compose.yml"
 TZ_HOST="$(timedatectl show -p Timezone --value 2>/dev/null || echo UTC)"

@@ -20,8 +20,11 @@ WHAT="${2:-both}"
 USER_="${PLUM_TEST_USER:-plum-admin}"
 PW="${PLUM_TEST_PW:?set PLUM_TEST_PW (docker/.deploy.env)}"
 
-ssh_() { sshpass -p "$PW" ssh -o StrictHostKeyChecking=no -o LogLevel=ERROR -o NumberOfPasswordPrompts=1 "$USER_@$HOST" "$@"; }
-sudo_() { ssh_ "echo '$PW' | sudo -S -p '' $*"; }
+# The login password goes to sshpass in the environment (`sshpass -e`), and the sudo password goes
+# on stdin. Neither is an argument: an argument is in the process list. Same pattern as deploy.sh.
+sshpass_() { SSHPASS="$PW" sshpass -e "$@"; }
+ssh_() { sshpass_ ssh -o StrictHostKeyChecking=no -o LogLevel=ERROR -o NumberOfPasswordPrompts=1 "$USER_@$HOST" "$@"; }
+sudo_() { ssh_ "sudo -S -p '' $*" <<<"$PW"; }
 
 # Stage a tar on the HOST, then feed it to `docker exec` with a REDIRECT. Piping the archive over
 # ssh cannot work: `sudo -S` reads its password from stdin, so tar would receive the password as its
@@ -30,7 +33,7 @@ push_tar() {  # push_tar <local-dir> <tar-args...> ; extracts into <container-de
     local src="$1" dest="$2"; shift 2
     COPYFILE_DISABLE=1 tar --no-xattrs -C "$src" -cf "$TMPTAR" "$@" 2>/dev/null \
         || tar -C "$src" -cf "$TMPTAR" "$@"   # --no-xattrs is BSD/GNU-tar dependent
-    sshpass -p "$PW" scp -q -o StrictHostKeyChecking=no -o LogLevel=ERROR "$TMPTAR" "$USER_@$HOST:/tmp/plum-hotpatch.tar"
+    sshpass_ scp -q -o StrictHostKeyChecking=no -o LogLevel=ERROR "$TMPTAR" "$USER_@$HOST:/tmp/plum-hotpatch.tar"
     sudo_ "sh -c 'docker exec -i plum-audio tar -C $dest -xf - < /tmp/plum-hotpatch.tar'"
     ssh_ "rm -f /tmp/plum-hotpatch.tar"
 }

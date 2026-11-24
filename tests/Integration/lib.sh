@@ -49,9 +49,28 @@ retry_ssh_() {
     done
 }
 
+# The password goes to sshpass in the ENVIRONMENT (`sshpass -e` reads SSHPASS), never with `-p`: an
+# argument is in this workstation's process list for each connection. Set for the one command, not
+# exported. docker/deploy.sh uses the same pattern.
 ssh_() {
     local host="$1"; shift
-    retry_ssh_ sshpass -p "$PW" ssh $SSH_OPTS "${USER_}@${host}" "$@"
+    SSHPASS="$PW" retry_ssh_ sshpass -e ssh $SSH_OPTS "${USER_}@${host}" "$@"
+}
+
+# sudo_ssh_ <host> <command...> — run a command on a Pi as root.
+# The sudo password goes on STDIN. It used to be `echo '<password>' | sudo -S` inside the remote
+# command, which put it in the process list of the workstation and of the unit, and broke on a
+# password with a quote. The here-string is made again for each try, so a retry sends it again.
+# The remote command gets no other stdin: `sudo -S` reads the first line.
+sudo_ssh_() {
+    local host="$1" n=0 rc; shift
+    while :; do
+        SSHPASS="$PW" sshpass -e ssh $SSH_OPTS "${USER_}@${host}" "sudo -S -p '' $*" <<<"$PW"; rc=$?
+        [[ $rc -ne 255 ]] && return $rc
+        n=$((n + 1))
+        [[ $n -ge 3 ]] && return $rc
+        sleep 2
+    done
 }
 
 # Evaluate a python expression against JSON on stdin, with the parsed document bound to `d`.
@@ -99,21 +118,21 @@ ssh_json() {
 # on 6.0.5 as well as 9.x, verified against a control unit 2026-08-13.
 dexec_() {
     local host="$1"; shift
-    ssh_ "$host" "echo '$PW' | sudo -S -p '' docker exec plum-audio $*"
+    sudo_ssh_ "$host" "docker exec plum-audio $*"
 }
 
 # feed_fifo_ <host> <fifo> [chunks] — push silence into a source FIFO from inside the container.
 # Backgrounded and detached so the caller can poll while it runs; returns immediately.
 feed_fifo_() {
     local host="$1" fifo="$2" chunks="${3:-40}"
-    ssh_ "$host" "echo '$PW' | sudo -S -p '' docker exec -d plum-audio \
+    sudo_ssh_ "$host" "docker exec -d plum-audio \
         sh -c 'dd if=/dev/zero of=$fifo bs=17640 count=$chunks 2>/dev/null'"
 }
 
 # stop_feed_ <host> <fifo> — kill a feed started by feed_fifo_ (for `defer`).
 stop_feed_() {
     local host="$1" fifo="$2"
-    ssh_ "$host" "echo '$PW' | sudo -S -p '' docker exec plum-audio \
+    sudo_ssh_ "$host" "docker exec plum-audio \
         pkill -f 'dd if=/dev/zero of=$fifo' 2>/dev/null; true"
 }
 

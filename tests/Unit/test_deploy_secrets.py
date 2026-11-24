@@ -147,3 +147,125 @@ def test_install_gives_mode_600_and_replaces_a_readable_file(tmp_path):
     with open(target, "w") as fh:  # `cat >` and `tee` truncate and keep the mode
         fh.write("PLUM_FLEET_PSK=new\n")
     assert target.stat().st_mode & 0o777 == 0o600
+
+
+# -- the integration-test helpers and hotpatch.sh ----------------------------------------------
+#
+# tests/Integration/lib.sh kept `sshpass -p` and `echo '$PW' | sudo -S` after deploy.sh lost them.
+# Both put the rig password in a process list: the first on the workstation, the second on both.
+
+LIB = REPO / "tests" / "Integration" / "lib.sh"
+HOTPATCH = REPO / "docker" / "hotpatch.sh"
+SHELL_TESTS = sorted((REPO / "tests" / "Integration").glob("*.sh"))
+
+
+@pytest.mark.parametrize("script", [*SHELL_TESTS, HOTPATCH], ids=lambda p: p.name)
+def test_no_integration_script_puts_the_password_on_a_command_line(script):
+    text = script.read_text()
+    assert "sshpass -p" not in text
+    assert "'$PW'" not in text  # `echo '$PW' | sudo -S` inside a remote command string
+
+
+def _lib_harness(tmp_path: Path, body: str, sshpass_body: str) -> subprocess.CompletedProcess:
+    text = LIB.read_text()
+    stub = tmp_path / "bin" / "sshpass"
+    stub.parent.mkdir(exist_ok=True)
+    stub.write_text(f"#!/bin/bash\n{sshpass_body}\n")
+    stub.chmod(0o755)
+    names = ["retry_ssh_", "ssh_", "sudo_ssh_", "dexec_", "feed_fifo_", "stop_feed_"]
+    functions = "\n".join(_function(text, name) for name in names)
+    program = f'set -uo pipefail\nPW="$PLUM_TEST_PW"\nUSER_=pi\nSSH_OPTS="-o X=y"\nsleep() {{ :; }}\n{functions}\n{body}\n'
+    return subprocess.run(
+        ["bash", "-c", program],
+        env={"PATH": f"{stub.parent}:/usr/bin:/bin", "PLUM_TEST_PW": PASSWORD, "OUT": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_lib_ssh_sends_the_password_in_the_environment(tmp_path):
+    result = _lib_harness(tmp_path, 'ssh_ unit-1 "uname -a"', RECORD)
+    assert result.returncode == 0, result.stderr
+    argv = (tmp_path / "argv").read_text()
+    assert PASSWORD not in argv
+    assert argv.splitlines()[:2] == ["-e", "ssh"]
+    assert (tmp_path / "env").read_text() == PASSWORD
+    assert (tmp_path / "stdin").read_text() == "", "a plain ssh_ gets no password on stdin"
+
+
+@pytest.mark.parametrize(
+    ("call", "expected"),
+    [
+        ("dexec_ unit-1 ls /tmp", "sudo -S -p '' docker exec plum-audio ls /tmp"),
+        ("feed_fifo_ unit-1 /tmp/a-fifo 3", "of=/tmp/a-fifo bs=17640 count=3"),
+        ("stop_feed_ unit-1 /tmp/a-fifo", "pkill -f 'dd if=/dev/zero of=/tmp/a-fifo'"),
+    ],
+    ids=["dexec", "feed", "stop-feed"],
+)
+def test_lib_sudo_gets_the_password_on_stdin(tmp_path, call, expected):
+    result = _lib_harness(tmp_path, call, RECORD)
+    assert result.returncode == 0, result.stderr
+    argv = (tmp_path / "argv").read_text()
+    assert PASSWORD not in argv
+    assert expected in argv
+    assert "sudo -S -p ''" in argv
+    assert (tmp_path / "stdin").read_text() == PASSWORD + "\n"
+    assert (tmp_path / "env").read_text() == PASSWORD
+
+
+def test_lib_sudo_sends_the_password_again_on_a_retry(tmp_path):
+    """A retry with stdin at end-of-file gives sudo no password."""
+    stub = (
+        'n=$(cat "$OUT/n" 2>/dev/null || echo 0); echo $((n+1)) > "$OUT/n"; '
+        'cat > "$OUT/stdin.$n"; [ "$n" = 0 ] && exit 255; exit 0'
+    )
+    result = _lib_harness(tmp_path, 'dexec_ unit-1 true; echo "rc=$?"', stub)
+    assert "rc=0" in result.stdout, result.stderr
+    assert (tmp_path / "stdin.0").read_text() == PASSWORD + "\n"
+    assert (tmp_path / "stdin.1").read_text() == PASSWORD + "\n"
+
+
+def test_lib_sudo_passes_the_remote_status_and_does_not_retry_it(tmp_path):
+    stub = 'echo run >> "$OUT/runs"; cat > /dev/null; exit 7'
+    result = _lib_harness(tmp_path, 'dexec_ unit-1 false; echo "rc=$?"', stub)
+    assert "rc=7" in result.stdout
+    assert (tmp_path / "runs").read_text().count("run") == 1
+
+
+# -- the fleet PSK -----------------------------------------------------------------------------
+
+
+def test_the_fleet_psk_is_not_a_remote_argument():
+    text = DEPLOY.read_text()
+    assert "'${PLUM_FLEET_PSK:-}'" not in text
+    assert 'FLEET_PSK="${12:-}"' not in text
+    for line in text.splitlines():
+        if "bash -s" in line and "ssh_sudo_ " in line:
+            assert "PSK" not in line.split("ssh_sudo_ ", 1)[1], line  # the remote command
+
+
+def test_the_fleet_psk_reaches_the_remote_block_on_stdin(tmp_path):
+    """Run the real line from deploy.sh through a local `bash -s`, with a PSK that needs quotes."""
+    psk = "k'e y$(touch PWNED)\"z\\"
+    lines = DEPLOY.read_text().splitlines()
+    (line,) = [item.strip() for item in lines if "FLEET_PSK=%q" in item and not item.strip().startswith("#")]
+    assert line.endswith("|| return 1")
+    block = 'printf \'%s|%s|%s\' "$FLEET_PSK" "$2" "$#" > "$OUT/seen"\n'
+    names = ["host", "unit_id", "unit_name", "player_id", "player_name", "dac", "profile", "player_enabled"]
+    setup = "\n".join(f"{name}=v" for name in names) + "\nREMOTE_ROOT=/opt/x\nPLUM_IMAGE_NAME=i\nPLUM_IMAGE_TAG=t\n"
+    body = f'PLUM_FLEET_PSK="$TEST_PSK"\n{setup}{line[: -len("|| return 1")]}\n{block}EOS'
+    remote = 'printf "%s\\n" "$@" > "$OUT/argv"; cd "$OUT"; exec bash -c "${@: -1}"'
+    text = DEPLOY.read_text()
+    stub = tmp_path / "bin" / "sshpass"
+    stub.parent.mkdir()
+    stub.write_text(f"#!/bin/bash\n{remote}\n")
+    stub.chmod(0o755)
+    functions = "\n".join(_function(text, name) for name in ["sshpass_", "ssh_sudo_"])
+    program = f'set -euo pipefail\nPW="$PLUM_TEST_PW"\nUSER_=pi\nSSH_OPTS="-o X=y"\nsleep() {{ :; }}\n{functions}\n{body}\n'
+    env = {"PATH": f"{stub.parent}:/usr/bin:/bin", "PLUM_TEST_PW": PASSWORD, "OUT": str(tmp_path), "TEST_PSK": psk}
+    result = subprocess.run(["bash", "-c", program], env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "seen").read_text() == f"{psk}|/opt/x|11"
+    assert "k'e" not in (tmp_path / "argv").read_text()
+    assert not (tmp_path / "PWNED").exists()

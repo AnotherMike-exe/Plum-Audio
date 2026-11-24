@@ -26,7 +26,7 @@ B="${2:?need unit-b}"
 
 echo "== Tier 4: half-open peer — does it wedge the player? ($A player, $B frozen) =="
 
-host_docker() { ssh_ "$1" "echo '$PW' | sudo -S -p '' docker $2 plum-audio" >/dev/null 2>&1; }
+host_docker() { sudo_ssh_ "$1" "docker $2 plum-audio" >/dev/null 2>&1; }
 
 own_player() { ssh_json "$1" /api/mesh/snapshot 'json.dumps((d.get("local_player") or {}).get("player_id") or "")' | tr -d '"'; }
 PA="$(wait_for_nonempty 30 own_player "$A")"
