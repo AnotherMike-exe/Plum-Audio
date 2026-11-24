@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import logging
 import socket
+import time
 from collections.abc import Awaitable, Callable
 
 from sync_engine.base import SyncEngine
@@ -52,6 +53,9 @@ FetchSnapshot = Callable[[Peer], Awaitable["dict | None"]]
 DEFAULT_INTERVAL_S = 2.0
 # Comfortably above any real rig, so normal operation is still one round trip for everyone at once.
 MAX_CONCURRENT_FETCHES = 16
+# A refresh that keeps failing is logged once, then at most this often. The poll runs every 2 s, so
+# an unlimited log is 43 000 tracebacks a day onto an SD card for one persistent bug.
+REFRESH_ERROR_LOG_EVERY_S = 60.0
 
 
 class DataAggregator:
@@ -63,6 +67,7 @@ class DataAggregator:
         fetch_snapshot: FetchSnapshot,
         *,
         interval_s: float = DEFAULT_INTERVAL_S,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.local_unit_id = local_unit_id
         self._local_player_state: dict | None = None  # our speaker's self-report (see model)
@@ -70,6 +75,7 @@ class DataAggregator:
         self._discovery = discovery
         self._fetch = fetch_snapshot
         self.interval_s = interval_s
+        self._clock = clock  # injected so tests can move time
         self._local_host = _detect_local_host()
         self._view = MeshView(units=[self.local_snapshot()])
         self._task: asyncio.Task | None = None
@@ -137,7 +143,35 @@ class DataAggregator:
         return snap
 
     async def _poll_loop(self) -> None:
+        """Refresh the view every interval. A failure is logged and the loop continues.
+
+        This used to suppress every exception with no log. One bug in a snapshot then froze the mesh
+        view — routing, follow and the GUI all read it — and the only sign was that nothing changed.
+        Rate-limited: the first failure is logged at once with its traceback, a fault that persists
+        is logged again every REFRESH_ERROR_LOG_EVERY_S with the count in between, and the recovery
+        is logged, so the log shows when the view was frozen and for how long.
+        """
+        failing = False
+        last_logged = 0.0
+        unlogged = 0
         while not self._stop.is_set():
-            with contextlib.suppress(Exception):
+            try:
                 await self.refresh()
+            except Exception:  # noqa: BLE001 - the loop must survive any fault in one refresh
+                now = self._clock()
+                if not failing or now - last_logged >= REFRESH_ERROR_LOG_EVERY_S:
+                    logger.exception(
+                        "mesh view refresh failed; the view is frozen%s",
+                        f" ({unlogged} more failure(s) since the last report)" if unlogged else "",
+                    )
+                    last_logged = now
+                    unlogged = 0
+                else:
+                    unlogged += 1
+                failing = True
+            else:
+                if failing:
+                    logger.info("mesh view refresh recovered")
+                failing = False
+                unlogged = 0
             await asyncio.sleep(self.interval_s)
