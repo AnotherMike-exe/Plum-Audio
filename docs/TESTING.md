@@ -21,6 +21,7 @@ weights integration and interop over breadth of unit coverage.
 | Suite | Runs | Covers |
 |---|---|---|
 | `tests/Integration/t0_sendspin_protocol.py` (**tier 0**) | `<venv>/bin/python tests/Integration/t0_sendspin_protocol.py` | the aiosendspin VERSION GATE — real protocol, no rig; run before any pin bump |
+| `tests/Integration/t0_player_peer_watchdog.py` (**tier 0**) | `<venv>/bin/python tests/Integration/t0_player_peer_watchdog.py` | the peer-silence watchdog — a real server dials the player through a TCP proxy that freezes without closing; loopback only, about 45 s |
 | `tests/Unit/**` (pytest, **463**) | `PYTHONPATH=backend/scripts pytest tests/Unit` | see the breakdown below |
 | `frontend/tests/unit/**` (vitest, **133**) | `cd frontend && npx vitest run` | view→model mapping, local-player-by-host, progress extrapolation, `TimeFilter` clock sync, audio + settings + integrations services |
 
@@ -164,7 +165,7 @@ non-negotiable for tier 4's live third-party devices. `run.sh` drives a whole ri
 | `t2_calibration_tone.sh` | ✅ passing (both `.7` units, 2026-08-22) — the tone reaches the audio path; needs no meter or speaker |
 | `t3_loudness_match.sh` | ✅ passing (mesh pair, 2026-08-22) — cross-unit curve merge, causal rev, and matching driven live |
 | `t4_player_wedge_soak.sh` | ran 2026-08-24, **did not reproduce** in 80 cycles across two churn profiles (OPEN-ITEMS #23) |
-| `t4_player_halfopen.sh` | ✅ passing (mesh pair, 2026-08-24) — freezes a peer mid-connection; the half-open state is real but does not wedge |
+| `t4_player_halfopen.sh` | ✅ passing (mesh pair, 2026-08-24, before the peer-silence watchdog) — freezes a peer mid-connection; the half-open state is real but does not wedge. **Stale since `4375afd`:** step 2 expects A's session to survive the freeze. The watchdog closes that session at about 30 s, so step 2 now reports the opposite. Not re-run on this branch. |
 | `t3_phase_lock.sh` | ✅ passing 12/12 (all four `.7` units, 2026-09-13) — settled spread 2.7 ms across bcm2835 + 3x HiFiBerry, 0 xruns |
 
 **Remaining:** add `t2_airplay_mpris.sh` (per-endpoint private-bus MPRIS ownership) and a
