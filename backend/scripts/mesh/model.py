@@ -245,7 +245,11 @@ class UnitSnapshot:
     # None = unknown (no file, unreadable, or an older image). The keys belong to the healthcheck
     # and are not fixed here, so a consumer must treat a key it does not know as "unknown" too.
     health: dict | None = None
-    # Age of that file in seconds, so a healthcheck that stopped running shows as old, not as OK.
+    # Seconds since the healthcheck last WROTE its verdict: from the file's `checked_at`, or from
+    # the file mtime when that key is not a sane time (mesh/aggregator._read_health). It is not
+    # "seconds since the check last ran". An unhealthy verdict is written on every run (30 s), but a
+    # healthy one is rewritten only every healthcheck.HEALTHY_REFRESH_S (300 s), so a healthy unit
+    # reads up to about 330 s here. A consumer must put its "the check stopped" limit above that.
     health_age_s: float | None = None
 
     def to_dict(self) -> dict:

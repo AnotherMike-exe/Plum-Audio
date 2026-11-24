@@ -7,9 +7,12 @@ Pure logic: the engine, discovery and the peer fetch are fakes. Run: `pytest tes
 """
 
 import asyncio
+import json
 import logging
 import sys
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "backend" / "scripts"))
 
@@ -255,3 +258,29 @@ def test_the_health_file_is_not_read_on_every_snapshot(tmp_path):
     assert agg.local_snapshot().health == {"status": "ok"}  # cached
     clock.now += agg_mod.HEALTH_REREAD_S + 0.1
     assert agg.local_snapshot().health == {"status": "bad"}
+
+
+# --- health_age_s comes from the verdict, not from the file -----------------------------------------
+
+
+def test_the_health_age_is_read_from_checked_at(tmp_path):
+    """The mtime moves with a copy or a restore. `checked_at` is when the check last ran."""
+    import time
+
+    path = tmp_path / "health.json"
+    path.write_text(json.dumps({"healthy": True, "checked_at": time.time() - 250}))  # written just now
+    age = make_aggregator(health_file=str(path)).local_snapshot().health_age_s
+    assert age is not None and 249 <= age <= 260
+
+
+@pytest.mark.parametrize("checked_at", ["soon", None, True, -5, 0, float("nan"), float("inf"), 4102444800, [1]])
+def test_a_checked_at_that_is_not_a_sane_time_falls_back_to_the_mtime(tmp_path, checked_at):
+    import os
+    import time
+
+    path = tmp_path / "health.json"
+    path.write_text(json.dumps({"healthy": True, "checked_at": checked_at}))
+    then = time.time() - 100
+    os.utime(path, (then, then))
+    age = make_aggregator(health_file=str(path)).local_snapshot().health_age_s
+    assert age is not None and 99 <= age <= 110

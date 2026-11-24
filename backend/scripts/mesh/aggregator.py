@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import socket
 import time
@@ -67,6 +68,9 @@ LOCAL_PLAYER_STALE_S = 5 * LOCAL_PLAYER_REPORT_INTERVAL_S
 # Written by the container healthcheck. Optional: no file means "unknown", never "unhealthy".
 HEALTH_FILE = os.environ.get("PLUM_HEALTH_FILE", "/data/health.json")
 HEALTH_MAX_BYTES = 16 * 1024  # it rides every snapshot to every peer, so it stays small
+# A `checked_at` this far ahead of our clock is still believed (it reads as age 0). The healthcheck
+# and this process share one clock, so more than this is a damaged value.
+HEALTH_CLOCK_SKEW_S = 60.0
 HEALTH_REREAD_S = 5.0  # local_snapshot() runs per poll AND per API request; do not stat each time
 
 
@@ -153,7 +157,12 @@ class DataAggregator:
 
         Defensive on every axis, because another component owns the file and its keys are not
         settled: a missing file, an unreadable one, an oversized one, invalid JSON or a non-object
-        all read as unknown. Nothing here interprets a key. Cached for HEALTH_REREAD_S.
+        all read as unknown. Cached for HEALTH_REREAD_S.
+
+        One key is read: `checked_at`, the wall-clock time of the last check, gives the age. The
+        file mtime is the fallback for a value that is not a sane time (absent, not a number, not
+        finite, zero or negative, or more than HEALTH_CLOCK_SKEW_S ahead of this clock). The
+        mtime alone is not the check time: a copy or a restore of /data moves it.
         """
         now = self._clock()
         if self._health_read_at is not None and now - self._health_read_at < HEALTH_REREAD_S:
@@ -166,7 +175,15 @@ class DataAggregator:
                 with open(self.health_file, encoding="utf-8") as fh:
                     data = json.load(fh)
                 if isinstance(data, dict):
-                    result = (data, round(max(0.0, time.time() - stat.st_mtime), 1))
+                    wall = time.time()
+                    checked = data.get("checked_at")
+                    sane = (
+                        isinstance(checked, (int, float))
+                        and not isinstance(checked, bool)
+                        and math.isfinite(checked)
+                        and 0 < checked <= wall + HEALTH_CLOCK_SKEW_S
+                    )
+                    result = (data, round(max(0.0, wall - (checked if sane else stat.st_mtime)), 1))
         except (OSError, ValueError):
             pass  # absent or mid-write: unknown this time, read again on the next pass
         self._health = result
