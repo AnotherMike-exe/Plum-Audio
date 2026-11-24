@@ -195,3 +195,58 @@ describe('PairDeviceDialog polling', () => {
     errors.mockRestore();
   });
 });
+
+describe('PairDeviceDialog while the start request is in flight', () => {
+  type StartResult = { ok: boolean; message?: string };
+
+  /** An onStart that stays pending until the test answers it. */
+  function deferredStart() {
+    let answer: (r: StartResult) => void = () => {};
+    const onStart = vi.fn(() => new Promise<StartResult>((resolve) => { answer = resolve; }));
+    return { onStart, answer: (r: StartResult) => answer(r) };
+  }
+
+  const clickPair = async () => {
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Pair' }));
+    });
+  };
+
+  it('does not cancel on Escape', async () => {
+    const { onStart } = deferredStart();
+    const { props } = setup({ onStart });
+    await clickPair();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(props.onCancel).not.toHaveBeenCalled();
+  });
+
+  it('does not cancel on a backdrop click', async () => {
+    const { onStart } = deferredStart();
+    const { props } = setup({ onStart });
+    await clickPair();
+    fireEvent.click(backdrop());
+    expect(props.onCancel).not.toHaveBeenCalled();
+  });
+
+  it('cancels on Escape again when the unit accepts the attempt', async () => {
+    const { onStart, answer } = deferredStart();
+    const { props } = setup({ onStart });
+    await clickPair();
+    await act(async () => { answer({ ok: true }); });
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(props.onCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels the attempt when the start request resolves after the dialog closed', async () => {
+    const { onStart, answer } = deferredStart();
+    const { props, unmount } = setup({ onStart });
+    await clickPair();
+    // The Cancel button stays live. Its cancel can reach the unit before the attempt exists.
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(props.onCancel).toHaveBeenCalledTimes(1);
+    unmount();
+    await act(async () => { answer({ ok: true }); });
+    // The attempt exists now, and no dialog shows it. Cancel it a second time.
+    expect(props.onCancel).toHaveBeenCalledTimes(2);
+  });
+});

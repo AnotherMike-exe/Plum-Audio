@@ -43,6 +43,14 @@ export const PairDeviceDialog: React.FC<PairDeviceDialogProps> = ({
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const panelRef = useRef<HTMLDivElement | null>(null);
+  // Read by `start()` after its await, when this render's props can be old or the dialog gone.
+  const mountedRef = useRef(true);
+  const onCancelRef = useRef(onCancel);
+  onCancelRef.current = onCancel;
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
 
   // While an attempt runs, a stray click outside the panel must not abandon it: cancel tells the unit
   // to drop the attempt, and the device then needs the whole exchange again. Cancel stays one
@@ -50,6 +58,11 @@ export const PairDeviceDialog: React.FC<PairDeviceDialogProps> = ({
   const attemptLive = phase === 'running' || phase === 'pin';
   // Once paired there is nothing to cancel, so every way out is "done".
   const dismiss = phase === 'done' ? onDone : onCancel;
+  // The start request is in flight: the unit did not register the attempt yet. A cancel sent now
+  // can arrive first and find nothing, and the attempt then runs with no dialog — a PIN attempt
+  // waits on a person who cannot see it. So Escape and the backdrop do nothing until the unit
+  // answers. (`busy` in the `pin` phase is a PIN submit, and Escape stays live there.)
+  const starting = busy && !attemptLive;
 
   // While an attempt runs, the unit is the source of truth for what is happening — including
   // "awaiting_pin", which is how we learn the device has DISPLAYED a PIN and it is worth asking for.
@@ -108,7 +121,7 @@ export const PairDeviceDialog: React.FC<PairDeviceDialogProps> = ({
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.preventDefault();
-        dismiss();
+        if (!starting) dismiss();
         return;
       }
       const panel = panelRef.current;
@@ -130,12 +143,19 @@ export const PairDeviceDialog: React.FC<PairDeviceDialogProps> = ({
     };
     document.addEventListener('keydown', onKeyDown);
     return () => document.removeEventListener('keydown', onKeyDown);
-  }, [dismiss]);
+  }, [dismiss, starting]);
 
   const start = async () => {
     setBusy(true);
     setMessage(null);
     const res = await onStart(method, method === 'pairing_psk' ? token.trim() : undefined);
+    if (!mountedRef.current) {
+      // The dialog closed while the request was in flight (the Cancel button stays live). That
+      // cancel can have reached the unit before the attempt existed. Send it again, now that the
+      // unit answered, so no attempt runs without a dialog.
+      onCancelRef.current();
+      return;
+    }
     setBusy(false);
     if (!res.ok) {
       setMessage(res.message ?? 'Could not start pairing.');
@@ -163,7 +183,7 @@ export const PairDeviceDialog: React.FC<PairDeviceDialogProps> = ({
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs"
-      onClick={attemptLive ? undefined : dismiss}
+      onClick={attemptLive || starting ? undefined : dismiss}
       role="dialog"
       aria-modal="true"
       aria-labelledby="pair-dialog-title"

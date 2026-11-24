@@ -442,7 +442,9 @@ export default function MeshApp(): React.ReactElement {
     // Tell the unit to abandon the attempt rather than just closing the dialog: an attempt left
     // running holds the device in a pairing state where it cannot play.
     if (pairingTarget?.serverId) void service.cancelPairing(pairingTarget.serverId, pairingTarget.id);
-    setPairingTarget(null);
+    // Close only the dialog of THIS device. The dialog can call this a second time after it
+    // closed (its start request resolved late), and a dialog for another device can be open then.
+    setPairingTarget((current) => (current?.id === pairingTarget?.id ? null : current));
   }, [pairingTarget]);
 
   // -- Listen in Browser: this tab becomes a Sendspin player of the unit that serves it -------------
