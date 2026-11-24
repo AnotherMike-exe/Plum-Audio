@@ -29,45 +29,46 @@ LOG = "plum.sendspin_player"
 # -- background tasks ------------------------------------------------------------------------------
 
 
-def test_a_background_task_that_dies_is_logged(caplog):
+def test_the_player_uses_the_shared_spawn_helper():
+    """One helper holds the reference and logs the failure. The player had a copy of it."""
+    import background_tasks
+
+    assert sendspin_player.spawn is background_tasks.spawn
+    assert not hasattr(sendspin_player, "_spawn") and not hasattr(sendspin_player, "_BACKGROUND_TASKS")
+
+
+def test_a_player_task_that_dies_is_logged(caplog):
     """A bare ensure_future drops the exception until the task is collected, if it ever is."""
+    import background_tasks
 
     async def scenario():
         async def boom():
             raise RuntimeError("watcher fell over")
 
-        task = sendspin_player._spawn(boom(), name="output watch")
-        assert task in sendspin_player._BACKGROUND_TASKS, "a reference must be held or the task can be collected"
+        sendspin_player.spawn(boom(), "output watch")
+        assert background_tasks.pending() == 1, "a reference must be held or the task can be collected"
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        assert task not in sendspin_player._BACKGROUND_TASKS
+        assert background_tasks.pending() == 0
 
-    with caplog.at_level(logging.ERROR, logger=LOG):
+    with caplog.at_level(logging.ERROR, logger="plum.background_tasks"):
         asyncio.run(scenario())
-    messages = [r.getMessage() for r in caplog.records]
-    assert any("output watch" in m and "watcher fell over" in m for m in messages)
+    assert any("output watch" in r.getMessage() and "watcher fell over" in str(r.exc_info[1]) for r in caplog.records)
 
 
-def test_a_cancelled_or_clean_background_task_is_quiet(caplog):
+def test_the_last_playing_server_is_saved_through_a_coroutine(tmp_path):
+    """`spawn` takes a coroutine. The save used to hand it an executor future."""
+    import json
+
+    class P:
+        _state_file = str(tmp_path / "player_state.json")
+        _save_last_playing_server = sendspin_player.SendspinPlayer._save_last_playing_server
+
     async def scenario():
-        async def forever():
-            await asyncio.sleep(3600)
+        await sendspin_player.spawn(P()._save_last_playing_server("server-b"), "last playing server save")
 
-        async def done():
-            return None
-
-        task = sendspin_player._spawn(forever(), name="rename watch")
-        sendspin_player._spawn(done(), name="one shot")
-        await asyncio.sleep(0)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        await asyncio.sleep(0)
-        assert not sendspin_player._BACKGROUND_TASKS
-
-    with caplog.at_level(logging.DEBUG, logger=LOG):
-        asyncio.run(scenario())
-    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    asyncio.run(scenario())
+    assert json.loads((tmp_path / "player_state.json").read_text())["last_playing_server_id"] == "server-b"
 
 
 # -- stop() ----------------------------------------------------------------------------------------
@@ -752,7 +753,12 @@ def test_a_silent_session_is_closed_and_logged_once(caplog):
         p._check_peer_silence()
         await asyncio.sleep(0.01)
         p._check_peer_silence()  # the next poll must not close or log it again
-        await asyncio.sleep(0.1)
+        # Wait for the detach, with a limit. A fixed 0.1 s was two poll periods of the close path
+        # and failed on a loaded CI runner.
+        for _ in range(500):
+            if 306 not in p._session_ws:
+                break
+            await asyncio.sleep(0.01)
         assert 306 not in p._session_ws and 307 in p._session_ws
         return p, dead, live
 

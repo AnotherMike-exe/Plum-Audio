@@ -297,3 +297,21 @@ def test_the_spotify_manager_survives_a_bad_bitrate(tmp_path, caplog, bad):
         again = manager.desired(settings)
     assert first["1"][0][2] == sc.DEFAULT_BITRATE and again["1"][0] == first["1"][0]
     assert caplog.text.count("bitrate") == 1, "one warning for a bad value, not one per poll"
+
+
+def test_the_warned_set_is_capped(caplog):
+    """Each distinct bad record adds a key. Without a cap the set grows for the life of the process."""
+    ec._warned.clear()
+
+    def refuse(_endpoint):
+        raise ec.InvalidEndpoint("bad")
+
+    with caplog.at_level("WARNING"):
+        for n in range(500):
+            assert ec.resolve("airplay", [{"id": f"../{n}"}], refuse) == []
+    assert len(ec._warned) <= ec._WARNED_MAX
+    assert len(caplog.records) == 500, "a new bad record is still reported"
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        ec.resolve("airplay", [{"id": "../499"}], refuse)
+    assert not caplog.records, "the same record is not reported twice in a row"

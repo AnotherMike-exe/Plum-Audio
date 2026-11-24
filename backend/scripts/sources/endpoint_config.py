@@ -116,7 +116,11 @@ def validate_section(source: str, section: object) -> None:
 
 # The managers resolve the endpoints on every poll. Without this set, one bad record writes the
 # same warning every few seconds for as long as it stays in the file.
+# The set is capped. Each distinct bad record adds a key, and a caller that writes a new bad record
+# on every request would grow it without limit. At the cap it starts again: the cost is one more
+# warning for a record that is still bad, and that is the smaller fault.
 _warned: set[tuple[str, str]] = set()
+_WARNED_MAX = 64
 
 
 def resolve(source: str, endpoints: list, build) -> list:
@@ -130,6 +134,8 @@ def resolve(source: str, endpoints: list, build) -> list:
         except InvalidEndpoint as exc:
             key = (source, repr(endpoint)[:200])
             if key not in _warned:
+                if len(_warned) >= _WARNED_MAX:
+                    _warned.clear()
                 _warned.add(key)
                 logger.warning("skipping %s endpoint: %s", source, exc)
     return instances

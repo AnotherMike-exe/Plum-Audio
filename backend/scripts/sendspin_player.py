@@ -38,7 +38,6 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
-import functools
 import logging
 import os
 import threading
@@ -73,6 +72,7 @@ except Exception:  # noqa: BLE001 - allows --probe-config / import without PortA
 import audio_devices
 import sendspin_identity
 import unit_identity
+from background_tasks import spawn
 from lifecycle import install_shutdown_handlers
 from mesh.avahi import CLIENT_SERVICE, AvahiClient
 from player_state import (
@@ -318,35 +318,9 @@ SYNC_STEP_LOG_GAP_S = 2.0  # throttle on the step log line, NOT on the step itse
 MAX_DAC_LEAD_US = 1_000_000
 
 
-# Every background task this process starts. asyncio keeps only a WEAK reference to a task, so one
-# created with a bare ensure_future and never awaited can be collected mid-flight — and one that
-# raises keeps its exception until it is collected, which for a task held in a local is "never".
-# Both happened here in silence: the settings watchers and the render-state echo.
-_BACKGROUND_TASKS: set[asyncio.Task] = set()
-
-
 def _relay_backoff(failures: int) -> float:
     """Seconds to wait before relay attempt `failures + 1`: 2, 4, 8, 16, then 30 from there on."""
     return min(RELAY_RETRY_MAX_S, RELAY_RETRY_MIN_S * 2 ** min(max(0, failures - 1), 16))
-
-
-def _spawn(coro, *, name: str) -> asyncio.Task:
-    """Start `coro` as a task that is referenced until it ends and says so if it dies."""
-    task = asyncio.ensure_future(coro)
-    _BACKGROUND_TASKS.add(task)
-    task.add_done_callback(functools.partial(_task_done, name))
-    return task
-
-
-def _task_done(name: str, task: asyncio.Task) -> None:
-    _BACKGROUND_TASKS.discard(task)
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc is not None:
-        # ERROR, and with the traceback: a watcher that died stays dead, so from here on a rename or
-        # an output change in Settings does nothing until the process restarts.
-        logger.error("background task %r died: %r — it does not restart", name, exc, exc_info=exc)
 
 
 @dataclass(slots=True)
@@ -1316,7 +1290,7 @@ class SendspinPlayer:
                 self.client.connected,
                 self._audio_flowing,
             )
-            _spawn(self._close_silent_session(session, watched), name=f"close silent session {session}")
+            spawn(self._close_silent_session(session, watched), f"close silent session {session}")
 
     async def _close_silent_session(self, session: int, watched: _WatchedWebSocket) -> None:
         """Close one silent session: a websocket close first, then a TCP abort if it is still held."""
@@ -1765,7 +1739,7 @@ class SendspinPlayer:
 
         async with aiohttp.ClientSession() as session, session.ws_connect(self.relay_url, heartbeat=30) as ws:
             self._relay_connected()
-            sender = _spawn(self._relay_send(ws), name="consume relay sender")
+            sender = spawn(self._relay_send(ws), "consume relay sender")
             try:
                 async for msg in ws:
                     if msg.type is not aiohttp.WSMsgType.TEXT:
@@ -1960,11 +1934,12 @@ class SendspinPlayer:
         server_id = getattr(info, "server_id", None)
         if server_id and server_id != self._last_playing_server:
             self._last_playing_server = server_id
-            _spawn(
-                asyncio.get_running_loop().run_in_executor(None, save_last_playing_server, self._state_file, server_id),
-                name="last playing server save",
-            )
+            spawn(self._save_last_playing_server(server_id), "last playing server save")
             logger.info("now playing for server %s (persisted)", server_id)
+
+    async def _save_last_playing_server(self, server_id: str) -> None:
+        """The write, in a worker thread. A coroutine, because `spawn` takes one and not a future."""
+        await asyncio.get_running_loop().run_in_executor(None, save_last_playing_server, self._state_file, server_id)
 
     async def _report_loop(self) -> None:
         """Push our state to this unit's mesh API. Best-effort: the audio path never waits on it."""
@@ -2042,11 +2017,11 @@ class SendspinPlayer:
         )
         await self._listener.start()
         logger.info("player listening on :%d (id=%s)", self.port, self.player_id)
-        self._health_task = _spawn(self._health_loop(), name="health loop")
+        self._health_task = spawn(self._health_loop(), "health loop")
         if self.report_url:
-            self._report_task = _spawn(self._report_loop(), name="state report")
+            self._report_task = spawn(self._report_loop(), "state report")
         if self.relay_url:
-            self._relay_task = _spawn(self._relay_loop(), name="consume relay")
+            self._relay_task = spawn(self._relay_loop(), "consume relay")
 
         # Advertise ourselves the way the spec says a server-dialed client should: _sendspin._tcp,
         # port 8928, TXT path + name. Published through the system Avahi rather than aiosendspin's
@@ -2097,7 +2072,7 @@ class SendspinPlayer:
                 if task is not None:
                     task.cancel()
                     # Exception too: a task that died earlier re-raises here, and that must not
-                    # abort the shutdown. _task_done already logged it.
+                    # abort the shutdown. background_tasks.spawn already logged it.
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await task
                     setattr(self, task_attr, None)
@@ -2202,14 +2177,14 @@ class SendspinPlayer:
         library's group-volume redistribution computes its delta from a baseline that is not real.
         """
         if self.client.connected:
-            _spawn(self._send_render_state(), name="render state echo")
+            spawn(self._send_render_state(), "render state echo")
         # Also keep the values the client reports on its NEXT connect in step: after a roam the
         # library re-sends its constructor-time initial_volume, which would otherwise hand the new
         # server a stale level.
         self.client._initial_volume = self._volume  # noqa: SLF001
         self.client._initial_muted = self._muted  # noqa: SLF001
         if self._save_task is None or self._save_task.done():
-            self._save_task = _spawn(self._save_render_state(), name="render state save")
+            self._save_task = spawn(self._save_render_state(), "render state save")
 
     def _health(self) -> PlayerHealth:
         """SYNCHRONIZED, or ERROR while we are demonstrably failing to keep up.
@@ -2378,8 +2353,8 @@ async def main() -> int | None:
                 player.player_id, CLIENT_SERVICE, player.port, {"path": "/sendspin", "name": new_name}
             )
 
-    rename_watch = _spawn(
-        unit_identity.watch_device_name(_apply_player_name, fallback=env_player_name), name="device name watch"
+    rename_watch = spawn(
+        unit_identity.watch_device_name(_apply_player_name, fallback=env_player_name), "device name watch"
     )
 
     # Follow an output change from Settings. The swap runs in a worker thread: PortAudio teardown
@@ -2406,13 +2381,13 @@ async def main() -> int | None:
         return applied  # False keeps watch_output_device retrying this target
 
     save_active_output(state_file, renderer.open_device or renderer.device)
-    output_watch = _spawn(audio_devices.watch_output_device(_apply_output), name="output device watch")
+    output_watch = spawn(audio_devices.watch_output_device(_apply_output), "output device watch")
 
     stop = install_shutdown_handlers()
     # Run until SIGTERM, or until a watchdog asks for a new process (player.request_exit).
     waiters = [
-        _spawn(stop.wait(), name="shutdown signal"),
-        _spawn(player.exit_requested.wait(), name="exit request"),
+        spawn(stop.wait(), "shutdown signal"),
+        spawn(player.exit_requested.wait(), "exit request"),
     ]
     try:
         await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
