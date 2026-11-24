@@ -45,6 +45,7 @@ const ClientDevice: React.FC<{
                     onChange={(e) => onVolumeChange(client.id, Number(e.target.value))}
                     className="w-full h-2 rounded-lg appearance-none cursor-pointer volume-slider"
                     style={sliderStyle}
+                    aria-label={`${client.name} volume control`}
                 />
             </div>
             <StreamPickerButton
