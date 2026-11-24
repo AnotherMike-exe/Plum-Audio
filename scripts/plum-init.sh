@@ -3,7 +3,7 @@
 #
 #   sudo ./plum-init.sh "Kitchen"                 # everything: host setup, image, config, start
 #   sudo ./plum-init.sh "Kitchen" --check         # report what is missing, change nothing
-#   sudo ./plum-init.sh "Kitchen" --fleet-psk XYZ # join a fleet that already exists
+#   sudo ./plum-init.sh "Kitchen" --fleet-psk-file FILE   # join a fleet that already exists
 #
 # The device name is the ONLY thing this needs. Everything else is derived from the unit:
 # the unit id from the hostname, the player id from the unit id, the audio output from the cards
@@ -59,8 +59,12 @@ usage() {
 Options
   --image REF        image to run (default: ghcr.io/anothermike-exe/plum-audio:latest)
   --tarball FILE     load this local image tarball instead of pulling
-  --fleet-psk VALUE  the fleet pairing secret. Omit on the FIRST unit — one is minted and
-                     printed. Give that printed value to every later unit.
+  --fleet-psk-file FILE
+                     read the fleet pairing secret from the first line of FILE. Omit on the
+                     FIRST unit: one is minted and printed. Give that value to every later unit.
+  --fleet-psk -      read the fleet pairing secret from the first line of stdin.
+  --fleet-psk VALUE  the secret as an argument. It still works, but every user on the unit can
+                     read an argument in the process list. Use one of the two forms above.
   --fleet-psk-from HOST
                      copy the fleet pairing secret off a unit you already run, over ssh
                      ([user@]host). Use this when you no longer have the value on hand.
@@ -74,11 +78,35 @@ Options
 USAGE
 }
 
+# The fleet pairing secret from a file or from stdin, so it is never an argument. An argument is
+# in the process list of the unit, and in the shell history, for as long as this script runs.
+# Both take the first line. A `PLUM_FLEET_PSK=` prefix is removed, so a line copied from a
+# plum-audio.env works.
+PSK_ON_ARGV=0
+fleet_psk_line() {
+    local line=""
+    IFS= read -r line || true
+    line="${line%$'\r'}"
+    printf '%s' "${line#PLUM_FLEET_PSK=}"
+}
+fleet_psk_from_file() {
+    [[ -f "$1" && -r "$1" ]] || { echo "--fleet-psk-file: cannot read $1" >&2; exit 2; }
+    FLEET_PSK="$(fleet_psk_line < "$1")"
+    [[ -n "$FLEET_PSK" ]] || { echo "--fleet-psk-file: the first line of $1 is empty" >&2; exit 2; }
+}
+fleet_psk_from_stdin() {
+    FLEET_PSK="$(fleet_psk_line)"
+    [[ -n "$FLEET_PSK" ]] || { echo "--fleet-psk -: no secret on stdin" >&2; exit 2; }
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --image)       IMAGE_REF="$2"; shift 2 ;;
         --tarball)     TARBALL="$2"; shift 2 ;;
-        --fleet-psk)   FLEET_PSK="$2"; shift 2 ;;
+        --fleet-psk)
+            if [[ "${2:-}" == "-" ]]; then fleet_psk_from_stdin; else FLEET_PSK="${2:-}"; PSK_ON_ARGV=1; fi
+            shift 2 ;;
+        --fleet-psk-file) fleet_psk_from_file "${2:-}"; shift 2 ;;
         --fleet-psk-from) FLEET_PSK_FROM="$2"; shift 2 ;;
         --output)      OUTPUT_SPEC="$2"; shift 2 ;;
         --overlay)     OVERLAY="$2"; shift 2 ;;
@@ -98,6 +126,8 @@ ok()   { printf '    \033[32mOK\033[0m   %-26s %s\n' "$1" "$2"; }
 bad()  { printf '    \033[31mTODO\033[0m %-26s %s\n' "$1" "$2"; }
 warn() { printf '\033[33m    !! %s\033[0m\n' "$*"; }
 note() { printf '    \033[36m--\033[0m   %-26s %s\n' "$1" "$2"; }
+
+[[ "$PSK_ON_ARGV" == 1 ]] && warn "--fleet-psk <value> shows the secret in the process list. Use --fleet-psk-file <path> or --fleet-psk -"
 
 # Root by sudo, not by demanding `sudo ./plum-init.sh`: the script writes /opt/plum-audio as the
 # INVOKING user (PUID/PGID in plum-audio.env come from that account), so it has to know who that is.
@@ -795,9 +825,14 @@ or the units cannot pair with each other's speakers:
 
     PLUM_FLEET_PSK=${FLEET_PSK}
 
-Write it down now. On the next unit, run:
+Write it down now. On the next unit, put that value in a file that only you can read.
+Then run this, and delete the file:
 
-    sudo ./plum-init.sh "<its name>" --fleet-psk ${FLEET_PSK}
+    sudo ./plum-init.sh "<its name>" --fleet-psk-file <the file>
+
+Or let the next unit copy it from this one over ssh:
+
+    sudo ./plum-init.sh "<its name>" --fleet-psk-from ${IP:-<this-pi>}
 PSK
 else
     echo "Joined the fleet on the shared pairing secret."

@@ -387,6 +387,19 @@ fi
 
 # --- fleet pairing secret, part two: recover it before inventing one -------------------------------
 
+# Mode 600 BEFORE the content. `printf >>` on a file that does not exist creates it with the
+# default umask, which is 644 on most workstations. An existing file gets 600 too: it also holds
+# PLUM_TEST_PW.
+save_fleet_psk() {
+    local file="${HERE}/.deploy.env"
+    if [[ -e "$file" ]]; then
+        chmod 600 "$file"
+    else
+        install -m 600 /dev/null "$file"
+    fi
+    printf 'PLUM_FLEET_PSK=%s\n' "$1" >> "$file"
+}
+
 if [[ "$NEED_PSK" == 1 ]]; then
     say "no fleet pairing secret on this workstation — asking the units"
     # EVERY unit in the table, not just the ones being deployed. A peer that is not part of this run
@@ -418,7 +431,7 @@ if [[ "$NEED_PSK" == 1 ]]; then
 
     if [[ -n "$_found" ]]; then
         PLUM_FLEET_PSK="$_found"
-        printf 'PLUM_FLEET_PSK=%s\n' "$PLUM_FLEET_PSK" >> "${HERE}/.deploy.env"
+        save_fleet_psk "$PLUM_FLEET_PSK"
         say "recovered the fleet pairing secret from ${_found_on} and restored it to docker/.deploy.env"
     elif [[ -n "$_unreachable" && "$FORCE_NEW_PSK" != 1 ]]; then
         # Refusing beats a silent split. A new secret here would leave the units that ARE up unable
@@ -431,7 +444,7 @@ if [[ "$NEED_PSK" == 1 ]]; then
         exit 1
     else
         PLUM_FLEET_PSK="$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')"
-        printf 'PLUM_FLEET_PSK=%s\n' "$PLUM_FLEET_PSK" >> "${HERE}/.deploy.env"
+        save_fleet_psk "$PLUM_FLEET_PSK"
         say "minted a fleet pairing secret into docker/.deploy.env (shared by every unit)"
         [[ "$FORCE_NEW_PSK" == 1 ]] && warn "--new-fleet-psk: redeploy EVERY unit so they all get this value"
     fi

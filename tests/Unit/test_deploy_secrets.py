@@ -269,3 +269,86 @@ def test_the_fleet_psk_reaches_the_remote_block_on_stdin(tmp_path):
     assert (tmp_path / "seen").read_text() == f"{psk}|/opt/x|11"
     assert "k'e" not in (tmp_path / "argv").read_text()
     assert not (tmp_path / "PWNED").exists()
+
+
+# -- the fleet PSK on the workstation and on the unit's command line ---------------------------
+
+
+def test_deploy_makes_its_env_file_mode_600_before_the_psk_is_written(tmp_path):
+    """`printf >>` on a file that does not exist creates it with the default umask."""
+    text = DEPLOY.read_text()
+    assert ">> \"${HERE}/.deploy.env\"" not in text, "every write goes through save_fleet_psk"
+    assert text.count('save_fleet_psk "$PLUM_FLEET_PSK"') == 2
+    target = tmp_path / ".deploy.env"
+    program = f'set -euo pipefail\numask 022\nHERE="$OUT"\n{_function(text, "save_fleet_psk")}\nsave_fleet_psk first\n'
+    env = {"PATH": "/usr/bin:/bin", "OUT": str(tmp_path)}
+    subprocess.run(["bash", "-c", program], env=env, check=True, timeout=30)
+    assert target.stat().st_mode & 0o777 == 0o600
+    assert target.read_text() == "PLUM_FLEET_PSK=first\n"
+
+    target.write_text("PLUM_TEST_PW=x\n")
+    target.chmod(0o644)
+    subprocess.run(["bash", "-c", program], env=env, check=True, timeout=30)
+    assert target.stat().st_mode & 0o777 == 0o600, "a file that exists gets the mode too"
+    assert target.read_text() == "PLUM_TEST_PW=x\nPLUM_FLEET_PSK=first\n"
+
+
+def _init_arguments(tmp_path: Path, args: list[str], stdin: str = "") -> subprocess.CompletedProcess:
+    """Run the real argument parser of plum-init.sh, then print what it found."""
+    text = PLUM_INIT.read_text()
+    parser = text[text.index("PSK_ON_ARGV=0") : text.index("say()  {")]
+    program = (
+        'set -euo pipefail\nNAME=""\nFLEET_PSK=""\nusage() { :; }\n'
+        f'{parser}\nprintf "%s|%s|%s" "$NAME" "$FLEET_PSK" "$PSK_ON_ARGV"\n'
+    )
+    return subprocess.run(
+        ["bash", "-c", program, "plum-init.sh", *args],
+        env={"PATH": "/usr/bin:/bin"},
+        input=stdin,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+PSK = "k'e y$(touch PWNED)\"z"
+
+
+def test_plum_init_reads_the_psk_from_a_file(tmp_path):
+    secret = tmp_path / "psk"
+    secret.write_text(PSK + "\nsecond line\n")
+    result = _init_arguments(tmp_path, ["Kitchen", "--fleet-psk-file", str(secret)])
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"Kitchen|{PSK}|0"
+
+
+def test_plum_init_takes_a_line_copied_from_an_env_file(tmp_path):
+    secret = tmp_path / "psk"
+    secret.write_text("PLUM_FLEET_PSK=abc-123_x\r\n")
+    assert _init_arguments(tmp_path, ["--fleet-psk-file", str(secret), "Kitchen"]).stdout == "Kitchen|abc-123_x|0"
+
+
+def test_plum_init_reads_the_psk_from_stdin(tmp_path):
+    result = _init_arguments(tmp_path, ["Kitchen", "--fleet-psk", "-"], stdin=PSK + "\n")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"Kitchen|{PSK}|0"
+
+
+def test_plum_init_keeps_the_old_flag_and_marks_it_for_a_warning(tmp_path):
+    assert _init_arguments(tmp_path, ["Kitchen", "--fleet-psk", "abc"]).stdout == "Kitchen|abc|1"
+    text = PLUM_INIT.read_text()
+    (line,) = [item for item in text.splitlines() if item.startswith('[[ "$PSK_ON_ARGV" == 1 ]] && warn ')]
+    assert "--fleet-psk-file" in line
+
+
+@pytest.mark.parametrize("args", [["--fleet-psk-file", "/nonexistent/psk"], ["--fleet-psk", "-"]])
+def test_plum_init_refuses_a_psk_source_with_no_secret(tmp_path, args):
+    result = _init_arguments(tmp_path, ["Kitchen", *args])
+    assert result.returncode == 2
+    assert "Kitchen|" not in result.stdout
+
+
+def test_plum_init_does_not_print_a_command_that_holds_the_psk():
+    text = PLUM_INIT.read_text()
+    assert "--fleet-psk ${FLEET_PSK}" not in text
+    assert '--fleet-psk-file <the file>' in text
