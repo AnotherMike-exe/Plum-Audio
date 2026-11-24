@@ -28,6 +28,7 @@ import { SyncedDevices } from './components/SyncedDevices';
 import { ClientManager } from './components/ClientManager';
 import { PairDeviceDialog, type PairMethod } from './components/PairDeviceDialog';
 import { IncomingPairPrompt } from './components/IncomingPairPrompt';
+import { ActionErrorToast } from './components/ActionErrorToast';
 import { Icon } from './components/Icon';
 import { Settings } from './components/Settings';
 import { Visualizer } from './components/Visualizer';
@@ -38,6 +39,7 @@ import { settingsService } from './services/settingsService';
 import { aboutService } from './services/aboutService';
 import { useThemeSettings } from './hooks/useThemeSettings';
 import { useBrowserPlayer } from './hooks/useBrowserPlayer';
+import { useActionError } from './hooks/useActionError';
 
 const service = new SendspinDataService();
 const EMPTY: Model = { servers: [], streams: [], clients: [], localPlayerIds: [] };
@@ -117,6 +119,10 @@ export default function MeshApp(): React.ReactElement {
   const [settings, setSettings] = useState<SettingsType>(settingsService.getMergedSettings());
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const browser = useBrowserPlayer();
+  // Where a failed command goes. Every mesh command below is a promise that rejects when the unit
+  // refuses it (400) or cannot be reached; `guard` catches that and the toast at the bottom of the
+  // page says what did not happen and why. `guard` and `reportError` are identity-stable.
+  const { error: actionError, guard, report: reportError, dismiss: dismissActionError } = useActionError();
 
   useEffect(() => {
     service.start();
@@ -328,13 +334,18 @@ export default function MeshApp(): React.ReactElement {
   //                   volume). Ours to carry: the protocol has no such concept.
   const onMyVolume = useCallback((v: number) => {
     const mine = modelRef.current.clients.find((c) => c.isLocal);
-    if (mine) void service.setVolume(mine.id, clampVol(v));
-  }, []);
+    if (mine) guard(service.setVolume(mine.id, clampVol(v)), 'Could not change the volume');
+  }, [guard]);
   const onSourceVolume = useCallback((v: number) => {
     const f = featuredRef.current;
-    if (f) void service.setSourceVolume(f.id, clampVol(v));
-  }, []);
-  const onClientVolume = useCallback((clientId: string, v: number) => service.setVolume(clientId, v), []);
+    if (f) guard(service.setSourceVolume(f.id, clampVol(v)), 'Could not change the source volume');
+  }, [guard]);
+  // Returns nothing on purpose. This used to return the promise to a component that typed the
+  // handler as `void` and dropped it — the same unhandled rejection, one step further away.
+  const onClientVolume = useCallback((clientId: string, v: number) => {
+    const name = modelRef.current.clients.find((c) => c.id === clientId)?.name ?? 'the device';
+    guard(service.setVolume(clientId, v), `Could not change the volume of ${name}`);
+  }, [guard]);
 
   // Native visualizer frames for the featured source; read on rAF by the visualizer.
   const getSpectrum = useCallback(() => (featuredId ? service.getVizFrame(featuredId) : null), [featuredId]);
@@ -348,16 +359,16 @@ export default function MeshApp(): React.ReactElement {
     if (streamId && streamId.startsWith(FOREIGN_PREFIX)) return; // foreign session: nothing to route
     const url = client.url;
     if (streamId && url && (client.isForeign || client.foreignServer)) {
-      void service.adoptSpeaker(url, streamId);
+      guard(service.adoptSpeaker(url, streamId), `Could not bring ${client.name} onto the stream`);
       return;
     }
     if (!streamId && client.isForeign && client.currentStreamId) {
-      void service.releaseSpeaker(client.id, client.currentStreamId, url);
+      guard(service.releaseSpeaker(client.id, client.currentStreamId, url), `Could not release ${client.name}`);
       return;
     }
-    if (streamId) void service.routeClient(client.id, streamId);
-    else void service.unrouteClient(client.id);
-  }, []);
+    if (streamId) guard(service.routeClient(client.id, streamId), `Could not move ${client.name} to the stream`);
+    else guard(service.unrouteClient(client.id), `Could not remove ${client.name} from its stream`);
+  }, [guard]);
 
   /** Route THIS unit's own endpoint onto the chosen source. Never touches whoever else happens to
    *  share the current group (e.g. a peer we're following, or one following us) — that shared
@@ -440,10 +451,11 @@ export default function MeshApp(): React.ReactElement {
     browserTargetRef.current = validTarget;
     browserRoutedRef.current = false;
     browserHandledReconnectRef.current = 0;
-    void browserStart(host).catch(() => {
+    void browserStart(host).catch((err) => {
       browserTargetRef.current = null;
+      reportError('Could not start audio in this browser', err);
     });
-  }, [browserStart]);
+  }, [browserStart, reportError]);
 
   const onStopBrowserAudio = useCallback(() => {
     browserTargetRef.current = null;
@@ -704,6 +716,8 @@ export default function MeshApp(): React.ReactElement {
           onOpenPairingWindows={() => service.openPairingWindowEverywhere()}
         />
       )}
+
+      <ActionErrorToast message={actionError} onDismiss={dismissActionError} />
 
       <Visualizer
         isOpen={visualizerOpen}
