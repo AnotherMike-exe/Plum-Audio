@@ -244,6 +244,7 @@ class SourceManagerBase:
             return
         inst = running.instance
         for spec in self.daemons(inst):
+            log = None
             try:
                 log = open(spec.log_path, "ab", buffering=0)  # noqa: SIM115 - closed in _close_logs
                 proc = await asyncio.create_subprocess_exec(
@@ -254,7 +255,17 @@ class SourceManagerBase:
                     env={**os.environ, **spec.env},
                     start_new_session=True,  # own process group: kill it without touching the server
                 )
-            except OSError as e:
+            except BaseException as e:
+                # The log is only handed to `running.logs` (and so to _close_logs) AFTER a successful
+                # exec. Until then it is ours to close, or a missing binary leaks one descriptor per
+                # respawn — every RESPAWN_BACKOFF seconds, until the process hits its fd limit and
+                # can open nothing at all, FIFOs and sockets included. BaseException so that a
+                # cancel during the exec closes it too.
+                if log is not None:
+                    with contextlib.suppress(Exception):
+                        log.close()
+                if not isinstance(e, OSError):
+                    raise
                 # Binary missing (dev laptop / partial rig): the source still exists, it just has
                 # nothing feeding it. Back off so we don't spin, and drop any half-started set.
                 logger.warning("[%s] %s launch failed: %s", inst.source_id, spec.argv[0], e)

@@ -246,3 +246,77 @@ def test_a_vanished_sendspin_source_is_rebuilt():
     # ...and the daemons re-pointed at the fresh FIFO, not left writing into the old one.
     assert ("daemon_kill", "1") in mgr.events
     assert ("daemon_spawn", "1") in mgr.events
+
+
+# --- _spawn_daemons: the log descriptor on a failed launch -------------------
+#
+# `open()` ran before `create_subprocess_exec`, and the file was only tracked after a successful
+# exec. A missing binary therefore leaked one descriptor per respawn, every 5 s.
+
+
+class SpawningManager(FakeManager):
+    """FakeManager with the REAL process layer back, and one daemon whose binary is missing."""
+
+    _spawn_daemons = SourceManagerBase._spawn_daemons
+    _kill_daemons = SourceManagerBase._kill_daemons
+
+    def __init__(self, argv, log_path):
+        super().__init__([])
+        self._argv, self._log_path = argv, log_path
+
+    def daemons(self, instance):
+        from sources.source_manager import DaemonSpec
+
+        return [DaemonSpec(argv=self._argv, log_path=self._log_path)]
+
+
+def _track_opens(monkeypatch):
+    import builtins
+
+    from sources import source_manager
+
+    opened = []
+
+    def tracking_open(*a, **kw):
+        fh = builtins.open(*a, **kw)
+        opened.append(fh)
+        return fh
+
+    monkeypatch.setattr(source_manager, "open", tracking_open, raising=False)
+    return opened
+
+
+def test_a_failed_daemon_launch_closes_its_log_file(tmp_path, monkeypatch):
+    from sources.source_manager import _Running
+
+    opened = _track_opens(monkeypatch)
+    manager = SpawningManager(["/no/such/binary-plum-test"], str(tmp_path / "daemon.log"))
+    running = _Running(FakeInstance("1", "Kitchen"), ("Kitchen",))
+
+    asyncio.run(manager._spawn_daemons(running))
+
+    assert len(opened) == 1
+    assert opened[0].closed  # was left open: one leaked fd for each respawn
+    assert running.logs == [] and running.procs == []
+    assert running.next_spawn_at > 0  # and the backoff still applies
+
+
+def test_a_cancelled_daemon_launch_closes_its_log_file(tmp_path, monkeypatch):
+    from sources import source_manager
+    from sources.source_manager import _Running
+
+    opened = _track_opens(monkeypatch)
+
+    async def cancelled_exec(*_a, **_kw):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(source_manager.asyncio, "create_subprocess_exec", cancelled_exec)
+    manager = SpawningManager(["/bin/true"], str(tmp_path / "daemon.log"))
+    running = _Running(FakeInstance("1", "Kitchen"), ("Kitchen",))
+
+    async def scenario():
+        with pytest.raises(asyncio.CancelledError):
+            await manager._spawn_daemons(running)
+
+    asyncio.run(scenario())
+    assert opened[0].closed
