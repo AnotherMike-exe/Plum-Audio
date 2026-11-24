@@ -443,3 +443,38 @@ def test_flask_passes_everything_when_the_guard_is_off(client, monkeypatch):
     monkeypatch.setenv("PLUM_API_GUARD", "0")
     response = client.post("/api/settings", data="{}", content_type="text/plain", headers={"Host": "evil.example"})
     assert response.status_code == 200
+
+
+# -- a peer's `hostname` is a peer's JSON too -----------------------------------------------------
+# Only `mdns_hostname` was checked. `hostname` reached the allowed set as sent: a dotted value added
+# a whole domain, and a value that is not a string raised and dropped every peer's host.
+
+_BASE = set(cors_policy.LOOPBACK_HOSTS) | {"198.51.100.30"}
+
+
+@pytest.mark.parametrize("junk", ["a b", "-lead", "x" * 64, "", " ", 7, ["kitchen"], {"a": 1}, None, True])
+def test_a_peers_hostname_that_is_not_a_name_adds_nothing(junk):
+    snap = UnitSnapshot.from_dict({"unit_id": "unit-x", "host": "198.51.100.30", "hostname": junk})
+    assert snap.hostname is None
+    assert known_hosts([snap]) == _BASE
+    direct = UnitSnapshot("unit-x", "X", host="198.51.100.30", hostname=junk)
+    assert known_hosts([direct]) == _BASE
+
+
+def test_a_dotted_hostname_adds_its_first_label_and_never_the_domain():
+    """A kernel hostname can be an FQDN. Its first label is the name; the domain is the peer's claim."""
+    for snap in (
+        UnitSnapshot.from_dict({"unit_id": "unit-x", "host": "198.51.100.30", "hostname": "Plum-Den.evil.example"}),
+        UnitSnapshot("unit-x", "X", host="198.51.100.30", hostname="Plum-Den.evil.example"),
+    ):
+        assert known_hosts([snap]) == _BASE | {"plum-den", "plum-den.local", "plum-den.lan"}
+
+
+def test_one_peer_with_a_bad_hostname_does_not_drop_the_other_peers():
+    bad = UnitSnapshot("unit-x", "X", host=7, hostname=["kitchen"])
+    good = [
+        UnitSnapshot("unit-10021", "Plum Amp100", host="198.51.100.21", hostname="plum-amp100"),
+        UnitSnapshot("unit-10020", "Plum Interop", host="198.51.100.20", hostname="plum-interop"),
+    ]
+    hosts = known_hosts([bad, *good])
+    assert {"198.51.100.21", "plum-amp100.local", "plum-interop.lan"} <= hosts

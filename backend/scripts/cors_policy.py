@@ -175,12 +175,18 @@ def known_hosts(units) -> set[str]:
     """
     hosts: set[str] = set(LOOPBACK_HOSTS)
     for unit in units:
-        host = (getattr(unit, "host", None) or "").strip().lower()
-        if host:
-            hosts.add(host)
-        name = (getattr(unit, "hostname", None) or "").strip()
-        if name:
-            hosts |= name_forms(name)
+        # Every value here arrives in a peer's JSON. A value that is not a string is skipped: a
+        # `.strip()` on it raised, and one bad peer then dropped every peer's host.
+        host = getattr(unit, "host", None)
+        if isinstance(host, str) and host.strip():
+            hosts.add(host.strip().lower())
+        # The kernel hostname, which can be an FQDN. Only its FIRST label is a name of the unit:
+        # the whole value would put the peer's domain in the set. Same rule as mesh/model.py.
+        name = getattr(unit, "hostname", None)
+        if isinstance(name, str):
+            label = name.strip().lower().split(".", 1)[0]
+            if _HOSTNAME_LABEL.fullmatch(label):
+                hosts |= name_forms(label)
         # The name from Settings -> Device. It arrives in a peer's JSON, so it must be ONE label:
         # a dotted value would put a whole domain in the set.
         mdns = getattr(unit, "mdns_hostname", None)

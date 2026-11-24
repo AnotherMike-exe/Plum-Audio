@@ -39,6 +39,17 @@ def _single_label(value: object) -> str | None:
     return name if _DNS_LABEL.fullmatch(name) else None
 
 
+def _host_label(value: object) -> str | None:
+    """A peer's kernel hostname as one lowercase DNS label, or None.
+
+    `socket.gethostname()` can be an FQDN, so the first label is taken and the rest is dropped:
+    the domain is the peer's claim, and it must not reach the allowed-host set.
+    """
+    if not isinstance(value, str):
+        return None
+    return _single_label(value.strip().split(".", 1)[0])
+
+
 @dataclass
 class PlayerState:
     """A render endpoint connected to a unit's server."""
@@ -268,7 +279,7 @@ class UnitSnapshot:
             players=[PlayerState.from_dict(p) for p in d.get("players", [])],
             local_player=d.get("local_player"),
             has_player=bool(d.get("has_player", True)),
-            hostname=d.get("hostname"),
+            hostname=_host_label(d.get("hostname")),
             mdns_hostname=_single_label(d.get("mdns_hostname")),
             server_id=d.get("server_id"),
             follows_unit_id=d.get("follows_unit_id"),
