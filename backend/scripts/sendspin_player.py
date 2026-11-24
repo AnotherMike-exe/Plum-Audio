@@ -116,6 +116,9 @@ HEALTH_POLL_S = 3.0  # how often we re-evaluate whether to report client/state e
 # than any normal roam or listening session boundary, so a healthy player never trips it — this is
 # only meant to make a connection nobody is on the other end of visible after the fact.
 STUCK_SESSION_WARN_S = 900.0
+# Upper bound on each network step of stop(). Three of them fit inside the supervisord
+# `stopwaitsecs` with room for the DAC release that follows.
+STOP_STEP_TIMEOUT_S = 2.5
 
 
 # -- multi-room phase lock -------------------------------------------------------------------------
@@ -1454,22 +1457,59 @@ class SendspinPlayer:
                     logger.info("dialed home server %s", home_server_url)
 
     async def stop(self) -> None:
-        for task_attr in ("_report_task", "_relay_task", "_health_task"):
-            task = getattr(self, task_attr)
-            if task is not None:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-                setattr(self, task_attr, None)
-        if self._avahi is not None:
-            with contextlib.suppress(Exception):
-                await self._avahi.close()
-            self._avahi = None
-        with contextlib.suppress(Exception):
-            await self.client.disconnect()
-        if self._listener is not None:
-            await self._listener.stop()
-        self.renderer.stop()
+        """Shut down. Every step runs even if the one before it raised.
+
+        Order is by what a failure costs. The level goes to disk FIRST: it is the only step whose
+        loss outlives the process, it needs nothing else to be alive, and supervisord sends SIGKILL
+        `stopwaitsecs` after SIGTERM — so anything that can block must come after it. The DAC is
+        released LAST and in a `finally`, because a listener that failed to stop used to skip it.
+
+        The network steps are bounded. `client.disconnect()` sends a goodbye and then waits for the
+        peer's close frame, and on a half-open connection that wait is the full aiohttp close
+        timeout; unbounded, it uses the whole SIGTERM grace period on a peer that is not there.
+        """
+        try:
+            self._flush_render_state()
+            for task_attr in ("_report_task", "_relay_task", "_health_task"):
+                task = getattr(self, task_attr)
+                if task is not None:
+                    task.cancel()
+                    # Exception too: a task that died earlier re-raises here, and that must not
+                    # abort the shutdown. _task_done already logged it.
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+                    setattr(self, task_attr, None)
+            if self._avahi is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(self._avahi.close(), STOP_STEP_TIMEOUT_S)
+                self._avahi = None
+            try:
+                await asyncio.wait_for(self.client.disconnect(), STOP_STEP_TIMEOUT_S)
+            except Exception as exc:
+                logger.warning("stop: the client did not disconnect cleanly: %r", exc)
+            if self._listener is not None:
+                try:
+                    await asyncio.wait_for(self._listener.stop(), STOP_STEP_TIMEOUT_S)
+                except Exception as exc:
+                    logger.warning("stop: the listener did not stop cleanly: %r", exc)
+                self._listener = None
+        finally:
+            self.renderer.stop()
+
+    def _flush_render_state(self) -> None:
+        """Write a pending level NOW. Synchronous on purpose: this is the shutdown path.
+
+        `_publish_render_state` debounces the save by STATE_SAVE_DEBOUNCE_S so a slider drag is one
+        write. A SIGTERM inside that window used to cancel nothing and save nothing — the process
+        exited with the task still asleep, and the unit came back at the level from before the drag.
+        """
+        task = self._save_task
+        self._save_task = None
+        if task is None or task.done():
+            return  # nothing pending: the last change is already on disk
+        task.cancel()
+        save_render_state(self._state_file, self._volume, self._muted)
+        logger.info("stop: saved the pending level (volume=%d muted=%s)", self._volume, self._muted)
 
     # -- server → player events ---------------------------------------------
 
