@@ -1126,8 +1126,10 @@ export class SendspinDataService {
       });
       const parsed = await res.json().catch(() => ({}));
       void this.poll();
-      if (!res.ok) return { ok: false, message: parsed?.error || `request failed (${res.status})` };
-      return { ok: parsed?.ok !== false, message: parsed?.error };
+      // Only a string is a sentence. An object here became "[object Object]" in the dialog.
+      const error: string | undefined = typeof parsed?.error === 'string' ? parsed.error : undefined;
+      if (!res.ok) return { ok: false, message: error || `request failed (${res.status})` };
+      return { ok: parsed?.ok !== false, message: error };
     } catch {
       return { ok: false, message: 'Could not reach the unit' };
     }
@@ -1153,7 +1155,9 @@ export class SendspinDataService {
       // sentence to the caller: it is the only place the reason exists.
       let reason: string | undefined;
       try {
-        reason = (await res.json())?.error;
+        // Only a string is a sentence. An object here became "[object Object]" in the toast.
+        const error: unknown = (await res.json())?.error;
+        if (typeof error === 'string') reason = error;
       } catch {
         // no JSON body — the status is all we have
       }

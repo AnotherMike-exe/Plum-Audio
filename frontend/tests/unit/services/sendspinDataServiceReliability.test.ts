@@ -221,3 +221,26 @@ describe('the consume relay socket', () => {
     svc.stop();
   });
 });
+
+describe('a refusal whose `error` is not a sentence', () => {
+  it('falls back to the status and does not show "[object Object]"', async () => {
+    const svc = new SendspinDataService();
+    internals(svc).applyView(structuredClone(VIEW));
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: false,
+      status: 422,
+      json: async () => ({ error: { code: 'bad_request', detail: 'player_id' } }),
+    })));
+    const err = await svc.routeClient('player-210', 'unit-210::airplay').catch((e) => e);
+    expect(err).toBeInstanceOf(MeshRequestError);
+    expect(err.message).toBe('Request failed (422)');
+  });
+
+  it('does the same for a pairing request', async () => {
+    const svc = new SendspinDataService();
+    internals(svc).applyView(structuredClone(VIEW));
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 422, json: async () => ({ error: { code: 'bad' } }) })));
+    const res = await svc.pairDevice('unit-210', 'player-210', 'dynamic_pin');
+    expect(res).toEqual({ ok: false, message: 'request failed (422)' });
+  });
+});
