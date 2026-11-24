@@ -24,6 +24,8 @@ import logging
 import os
 from dataclasses import dataclass
 
+from . import endpoint_config
+
 logger = logging.getLogger("plum.bluetooth_config")
 
 # Defaults are container paths (Binhex /app layout); every path is overridable — by argument or the
@@ -99,17 +101,24 @@ def enabled_endpoints(settings: dict) -> list[dict]:
     """Enabled Bluetooth endpoints from a settings dict, capped at MAX_ENDPOINTS."""
     bluetooth = settings.get("integrations", {}).get("bluetooth", {}) or {}
     endpoints = bluetooth.get("endpoints", []) or []
-    return [e for e in endpoints[:MAX_ENDPOINTS] if e.get("enabled")]
+    if not isinstance(endpoints, list):
+        return []  # a raw settings write can put anything here
+    return [e for e in endpoints[:MAX_ENDPOINTS] if isinstance(e, dict) and e.get("enabled")]
 
 
 def _instance(endpoint: dict, section: dict, config_root: str) -> BluetoothInstance:
-    instance_id = str(endpoint.get("id"))
+    """Resolve one endpoint, or raise `endpoint_config.InvalidEndpoint`.
+
+    The id names `config_dir` and the FIFO. The adapter is an argument to bluealsa (`-i <adapter>`,
+    bluetooth_manager.daemons) and part of a D-Bus object path. Every sink uses the CHECKED values.
+    """
+    instance_id = endpoint_config.checked_id(endpoint.get("id"))
     return BluetoothInstance(
         instance_id=instance_id,
-        device_name=endpoint.get("deviceName", f"Plum Audio {instance_id}"),
+        device_name=endpoint_config.checked_name(endpoint.get("deviceName"), f"Plum Audio {instance_id}"),
         # Stored per endpoint (the GUI shows it), falling back to the derived adapter so an endpoint
         # written by an older build still lands on a real radio.
-        adapter=endpoint.get("adapter") or adapter_for(instance_id),
+        adapter=endpoint_config.checked_adapter(endpoint.get("adapter") or adapter_for(instance_id)),
         fifo_path=fifo_path_for(instance_id),
         config_dir=os.path.join(config_root, instance_id),
         # Section-level: these describe the pairing behaviour of the whole integration, not one radio.
@@ -119,9 +128,14 @@ def _instance(endpoint: dict, section: dict, config_root: str) -> BluetoothInsta
 
 
 def instances_from_settings(settings: dict, *, config_root: str = DEFAULT_CONFIG_ROOT) -> list[BluetoothInstance]:
-    """Resolve enabled endpoints to BluetoothInstances WITHOUT writing any files."""
+    """Resolve enabled endpoints to BluetoothInstances WITHOUT writing any files.
+
+    An endpoint that fails `endpoint_config` is skipped with a warning; the others still start.
+    """
     section = settings.get("integrations", {}).get("bluetooth", {}) or {}
-    return [_instance(e, section, config_root) for e in enabled_endpoints(settings)]
+    return endpoint_config.resolve(
+        "bluetooth", enabled_endpoints(settings), lambda e: _instance(e, section, config_root)
+    )
 
 
 def render_configs(
