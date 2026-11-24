@@ -180,3 +180,78 @@ def test_a_background_task_that_already_died_does_not_abort_stop(tmp_path):
         return p
 
     assert asyncio.run(scenario()).renderer.stopped
+
+
+# -- consume relay ---------------------------------------------------------------------------------
+
+
+def test_the_relay_retry_delay_doubles_and_stops_at_thirty_seconds():
+    delays = [sendspin_player._relay_backoff(n) for n in range(1, 9)]
+    assert delays == [2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0, 30.0]
+
+
+class _RelayPlayer:
+    """_relay_loop with a scripted _relay_session: True = connects then closes, False = fails."""
+
+    relay_url = "ws://127.0.0.1:5001/api/mesh/consume?role=player"
+
+    def __init__(self, script):
+        self._script = list(script)
+        self._relay_failures = 0
+        self._relay_down_since = 0.0
+
+    async def _relay_session(self) -> None:
+        if not self._script:
+            raise asyncio.CancelledError
+        if not self._script.pop(0):
+            raise ConnectionRefusedError("mesh API is down")
+        self._relay_connected()
+
+    _relay_loop = sendspin_player.SendspinPlayer._relay_loop
+    _relay_connected = sendspin_player.SendspinPlayer._relay_connected
+
+
+def _run_relay(script, monkeypatch, caplog):
+    delays: list[float] = []
+
+    async def fake_sleep(seconds):
+        delays.append(seconds)
+
+    monkeypatch.setattr(sendspin_player.asyncio, "sleep", fake_sleep)
+    with caplog.at_level(logging.INFO, logger=LOG), pytest.raises(asyncio.CancelledError):
+        asyncio.run(_RelayPlayer(script)._relay_loop())
+    return delays
+
+
+def test_the_relay_backs_off_while_the_mesh_api_is_down(monkeypatch, caplog):
+    delays = _run_relay([False] * 6, monkeypatch, caplog)
+    assert delays == [2.0, 4.0, 8.0, 16.0, 30.0, 30.0]
+
+
+def test_the_relay_warns_once_for_an_outage_and_reports_the_recovery(monkeypatch, caplog):
+    _run_relay([False, False, False, True], monkeypatch, caplog)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, "one line for the outage, not one per attempt"
+    assert "mesh API is down" in warnings[0].getMessage()
+    recovered = [r for r in caplog.records if r.levelno == logging.INFO and "after 3 failed" in r.getMessage()]
+    assert len(recovered) == 1
+
+
+def test_the_relay_backoff_restarts_after_a_recovery(monkeypatch, caplog):
+    delays = _run_relay([False, False, True, False], monkeypatch, caplog)
+    assert delays == [2.0, 4.0, 2.0, 2.0]
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 2, "a second outage warns again"
+
+
+class _CommandClient:
+    async def send_group_command(self, cmd, **kwargs):
+        raise RuntimeError("not connected")
+
+
+def test_a_relay_command_that_fails_is_not_swallowed():
+    class P:
+        client = _CommandClient()
+        _relay_command = sendspin_player.SendspinPlayer._relay_command
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(P()._relay_command({"t": "cmd", "command": "play"}))

@@ -119,6 +119,9 @@ STUCK_SESSION_WARN_S = 900.0
 # Upper bound on each network step of stop(). Three of them fit inside the supervisord
 # `stopwaitsecs` with room for the DAC release that follows.
 STOP_STEP_TIMEOUT_S = 2.5
+# Consume-relay reconnect delay: doubles from MIN on each consecutive failure, capped at MAX.
+RELAY_RETRY_MIN_S = 2.0
+RELAY_RETRY_MAX_S = 30.0
 
 
 # -- multi-room phase lock -------------------------------------------------------------------------
@@ -156,6 +159,11 @@ MAX_DAC_LEAD_US = 1_000_000
 # raises keeps its exception until it is collected, which for a task held in a local is "never".
 # Both happened here in silence: the settings watchers and the render-state echo.
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+def _relay_backoff(failures: int) -> float:
+    """Seconds to wait before relay attempt `failures + 1`: 2, 4, 8, 16, then 30 from there on."""
+    return min(RELAY_RETRY_MAX_S, RELAY_RETRY_MIN_S * 2 ** min(max(0, failures - 1), 16))
 
 
 def _spawn(coro, *, name: str) -> asyncio.Task:
@@ -950,6 +958,8 @@ class SendspinPlayer:
         # the relay is loopback-only so it never leaves the unit.
         self._relay_pair: dict | None = None
         self._relay_pair_dirty = False
+        self._relay_failures = 0  # consecutive failed relay connections — drives backoff + logging
+        self._relay_down_since = 0.0
         self.relay_url = os.environ.get("PLUM_PLAYER_RELAY_URL", "ws://127.0.0.1:5001/api/mesh/consume?role=player")
         self.client.add_group_update_listener(self._on_group_update)
         self.client.add_metadata_listener(self._on_metadata)
@@ -1161,28 +1171,71 @@ class SendspinPlayer:
 
     async def _relay_loop(self) -> None:
         """Producer side of the consume relay: push ctrl + viz to the mesh API, take commands back.
-        Best-effort; the audio path never waits on it."""
-        import aiohttp
+        Best-effort; the audio path never waits on it.
 
+        Retries with a doubling delay, RELAY_RETRY_MIN_S to RELAY_RETRY_MAX_S. The mesh API lives in
+        the server process, so "down" is either a restart (seconds) or a server that is not coming
+        back (hours) — a flat 2 s retry is right for the first and is 43 000 connection attempts a
+        day for the second. One WARNING per outage and one INFO when it ends: this relay carries the
+        pairing PIN and the transport controls, so a dead one must be visible at the default level,
+        and at DEBUG it was not.
+        """
         while True:
             try:
-                async with aiohttp.ClientSession() as session, session.ws_connect(self.relay_url, heartbeat=30) as ws:
-                    logger.info("consume relay connected (%s)", self.relay_url)
-                    sender = _spawn(self._relay_send(ws), name="consume relay sender")
-                    try:
-                        async for msg in ws:
-                            if msg.type is aiohttp.WSMsgType.TEXT:
-                                with contextlib.suppress(Exception):
-                                    await self._relay_command(msg.json())
-                    finally:
-                        sender.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await sender
+                await self._relay_session()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - mesh API down / restarting; retry
-                logger.debug("consume relay error; retrying", exc_info=True)
-            await asyncio.sleep(2.0)
+            except Exception as exc:  # noqa: BLE001 - mesh API down / restarting; retry
+                self._relay_failures += 1
+                if self._relay_failures == 1:
+                    self._relay_down_since = time.monotonic()
+                    logger.warning(
+                        "consume relay to %s failed: %r — retrying with backoff up to %.0fs; the GUI gets "
+                        "no transport state, visualizer or pairing PIN from this player until it returns",
+                        self.relay_url,
+                        exc,
+                        RELAY_RETRY_MAX_S,
+                    )
+                else:
+                    logger.debug("consume relay still down (attempt %d)", self._relay_failures, exc_info=True)
+            else:
+                logger.info("consume relay closed by the mesh API; reconnecting")
+            await asyncio.sleep(_relay_backoff(max(1, self._relay_failures)))
+
+    def _relay_connected(self) -> None:
+        """The relay websocket is up: log it, and end the outage if there was one."""
+        if self._relay_failures:
+            logger.info(
+                "consume relay recovered after %d failed attempt(s) over %.0fs (%s)",
+                self._relay_failures,
+                time.monotonic() - self._relay_down_since,
+                self.relay_url,
+            )
+        else:
+            logger.info("consume relay connected (%s)", self.relay_url)
+        self._relay_failures = 0
+
+    async def _relay_session(self) -> None:
+        """One relay connection, for its whole life. Returns on a clean close, raises on a failure."""
+        import aiohttp
+
+        async with aiohttp.ClientSession() as session, session.ws_connect(self.relay_url, heartbeat=30) as ws:
+            self._relay_connected()
+            sender = _spawn(self._relay_send(ws), name="consume relay sender")
+            try:
+                async for msg in ws:
+                    if msg.type is not aiohttp.WSMsgType.TEXT:
+                        continue
+                    try:
+                        await self._relay_command(msg.json())
+                    except Exception as exc:  # noqa: BLE001 - one bad command must not end the relay
+                        # A transport button that does nothing is a user-visible fault, and the
+                        # blanket suppress that was here left no trace of it.
+                        logger.warning("consume relay: command %.200r failed: %r", msg.data, exc)
+            finally:
+                sender.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await sender
 
     async def _relay_send(self, ws) -> None:
         """~30 fps: emit the latest ctrl (on change) + latest viz frame (coalesced)."""
@@ -1269,9 +1322,9 @@ class SendspinPlayer:
             kwargs["volume"] = int(data["volume"])
         if cmd is MediaCommand.MUTE and data.get("mute") is not None:
             kwargs["mute"] = bool(data["mute"])
-        with contextlib.suppress(Exception):
-            await self.client.send_group_command(cmd, **kwargs)
-            logger.info("consume relay: sent %s to server", cmd.value)
+        # Raises on purpose: _relay_session logs the failure with the command that caused it.
+        await self.client.send_group_command(cmd, **kwargs)
+        logger.info("consume relay: sent %s to server", cmd.value)
 
     async def _health_loop(self) -> None:
         """Report client/state whenever our health changes, not only when the volume moves.
