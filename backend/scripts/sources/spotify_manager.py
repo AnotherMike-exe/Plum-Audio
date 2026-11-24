@@ -41,16 +41,12 @@ class SpotifyManager(SourceManagerBase):
         self.stale_pattern = f"go-librespot.*{config_root}"
 
     def desired(self, settings: dict) -> dict[str, tuple[tuple, object]]:
-        spotify = settings.get("integrations", {}).get("spotify", {}) or {}
-        bitrate = int(spotify.get("bitrate", spotify_config.DEFAULT_BITRATE))
-        endpoints = spotify_config.enabled_endpoints(settings)
+        # From the instances ONLY, as bluetooth_manager does. instances_from_settings skips an
+        # endpoint that is not valid, so a zip against enabled_endpoints raised on every poll and
+        # stopped all reconciliation for one bad record. The instance holds the CHECKED values.
+        bitrate = spotify_config.bitrate_from_settings(settings)
         instances = spotify_config.instances_from_settings(settings, config_root=self.config_root)
-        return {
-            str(e.get("id")): ((e.get("deviceName"), int(e.get("zeroconfPort", 5354)), bitrate), inst)
-            # strict: instances_from_settings is one _instance per enabled_endpoints entry, from the
-            # same settings dict — a length mismatch means that invariant broke and must not be silent.
-            for e, inst in zip(endpoints, instances, strict=True)
-        }
+        return {inst.instance_id: ((inst.device_name, inst.zeroconf_port, bitrate), inst) for inst in instances}
 
     def render(self, settings: dict) -> None:
         spotify_config.render_configs(settings, template_path=self.template_path, config_root=self.config_root)

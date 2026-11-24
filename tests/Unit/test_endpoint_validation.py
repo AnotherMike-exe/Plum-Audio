@@ -257,3 +257,43 @@ def test_a_non_string_device_name_does_not_stop_the_render():
     settings = {"integrations": {"airplay": {"endpoints": [{"id": "1", "enabled": True, "deviceName": 7}]}}}
     (inst,) = ac.instances_from_settings(settings)
     assert isinstance(inst.device_name, str)
+
+
+# -- the managers reconcile what is valid ---------------------------------------------------------
+# `desired()` runs on every poll. An exception there stops ALL reconciliation for that source, so
+# one bad record on disk must cost that endpoint alone.
+
+
+def test_the_airplay_manager_still_starts_the_valid_endpoint(tmp_path):
+    from sources.airplay_manager import AirplayManager
+
+    manager = AirplayManager(None, settings_file=str(tmp_path / "s.json"), config_root=str(tmp_path))
+    desired = manager.desired({"integrations": {"airplay": {"endpoints": _mixed()}}})
+    assert list(desired) == ["1"]
+    signature, instance = desired["1"]
+    assert signature == ("Good", instance.port, instance.udp_port_base)
+
+
+def test_the_spotify_manager_still_starts_the_valid_endpoint(tmp_path):
+    from sources.spotify_manager import SpotifyManager
+
+    manager = SpotifyManager(None, settings_file=str(tmp_path / "s.json"), config_root=str(tmp_path))
+    endpoints = _mixed({"zeroconfPort": 5360})
+    desired = manager.desired({"integrations": {"spotify": {"bitrate": 160, "endpoints": endpoints}}})
+    assert list(desired) == ["1"]
+    signature, instance = desired["1"]
+    assert signature == ("Good", 5360, 160) and instance.zeroconf_port == 5360
+
+
+@pytest.mark.parametrize("bad", ["fast", None, True, [320], "320\nx: y", 128])
+def test_the_spotify_manager_survives_a_bad_bitrate(tmp_path, caplog, bad):
+    from sources.spotify_manager import SpotifyManager
+
+    manager = SpotifyManager(None, settings_file=str(tmp_path / "s.json"), config_root=str(tmp_path))
+    settings = {"integrations": {"spotify": {"bitrate": bad, "endpoints": [{"id": "1", "enabled": True}]}}}
+    sc._bitrate_warned.clear()
+    with caplog.at_level("WARNING"):
+        first = manager.desired(settings)
+        again = manager.desired(settings)
+    assert first["1"][0][2] == sc.DEFAULT_BITRATE and again["1"][0] == first["1"][0]
+    assert caplog.text.count("bitrate") == 1, "one warning for a bad value, not one per poll"

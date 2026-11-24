@@ -84,6 +84,30 @@ def enabled_endpoints(settings: dict) -> list[dict]:
     return [e for e in endpoints[:MAX_ENDPOINTS] if isinstance(e, dict) and e.get("enabled")]
 
 
+# desired() asks on every poll. One warning for each bad value, and the set stays small.
+_bitrate_warned: set[str] = set()
+_BITRATE_WARNED_MAX = 16
+
+
+def bitrate_from_settings(settings: dict) -> int:
+    """The Spotify bitrate, or DEFAULT_BITRATE with a warning when the stored value is not one.
+
+    The value lands unescaped in the template and it is part of the manager's signature. A value
+    that is not a real bitrate must not stop every endpoint, so it becomes the default.
+    """
+    spotify = settings.get("integrations", {}).get("spotify", {}) or {}
+    bitrate = spotify.get("bitrate", DEFAULT_BITRATE)
+    if isinstance(bitrate, int) and not isinstance(bitrate, bool) and bitrate in endpoint_config.SPOTIFY_BITRATES:
+        return bitrate
+    key = repr(bitrate)[:80]
+    if key not in _bitrate_warned:
+        if len(_bitrate_warned) >= _BITRATE_WARNED_MAX:
+            _bitrate_warned.clear()
+        _bitrate_warned.add(key)
+        logger.warning("spotify bitrate %s is not valid; using %d", key, DEFAULT_BITRATE)
+    return DEFAULT_BITRATE
+
+
 def _instance(endpoint: dict, config_root: str) -> SpotifyInstance:
     """Resolve one endpoint, or raise `endpoint_config.InvalidEndpoint`.
 
@@ -118,13 +142,7 @@ def render_configs(
     config_root: str = DEFAULT_CONFIG_ROOT,
 ) -> list[SpotifyInstance]:
     """Write a config.yml into each enabled endpoint's config dir; return the instances to bring up."""
-    spotify = settings.get("integrations", {}).get("spotify", {}) or {}
-    # The bitrate lands unescaped in the template. Anything that is not a real bitrate becomes the
-    # default: one bad section value must not stop every endpoint.
-    bitrate = spotify.get("bitrate", DEFAULT_BITRATE)
-    if isinstance(bitrate, bool) or bitrate not in endpoint_config.SPOTIFY_BITRATES:
-        logger.warning("spotify bitrate %r is not valid; using %d", bitrate, DEFAULT_BITRATE)
-        bitrate = DEFAULT_BITRATE
+    bitrate = bitrate_from_settings(settings)
     with open(template_path, encoding="utf-8") as f:
         template = f.read()
 

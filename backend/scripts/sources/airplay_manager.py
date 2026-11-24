@@ -54,14 +54,11 @@ class AirplayManager(SourceManagerBase):
         self.stale_pattern = [f"shairport-sync.*{config_root}", f"dbus-daemon.*{config_root}"]
 
     def desired(self, settings: dict) -> dict[str, tuple[tuple, object]]:
-        endpoints = airplay_config.enabled_endpoints(settings)
+        # From the instances ONLY, as bluetooth_manager does. instances_from_settings skips an
+        # endpoint that is not valid, so a zip against enabled_endpoints raised on every poll and
+        # stopped all reconciliation for one bad record.
         instances = airplay_config.instances_from_settings(settings, config_root=self.config_root)
-        return {
-            inst.instance_id: ((inst.device_name, inst.port, inst.udp_port_base), inst)
-            # strict: instances_from_settings is one _instance per enabled_endpoints entry, from the
-            # same settings dict — a length mismatch means that invariant broke and must not be silent.
-            for _e, inst in zip(endpoints, instances, strict=True)
-        }
+        return {inst.instance_id: ((inst.device_name, inst.port, inst.udp_port_base), inst) for inst in instances}
 
     def render(self, settings: dict) -> None:
         airplay_config.render_configs(settings, template_path=self.template_path, config_root=self.config_root)
