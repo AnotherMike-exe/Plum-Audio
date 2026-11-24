@@ -182,8 +182,10 @@ class MeshApi:
             # tone source must be published into it before anything can be routed onto it.
             refresh_view=self._agg.refresh,
         )
-        # Read-only here: the audio process learns these while a speaker is attached (see
-        # sendspin_server.snapshot). Its own instance, so a reload picks up whatever is on disk.
+        # Read-only here: the audio server learns these while a speaker is attached (see
+        # sendspin_server.snapshot) and writes them through ITS OWN instance. This one reads the
+        # file again whenever it changed (SpeakerNames._refresh), so a name learned after startup
+        # is served on the next request.
         self._speaker_names = SpeakerNames()
         self.port = port
         self._runner: web.AppRunner | None = None
@@ -418,12 +420,13 @@ class MeshApi:
         # until that particular tab had watched that particular speaker attach. Doing it here makes
         # one answer for every client, and needs no GUI change at all — it already prefers
         # `friendly_name`. See speaker_names.py.
-        names = self._speaker_names.all()
-        if names:
-            for entry in payload.get("players", []):
-                learned = names.get(entry.get("url"))
-                if learned:
-                    entry["friendly_name"] = learned
+        #
+        # Through `get`, not a lookup in `all()`: `get` also matches on host and port, because the
+        # URL mDNS advertises and the URL the handshake registered can differ in path or scheme.
+        for entry in payload.get("players", []):
+            learned = self._speaker_names.get(entry.get("url"))
+            if learned:
+                entry["friendly_name"] = learned
         return web.json_response(payload)
 
     async def _route(self, request: web.Request) -> web.Response:

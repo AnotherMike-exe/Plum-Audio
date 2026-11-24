@@ -117,3 +117,98 @@ def test_no_temp_files_are_left_behind(tmp_path):
     for i in range(5):
         n.learn(f"ws://10.0.0.{i}:8928/sendspin", f"S{i}")
     assert sorted(p.name for p in tmp_path.iterdir()) == ["speaker_names.json"]
+
+
+# -- two instances on one file -----------------------------------------------------------------
+#
+# The audio server LEARNS names and the mesh API SERVES them, each through its own instance. The
+# file was read once, in __init__, so a name learned after startup was on disk and never served
+# until a restart.
+
+
+def test_a_second_instance_serves_a_name_learned_after_it_was_built(tmp_path):
+    path = str(tmp_path / "speaker_names.json")
+    writer, reader = SpeakerNames(path), SpeakerNames(path)
+    assert reader.all() == {}
+
+    writer.learn(URL, FRIENDLY)
+
+    assert reader.get(URL) == FRIENDLY
+    assert reader.all() == {URL: FRIENDLY}
+
+
+def test_a_second_instance_follows_a_rename_and_a_second_speaker(tmp_path):
+    path = str(tmp_path / "speaker_names.json")
+    writer, reader = SpeakerNames(path), SpeakerNames(path)
+    writer.learn(URL, FRIENDLY)
+    assert reader.get(URL) == FRIENDLY
+    writer.learn(URL, "Kitchen Speaker")
+    writer.learn("ws://198.51.100.32:8928/sendspin", "Office")
+    assert reader.get(URL) == "Kitchen Speaker"
+    assert reader.get("ws://198.51.100.32:8928/sendspin") == "Office"
+
+
+def test_the_file_is_not_read_again_while_it_is_unchanged(tmp_path, monkeypatch):
+    """The neighbourhood is polled by every open GUI. An unchanged file costs one stat, not a parse."""
+    path = str(tmp_path / "speaker_names.json")
+    SpeakerNames(path).learn(URL, FRIENDLY)
+    reader = SpeakerNames(path)
+    loads = []
+    real_load = reader._load
+    monkeypatch.setattr(reader, "_load", lambda: loads.append(1) or real_load())
+    for _ in range(50):
+        assert reader.get(URL) == FRIENDLY
+        reader.all()
+    assert loads == []
+
+
+def test_a_writer_does_not_drop_what_another_instance_learned(tmp_path):
+    path = str(tmp_path / "speaker_names.json")
+    a, b = SpeakerNames(path), SpeakerNames(path)
+    a.learn(URL, FRIENDLY)
+    b.learn("ws://198.51.100.32:8928/sendspin", "Office")
+    assert SpeakerNames(path).all() == {URL: FRIENDLY, "ws://198.51.100.32:8928/sendspin": "Office"}
+
+
+def test_a_file_that_goes_away_or_goes_bad_never_raises(tmp_path):
+    path = tmp_path / "speaker_names.json"
+    writer, reader = SpeakerNames(str(path)), SpeakerNames(str(path))
+    writer.learn(URL, FRIENDLY)
+    assert reader.get(URL) == FRIENDLY
+    path.write_text("{ torn")
+    assert reader.all() == {}
+    path.unlink()
+    assert reader.get(URL) is None
+
+
+# -- the URL match -----------------------------------------------------------------------------
+#
+# mDNS advertises one spelling of a listener URL and the handshake registers another. The path and
+# the scheme vary; the host and the port are the comparable part, which is the rule
+# `neighbourhood._hostport` already applies to this unit's own player.
+
+
+def test_a_name_is_found_by_host_and_port_when_the_url_text_differs(names):
+    names.learn("ws://198.51.100.31:8928/sendspin", FRIENDLY)
+    for same in (
+        "ws://198.51.100.31:8928",
+        "ws://198.51.100.31:8928/",
+        "ws://198.51.100.31:8928/sendspin/",
+        "wss://198.51.100.31:8928/sendspin",
+    ):
+        assert names.get(same) == FRIENDLY, same
+
+
+def test_a_different_host_or_port_does_not_match(names):
+    names.learn("ws://198.51.100.31:8928/sendspin", FRIENDLY)
+    assert names.get("ws://198.51.100.31:8929/sendspin") is None
+    assert names.get("ws://198.51.100.32:8928/sendspin") is None
+    assert names.get("not a url") is None
+    assert names.get("") is None
+
+
+def test_the_exact_url_wins_over_a_host_and_port_match(names):
+    names.learn("ws://198.51.100.31:8928/a", "A")
+    names.learn("ws://198.51.100.31:8928/b", "B")
+    assert names.get("ws://198.51.100.31:8928/a") == "A"
+    assert names.get("ws://198.51.100.31:8928/b") == "B"
