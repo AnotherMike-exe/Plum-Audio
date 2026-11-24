@@ -367,7 +367,9 @@ The *reasoning* behind these, and the failures that produced them, is in
   output. `PLUM_PEER_SILENCE_TIMEOUT_S`, `PLUM_OUTPUT_WATCHDOG` and `PLUM_OUTPUT_REOPEN_MAX` set
   those. supervisord restarts an exit (`startretries=600`). The healthcheck writes
   `PLUM_HEALTH_FILE` (`/data/health.json`), stale after `PLUM_HEALTH_STALE_S`. Docker does not
-  restart on unhealthy. `docs/OPERATIONS.md`, "An endpoint is down".
+  restart on unhealthy. The host watchdog (`plum-updater.sh health`, a 60 s timer) reads that file
+  and restarts the container when `restart_advised` is not `false`. `docs/OPERATIONS.md`, "An
+  endpoint is down".
 
 ## Gotchas
 

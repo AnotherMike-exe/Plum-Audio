@@ -41,7 +41,7 @@ image compares as different across units.
 
 ---
 
-## Phase 3 — remaining sources, GUI, container (`feature/phase3-sources-gui`, in progress)
+## Phase 3 — remaining sources, GUI, container (`feature/phase3-sources-gui`, merged)
 
 ### Maintenance and hardening — 2026-11-24 (`feature/maintenance-2026-11`)
 

@@ -241,8 +241,55 @@ restart the container.
 | Output exit | `PLUM_OUTPUT_REOPEN_MAX` re-opens (default 3) fail in a row. | Exits with code 3. supervisord starts the player again. | ERROR `exiting with code 3` |
 | supervisord restart | Any exit of a running program. A failed start counts against `startretries=600`. | Restarts at once. Failed starts wait longer each time, up to 10 minutes between tries. | `/opt/plum-audio/config/supervisord.log` |
 | Healthcheck | Docker `HEALTHCHECK`, every 30 s. The player report is stale after `PLUM_HEALTH_STALE_S` (default 120 s). | Writes `/opt/plum-audio/data/health.json` (`PLUM_HEALTH_FILE`). Docker does not restart an unhealthy container. | Each problem as one line in `docker inspect` health log, and in the `problems` list of `health.json` |
+| Host watchdog | `plum-updater-health.timer` runs `plum-updater.sh health` on the host every 60 s. The verdict is unhealthy for more than 180 s and `restart_advised` is not `false`. Two runs in a row see it. | Runs `docker compose restart`. At most 3 restarts in one hour. | `journalctl -u plum-updater-health.service`: `watchdog: ... restart 1 of 3 in 3600s`, or `unhealthy, restart not advised` |
 
-The healthcheck does not repair anything. It reports. A host agent or a person acts on the report.
+The healthcheck does not repair anything. It reports. The host watchdog acts on the report.
+
+### The host watchdog
+
+Docker does not restart an unhealthy container, and the container holds no Docker socket. The host
+watchdog reads `/opt/plum-audio/data/health.json` from the bind mount and restarts the container.
+It is the `health` action of `scripts/host-setup/plum-updater.sh`.
+
+- **Period.** The timer starts 180 s after boot. It then runs 60 s after the end of each run.
+- **Unhealthy.** The verdict must be unhealthy for more than 180 s (`PLUM_WATCHDOG_UNHEALTHY_S`).
+  The container must also be up for more than 180 s.
+- **`restart_advised`.** The healthcheck writes this boolean. It is `true` only when a container
+  restart can fix the problem. The watchdog does not restart when it is `false`. It logs
+  `unhealthy, restart not advised` with the problems, one time for each change of state. An absent
+  key counts as `true`, because an older image does not write it.
+- **Stale verdict.** A `checked_at` older than 600 s (`PLUM_WATCHDOG_STALE_S`) means the healthcheck
+  itself stopped. The watchdog restarts a running container in that case. `restart_advised` does
+  not apply. It does not restart while Docker reports the container as healthy.
+- **Two sightings.** A restart needs the same finding on two runs in a row. A Pi has no clock
+  battery, so one run can see a wrong age after a boot. The first restart thus comes about 4 to 5
+  minutes after the fault starts.
+- **Rate limit.** At most 3 restarts in 3600 s (`PLUM_WATCHDOG_MAX_RESTARTS`,
+  `PLUM_WATCHDOG_WINDOW_S`). The count is in `/var/lib/plum-audio/watchdog.state`. The container
+  cannot write that file.
+- **Updates.** The watchdog does not restart while an update runs, or while `update.request` waits.
+- **Stopped container.** The watchdog runs `docker compose up -d` when the last verdict is fresh
+  and unhealthy. It leaves a container with a stale verdict alone, because an operator stopped it.
+
+Set the `PLUM_WATCHDOG_*` variables in `/etc/default/plum-updater` on the host. They are not
+container variables.
+
+To disable the watchdog, use one of these. Neither needs a `daemon-reload`.
+
+- Put `PLUM_WATCHDOG=0` in `/etc/default/plum-updater`.
+- Run `sudo touch /opt/plum-audio/watchdog.disabled`.
+
+To read what the watchdog did, run `journalctl -u plum-updater-health.service -n 50`.
+
+**A unit provisioned before the watchdog has no timer.** Run
+`scripts/host-setup/provision.sh <unit>` again from the workstation. The script is idempotent, and
+it installs and enables `plum-updater-health.timer`. Then run
+`systemctl is-active plum-updater-health.timer` on the unit.
+
+**A unit with no speaker must use the output `none`.** Set it in Settings → Audio, or put `none` in
+the third column of `docker/units.conf`. A unit that names an absent DAC keeps its player in
+`BACKOFF`, so the unit stays unhealthy. `restart_advised` is `false` there, so the watchdog does
+not restart it. The GUI shows the unit as unhealthy until the output is `none` or the DAC is back.
 
 ## Debugging cookbook
 
@@ -465,6 +512,57 @@ docker compose up -d
 
 There is no automatic rollback. A unit that fails to start is visible and recoverable; a unit that
 silently reverted itself is neither.
+
+## The API guard
+
+`backend/scripts/cors_policy.py` guards the mesh API (:5001) and the config API (:5002). It is on by
+default. It is not authentication: a LAN client that sends no `Origin` and uses the unit IP still
+reaches each route.
+
+| Request | Answer |
+|---|---|
+| An `Origin` that is not allowed, any method | 403 |
+| No `Origin`, and a `Host` that is not an IP, loopback or a name the units know | 403 |
+| A POST, PUT or DELETE with a body that is not `application/json` | 415 |
+
+A unit allows a page served from itself or from a unit in its mesh. It knows each unit by IP, by
+hostname, by `<hostname>.local` and `<hostname>.lan`, and by the mDNS name set in Settings.
+
+**A page opened at a name the units do not know gets 403 on each write.** A reverse proxy, a DNS
+alias and a dev server are the usual cases. The page loads, and each route, volume or settings
+change fails. Do these steps on each unit that the page drives:
+
+1. Open `/opt/plum-audio/plum-audio.env`.
+2. Set `PLUM_ALLOWED_ORIGINS` to the origin in the address bar, for example
+   `PLUM_ALLOWED_ORIGINS=http://audio.example.lan`.
+3. Recreate the container. Run `cd /opt/plum-audio && docker compose up -d`.
+
+The value is a list of absolute origins (`http://host` or `http://host:port`) with a comma between
+them. `PLUM_ALLOWED_ORIGINS=*` allows each origin and each `Host`.
+
+**A deploy removes the line.** `docker/deploy.sh` and `scripts/plum-init.sh` write
+`plum-audio.env` again on each run, and neither one writes `PLUM_ALLOWED_ORIGINS` or
+`PLUM_API_GUARD`. Do steps 1 to 3 again after each deploy.
+
+**`PLUM_API_GUARD=0` turns the guard off.** The values `false`, `no` and `off` do the same. The 403
+and 415 answers stop. The CORS headers stay as they are, so a browser still blocks a page at an
+unknown origin. Use it to find out if the guard is the cause of a failure. Then remove it.
+
+**An external client must send JSON and use a known address.** A Home Assistant `rest_command`, a
+script and `curl` are such clients. They send no `Origin`, so two rules apply:
+
+- Send `Content-Type: application/json` on each POST, PUT or DELETE that has a body.
+- Reach the unit by its IP, or by a name the units know. A different name needs an entry in
+  `PLUM_ALLOWED_ORIGINS`, for example `http://plum-kitchen.example.lan`.
+
+```yaml
+rest_command:
+  plum_volume:
+    url: "http://192.0.2.10:5001/api/mesh/volume"
+    method: POST
+    content_type: "application/json"
+    payload: '{"player_id": "{{ player_id }}", "volume": {{ volume }}}'
+```
 
 ## Ports
 

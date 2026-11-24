@@ -567,9 +567,13 @@
     `provision.sh` also set `UserKnownHostsFile=/dev/null`, because a reimaged unit presents a new
     key (OPERATIONS.md). `hotpatch.sh` sets only the first option.
 
-40. **No host WiFi watchdog.** No script in `scripts/host-setup/` checks `wlan0` or restarts the
-    link. NetworkManager owns the interface (`docs/CLAUDE.md`). Nothing on the host verifies that
-    the unit is reachable after a WiFi drop.
+40. **No host WiFi watchdog.** *Changed 2026-11-24:* a host watchdog for the CONTAINER now exists.
+    `plum-updater.sh health` runs from `plum-updater-health.timer` and restarts a container that
+    `/data/health.json` reports as unhealthy (`docs/OPERATIONS.md`, "The host watchdog"). No rig
+    run of that watchdog is on record for this branch. The WiFi part is still open: no script in
+    `scripts/host-setup/` checks `wlan0` or restarts the link. NetworkManager owns the interface
+    (`docs/CLAUDE.md`). Nothing on the host verifies that the unit is reachable after a WiFi drop,
+    and a container restart does not repair a dead link.
 
 41. **The Home Assistant integration lives in the separate `HA-Sendspin` repository.** It calls
     `POST /api/mesh/volume` and `POST /api/mesh/release` (`4d8a46b`), and it names a speaker by its
