@@ -1454,3 +1454,83 @@ def test_a_role_with_no_buffer_attribute_is_skipped():
     unit.server.add(FakeClient("ctrl", roles=["player@v1"]))  # a bare string, not a role object
 
     unit._clamp_player_min_buffer("ctrl")  # must not raise
+
+
+# --- _attach_local_player_once ----------------------------------------------
+#
+# The attach was wrapped in contextlib.suppress(Exception): a failure left the player connected,
+# unattached and silent, with no log line and no second attempt.
+
+LOCAL_PLAYER_URL = "ws://127.0.0.1:8928/sendspin"
+
+
+def test_a_failed_local_attach_is_logged_and_tried_again(monkeypatch, caplog):
+    async def scenario():
+        unit = make_unit("airplay-1")
+        unit.server.add(FakeClient("local-player", roles=("player@v1",)), url=LOCAL_PLAYER_URL)
+        monkeypatch.setattr(ss, "LOCAL_ATTACH_BACKOFF_S", (0.01, 0.01, 0.01))
+        attempts = []
+
+        async def flaky_attach(source_id, player_id):
+            attempts.append((source_id, player_id))
+            if len(attempts) < 3:
+                raise RuntimeError("group churn")
+
+        monkeypatch.setattr(unit, "attach_player", flaky_attach)
+        await unit._attach_local_player_once("airplay-1", "local-player", LOCAL_PLAYER_URL)
+        assert len(attempts) == 3  # two failures, then success
+
+    with caplog.at_level("ERROR", logger="plum.sendspin_server"):
+        run_scenario(scenario)
+    failures = [r for r in caplog.records if "local player attach failed" in r.getMessage()]
+    assert len(failures) == 2
+    assert all(r.exc_info for r in failures)  # logger.exception, so the traceback is in the log
+
+
+def test_a_local_attach_that_never_works_gives_up_and_releases_the_player(monkeypatch, caplog):
+    """Bounded: after the last attempt the unit must not keep an unattached player (CLAUDE.md)."""
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        unit.server.add(FakeClient("local-player", roles=("player@v1",)), url=LOCAL_PLAYER_URL)
+        monkeypatch.setattr(ss, "LOCAL_ATTACH_BACKOFF_S", (0.01, 0.01))
+        attempts = []
+        released = []
+
+        async def broken_attach(source_id, player_id):
+            attempts.append(player_id)
+            raise RuntimeError("always")
+
+        async def fake_release():
+            released.append(True)
+
+        monkeypatch.setattr(unit, "attach_player", broken_attach)
+        monkeypatch.setattr(unit, "release_local_player", fake_release)
+        await unit._attach_local_player_once("airplay-1", "local-player", LOCAL_PLAYER_URL)
+        assert len(attempts) == 3  # the first attempt plus one for each backoff step
+        assert released == [True]
+
+    with caplog.at_level("ERROR", logger="plum.sendspin_server"):
+        run_scenario(scenario)
+    assert any("gave up" in r.getMessage() for r in caplog.records)
+
+
+def test_a_local_attach_retry_stops_when_the_player_goes_away(monkeypatch):
+    """A player that roamed to a peer between attempts must not be pulled back by a retry."""
+
+    async def scenario():
+        unit = make_unit("airplay-1")
+        player = unit.server.add(FakeClient("local-player", roles=("player@v1",)), url=LOCAL_PLAYER_URL)
+        monkeypatch.setattr(ss, "LOCAL_ATTACH_BACKOFF_S", (0.01, 0.01, 0.01))
+        attempts = []
+
+        async def attach_then_lose(source_id, player_id):
+            attempts.append(player_id)
+            player.is_connected = False
+            raise RuntimeError("it left")
+
+        monkeypatch.setattr(unit, "attach_player", attach_then_lose)
+        await unit._attach_local_player_once("airplay-1", "local-player", LOCAL_PLAYER_URL)
+        assert len(attempts) == 1
+
+    run_scenario(scenario)

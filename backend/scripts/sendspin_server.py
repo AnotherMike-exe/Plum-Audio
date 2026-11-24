@@ -156,6 +156,10 @@ CANCEL_POLL_S = 0.25  # how long to wait between cancels of a dial task — see 
 # walking to a speaker to read it off a display. Bounded so an abandoned dialog cannot pin a
 # client in the pairing state forever, which would leave it unable to play.
 PAIRING_PIN_TIMEOUT_S = 180.0
+# Waits between attempts to attach the local player in _attach_local_player_once. Short and bounded:
+# the failures seen are group churn during connect, which clears in well under a second, and a unit
+# that cannot attach must release the player (see that method) rather than hold it for minutes.
+LOCAL_ATTACH_BACKOFF_S: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
 
 
 def _security_of(client) -> str | None:
@@ -2136,9 +2140,31 @@ class PlumSendspinServer:
         if not await self._await_source(source_id, timeout_s=30.0):
             logger.warning("[%s] source never appeared; local player left unattached", source_id)
             return
-        with contextlib.suppress(Exception):
-            await self.attach_player(source_id, player_id)
-            logger.info("[%s] local player %s attached (mesh-owned)", source_id, player_id)
+        # Bounded retry. A failure here used to be swallowed, which left the player connected,
+        # unattached and silent with nothing in the log. One attempt, then one more after each
+        # backoff step.
+        for delay in (*LOCAL_ATTACH_BACKOFF_S, None):
+            try:
+                await self.attach_player(source_id, player_id)
+            except Exception:  # noqa: BLE001 - transient during connect/route churn; retried below
+                logger.exception("[%s] local player attach failed", source_id)
+            else:
+                logger.info("[%s] local player %s attached (mesh-owned)", source_id, player_id)
+                return
+            if delay is None:
+                break
+            await asyncio.sleep(delay)
+            client = self.server.get_client(player_id) if self.server is not None else None
+            if self._stop_evt.is_set() or client is None or not client.is_connected:
+                # It left between attempts (a peer reclaimed it, or the process is stopping). A
+                # retry would dial nothing, and pulling a roamed player back is not our call.
+                logger.info("[%s] local player %s went away; attach retry stopped", source_id, player_id)
+                return
+        # Out of attempts. A unit does not hold its own player while that player is attached to
+        # nothing: the websocket we keep is what stops any other server claiming the speaker. Let
+        # go, so the router's idle-speaker fallback dials it back on the next route.
+        logger.error("[%s] gave up attaching local player %s; releasing it", source_id, player_id)
+        await self.release_local_player()
 
     async def _await_source(self, source_id: str, timeout_s: float) -> bool:
         """Poll until a source exists. Sources are brought up asynchronously by their manager, so
