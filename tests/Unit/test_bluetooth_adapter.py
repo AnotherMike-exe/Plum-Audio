@@ -148,3 +148,31 @@ def test_the_last_phone_leaving_stops_capture():
         assert adapter.active_address is None
 
     asyncio.run(scenario())
+
+
+def test_a_handler_queued_behind_stop_starts_no_capture():
+    """stop() takes the lock, stops the capture and returns. A signal that waited must not start one."""
+
+    async def scenario():
+        adapter = make_adapter()
+        adapter.device_props = {PHONE_A: _Props(), PHONE_B: _Props()}
+        await adapter._on_device_props(PHONE_A, {})
+        await asyncio.sleep(0)
+        assert len(live_loops(adapter)) == 1
+
+        await adapter._device_lock.acquire()  # something holds the lock: both calls below queue
+        stopper = asyncio.ensure_future(adapter.stop())
+        await asyncio.sleep(0)
+        connect = asyncio.ensure_future(adapter._on_device_props(PHONE_B, {}))
+        drop = asyncio.ensure_future(adapter._drop_device(PHONE_A))
+        await asyncio.sleep(0)
+        adapter._device_lock.release()
+        await asyncio.gather(stopper, connect, drop)
+        await asyncio.sleep(0.05)
+
+        assert live_loops(adapter) == []
+        assert adapter._capture_task is None and adapter.active_address is None
+        assert adapter._connected == {}
+        await cleanup(adapter)
+
+    asyncio.run(scenario())

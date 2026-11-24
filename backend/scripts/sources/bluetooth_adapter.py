@@ -108,6 +108,10 @@ class BluetoothAdapter:
         self._stale_strikes: dict[str, int] = {}  # address -> consecutive failed connections
         # Held across every decision that starts, retargets or stops capture. See _on_device_props.
         self._device_lock = asyncio.Lock()
+        # Set by stop() under that lock. A signal handler that waited for the lock behind stop()
+        # reads it and does nothing: without it, that handler starts a capture after stop() returned,
+        # and nothing owns the capture any more.
+        self._stopped = False
 
     # -- listener registration (bluetooth_avrcp hooks in here) ----------------
 
@@ -131,6 +135,7 @@ class BluetoothAdapter:
     # -- lifecycle -----------------------------------------------------------
 
     async def start(self) -> None:
+        self._stopped = False
         self._bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
         logger.info("[%s] connected to system D-Bus", self.instance.source_id)
         await self._subscribe()
@@ -140,6 +145,7 @@ class BluetoothAdapter:
 
     async def stop(self) -> None:
         async with self._device_lock:  # not underneath a signal handler that is mid-retarget
+            self._stopped = True
             await self._stop_capture()
         await self._unregister_agent()
         # Stop advertising. We configured the radio on the way up, so leaving it discoverable and
@@ -355,6 +361,8 @@ class BluetoothAdapter:
         signal finds the device already adopted and returns.
         """
         async with self._device_lock:
+            if self._stopped:
+                return  # queued behind stop(): the adapter is down, and nothing may start a capture
             await self._on_device_props_locked(path, changed)
 
     async def _on_device_props_locked(self, path: str, changed: dict) -> None:
@@ -398,6 +406,8 @@ class BluetoothAdapter:
     async def _drop_device(self, path: str) -> None:
         """A device went away. Serialised with `_on_device_props` — see the note there."""
         async with self._device_lock:
+            if self._stopped:
+                return  # a drop can hand capture to another phone, so it is refused too
             await self._drop_device_locked(path)
 
     async def _drop_device_locked(self, path: str) -> None:
