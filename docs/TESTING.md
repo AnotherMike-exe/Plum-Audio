@@ -22,7 +22,7 @@ weights integration and interop over breadth of unit coverage.
 |---|---|---|
 | `tests/Integration/t0_sendspin_protocol.py` (**tier 0**) | `<venv>/bin/python tests/Integration/t0_sendspin_protocol.py` | the aiosendspin VERSION GATE — real protocol, no rig; run before any pin bump |
 | `tests/Integration/t0_player_peer_watchdog.py` (**tier 0**) | `<venv>/bin/python tests/Integration/t0_player_peer_watchdog.py` | the peer-silence watchdog — a real server dials the player through a TCP proxy that freezes without closing; loopback only, about 45 s |
-| `tests/Unit/**` (pytest, **1305** in 46 files, counted 2026-11-24) | `PYTHONPATH=backend/scripts pytest tests/Unit` | see the breakdown below |
+| `tests/Unit/**` (pytest, **1347** in 46 files, counted 2026-11-24) | `PYTHONPATH=backend/scripts pytest tests/Unit` | see the breakdown below |
 | `frontend/tests/unit/**` (vitest, **289** in 21 files, counted 2026-11-24) | `cd frontend && npx vitest run` | view→model mapping, local-player-by-host, progress extrapolation, `TimeFilter` clock sync, audio + settings + integrations services |
 
 Both counts are from the working tree of `feature/maintenance-2026-11`, which held changes that
