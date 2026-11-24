@@ -270,6 +270,15 @@ OUTPUT_FLAP_RETRY_MAX_S = 300.0
 HEALTH_REPORT_S = 30.0
 # Exit codes for a deliberate self-restart. 2 is "configured for no output" (see main()).
 EXIT_OUTPUT_LOST = 3
+# Upper bound on one AlsaRenderer.recover() call. PortAudio's stop()/close() can block for ever on a
+# USB DAC that was unplugged, and the health loop awaits the call: without a bound, the peer-silence
+# check, the health report and request_exit all stop with it. 30 s is ten health polls, far above a
+# real re-open (1-2 s). 0 disables the bound.
+OUTPUT_RECOVER_TIMEOUT_S = _env_seconds("PLUM_OUTPUT_RECOVER_TIMEOUT_S", 30.0)
+# How long AlsaRenderer.stop() waits for the re-open lock. A worker thread that is stuck inside
+# PortAudio holds the lock and never gives it back, and stop() runs on the SIGTERM path, where
+# supervisord sends SIGKILL after `stopwaitsecs`.
+RENDERER_STOP_LOCK_TIMEOUT_S = 1.0
 
 # Upper bound on each network step of stop(). Three of them fit inside the supervisord
 # `stopwaitsecs` with room for the DAC release that follows.
@@ -687,14 +696,30 @@ class AlsaRenderer:
         if not self._closing:
             self.stream_finished = True
 
-    def stop(self) -> None:
-        with self._reopen_lock:
+    def stop(self) -> bool:
+        """Close the output stream. False if another thread holds the re-open lock and keeps it.
+
+        The lock is re-entrant, so reopen() and recover() pass straight through. A caller on a
+        different thread waits RENDERER_STOP_LOCK_TIMEOUT_S at most: the holder can be a worker
+        that PortAudio never returns to, and this is the last step of a SIGTERM shutdown.
+        """
+        if not self._reopen_lock.acquire(timeout=RENDERER_STOP_LOCK_TIMEOUT_S):
+            logger.error(
+                "stop: a re-open of %r did not release the output lock in %.1fs — the stream stays open",
+                self.device,
+                RENDERER_STOP_LOCK_TIMEOUT_S,
+            )
+            return False
+        try:
             if self._stream is not None:
                 self._closing = True
                 with contextlib.suppress(Exception):
                     self._stream.stop()
                     self._stream.close()
                 self._stream = None
+            return True
+        finally:
+            self._reopen_lock.release()
 
     # -- fill (asyncio thread) ----------------------------------------------
 
@@ -1228,6 +1253,9 @@ class SendspinPlayer:
         self._output_unproven = 0  # successful re-opens in a row with no healthy poll after them
         self._output_retry_after = 0.0  # monotonic time before which a flapping output is left alone
         self._health_report_at = 0.0  # monotonic time of the last periodic report write
+        # False when stop() could not release the DAC because a worker thread holds the re-open
+        # lock. main() then leaves with os._exit, because asyncio.run() would join that thread.
+        self.renderer_released = True
         # Dead-peer watchdog: the watched websocket of every open session, keyed like _sessions, and
         # when we started closing the ones found silent.
         self._session_ws: dict[int, _WatchedWebSocket] = {}
@@ -1381,7 +1409,19 @@ class SendspinPlayer:
             renderer.stats(),
         )
         self._set_output_state("recovering", fault)
-        recovered = await asyncio.get_running_loop().run_in_executor(None, renderer.recover)
+        # shield: a timeout must not cancel the worker's future, only stop the wait for it. The
+        # thread cannot be interrupted, and `renderer.reopening` stays True while it is stuck, so
+        # the early return above keeps this method from starting a second re-open beside it.
+        attempt = asyncio.get_running_loop().run_in_executor(None, renderer.recover)
+        try:
+            recovered = await asyncio.wait_for(asyncio.shield(attempt), OUTPUT_RECOVER_TIMEOUT_S or None)
+        except TimeoutError:
+            self._set_output_state("lost", fault)
+            self.request_exit(
+                EXIT_OUTPUT_LOST,
+                f"the output re-open did not return in {OUTPUT_RECOVER_TIMEOUT_S:.0f}s ({fault})",
+            )
+            return
         self._callbacks_seen = -1
         self._callback_stalls = 0
         if not recovered:
@@ -2062,7 +2102,8 @@ class SendspinPlayer:
                     logger.warning("stop: the listener did not stop cleanly: %r", exc)
                 self._listener = None
         finally:
-            self.renderer.stop()
+            # False only from AlsaRenderer.stop() when it could not take the lock.
+            self.renderer_released = self.renderer.stop() is not False
 
     def _flush_render_state(self) -> None:
         """Write a pending level NOW. Synchronous on purpose: this is the shutdown path.
@@ -2226,6 +2267,22 @@ class SendspinPlayer:
         )
 
 
+def _hard_exit_if_stuck(player) -> None:  # noqa: ANN001 - SendspinPlayer
+    """Leave with os._exit when a worker thread is stuck inside PortAudio.
+
+    asyncio.run() joins the default executor before it returns, and the interpreter joins its
+    threads again at exit. A thread inside PortAudio's stop()/close() on a removed USB DAC never
+    returns, so the process stays up until SIGKILL and supervisord never sees the exit code.
+    player.stop() ran before this: the level and the health report are on disk.
+    """
+    if player.renderer_released:
+        return
+    code = player.exit_code if player.exit_code is not None else 0
+    logger.error("a worker thread holds the output lock — leaving with os._exit(%d)", code)
+    logging.shutdown()  # flush the log handlers; os._exit runs no cleanup
+    os._exit(code)
+
+
 async def main() -> int | None:
     logging.basicConfig(
         level=os.environ.get("PLUM_LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -2353,6 +2410,7 @@ async def main() -> int | None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         await player.stop()
+    _hard_exit_if_stuck(player)
     # None on SIGTERM (exit 0). A watchdog's code otherwise, so supervisord logs an unexpected exit.
     return player.exit_code
 

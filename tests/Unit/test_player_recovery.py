@@ -884,3 +884,98 @@ def test_closing_a_real_aiohttp_websocket_wakes_a_blocked_reader():
     woke = asyncio.run(scenario())
     assert woke is not None, "the reader stayed blocked: the session cannot be closed from our side"
     assert woke.type.name in ("CLOSING", "CLOSED", "CLOSE")
+
+
+# -- a re-open that never returns --------------------------------------------------------------------
+
+
+class _BlockingRenderer(_WatchedRenderer):
+    """recover() blocks as PortAudio does on an unplugged USB DAC, until the test lets it go."""
+
+    def __init__(self):
+        super().__init__()
+        import threading
+
+        self.release = threading.Event()
+
+    def recover(self) -> bool:
+        self.recover_calls += 1
+        self.reopening = True
+        self.release.wait(10)
+        return False
+
+
+def test_a_recover_that_blocks_ends_in_an_exit_request(tmp_path, monkeypatch):
+    """The health loop must not wait on PortAudio for ever: the other watchdogs live in it."""
+    import json
+
+    monkeypatch.setattr(sendspin_player, "OUTPUT_RECOVER_TIMEOUT_S", 0.05)
+    p = _OutputPlayer(tmp_path, _BlockingRenderer())
+    p.renderer.fault = "PortAudio finished the stream"
+
+    async def scenario():
+        try:
+            await asyncio.wait_for(p._check_output(), 5)
+            await asyncio.wait_for(p._check_output(), 5)  # the stuck re-open is not started again
+        finally:
+            p.renderer.release.set()  # let asyncio.run() join the worker thread
+
+    asyncio.run(scenario())
+    assert p.renderer.recover_calls == 1
+    assert p.exit_code == sendspin_player.EXIT_OUTPUT_LOST and p.exit_requested.is_set()
+    assert json.loads(Path(p._state_file).read_text())["health"]["output"]["state"] == "lost"
+
+
+def test_renderer_stop_gives_up_on_a_lock_that_a_stuck_worker_holds(fake_sd, monkeypatch, caplog):
+    """SIGTERM must reach the end of stop() before supervisord sends SIGKILL."""
+    import threading
+
+    monkeypatch.setattr(sendspin_player, "RENDERER_STOP_LOCK_TIMEOUT_S", 0.05)
+    renderer = _renderer()
+    held, release = threading.Event(), threading.Event()
+
+    def worker():
+        with renderer._reopen_lock:
+            held.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    assert held.wait(5)
+    try:
+        with caplog.at_level(logging.ERROR, logger=LOG):
+            assert renderer.stop() is False
+    finally:
+        release.set()
+        thread.join(5)
+    assert any("did not release" in r.getMessage() for r in caplog.records)
+    assert renderer.stop() is True, "a free lock still releases the stream"
+    assert renderer._stream is None
+
+
+def test_stop_records_a_dac_that_was_not_released(tmp_path):
+    p = _StopPlayer(tmp_path)
+    p.renderer.stop = lambda: False
+    asyncio.run(p.stop())
+    assert p.renderer_released is False
+    q = _StopPlayer(tmp_path)
+    asyncio.run(q.stop())
+    assert q.renderer_released is True
+
+
+def test_a_stuck_worker_thread_ends_in_a_hard_exit(monkeypatch):
+    """asyncio.run() joins the executor threads. A thread inside PortAudio never returns."""
+    exits = []
+    monkeypatch.setattr(sendspin_player.os, "_exit", exits.append)
+
+    class P:
+        renderer_released = True
+        exit_code = None
+
+    sendspin_player._hard_exit_if_stuck(P)
+    assert exits == [], "a clean stop returns through asyncio.run()"
+    P.renderer_released = False
+    sendspin_player._hard_exit_if_stuck(P)
+    P.exit_code = sendspin_player.EXIT_OUTPUT_LOST
+    sendspin_player._hard_exit_if_stuck(P)
+    assert exits == [0, sendspin_player.EXIT_OUTPUT_LOST]
