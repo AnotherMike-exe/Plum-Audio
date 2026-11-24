@@ -99,12 +99,20 @@ class MeshDiscovery:
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        with contextlib.suppress(AttributeError, OSError):
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)  # not on all platforms
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.bind(("", self.beacon_port))
-        self._transport, _ = await loop.create_datagram_endpoint(lambda: _BeaconProtocol(self._on_datagram), sock=sock)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with contextlib.suppress(AttributeError, OSError):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)  # not on all platforms
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.bind(("", self.beacon_port))
+            self._transport, _ = await loop.create_datagram_endpoint(
+                lambda: _BeaconProtocol(self._on_datagram), sock=sock
+            )
+        except BaseException:
+            # Until the transport exists the socket is ours. A bind on a port in use, or an endpoint
+            # that fails or is cancelled, otherwise leaves it open with nothing that will close it.
+            sock.close()
+            raise
         self._task = asyncio.ensure_future(self._broadcast_loop())
         logger.info("mesh discovery up: unit=%s beacon=:%d", self.unit_id, self.beacon_port)
 
