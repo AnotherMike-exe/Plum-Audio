@@ -28,6 +28,7 @@ import { SyncedDevices } from './components/SyncedDevices';
 import { ClientManager } from './components/ClientManager';
 import { PairDeviceDialog, type PairMethod } from './components/PairDeviceDialog';
 import { IncomingPairPrompt } from './components/IncomingPairPrompt';
+import { ActionErrorToast } from './components/ActionErrorToast';
 import { Icon } from './components/Icon';
 import { Settings } from './components/Settings';
 import { Visualizer } from './components/Visualizer';
@@ -38,10 +39,17 @@ import { settingsService } from './services/settingsService';
 import { aboutService } from './services/aboutService';
 import { useThemeSettings } from './hooks/useThemeSettings';
 import { useBrowserPlayer } from './hooks/useBrowserPlayer';
+import { useActionError } from './hooks/useActionError';
+import { RetryBackoff } from './utils/retryBackoff';
 
 const service = new SendspinDataService();
 const EMPTY: Model = { servers: [], streams: [], clients: [], localPlayerIds: [] };
 const clampVol = (v: number) => Math.max(0, Math.min(100, v));
+// Browser-player route retry: 1 s, 2 s, 4 s ... capped at 30 s. The first failures are expected (the
+// unit's own view lags the row we can already see), so only this many in a row are worth a message.
+const BROWSER_ROUTE_RETRY_BASE_MS = 1_000;
+const BROWSER_ROUTE_RETRY_MAX_MS = 30_000;
+const BROWSER_ROUTE_FAILURES_TO_REPORT = 4;
 
 /**
  * Which stream the main card features.
@@ -101,6 +109,38 @@ export const playerControlsPropsEqual = (
     a.onVolumeChange === b.onVolumeChange &&
     a.onSourceVolumeChange === b.onSourceVolumeChange;
 
+/**
+ * The identity of the device lists. `stableClients` — and so ClientManager and SyncedDevices, which
+ * are memoised on it — changes only when this string does.
+ *
+ * Every field a device row RENDERS or the lists FILTER on must be here; one that is missing gives a
+ * row that stays stale until some other field moves, with no error anywhere. It happened twice:
+ *   - pairingState: a device that finished pairing kept its Pair button. Silent, and
+ *     indistinguishable from pairing having failed.
+ *   - foreignServer (name, title, artist), url, isForeign, isLocal: the idle row's "Music Assistant
+ *     · Track — Artist" line kept the track that was playing when the speaker was claimed, and a
+ *     speaker that changed hands kept the old owner's name.
+ *
+ * JSON, not a joined string: a separator inside a name must not make two different lists equal.
+ * Exported for tests, for the same reason as playerControlsPropsEqual above.
+ */
+export const clientsSignature = (clients: Client[]): string =>
+  JSON.stringify(
+    clients.map((c) => [
+      c.id,
+      c.name,
+      c.currentStreamId ?? '',
+      c.volume,
+      c.connected,
+      c.pairingState ?? '',
+      c.url ?? '',
+      !!c.isForeign,
+      !!c.isLocal,
+      !!c.offline,
+      c.foreignServer ? [c.foreignServer.name, c.foreignServer.title ?? '', c.foreignServer.artist ?? ''] : null,
+    ]),
+  );
+
 const MemoPlayerControls = React.memo(PlayerControls, playerControlsPropsEqual);
 const MemoStreamSelector = React.memo(StreamSelector);
 const MemoSyncedDevices = React.memo(SyncedDevices);
@@ -117,6 +157,10 @@ export default function MeshApp(): React.ReactElement {
   const [settings, setSettings] = useState<SettingsType>(settingsService.getMergedSettings());
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const browser = useBrowserPlayer();
+  // Where a failed command goes. Every mesh command below is a promise that rejects when the unit
+  // refuses it (400) or cannot be reached; `guard` catches that and the toast at the bottom of the
+  // page says what did not happen and why. `guard` and `reportError` are identity-stable.
+  const { error: actionError, guard, report: reportError, dismiss: dismissActionError } = useActionError();
 
   useEffect(() => {
     service.start();
@@ -267,12 +311,7 @@ export default function MeshApp(): React.ReactElement {
     .map((s) =>
       `${s.id}|${s.name}|${s.serverName ?? ''}|${s.isPlaying}|${s.volume ?? ''}|${s.sourceVolume ?? ''}|${s.active}`)
     .join(';');
-  const clientsSig = viewClients
-    // pairingState is in here deliberately: ClientManager is memoised on this string, so a device
-    // that finishes pairing would keep rendering its Pair button until some OTHER field happened to
-    // change. Silent, and indistinguishable from pairing having failed.
-    .map((c) => `${c.id}|${c.name}|${c.currentStreamId ?? ''}|${c.volume}|${c.connected}|${c.pairingState ?? ''}`)
-    .join(';');
+  const clientsSig = clientsSignature(viewClients);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const stableStreams = useMemo(() => model.streams, [streamsSig]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -328,13 +367,18 @@ export default function MeshApp(): React.ReactElement {
   //                   volume). Ours to carry: the protocol has no such concept.
   const onMyVolume = useCallback((v: number) => {
     const mine = modelRef.current.clients.find((c) => c.isLocal);
-    if (mine) void service.setVolume(mine.id, clampVol(v));
-  }, []);
+    if (mine) guard(service.setVolume(mine.id, clampVol(v)), 'Could not change the volume');
+  }, [guard]);
   const onSourceVolume = useCallback((v: number) => {
     const f = featuredRef.current;
-    if (f) void service.setSourceVolume(f.id, clampVol(v));
-  }, []);
-  const onClientVolume = useCallback((clientId: string, v: number) => service.setVolume(clientId, v), []);
+    if (f) guard(service.setSourceVolume(f.id, clampVol(v)), 'Could not change the source volume');
+  }, [guard]);
+  // Returns nothing on purpose. This used to return the promise to a component that typed the
+  // handler as `void` and dropped it — the same unhandled rejection, one step further away.
+  const onClientVolume = useCallback((clientId: string, v: number) => {
+    const name = modelRef.current.clients.find((c) => c.id === clientId)?.name ?? 'the device';
+    guard(service.setVolume(clientId, v), `Could not change the volume of ${name}`);
+  }, [guard]);
 
   // Native visualizer frames for the featured source; read on rAF by the visualizer.
   const getSpectrum = useCallback(() => (featuredId ? service.getVizFrame(featuredId) : null), [featuredId]);
@@ -348,16 +392,16 @@ export default function MeshApp(): React.ReactElement {
     if (streamId && streamId.startsWith(FOREIGN_PREFIX)) return; // foreign session: nothing to route
     const url = client.url;
     if (streamId && url && (client.isForeign || client.foreignServer)) {
-      void service.adoptSpeaker(url, streamId);
+      guard(service.adoptSpeaker(url, streamId), `Could not bring ${client.name} onto the stream`);
       return;
     }
     if (!streamId && client.isForeign && client.currentStreamId) {
-      void service.releaseSpeaker(client.id, client.currentStreamId, url);
+      guard(service.releaseSpeaker(client.id, client.currentStreamId, url), `Could not release ${client.name}`);
       return;
     }
-    if (streamId) void service.routeClient(client.id, streamId);
-    else void service.unrouteClient(client.id);
-  }, []);
+    if (streamId) guard(service.routeClient(client.id, streamId), `Could not move ${client.name} to the stream`);
+    else guard(service.unrouteClient(client.id), `Could not remove ${client.name} from its stream`);
+  }, [guard]);
 
   /** Route THIS unit's own endpoint onto the chosen source. Never touches whoever else happens to
    *  share the current group (e.g. a peer we're following, or one following us) — that shared
@@ -399,7 +443,9 @@ export default function MeshApp(): React.ReactElement {
     // Tell the unit to abandon the attempt rather than just closing the dialog: an attempt left
     // running holds the device in a pairing state where it cannot play.
     if (pairingTarget?.serverId) void service.cancelPairing(pairingTarget.serverId, pairingTarget.id);
-    setPairingTarget(null);
+    // Close only the dialog of THIS device. The dialog can call this a second time after it
+    // closed (its start request resolved late), and a dialog for another device can be open then.
+    setPairingTarget((current) => (current?.id === pairingTarget?.id ? null : current));
   }, [pairingTarget]);
 
   // -- Listen in Browser: this tab becomes a Sendspin player of the unit that serves it -------------
@@ -418,6 +464,10 @@ export default function MeshApp(): React.ReactElement {
   const browserTargetRef = useRef<string | null>(null);
   const browserRoutedRef = useRef(false);
   const browserHandledReconnectRef = useRef(0);
+  // Paces the reconciler's route request. The effect below runs on every model emit — twice a
+  // second, because `model.clients` is a new array each time — so without this a route that kept
+  // failing was re-sent twice a second for as long as the tab stayed open.
+  const browserRouteBackoffRef = useRef(new RetryBackoff(BROWSER_ROUTE_RETRY_BASE_MS, BROWSER_ROUTE_RETRY_MAX_MS));
 
   const onStartBrowserAudio = useCallback(() => {
     const m = modelRef.current;
@@ -440,13 +490,16 @@ export default function MeshApp(): React.ReactElement {
     browserTargetRef.current = validTarget;
     browserRoutedRef.current = false;
     browserHandledReconnectRef.current = 0;
-    void browserStart(host).catch(() => {
+    browserRouteBackoffRef.current.reset();
+    void browserStart(host).catch((err) => {
       browserTargetRef.current = null;
+      reportError('Could not start audio in this browser', err);
     });
-  }, [browserStart]);
+  }, [browserStart, reportError]);
 
   const onStopBrowserAudio = useCallback(() => {
     browserTargetRef.current = null;
+    browserRouteBackoffRef.current.reset();
     browserStop();
   }, [browserStop]);
 
@@ -470,26 +523,44 @@ export default function MeshApp(): React.ReactElement {
 
     if (cur && !cur.startsWith(FOREIGN_PREFIX) && cur !== target) {
       browserTargetRef.current = cur; // (3) user moved it — follow, so reconnects restore THAT
+      browserRouteBackoffRef.current.reset();
       browserRoutedRef.current = true;
       browserHandledReconnectRef.current = browserReconnectSeq;
       return;
     }
     if (cur && cur === target) {
       browserRoutedRef.current = true; // landed / still on target
+      browserRouteBackoffRef.current.reset();
       browserHandledReconnectRef.current = browserReconnectSeq;
       return;
     }
     // cur is null → idle
     if (!target) return; // (started idle — unit had nothing active)
     if (!browserRoutedRef.current || reconnected) {
-      void service.routeClient(browserPlayerId, target).catch(() => {
-        /* view lag — retry next tick */
-      }); // (1) initial or (2) reconnect recovery
+      // (1) initial or (2) reconnect recovery. One request at a time, and a growing wait after each
+      // failure: this effect runs twice a second, and it must not POST twice a second.
+      const backoff = browserRouteBackoffRef.current;
+      if (!backoff.ready()) return;
+      const attempt = backoff.begin();
+      // The first misses are view lag and clear by themselves. A run of them is a real fault, and
+      // the tab plays nothing meanwhile — say so, once. An accepted route that the view never
+      // shows on target is a miss too: only the `reset()` above, on landing, clears the count.
+      // `applied` is false for an attempt from before a reset (the user stopped, or moved the
+      // player): that outcome belongs to no current session, and it reports nothing.
+      const settled = (applied: boolean, err: unknown) => {
+        if (applied && backoff.failures === BROWSER_ROUTE_FAILURES_TO_REPORT) {
+          reportError('Could not put this browser on the stream', err);
+        }
+      };
+      service.routeClient(browserPlayerId, target).then(
+        () => settled(backoff.succeed(attempt), new Error('the unit accepted the route, but the player did not join')),
+        (err) => settled(backoff.fail(attempt), err),
+      );
       return;
     }
     browserTargetRef.current = null; // (4) unrouted by the user → tear down
     browserStop();
-  }, [model.clients, browserActive, browserPlayerId, browserReconnectSeq, browserStop]);
+  }, [model.clients, browserActive, browserPlayerId, browserReconnectSeq, browserStop, reportError]);
   const adjustStreamVolume = useCallback((streamId: string, dir: 'up' | 'down') => {
     const s = modelRef.current.streams.find((x) => x.id === streamId);
     service.setStreamVolume(streamId, clampVol((s?.volume ?? 100) + (dir === 'up' ? 5 : -5)));
@@ -704,6 +775,8 @@ export default function MeshApp(): React.ReactElement {
           onOpenPairingWindows={() => service.openPairingWindowEverywhere()}
         />
       )}
+
+      <ActionErrorToast message={actionError} onDismiss={dismissActionError} />
 
       <Visualizer
         isOpen={visualizerOpen}

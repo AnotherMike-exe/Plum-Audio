@@ -26,6 +26,7 @@ here (that is what the unit's own configuration is for).
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from urllib.parse import urlparse
 
 from mesh.avahi import CLIENT_SERVICE, DEFAULT_PATH, SERVER_SERVICE, AvahiClient, DiscoveredService
@@ -72,6 +73,11 @@ class Neighbourhood:
         self.own_player_url = own_player_url
         self._avahi = AvahiClient()
         self._players: dict[str, DiscoveredService] = {}  # key -> service
+        # Called with the listener URL of every FOREIGN player record Avahi resolves, including one
+        # that reappears after it went away. The server uses it to dial an adopted speaker again
+        # (sendspin_server.note_speaker_seen). Fires once per interface and address, so the
+        # receiver must be safe to call repeatedly.
+        self.on_player_seen: Callable[[str], None] | None = None
         self._servers: dict[str, DiscoveredService] = {}
 
     async def start(self) -> None:
@@ -103,6 +109,12 @@ class Neighbourhood:
 
     def _on_player(self, service: DiscoveredService) -> None:
         self._players[service.key] = service
+        if self.on_player_seen is None or self.is_own_player(service):
+            return
+        try:
+            self.on_player_seen(service.ws_url)
+        except Exception:  # noqa: BLE001 - a listener fault must not stop discovery
+            logger.exception("on_player_seen failed for %s", service.key)
 
     def _on_server(self, service: DiscoveredService) -> None:
         self._servers[service.key] = service

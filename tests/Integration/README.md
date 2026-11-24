@@ -21,6 +21,7 @@ tier 4, which runs against live third-party devices in someone's home.
 | Script | Rig | Run |
 |---|---|---|
 | `t0_sendspin_protocol.py` | **none** — localhost only | `<venv>/bin/python t0_sendspin_protocol.py` |
+| `t0_player_peer_watchdog.py` | **none** — localhost only, ~45 s | `<venv>/bin/python t0_player_peer_watchdog.py` |
 | `t2_source_lifecycle.sh` | any one unit | `./t2_source_lifecycle.sh <host> [source-id]` |
 | `t2_endpoint_crud.sh` | any one unit (config API on :5002) | `./t2_endpoint_crud.sh <host> [spotify\|airplay]` |
 | `t2_calibration_tone.sh` | any one unit **with a player** | `./t2_calibration_tone.sh <host>` |

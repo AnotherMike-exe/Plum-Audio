@@ -13,10 +13,10 @@ Endpoints (parity with the old /api/federation/* surface, so the GUI ports with 
   GET  /api/mesh/neighbourhood     Sendspin servers/players on this segment, via mDNS (interop)
   POST /api/mesh/player-state      our own speaker's self-report (where it is attached, what plays)
   POST /api/mesh/adopt             dial a FOREIGN Sendspin speaker (mDNS URL) onto one of our sources
-  POST /api/mesh/release           hand it back to whatever server it came from
+  POST /api/mesh/release           {source_id, player_id | url}    hand it back to whatever server it came from
   POST /api/mesh/route             {player_id, source_id}          route a player onto a source
   POST /api/mesh/unroute           {player_id, source_id}          remove a player from a source
-  POST /api/mesh/volume            {player_id, volume, muted}      per-player (endpoint) volume
+  POST /api/mesh/volume            {player_id, volume?, muted?}    per-player (endpoint) volume
   POST /api/mesh/player-delay      {player_id, delay_ms}           correct an endpoint that plays LATE
   POST /api/mesh/source-volume     {source_id, volume?, muted?}    the SENDING DEVICE's own volume
   POST /api/mesh/source            {source_id, fifo?}              start a local source (a group)
@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import contextlib
 import hmac
+import json
 import logging
 import os
 from collections.abc import Awaitable, Callable
@@ -63,6 +64,7 @@ from speaker_names import SpeakerNames
 from sync_engine.base import SyncEngine
 
 from mesh.aggregator import DataAggregator
+from mesh.neighbourhood import _hostport
 from mesh.router import RouteError, Router
 
 logger = logging.getLogger("plum.mesh.api")
@@ -90,17 +92,48 @@ def make_cors_middleware(hosts_provider) -> _Middleware:
     Requests with NO Origin — peer snapshot polls, delegated routes, the loopback player-state POST —
     pass through untouched. They are not browser requests and CORS never applied to them; refusing
     them would break mesh aggregation from the inside with nothing visible in any browser.
+
+    The request GUARD runs first (`cors_policy.guard`, shared with the Flask API). The CORS headers
+    only stop a page from reading the reply; before the guard, the handler had already run for a
+    refused origin, and a websocket upgrade was never checked at all. `PLUM_API_GUARD=0` turns the
+    guard off and leaves the headers as they were.
     """
 
     @web.middleware
     async def _cors(request: web.Request, handler):
         origin = request.headers.get("Origin")
-        allow = cors_policy.origin_header(origin, hosts_provider())
+        hosts = hosts_provider()
+        allow = cors_policy.origin_header(origin, hosts)
 
-        if request.method == "OPTIONS":
+        refusal = cors_policy.guard(
+            method=request.method,
+            origin=origin,
+            host=request.headers.get("Host"),
+            content_type=request.headers.get("Content-Type"),
+            has_body=cors_policy.has_body(
+                request.headers.get("Content-Length"), request.headers.get("Transfer-Encoding")
+            ),
+            hosts=hosts,
+        )
+        if refusal is not None:
+            status, message = refusal
+            logger.warning(
+                "refused %s %s: %s (known hosts: %s)",
+                request.method,
+                request.path,
+                message,
+                ", ".join(sorted(hosts)) or "none",
+            )
+            resp = web.json_response({"error": message}, status=status)
+        elif request.method == "OPTIONS":
             resp = web.Response()
         else:
-            resp = await handler(request)
+            try:
+                resp = await handler(request)
+            except web.HTTPException as exc:
+                # An aiohttp error is a response. Keep it on this path so it gets the CORS headers:
+                # without them the GUI cannot read WHY a request failed, only that it did.
+                resp = exc
 
         if allow is not None:
             resp.headers["Access-Control-Allow-Origin"] = allow
@@ -150,8 +183,10 @@ class MeshApi:
             # tone source must be published into it before anything can be routed onto it.
             refresh_view=self._agg.refresh,
         )
-        # Read-only here: the audio process learns these while a speaker is attached (see
-        # sendspin_server.snapshot). Its own instance, so a reload picks up whatever is on disk.
+        # Read-only here: the audio server learns these while a speaker is attached (see
+        # sendspin_server.snapshot) and writes them through ITS OWN instance. This one reads the
+        # file again whenever it changed (SpeakerNames._refresh), so a name learned after startup
+        # is served on the next request.
         self._speaker_names = SpeakerNames()
         self.port = port
         self._runner: web.AppRunner | None = None
@@ -177,9 +212,13 @@ class MeshApi:
         this unit's OWN host (which the peer table never does — a unit ignores its own beacon), and
         that entry is exactly the one whose absence would break the page being looked at.
         """
+        # own_hosts() as well: it keeps this unit's own names in the set while the view is not
+        # ready, and it reads this unit's Settings name with no wait for a snapshot. A PEER's
+        # Settings name comes from the view (`UnitSnapshot.mdns_hostname`).
+        hosts = cors_policy.own_hosts()
         with contextlib.suppress(Exception):
-            return cors_policy.known_hosts(self._agg.view().units)
-        return set(cors_policy.LOOPBACK_HOSTS)
+            hosts |= cors_policy.known_hosts(self._agg.view().units)
+        return hosts
 
     async def start(self) -> None:
         app = web.Application(middlewares=[make_cors_middleware(self._known_hosts)])
@@ -292,10 +331,57 @@ class MeshApi:
         body = await self._json(request)
         url, source_id = body.get("url"), body.get("source_id")
         player_id = body.get("player_id")
-        if not player_id or not source_id:
-            return web.json_response({"error": "player_id and source_id required"}, status=400)
+        if not source_id or not (player_id or url):
+            return web.json_response({"error": "source_id and player_id or url required"}, status=400)
+        if not player_id:
+            # `url` alone. A caller outside the mesh (Home Assistant) knows a speaker by its
+            # listener URL: the handshake id comes back only in the reply to an adopt, and the
+            # caller does not have it after its own restart. The URL is the identifier both views
+            # of a speaker share (CLAUDE.md, "A speaker has TWO names").
+            player_id = self._attached_player_id(url)
+            if player_id is None:
+                return web.json_response({"error": "no attached player has that url"}, status=404)
+            await self._engine.release_client(source_id, player_id, url=url)
+            return web.json_response({"ok": True, "player_id": player_id})
         await self._engine.release_client(source_id, player_id, url=url)
         return web.json_response({"ok": True})
+
+    def _attached_player_id(self, url: str | None) -> str | None:
+        """The id of the player attached to THIS server at a listener URL, or None.
+
+        This unit's players only: a release is local, like an adopt. Exact URL text first, then
+        host and port, because the advertised URL and the registered one can differ in path.
+        """
+        try:
+            players = self._agg.local_snapshot().players
+        except Exception:  # noqa: BLE001 - no snapshot is the same answer as no match
+            return None
+        for player in players:
+            if player.url and player.url == url:
+                return player.player_id
+        wanted = _hostport(url)
+        if wanted is None:
+            return None
+        for player in players:
+            if _hostport(player.url) == wanted:
+                return player.player_id
+        return None
+
+    def _current_level(self, player_id: str) -> tuple[int | None, bool | None]:
+        """(volume, muted) as the mesh reports them for a player now. (None, None) if nobody does.
+
+        This unit's fresh snapshot first, then the aggregated view for a player on a peer. A
+        released speaker is in no `players` list at all, so there is no level to report for it.
+        """
+        with contextlib.suppress(Exception):
+            for player in self._agg.local_snapshot().players:
+                if player.player_id == player_id:
+                    return player.volume, player.muted
+        with contextlib.suppress(Exception):
+            found = self._agg.view().find_player(player_id)
+            if found is not None:
+                return found[1].volume, found[1].muted
+        return None, None
 
     async def _consume(self, request: web.Request) -> web.WebSocketResponse:
         """WS bridge for foreign-server consumption. `?role=player` = the producer (our local
@@ -381,12 +467,13 @@ class MeshApi:
         # until that particular tab had watched that particular speaker attach. Doing it here makes
         # one answer for every client, and needs no GUI change at all — it already prefers
         # `friendly_name`. See speaker_names.py.
-        names = self._speaker_names.all()
-        if names:
-            for entry in payload.get("players", []):
-                learned = names.get(entry.get("url"))
-                if learned:
-                    entry["friendly_name"] = learned
+        #
+        # Through `get`, not a lookup in `all()`: `get` also matches on host and port, because the
+        # URL mDNS advertises and the URL the handshake registered can differ in path or scheme.
+        for entry in payload.get("players", []):
+            learned = self._speaker_names.get(entry.get("url"))
+            if learned:
+                entry["friendly_name"] = learned
         return web.json_response(payload)
 
     async def _route(self, request: web.Request) -> web.Response:
@@ -409,19 +496,42 @@ class MeshApi:
         return web.json_response({"ok": True})
 
     async def _volume(self, request: web.Request) -> web.Response:
+        """Set a player's volume, its mute, or both. A field that is absent keeps its current value.
+
+        `volume` alone used to CLEAR mute (it defaulted to False), so a slider move on a muted
+        speaker made it play. `muted` alone was refused. A caller with a slider and a separate mute
+        button (Home Assistant) sends one field at a time. The protocol setter takes both, so the
+        absent one is read from the mesh.
+        """
         body = await self._json(request)
         player_id = body.get("player_id")
-        if not player_id or "volume" not in body:
-            return web.json_response({"error": "player_id and volume required"}, status=400)
-        volume = int(body["volume"])
+        has_volume, has_muted = body.get("volume") is not None, body.get("muted") is not None
+        if not player_id or not (has_volume or has_muted):
+            return web.json_response({"error": "player_id and volume or muted required"}, status=400)
+        current_volume, current_muted = self._current_level(player_id)
+        if has_volume:
+            try:
+                volume = int(body["volume"])
+            except (TypeError, ValueError):
+                return web.json_response({"error": "volume must be an integer"}, status=400)
+        elif current_volume is None:
+            # No level to keep, and an invented one would move a real speaker.
+            return web.json_response(
+                {"error": f"volume required: the current volume of {player_id!r} is not known"}, status=400
+            )
+        else:
+            volume = current_volume
+        # Not known and not given: False, which is what this handler always sent before.
+        muted = bool(body["muted"]) if has_muted else bool(current_muted)
         try:
-            await self._router.set_volume(player_id, volume, bool(body.get("muted", False)))
+            await self._router.set_volume(player_id, volume, muted)
         except (KeyError, RuntimeError) as e:
             return web.json_response({"error": str(e)}, status=400)
         # Tell the matcher what the user asked for rather than making it infer the same fact from a
         # cached view one poll later. This request IS the event; without it the whole lag between
         # moving one slider and the group following is the poll interval.
-        if self.on_user_volume is not None:
+        # Only for a request that carried a volume: a mute is not a new level for a group to follow.
+        if has_volume and self.on_user_volume is not None:
             with contextlib.suppress(Exception):
                 self.on_user_volume(player_id, volume)
         return web.json_response({"ok": True})
@@ -741,7 +851,18 @@ class MeshApi:
 
     @staticmethod
     async def _json(request: web.Request) -> dict:
+        """The request body as a dict. An empty or malformed body is `{}`; a non-object is 400.
+
+        Every handler calls `body.get(...)`, so a JSON array or string was an AttributeError and a
+        500 with a traceback. The Content-Type is checked before this, by the request guard.
+        """
         try:
-            return await request.json()
+            body = await request.json()
         except Exception:  # noqa: BLE001 - tolerate empty/malformed bodies as {}
             return {}
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest(
+                text=json.dumps({"error": "the request body must be a JSON object"}),
+                content_type="application/json",
+            )
+        return body

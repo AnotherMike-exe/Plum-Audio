@@ -95,7 +95,39 @@ retry_() {
         sleep 3
     done
 }
-ssh_() { retry_ sshpass -p "$PW" ssh $SSH_OPTS "${USER_}@$1" "${@:2}"; }
+# The login password goes to sshpass in the ENVIRONMENT (`sshpass -e` reads SSHPASS), never as
+# with the `-p` option: an argument is in the process list of this workstation for every
+# connection, and any local user can read it there. Set for the one command, not exported, so no
+# other child of this script inherits it.
+sshpass_() { SSHPASS="$PW" sshpass -e "$@"; }
+ssh_() { retry_ sshpass_ ssh $SSH_OPTS "${USER_}@$1" "${@:2}"; }
+# Run the script on stdin on a unit, with the sudo password as its "$1".
+#
+# The password used to be a remote ARGUMENT (`bash -s -- <password>`), so it was in the unit's process
+# list for the whole run, and in this workstation's as part of the ssh command. Now it is the
+# second LINE of stdin. `bash -s` reads its script from a pipe one byte at a time, so the first line
+# (`read`) takes the next line and nothing else. `set --` then puts it back at "$1", in shell
+# memory only, so every remote block still starts `PW="$1"` unchanged.
+#
+# The script is read into a variable first, so a retry sends the WHOLE script again. Before this, a
+# retry ran with stdin already at end-of-file: `bash -s` then ran nothing and returned 0, which
+# reported success for a block that did not run. Retries on 255 only (ssh's own failure), never on
+# the remote block's status: a state-changing block must not run twice because it failed once.
+ssh_sudo_() {
+    local host="$1" script n=0 rc
+    script="$(cat)"
+    while :; do
+        rc=0
+        # PIPESTATUS[1], not $?: under pipefail a remote block that ends before it read all of
+        # stdin gives printf a SIGPIPE, and that is not a failure.
+        printf '%s\n%s\n%s\n' 'IFS= read -r PW; set -- "$PW" "$@"' "$PW" "$script" \
+            | sshpass_ ssh $SSH_OPTS "${USER_}@${host}" "${@:2}" || rc="${PIPESTATUS[1]}"
+        [[ $rc -ne 255 ]] && return "$rc"
+        n=$((n + 1))
+        [[ $n -ge 3 ]] && return "$rc"
+        sleep 3
+    done
+}
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m    !! %s\033[0m\n' "$*"; }
 
@@ -112,7 +144,7 @@ fi
 # --- the report, which is also --check ------------------------------------------------------------
 
 report_one() {
-    ssh_ "$1" "bash -s -- '$PW'" <<'EOS'
+    ssh_sudo_ "$1" "bash -s --" <<'EOS'
 set -uo pipefail
 PW="$1"
 s() { echo "$PW" | sudo -S -p '' "$@"; }
@@ -181,6 +213,19 @@ else
     bad "update agent" "not installed — Settings -> Updates will report this host as unprovisioned"
 fi
 
+# The health watchdog rides the same agent. Docker never restarts an unhealthy container, so with
+# no timer a FATAL player stays down until a person power-cycles the unit.
+if systemctl is-active --quiet plum-updater-health.timer; then
+    if [[ -e /opt/plum-audio/watchdog.disabled ]] \
+       || grep -qsE '^PLUM_WATCHDOG=(0|false|off|no)$' /etc/default/plum-updater; then
+        note "health watchdog" "timer active, but DISABLED by the operator switch"
+    else
+        ok "health watchdog" "timer active"
+    fi
+else
+    bad "health watchdog" "plum-updater-health.timer is not active — an unhealthy container is never restarted"
+fi
+
 note "onboard audio" "$(grep -E '^dtparam=audio' /boot/firmware/config.txt 2>/dev/null || echo 'no dtparam=audio line')"
 for c in Digital PCM Master; do
     if amixer -c 0 sget "$c" >/dev/null 2>&1; then
@@ -205,21 +250,22 @@ provision_one() {
     # docker/deploy.sh, and there is no reason for a Pi to hold a copy of the whole repo.
     say "$host — pushing host-setup payload to ~/${PAYLOAD}"
     ssh_ "$host" "rm -rf '$PAYLOAD' && mkdir -p '$PAYLOAD/bluez'" || return 1
-    retry_ sshpass -p "$PW" scp $SSH_OPTS \
+    retry_ sshpass_ scp $SSH_OPTS \
         "${HERE}/configure-audio-hat.sh" "${USER_}@${host}:${PAYLOAD}/" || return 1
-    retry_ sshpass -p "$PW" scp $SSH_OPTS \
+    retry_ sshpass_ scp $SSH_OPTS \
         "${ROOT}/backend/config/bluez/"* "${USER_}@${host}:${PAYLOAD}/bluez/" || return 1
-    retry_ sshpass -p "$PW" scp $SSH_OPTS \
+    retry_ sshpass_ scp $SSH_OPTS \
         "${ROOT}/backend/config/bluealsa-plum-dbus.conf" "${USER_}@${host}:${PAYLOAD}/" || return 1
-    retry_ sshpass -p "$PW" scp $SSH_OPTS \
+    retry_ sshpass_ scp $SSH_OPTS \
         "${HERE}/plum-updater.sh" "${HERE}/plum-updater.path" "${HERE}/plum-updater.service" \
         "${HERE}/plum-updater-check.timer" "${HERE}/plum-updater-check.service" \
+        "${HERE}/plum-updater-health.timer" "${HERE}/plum-updater-health.service" \
         "${USER_}@${host}:${PAYLOAD}/" || return 1
     ssh_ "$host" "chmod +x '$PAYLOAD/configure-audio-hat.sh' '$PAYLOAD/bluez/install_patched_bluez.sh' '$PAYLOAD/plum-updater.sh'" || return 1
 
     # Steps 2, 3 (Experimental), 4, 5, 6 — all quick, all idempotent.
     say "$host — checklist"
-    ssh_ "$host" "bash -s -- '$PW' '$PAYLOAD'" <<'EOS' || return 1
+    ssh_sudo_ "$host" "bash -s -- '$PAYLOAD'" <<'EOS' || return 1
 set -euo pipefail
 PW="$1"; PAYLOAD="$2"
 s() { echo "$PW" | sudo -S -p '' "$@"; }
@@ -291,7 +337,8 @@ else
     echo "    update agent: installing"
     s install -m 0755 "$PAYLOAD/plum-updater.sh" /usr/local/bin/plum-updater.sh
 fi
-for unit in plum-updater.path plum-updater.service plum-updater-check.timer plum-updater-check.service; do
+for unit in plum-updater.path plum-updater.service plum-updater-check.timer plum-updater-check.service \
+            plum-updater-health.timer plum-updater-health.service; do
     s install -m 0644 "$PAYLOAD/$unit" /etc/systemd/system/
 done
 s systemctl daemon-reload
@@ -299,6 +346,10 @@ s systemctl daemon-reload
 # those two trigger, and enabling a oneshot would run it at every boot.
 s systemctl enable --now plum-updater.path >/dev/null 2>&1 || true
 s systemctl enable --now plum-updater-check.timer >/dev/null 2>&1 || true
+# The health watchdog: restarts a container whose healthcheck says unhealthy. Docker does not. A
+# unit provisioned before the watchdog existed gets it here, on a re-run. `enable --now` on a timer
+# that is already active changes nothing.
+s systemctl enable --now plum-updater-health.timer >/dev/null 2>&1 || true
 # Register the agent so the container knows one exists. Harmless before /opt/plum-audio is created:
 # the state file lands once the deploy makes the directory, and a re-run is idempotent.
 if [[ -d /opt/plum-audio ]]; then
@@ -321,7 +372,7 @@ EOS
     #    control sits at 0.00 dB.
     if [[ -n "$OVERLAY" ]]; then
         say "$host — audio HAT overlay: $OVERLAY"
-        ssh_ "$host" "bash -s -- '$PW' '$PAYLOAD' '$OVERLAY'" <<'EOS' || return 1
+        ssh_sudo_ "$host" "bash -s -- '$PAYLOAD' '$OVERLAY'" <<'EOS' || return 1
 set -euo pipefail
 PW="$1"; PAYLOAD="$2"; OVERLAY="$3"
 s() { echo "$PW" | sudo -S -p '' "$@"; }
@@ -335,7 +386,7 @@ EOS
     # applied — see HOST-PROVISIONING.md.
     if [[ "$DO_UNITY" == 1 ]]; then
         say "$host — pinning the HAT mixer to unity"
-        ssh_ "$host" "bash -s -- '$PW' '$PAYLOAD'" <<'EOS' || return 1
+        ssh_sudo_ "$host" "bash -s -- '$PAYLOAD'" <<'EOS' || return 1
 set -euo pipefail
 PW="$1"; PAYLOAD="$2"
 s() { echo "$PW" | sudo -S -p '' "$@"; }
@@ -348,7 +399,7 @@ EOS
     #     last because it is the only step that can fail slowly.
     if [[ "$WITH_BLUEZ" == 1 ]]; then
         say "$host — rebuilding bluetoothd with the AVRCP patches (~30 min, 2 jobs)"
-        ssh_ "$host" "bash -s -- '$PW' '$PAYLOAD'" <<'EOS' || return 1
+        ssh_sudo_ "$host" "bash -s -- '$PAYLOAD'" <<'EOS' || return 1
 set -euo pipefail
 PW="$1"; PAYLOAD="$2"
 s() { echo "$PW" | sudo -S -p '' "$@"; }

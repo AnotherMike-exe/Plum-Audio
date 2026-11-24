@@ -50,6 +50,8 @@ export class SendspinBrowserPlayer {
   private readonly onReconnected?: () => void;
   private player: SendspinPlayer | null = null;
   private onUnload: (() => void) | null = null;
+  /** Set by stop(). start() checks it after every await, because stop() can run during any of them. */
+  private stopped = false;
 
   constructor(host: string, opts: { name?: string; codecs?: Codec[]; onReconnected?: () => void } = {}) {
     this.host = host;
@@ -62,10 +64,16 @@ export class SendspinBrowserPlayer {
   /**
    * Construct the player and connect. MUST be awaited from within the click handler's gesture chain
    * (unlock() resumes the AudioContext, which browsers only allow under user activation).
+   *
+   * Resolves `true` when connected, and `false` when stop() ran before the connection completed. In
+   * that case nothing is left connecting: without the checks below, a stop() during the module
+   * import was followed by a new SDK player that nothing held a reference to — it connected, showed
+   * in the mesh as a speaker, and no Stop button could reach it.
    */
-  async start(): Promise<void> {
+  async start(): Promise<boolean> {
     const { SendspinPlayer: Player } = await warmBrowserPlayerModule();
-    this.player = new Player({
+    if (this.stopped) return false;
+    const player = new Player({
       playerId: this.playerId,
       baseUrl: `http://${this.host}:${SERVER_PORT}`, // -> ws://<host>:8927/sendspin
       clientName: this.name,
@@ -82,14 +90,28 @@ export class SendspinBrowserPlayer {
     });
     // Tab close/refresh sends no goodbye on its own and the SDK would try to reconnect — send a clean
     // shutdown so the server drops us immediately instead of holding a 30s reconnect grace.
+    this.player = player;
     this.onUnload = () => this.stop('shutdown');
     window.addEventListener('pagehide', this.onUnload);
     window.addEventListener('beforeunload', this.onUnload);
-    await this.player.unlock();
-    await this.player.connect();
+    await player.unlock();
+    if (this.stopped) return false; // stop() already disconnected it and removed the listeners
+    await player.connect();
+    if (this.stopped) {
+      // stop() ran while the socket was connecting. Its disconnect() came before there was a
+      // connection to close, so close the one that has now landed.
+      try {
+        player.disconnect('user_request');
+      } catch {
+        /* already gone */
+      }
+      return false;
+    }
+    return true;
   }
 
   stop(reason: GoodbyeReason = 'user_request'): void {
+    this.stopped = true;
     if (this.onUnload) {
       window.removeEventListener('pagehide', this.onUnload);
       window.removeEventListener('beforeunload', this.onUnload);

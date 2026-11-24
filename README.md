@@ -119,7 +119,7 @@ Allow about 10 minutes on a fresh card. Most of that is the Docker install and t
 must get the same value, or the units cannot pair with each other's speakers:
 
 ```bash
-sudo ./plum-init.sh "Living Room" --fleet-psk <the value the first unit printed>
+sudo ./plum-init.sh "Living Room" --fleet-psk-file /root/fleet.psk
 ```
 
 Adding a unit later and no longer have the value? Any running unit still holds it. Point the new
@@ -140,7 +140,7 @@ What it decides for you, and how to override each one:
 | Audio output | reads the Pi's cards, preferring a HAT or USB DAC over the onboard jack over HDMI | `--output <PortAudio name fragment>` |
 | Audio or headless | headless when the Pi has no sound card | `--output none` forces headless |
 | Which image | `ghcr.io/anothermike-exe/plum-audio:latest` | `--image <ref>` or `--tarball <file>` |
-| Fleet secret | mints one on the first unit | `--fleet-psk <value>` |
+| Fleet secret | mints one on the first unit | `--fleet-psk-file <path>` |
 
 Two things stay opt-in, because neither can be inferred:
 
@@ -429,7 +429,7 @@ is never bridged between servers. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.m
 
 - **Backend** — Python 3.13, [`aiosendspin`](https://github.com/Sendspin/aiosendspin) (pinned 9.1.1),
   PyAV, NumPy, Flask + aiohttp, supervisord
-- **Frontend** — React 19, TypeScript 5, Vite 6, served by nginx inside the container
+- **Frontend** — React 19.3, TypeScript 7, Vite 8, served by nginx inside the container
 - **Base image** — `python:3.13-slim-trixie`. glibc rather than Alpine, deliberately: PyAV, PortAudio
   and NumPy all have trivial wheels there
 
@@ -443,8 +443,9 @@ Known gaps, stated plainly:
 
 - **DLNA and Plexamp have no backend.** Settings stubs and GUI scaffolding exist; nothing is wired up.
 - **amd64 has never been built.**
-- **The APIs are unauthenticated.** Both bind `0.0.0.0` with permissive CORS. Any page on your LAN can
-  change a unit's settings. Run this on a trusted network.
+- **The APIs are unauthenticated.** Both bind `0.0.0.0`. A request guard refuses web pages from
+  unknown origins and non-JSON writes, but any device on your LAN can still call them directly. Run
+  this on a trusted network.
 - Remaining spec gaps are tracked in [SPEC-CONFORMANCE.md](docs/SPEC-CONFORMANCE.md).
 
 ## Acknowledgements

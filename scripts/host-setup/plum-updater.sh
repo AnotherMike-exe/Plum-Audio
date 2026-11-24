@@ -18,6 +18,7 @@
 #   plum-updater.sh check      refresh "what is available", install nothing  (the .timer calls this)
 #   plum-updater.sh update     pull and recreate now  (what a human runs to test it by hand)
 #   plum-updater.sh state      print the state file
+#   plum-updater.sh health     restart an unhealthy container  (plum-updater-health.timer calls this)
 #
 # WHY THE ORDER IS WHAT IT IS. `pull` runs first and `up -d` runs ONLY if it succeeded. A failed
 # pull — no internet on an isolated AV VLAN is the normal case, not the exotic one — must leave the
@@ -25,7 +26,7 @@
 # whether a replacement exists.
 set -uo pipefail
 
-AGENT_VERSION="1.0.0"
+AGENT_VERSION="1.1.0"
 
 ROOT="${PLUM_ROOT:-/opt/plum-audio}"
 CONFIG="${PLUM_CONFIG:-${ROOT}/config}"
@@ -33,6 +34,28 @@ REQUEST="${CONFIG}/update.request"
 STATE="${CONFIG}/update.state"
 LOCK="${ROOT}/.update.lock"
 ENV_FILE="${ROOT}/.env"
+# How long `watch` and `update` wait for the lock. Well under the 420 s start limit of the service.
+LOCK_WAIT_S=60
+
+# --- the health watchdog (`health`) ---------------------------------------------------------------
+# The container's healthcheck writes its verdict to /data/health.json. Docker does not restart an
+# unhealthy container, and the container holds no Docker socket, so this agent reads the verdict
+# from the bind mount and restarts the container.
+HEALTH_FILE="${PLUM_DATA:-${ROOT}/data}/health.json"
+# The restart count lives here, NOT under $ROOT/config or $ROOT/data: the container can write
+# those, and a container that can edit the count has no rate limit. Root-owned, mode 0700.
+WATCHDOG_STATE_DIR="${PLUM_WATCHDOG_STATE_DIR:-/var/lib/plum-audio}"
+# Two switches turn the watchdog off: PLUM_WATCHDOG=0 (the service reads /etc/default/plum-updater),
+# or this file. $ROOT is not mounted into the container, so the container cannot make the file.
+WATCHDOG_DISABLE_FILE="${ROOT}/watchdog.disabled"
+# Restart when the verdict was "unhealthy" for longer than this.
+WATCHDOG_UNHEALTHY_S="${PLUM_WATCHDOG_UNHEALTHY_S:-180}"
+# A verdict older than this means the healthcheck itself stopped. It is 600 and not 300, because
+# healthcheck.py writes a HEALTHY verdict only once in 300 s (HEALTHY_REFRESH_S) to save the SD
+# card. A healthy unit thus shows a `checked_at` up to about 330 s old.
+WATCHDOG_STALE_S="${PLUM_WATCHDOG_STALE_S:-600}"
+WATCHDOG_MAX_RESTARTS="${PLUM_WATCHDOG_MAX_RESTARTS:-3}"
+WATCHDOG_WINDOW_S="${PLUM_WATCHDOG_WINDOW_S:-3600}"
 
 DEFAULT_REGISTRY="ghcr.io/anothermike-exe/plum-audio"
 
@@ -42,6 +65,70 @@ DEFAULT_REGISTRY="ghcr.io/anothermike-exe/plum-audio"
 now_iso() { date -Is 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%S+00:00; }
 
 log() { printf '%s plum-updater: %s\n' "$(now_iso)" "$*"; }
+
+# A channel is an image TAG, and nothing else. It comes from $CONFIG/update.request, which the
+# container can write, and this script runs as root. The container's own allowlist (updater.py) is
+# no defence: anything that can write the file skips it. The value is printed into $ROOT/.env, so a
+# channel with a newline added a `PLUM_IMAGE=` line and the next `up -d` ran that image as root.
+#
+# The pattern is the OCI tag grammar, capped at 64. The first character is not `.` or `-`, so a tag
+# is never an option to a command. Bash matches `=~` against the WHOLE string: `$` is the end of the
+# string, never the end of a line, so a newline anywhere fails the bracket expression.
+valid_channel() {
+    [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ ]]
+}
+
+# A temp file in $ROOT, never in $CONFIG. $CONFIG is the container's bind mount, so a predictable
+# name there (`update.state.<pid>.tmp`) is a name the container can make a symlink first, and root
+# then writes through it. $ROOT is not mounted into the container. mktemp creates the file with
+# O_EXCL and mode 0600 and never follows a link. Same filesystem as $CONFIG, so the mv is a rename.
+make_temp() {
+    mktemp "${ROOT}/.${1}.XXXXXXXX"
+}
+
+# --- reading a file the container can write -------------------------------------------------------
+# $CONFIG and the data directory are bind mounts, and this script is root. The container can put a
+# symlink to any host file at a path this script reads, or a FIFO that blocks a reader, or a very
+# large file. So every such file (update.state, update.request, health.json) goes through ONE
+# reader: O_NOFOLLOW and O_NONBLOCK, a regular file only, and a size cap.
+#
+# `read_capped(path, what)` gives `(bytes, None)` or `(None, why)`. `what` names the file in `why`.
+# shellcheck disable=SC2016  # Python source, not a shell string: nothing in it must expand.
+READER_PY='
+import os as _os, stat as _stat
+
+MAX_BYTES = 65536        # each real file is a few hundred bytes
+
+
+def read_capped(path, what):
+    try:
+        fd = _os.open(path, _os.O_RDONLY | _os.O_NOFOLLOW | _os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None, f"no {what}"
+    except OSError:
+        return None, f"the {what} cannot be opened (a link, or no permission)"
+    try:
+        info = _os.fstat(fd)
+        if not _stat.S_ISREG(info.st_mode):
+            return None, f"the {what} is not a regular file"
+        if info.st_size > MAX_BYTES:
+            return None, f"the {what} is too large"
+        raw = _os.read(fd, MAX_BYTES + 1)
+    except OSError:
+        return None, f"the {what} cannot be read"
+    finally:
+        _os.close(fd)
+    if len(raw) > MAX_BYTES:
+        return None, f"the {what} is too large"
+    return raw, None
+'
+
+# python_with_reader ARG... <<'PY' — run the Python on stdin with `read_capped` defined before it.
+# The arguments are `sys.argv[1:]`, as with `python3 - ARG...`.
+python_with_reader() {
+    python3 -c "${READER_PY}
+$(cat)" "$@"
+}
 
 # --- state ----------------------------------------------------------------------------------------
 # One JSON object, written atomically, read by the container through the bind mount. Atomic because
@@ -61,14 +148,17 @@ S_LAST_UPDATE=""
 S_PREVIOUS=""
 
 load_state() {
-    [[ -f "$STATE" ]] || return 0
     # Read with python3 rather than jq: jq is not on a Pi OS Lite image and python3 always is.
+    # The container can replace this file, so it goes through `read_capped`. A state that cannot be
+    # read that way is the same as no state.
     local dump
-    dump="$(python3 - "$STATE" <<'PY' 2>/dev/null || true
+    dump="$(python_with_reader "$STATE" <<'PY' 2>/dev/null || true
 import json, shlex, sys
+raw, _why = read_capped(sys.argv[1], "state file")
+if raw is None:
+    sys.exit(0)
 try:
-    with open(sys.argv[1], encoding="utf-8") as fh:
-        d = json.load(fh)
+    d = json.loads(raw.decode("utf-8"))
 except Exception:
     sys.exit(0)
 if not isinstance(d, dict):
@@ -93,13 +183,14 @@ PY
 
 save_state() {
     mkdir -p "$CONFIG" 2>/dev/null || true
-    local tmp="${STATE}.$$.tmp"
+    local tmp
+    tmp="$(make_temp update.state)" || { log "could not create a temp file in ${ROOT}"; return 1; }
     # Values go in as ARGV, never interpolated into the script body. lastUpdate is itself a JSON
     # document built by record_result, so interpolating it would put quotes and backslashes straight
     # into Python source — a message containing an apostrophe would be a syntax error, and the state
     # file would silently stop updating mid-run.
     python3 - "$tmp" "$AGENT_VERSION" "$(now_iso)" "$S_PHASE" "$S_CHANNEL" "$S_IMAGE" \
-        "$S_DIGEST" "$S_AVAILABLE" "$S_LAST_CHECK" "$S_PREVIOUS" "$S_LAST_UPDATE" <<'PY' || return 1
+        "$S_DIGEST" "$S_AVAILABLE" "$S_LAST_CHECK" "$S_PREVIOUS" "$S_LAST_UPDATE" <<'PY' || { rm -f "$tmp"; return 1; }
 import json, sys
 (out, agent, written, phase, channel, image,
  digest, available, last_check, previous, last_update) = sys.argv[1:12]
@@ -122,11 +213,21 @@ with open(out, "w", encoding="utf-8") as fh:
     json.dump(payload, fh, indent=2)
     fh.write("\n")
 PY
-    mv -f "$tmp" "$STATE" || return 1
     # The container runs as a non-root user and only READS this, but /config is its own mount and a
     # root-owned 0600 file there is invisible to it. World-readable is correct: it holds a version
     # and a digest, nothing secret.
-    chmod 0644 "$STATE" 2>/dev/null || true
+    #
+    # chmod the TEMP, before the move. A chmod on $STATE after the move follows a symlink, and the
+    # container can put one there between the two calls.
+    chmod 0644 "$tmp" 2>/dev/null || true
+    # A rename replaces a symlink at $STATE and does not follow it. A real directory there would
+    # take the file INSIDE it, so refuse that.
+    if [[ -d "$STATE" && ! -L "$STATE" ]]; then
+        rm -f "$tmp"
+        log "state path ${STATE} is a directory — not writing"
+        return 1
+    fi
+    mv -f "$tmp" "$STATE" || { rm -f "$tmp"; return 1; }
     return 0
 }
 
@@ -168,8 +269,12 @@ set_tag() {
     # tag never moves and the unit quietly reinstalls the image it already had. The move is also
     # atomic, which matters because compose may read this file at any moment.
     local tag="$1" tmp
+    # Checked HERE as well as by every caller: this is the line that reaches the file.
+    valid_channel "$tag" || { log "set_tag: ignoring a tag that is not valid"; return 1; }
     [[ -f "$ENV_FILE" ]] || return 1
-    tmp="${ENV_FILE}.$$.tmp"
+    tmp="$(make_temp env)" || return 1
+    # mktemp gives 0600. Keep the mode the file had, so compose and the deploy user still read it.
+    chmod --reference="$ENV_FILE" "$tmp" 2>/dev/null || chmod 0644 "$tmp" 2>/dev/null || true
     if grep -qE '^PLUM_TAG=' "$ENV_FILE"; then
         grep -vE '^PLUM_TAG=' "$ENV_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
     else
@@ -225,6 +330,7 @@ compose() {
 do_check() {
     local name tag remote
     name="$(image_name)"; tag="${1:-$(current_tag)}"
+    valid_channel "$tag" || { log "check: ignoring a channel that is not a valid tag"; return 2; }
     S_CHANNEL="$tag"; S_IMAGE="${name}:${tag}"; S_DIGEST="$(local_digest)"
     S_LAST_CHECK="$(now_iso)"
     if remote="$(remote_digest "$name" "$tag")" && [[ -n "$remote" ]]; then
@@ -242,6 +348,7 @@ do_check() {
 
 do_update() {
     local channel="${1:-$(current_tag)}" name
+    valid_channel "$channel" || { log "update: ignoring a channel that is not a valid tag"; return 2; }
     name="$(image_name)"
     S_CHANNEL="$channel"
     S_IMAGE="${name}:${channel}"
@@ -295,28 +402,333 @@ do_update() {
     return 0
 }
 
+# --- the health watchdog --------------------------------------------------------------------------
+# $HEALTH_FILE is UNTRUSTED. The container writes it and this script is root. So:
+#   - Python parses it and prints three lines: an action from a fixed set, a 0/1 flag and a message.
+#     Nothing from the file is evaluated, and nothing from it is an argument to docker.
+#   - The message holds the `problems` list for the journal only. Python cuts it to printable ASCII
+#     on one line, and bash prints it with `printf '%s'`.
+#   - The file is read with `read_capped` (see READER_PY): no link, no FIFO, a size cap.
+#
+# A restart needs ALL of these:
+#   - `restart_advised` in the file is not `false`. The healthcheck sets it to `false` when a
+#     restart cannot fix the problem. An absent key counts as true, for an older image. This does
+#     not apply to a stale verdict: there the healthcheck itself stopped.
+#   - the verdict is unhealthy for more than WATCHDOG_UNHEALTHY_S, and `checked_at` is fresh. Or
+#     `checked_at` is older than WATCHDOG_STALE_S while the container runs and Docker's own health
+#     status is not "healthy" (a check that passes and cannot write its file needs no restart).
+#   - the container is up for longer than the same limit. After a restart the file holds the old
+#     `since` until the first check runs, and after a boot it holds the verdict from before.
+#   - the same finding on two runs in a row. A Pi has no RTC, so the clock steps at boot, and one
+#     run can see an age that is wrong by days. The two runs are compared on the monotonic clock.
+#   - fewer than WATCHDOG_MAX_RESTARTS restarts in WATCHDOG_WINDOW_S.
+#
+# A missing or unreadable file means "unknown", and the watchdog does nothing. A container that is
+# not running is brought up with `up -d` when its last verdict is fresh and unhealthy. A stale
+# verdict from a stopped container means an operator stopped it, and the watchdog leaves it alone.
+watchdog_disabled() {
+    case "$(printf '%s' "${PLUM_WATCHDOG:-1}" | tr '[:upper:]' '[:lower:]')" in
+        0|false|off|no) return 0 ;;
+    esac
+    [[ -e "$WATCHDOG_DISABLE_FILE" ]]
+}
+
+do_health() {
+    local disabled=0 pending=0 line running="" started="" docker_health="" out
+    local action="" quiet="" message=""
+    watchdog_disabled && disabled=1
+    # A request that waits for the .path unit is an update that starts in a moment. main() already
+    # holds the update lock, so no update runs at this instant.
+    [[ -e "$REQUEST" ]] && pending=1
+
+    # Docker's output, not the container's: this part is trusted. Empty when there is no container.
+    line="$(docker inspect -f \
+        '{{.State.Running}} {{.State.StartedAt}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' \
+        plum-audio 2>/dev/null | head -1)" || line=""
+    read -r running started docker_health <<<"$line" || true
+
+    out="$(python_with_reader "$HEALTH_FILE" "$WATCHDOG_STATE_DIR" "$disabled" "$pending" \
+        "${running:-}" "${started:-}" "${docker_health:-}" \
+        "$WATCHDOG_UNHEALTHY_S" "$WATCHDOG_STALE_S" "$WATCHDOG_MAX_RESTARTS" "$WATCHDOG_WINDOW_S" <<'PY'
+import calendar, json, math, os, re, sys, tempfile, time
+
+(health_path, state_dir, disabled, pending, running, started, docker_health,
+ unhealthy_s, stale_s, max_restarts, window_s) = sys.argv[1:12]
+
+STRIKE_MAX_AGE_S = 200   # "two runs in a row" on a 60 s timer, with room for a slow run
+state_path = os.path.join(state_dir, "watchdog.state")
+now = time.time()
+# The system-wide clock that a wall-clock step does not move. NOT time.monotonic(): its zero is
+# not defined, and on some platforms it is the start of this process, so two runs cannot compare.
+mono = time.clock_gettime(getattr(time, "CLOCK_BOOTTIME", time.CLOCK_MONOTONIC))
+
+
+def limit(text, default):
+    try:
+        value = float(text)
+    except ValueError:
+        return default
+    return value if math.isfinite(value) and value >= 0 else default
+
+
+unhealthy_s, stale_s = limit(unhealthy_s, 180.0), limit(stale_s, 600.0)
+max_restarts, window_s = int(limit(max_restarts, 3.0)), limit(window_s, 3600.0)
+
+
+def number(value):
+    """A finite JSON number, or None. A bool is not a number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        value = float(value)
+    except OverflowError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def clean(text, cap):
+    """Printable ASCII on one line. The journal is the only place this text goes."""
+    return "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in str(text)[:cap])
+
+
+def read_health():
+    """(report, None) or (None, why). Never follows a link, never blocks, never reads a big file."""
+    raw, why = read_capped(health_path, "health file")
+    if raw is None:
+        return None, why
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return None, "the health file is not JSON"
+    if not isinstance(data, dict) or not isinstance(data.get("healthy"), bool):
+        return None, "the health file holds no verdict"
+    since, checked = number(data.get("since")), number(data.get("checked_at"))
+    if since is None or checked is None:
+        return None, "the health file holds no valid times"
+    problems = data.get("problems")
+    problems = problems if isinstance(problems, list) else []
+    shown = "; ".join(clean(item, 160) for item in problems[:6])
+    if len(problems) > 6:
+        shown += f"; and {len(problems) - 6} more"
+    return {
+        "healthy": data["healthy"],
+        # Only a literal `false` stops a restart. An older image writes no such key.
+        "advised": data.get("restart_advised") is not False,
+        "since_age": max(0.0, now - since),
+        "checked_age": max(0.0, now - checked),
+        "problems": clean(shown, 1100) or "none listed",
+    }, None
+
+
+def uptime():
+    """Seconds since Docker started the container, or None."""
+    match = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)", started)
+    if not match:
+        return None
+    try:
+        return max(0.0, now - calendar.timegm(time.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S")))
+    except (ValueError, OverflowError):
+        return None
+
+
+def load_state():
+    try:
+        with open(state_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_state(new):
+    """True when the state is on disk. Root-owned directory, mode 0700, atomic replace."""
+    try:
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".watchdog-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(new, fh)
+            os.replace(tmp, state_path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        return False
+    return True
+
+
+old = load_state()
+restarts = old.get("restarts")
+restarts = [float(t) for t in restarts if number(t) is not None] if isinstance(restarts, list) else []
+# An entry from the future (the clock went back) still counts.
+restarts = [t for t in restarts if now - t < window_s]
+strike = old.get("strike") if isinstance(old.get("strike"), dict) else None
+new = {"restarts": restarts, "strike": None, "last": None}
+
+
+def finish(action, key, message, repeat_quiet=False):
+    """Print the answer and stop. A state that did not change is not written (SD card)."""
+    new["last"] = key
+    quiet = 1 if repeat_quiet and old.get("last") == key else 0
+    if new != {k: old.get(k) for k in new} and not save_state(new):
+        if action == "restart":
+            # A restart that cannot be counted has no rate limit.
+            action, message = "none", message + " [NOT restarted: cannot write the state file]"
+        quiet = 0 if action == "restart" or not repeat_quiet else 1
+    print(action)
+    print(quiet)
+    print(message)
+    sys.exit(0)
+
+
+if disabled == "1":
+    finish("none", "disabled", "watchdog: disabled (PLUM_WATCHDOG=0 or watchdog.disabled)", True)
+
+report, why = read_health()
+if report is None:
+    finish("none", "unknown:" + why, f"watchdog: health unknown ({why}) - no action", True)
+
+is_running = running == "true"
+up = uptime() if is_running else None
+problems = report["problems"]
+reason = None
+if report["checked_age"] > stale_s:
+    if not is_running:
+        finish("none", "stale-stopped",
+               "watchdog: the verdict is stale and the container is not running - no action", True)
+    if docker_health == "healthy":
+        finish("none", "stale-docker-healthy",
+               f"watchdog: the verdict is stale ({report['checked_age']:.0f}s) but Docker reports healthy - "
+               "the check cannot write its file, no action", True)
+    if up is None or up <= stale_s:
+        finish("none", "stale-young",
+               "watchdog: the verdict is stale, the container started a short time ago - wait", True)
+    kind = "stale"
+    reason = (f"the verdict is stale: checked {report['checked_age']:.0f}s ago "
+              f"(limit {stale_s:.0f}s), the healthcheck stopped")
+elif report["healthy"]:
+    finish("none", "healthy", "watchdog: healthy", True)
+elif not report["advised"]:
+    # The healthcheck says a restart cannot fix this (a unit with no speaker, for example).
+    # One line for each change of state, not one for each minute.
+    finish("none", "not-advised", f"watchdog: unhealthy, restart not advised. problems: {problems}", True)
+elif report["since_age"] <= unhealthy_s:
+    finish("none", "unhealthy-wait",
+           f"watchdog: unhealthy for {report['since_age']:.0f}s (limit {unhealthy_s:.0f}s) - wait. "
+           f"problems: {problems}")
+elif is_running and (up is None or up <= unhealthy_s):
+    finish("none", "unhealthy-young",
+           f"watchdog: unhealthy, but the container started a short time ago - wait. problems: {problems}")
+else:
+    kind = "unhealthy"
+    reason = f"unhealthy for {report['since_age']:.0f}s (limit {unhealthy_s:.0f}s)"
+
+tail = f"{reason}. problems: {problems}"
+if pending == "1":
+    finish("none", "update-pending", f"watchdog: {tail} - an update request waits, no restart")
+
+strike_mono = number(strike.get("mono")) if strike else None
+confirmed = (
+    strike is not None
+    and strike.get("kind") == kind
+    and strike_mono is not None
+    and 0 <= mono - strike_mono <= STRIKE_MAX_AGE_S
+)
+if not confirmed:
+    new["strike"] = {"kind": kind, "mono": mono}
+    finish("none", "strike", f"watchdog: {tail} - first sighting, the next run restarts it")
+
+if len(restarts) >= max_restarts:
+    new["strike"] = {"kind": kind, "mono": mono}  # stays confirmed: restart when the window opens
+    finish("none", "rate-limit",
+           f"watchdog: {tail} - rate limit, {len(restarts)} restarts in the last {window_s:.0f}s, no restart")
+
+restarts.append(now)
+verb = "restart" if is_running else "up -d (the container is not running)"
+finish("restart", "restart",
+       f"watchdog: {tail} - {verb}, restart {len(restarts)} of {max_restarts} in {window_s:.0f}s")
+PY
+)" || { log "watchdog: the decision step failed - no action"; return 0; }
+
+    { IFS= read -r action; IFS= read -r quiet; IFS= read -r message; } <<<"$out" || true
+    case "$action" in
+        none)
+            [[ "$quiet" == "1" ]] || log "$message"
+            return 0 ;;
+        restart) log "$message" ;;
+        *)  log "watchdog: the decision step gave no answer - no action"; return 0 ;;
+    esac
+
+    # The command is fixed text. Nothing from the health file reaches it.
+    if [[ "$running" == "true" ]]; then
+        if ! compose restart 2>&1 | sed 's/^/    /'; then
+            log "watchdog: docker compose restart FAILED"
+            return 1
+        fi
+    else
+        if ! compose up -d 2>&1 | sed 's/^/    /'; then
+            log "watchdog: docker compose up -d FAILED"
+            return 1
+        fi
+    fi
+    log "watchdog: done"
+    return 0
+}
+
 do_watch() {
-    [[ -f "$REQUEST" ]] || { log "watch: no request"; return 0; }
-    local channel check_only
-    channel="$(python3 -c '
+    # -L as well: a dangling symlink fails -e, and it must still be consumed.
+    [[ -e "$REQUEST" || -L "$REQUEST" ]] || { log "watch: no request"; return 0; }
+    local out status="" channel="" check_only="0"
+    # The container writes this file, so it goes through `read_capped`. Three lines come back:
+    #   - `ok`, or `unreadable` for a link, a FIFO, a directory or a file over the size cap.
+    #   - the channel. `-` for a channel that is present and not a string, so it fails
+    #     valid_channel below and is not read as "no channel given".
+    #   - 1 for a check-only request, else 0.
+    out="$(python_with_reader "$REQUEST" <<'PY' 2>/dev/null || true
 import json, sys
+raw, why = read_capped(sys.argv[1], "request file")
+if raw is None:
+    print("unreadable")
+    sys.exit(0)
 try:
-    d = json.load(open(sys.argv[1], encoding="utf-8"))
+    d = json.loads(raw.decode("utf-8"))
 except Exception:
     d = {}
-print(d.get("channel") or "")' "$REQUEST" 2>/dev/null)"
-    check_only="$(python3 -c '
-import json, sys
-try:
-    d = json.load(open(sys.argv[1], encoding="utf-8"))
-except Exception:
-    d = {}
-print("1" if d.get("checkOnly") else "0")' "$REQUEST" 2>/dev/null)"
+c = d.get("channel") if isinstance(d, dict) else "-"
+print("ok")
+if isinstance(c, str):
+    # One line for each answer. A channel with a newline is not a tag, and it must not become
+    # the next answer.
+    print("-" if "\n" in c else c)
+else:
+    print("" if c is None else "-")
+print("1" if isinstance(d, dict) and d.get("checkOnly") else "0")
+PY
+)"
+    { IFS= read -r status; IFS= read -r channel; IFS= read -r check_only; } <<<"$out" || true
 
     # Consume the request BEFORE acting. `up -d` kills the container that wrote it, and a request
     # still on disk after a successful update would be replayed by the .path unit the moment the
     # container comes back — an update loop that looks like a unit restarting forever.
     rm -f "$REQUEST"
+
+    # A request that is a link, a FIFO or a very large file is not a request. It is gone now (`rm`
+    # removes a link and not its target), and nothing more runs.
+    if [[ "$status" != "ok" ]]; then
+        log "watch: ignoring a request that is not a small regular file"
+        return 0
+    fi
+
+    # An absent channel means "the tag this unit already runs". Anything else must be a tag.
+    # Ignored, with no fallback: a request that carried a bad channel is not a request to trust
+    # for anything else. The value itself is not logged, because it can hold control characters.
+    if [[ -n "$channel" ]] && ! valid_channel "$channel"; then
+        log "watch: ignoring a request whose channel is not a valid tag (${#channel} characters)"
+        return 0
+    fi
 
     if [[ "$check_only" == "1" ]]; then
         do_check "${channel:-$(current_tag)}"
@@ -328,15 +740,33 @@ print("1" if d.get("checkOnly") else "0")' "$REQUEST" 2>/dev/null)"
 main() {
     local action="${1:-watch}"
     mkdir -p "$CONFIG" 2>/dev/null || true
-    load_state
 
     # One at a time. Two clicks in the GUI, or a .path trigger landing on top of a timer check, must
     # not run two pulls against the same compose project.
     exec 9>"$LOCK"
-    if ! flock -n 9; then
-        log "another run holds the lock — skipping"
-        return 0
-    fi
+    case "$action" in
+        watch|update)
+            # WAIT for the lock. The health timer takes it once a minute, and holds it for 10-20 s
+            # during a restart. A `watch` that gives up at once leaves update.request on disk. The
+            # PathExists unit then starts the service again immediately, and five starts in 10 s
+            # reach systemd's start limit: no update runs until `systemctl reset-failed`. The
+            # leftover request also makes the watchdog answer "update-pending" on every run.
+            if ! flock -w "$LOCK_WAIT_S" 9; then
+                log "another run held the lock for ${LOCK_WAIT_S}s — skipping"
+                return 0
+            fi
+            ;;
+        *)
+            # Do not wait. For `health` this is the "no restart while an update runs" rule: an
+            # update holds this lock from its pull to the end of its `up -d`.
+            if ! flock -n 9; then
+                log "another run holds the lock — skipping"
+                return 0
+            fi
+            ;;
+    esac
+    # Read the state AFTER the wait: the run that held the lock wrote it.
+    load_state
 
     case "$action" in
         watch)  do_watch ;;
@@ -347,7 +777,8 @@ main() {
         # what tells the container an agent EXISTS at all. Without it the API refuses every request
         # and the GUI correctly reports the host as unprovisioned.
         init)   save_state; log "agent ${AGENT_VERSION} registered" ;;
-        *)      echo "usage: plum-updater.sh [watch|check|update|state|init] [channel]" >&2; return 2 ;;
+        health) do_health ;;
+        *)      echo "usage: plum-updater.sh [watch|check|update|state|init|health] [channel]" >&2; return 2 ;;
     esac
 }
 

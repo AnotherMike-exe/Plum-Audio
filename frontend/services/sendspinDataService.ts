@@ -32,6 +32,7 @@ const DUPLICATE_VOLUME_MS = 250;
 // that is idle when the page opens still reads the way it does when it is playing.
 const NAME_MEMO_KEY = 'plum.speakerNames';
 const CLIENT_NONCE_PREFIX = 'plum.ctrlNonce.';
+const CONSUME_RECONNECT_MS = 2000;
 
 // ---- Mesh REST wire shapes (backend/scripts/mesh/model.py) ----
 interface WirePlayer {
@@ -85,7 +86,12 @@ interface WireUnit {
     playback_state?: string;
     title?: string;
     artist?: string;
+    /** The unit set this: the report went stale, and `attached` is then forced false. */
+    offline?: boolean;
   } | null;
+  /** The unit's own player stopped reporting. Absent from a peer running an older image — treat
+   *  that as "not offline", never as a dead speaker. */
+  local_player_offline?: boolean;
   /** Absent from a peer running an older image — treat that as "has one", never as playerless. */
   has_player?: boolean;
   /** This unit's SENDSPIN server id — an X25519 public key under aiosendspin 9.x, and NOT `unit_id`.
@@ -299,9 +305,15 @@ export function mapViewToModel(
     const foreignServer = claimedByOutsider
       ? { name: lp.server_name || lp.server_id!, title: lp.title, artist: lp.artist }
       : undefined;
+    // The player process stopped reporting. Strict `true` on both: a unit with an older image
+    // sends neither field, and that must not read as offline.
+    const offline = unit.local_player_offline === true || lp.offline === true;
     const existing = clients.find((c) => c.id === lp.player_id);
     if (existing) {
+      // `existing` can be a row from ANOTHER unit's `players` (a roamed speaker), so the flag is
+      // set here by player id and not in the loop above by unit.
       if (foreignServer) existing.foreignServer = foreignServer;
+      if (offline) existing.offline = true;
       continue;
     }
     // Not listed by any unit: it is attached elsewhere (or nowhere). Synthesize it from the report.
@@ -317,6 +329,7 @@ export function mapViewToModel(
       connected: !!lp.attached,
       isLocal,
       foreignServer,
+      offline: offline || undefined,
       url: lp.url,  // how we dial it back: the router can't reclaim what it cannot see
       // The self-report carries no role or security fields — a speaker attached to a FOREIGN server
       // has no roles we can see at all. Unknown is the truthful answer, and it renders no button.
@@ -421,7 +434,39 @@ function stableClientNonce(sourceId: string): string {
   }
 }
 
+/**
+ * The names the unit supplies for discovered speakers, by listener URL.
+ *
+ * Only a name that DIFFERS from the mDNS instance name counts. The unit sets `friendly_name` to the
+ * instance name when it knows nothing better, and that technical name must never outrank a real one
+ * this browser remembers. Exported for tests.
+ */
+export function backendFriendlyNames(neighbourhood: Neighbourhood | null | undefined): Map<string, string> {
+  const names = new Map<string, string>();
+  for (const p of neighbourhood?.players ?? []) {
+    if (p.url && p.friendly_name && p.friendly_name !== p.name) names.set(p.url, p.friendly_name);
+  }
+  return names;
+}
+
 type Listener = (model: Model) => void;
+
+/**
+ * A mesh command that did not apply. `message` is a sentence fit to show the user: the unit's own
+ * `{error}` text when it sent one, else the HTTP status, else "could not reach".
+ */
+export class MeshRequestError extends Error {
+  readonly path: string;
+  /** HTTP status, or undefined when the request never got an answer (unit down, CORS, offline). */
+  readonly status?: number;
+
+  constructor(message: string, path: string, status?: number) {
+    super(message);
+    this.name = 'MeshRequestError';
+    this.path = path;
+    this.status = status;
+  }
+}
 
 export class SendspinDataService {
   // Federated stream id ("<unitId>::<sourceId>") -> controller client. ONE PER SOURCE, not per
@@ -457,6 +502,18 @@ export class SendspinDataService {
   private listeners = new Set<Listener>();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
+  /** Pending consume reconnect. Tracked so stop() can cancel it — an untracked one reopened the
+   *  relay socket after the service had stopped. */
+  private consumeTimer: ReturnType<typeof setTimeout> | null = null;
+  /** True between stop() and the next start(). Every async completion checks it before it writes. */
+  private stopped = false;
+  // Poll ordering. Polls overlap: the 3 s interval does not wait for the previous response, and every
+  // command fires one more. Each poll takes a number at SEND time, and a response older than the one
+  // already applied is dropped — otherwise a slow reply overwrote a newer view, and a device that
+  // had just moved jumped back for a poll.
+  private pollSeq = 0;
+  private appliedViewSeq = 0;
+  private appliedNeighbourhoodSeq = 0;
   // Volume the user just set, held over the polled value until the round trip completes (set →
   // player applies → player reports → our next /view poll). Without it a drag fights the poll.
   // Player volume only; group volume needs none — the controller WS echoes it back immediately.
@@ -468,6 +525,10 @@ export class SendspinDataService {
   private nameByUrl = new Map<string, string>(loadNameMemo());
 
   start(): void {
+    // Idempotent: a second start() must not leave the first one's timers running untracked.
+    if (this.pollTimer) clearInterval(this.pollTimer);
+    if (this.tickTimer) clearInterval(this.tickTimer);
+    this.stopped = false;
     void this.poll();
     this.pollTimer = setInterval(() => void this.poll(), POLL_INTERVAL_MS);
     // Re-emit ~2x/s so extrapolated position advances even without new WS messages.
@@ -479,15 +540,34 @@ export class SendspinDataService {
     if (this.pollTimer) clearInterval(this.pollTimer);
     if (this.tickTimer) clearInterval(this.tickTimer);
     this.pollTimer = this.tickTimer = null;
+    this.stopped = true;
     for (const c of this.controllers.values()) c.close();
     this.controllers.clear();
-    this.consumeWs?.close();
+    if (this.consumeTimer) clearTimeout(this.consumeTimer);
+    this.consumeTimer = null;
+    // Forget the socket BEFORE closing it, so its close event reads as stale and does nothing.
+    const ws = this.consumeWs;
     this.consumeWs = null;
+    this.clearConsumeState();
+    ws?.close();
+  }
+
+  private clearConsumeState(): void {
+    this.consumeCtrl = null;
+    this.consumeViz = null;
+    this.consumeArt = null;
+    this.consumePair = null;
   }
 
   private openConsume(): void {
     // ws(s):// same-origin /api/mesh/consume (nginx proxies it). In dev, VITE_MESH_API_URL is a full
     // http URL → swap the scheme. Auto-reconnects; the relay is optional, the mesh renders without it.
+    if (this.stopped) return;
+    if (this.consumeTimer) clearTimeout(this.consumeTimer);
+    this.consumeTimer = null;
+    // One relay socket at a time. React StrictMode runs start → stop → start, and without this the
+    // second start opened a socket beside one that was still connecting.
+    if (this.consumeWs && this.consumeWs.readyState !== WebSocket.CLOSED) return;
     let url: string;
     if (MESH_API_BASE.startsWith('http')) url = MESH_API_BASE.replace(/^http/, 'ws') + '/consume';
     else url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + MESH_API_BASE + '/consume';
@@ -499,6 +579,7 @@ export class SendspinDataService {
     }
     this.consumeWs = ws;
     ws.onmessage = (ev) => {
+      if (this.consumeWs !== ws) return; // a socket we already replaced or dropped
       let m: any;
       try { m = JSON.parse(ev.data); } catch { return; }
       if (m.t === 'ctrl') {
@@ -536,11 +617,17 @@ export class SendspinDataService {
       }
     };
     ws.onclose = () => {
-      this.consumeCtrl = null;
-      this.consumeViz = null;
-      this.consumeArt = null;
-      this.consumePair = null;
-      if (this.pollTimer) setTimeout(() => this.openConsume(), 2000); // still running → reconnect
+      // A STALE socket's close must not touch the state of the socket that replaced it. A browser
+      // delivers `close` asynchronously, so under StrictMode the first socket's event arrived after
+      // the second start() — it blanked the live relay state and scheduled one more socket.
+      if (this.consumeWs !== ws) return;
+      this.consumeWs = null;
+      this.clearConsumeState();
+      if (this.stopped) return;
+      this.consumeTimer = setTimeout(() => {
+        this.consumeTimer = null;
+        this.openConsume();
+      }, CONSUME_RECONNECT_MS);
     };
     ws.onerror = () => ws.close();
   }
@@ -621,10 +708,54 @@ export class SendspinDataService {
     if (changed) saveNameMemo(this.nameByUrl);
   }
 
-  /** Give every speaker we have ever seen attached its protocol name, whatever state it is in. */
+  /** Take a discovery answer, and let the names it carries correct the local memo. */
+  private applyNeighbourhood(neighbourhood: Neighbourhood): void {
+    this.neighbourhood = neighbourhood;
+    // The unit keeps the authoritative URL -> name map (speaker_names.py) and serves it as
+    // `friendly_name`. The localStorage memo is older than that map and is only a fallback now — so
+    // when the unit names a speaker, write that name over whatever this browser remembered. Without
+    // this the memo held its own (older, or technical) name for ever, and showed it again the moment
+    // discovery had a gap.
+    const live = this.liveNamedUrls();
+    let changed = false;
+    for (const [url, name] of backendFriendlyNames(neighbourhood)) {
+      // A speaker the current view names is handled by rememberPlayerNames, where a unit's
+      // self-report follows a rename before the server-side map does.
+      if (live.has(url) || this.nameByUrl.get(url) === name) continue;
+      this.nameByUrl.set(url, name);
+      changed = true;
+    }
+    if (changed) saveNameMemo(this.nameByUrl);
+  }
+
+  /** Listener URLs the CURRENT view gives a name to — a handshake name or a unit's self-report. */
+  private liveNamedUrls(): Set<string> {
+    const urls = new Set<string>();
+    for (const unit of this.lastView.units) {
+      for (const p of unit.players) if (p.url && p.name) urls.add(p.url);
+      if (unit.local_player?.url && unit.local_player.name) urls.add(unit.local_player.url);
+    }
+    return urls;
+  }
+
+  /**
+   * Give every speaker one name, whatever state it is in. Precedence, first match wins:
+   *
+   *   1. the current view (self-report, then handshake) — live, and follows a rename in one poll.
+   *      rememberPlayerNames already folded both into the memo, in that order.
+   *   2. the unit's `friendly_name` from discovery — one answer for every browser.
+   *   3. this browser's memo — a fallback for a unit on an older image, which serves no names.
+   *   4. the bare mDNS instance name (already on the row).
+   *
+   * The memo used to be applied over everything. A name it learned earlier then beat the name the
+   * unit served, so two browsers showed two names for one idle speaker.
+   */
   private applyStableNames(model: Model): void {
+    const live = this.liveNamedUrls();
+    const friendly = backendFriendlyNames(this.neighbourhood);
     for (const c of model.clients) {
-      const known = c.url ? this.nameByUrl.get(c.url) : undefined;
+      if (!c.url) continue;
+      const known = (!live.has(c.url) && friendly.get(c.url)) || this.nameByUrl.get(c.url);
       if (known) c.name = known;
     }
   }
@@ -725,7 +856,16 @@ export class SendspinDataService {
     // Hold what the user just chose until the poll catches up: the round trip is player → server
     // → next /view poll, so without this a drag fights the last polled value and the knob jumps.
     this.pendingVolume.set(playerId, { volume, muted, at: now });
-    await this.post(unitId, '/volume', { player_id: playerId, volume, muted });
+    try {
+      await this.post(unitId, '/volume', { player_id: playerId, volume, muted });
+    } catch (err) {
+      // The level did not apply. Release the hold now, so the slider shows the real level at once
+      // instead of the refused one for VOLUME_HOLD_MS — and let an immediate retry through.
+      this.pendingVolume.delete(playerId);
+      this.lastVolumeSent.delete(playerId);
+      this.emit();
+      throw err;
+    }
   }
 
   /**
@@ -737,7 +877,13 @@ export class SendspinDataService {
     if (federatedStreamId.startsWith(FOREIGN_PREFIX)) return; // a foreign server owns its own sender
     const { unitId, sourceId } = parseStreamId(federatedStreamId);
     this.pendingSourceVolume.set(federatedStreamId, { volume, at: Date.now() });
-    await this.post(unitId, '/source-volume', { source_id: sourceId, volume, muted });
+    try {
+      await this.post(unitId, '/source-volume', { source_id: sourceId, volume, muted });
+    } catch (err) {
+      this.pendingSourceVolume.delete(federatedStreamId); // same reason as setVolume
+      this.emit();
+      throw err;
+    }
   }
 
   controlStream(federatedStreamId: string, command: ControllerCommand): void {
@@ -821,17 +967,26 @@ export class SendspinDataService {
   // -- internals ----------------------------------------------------------
 
   private async poll(): Promise<void> {
+    const seq = ++this.pollSeq;
     try {
       const res = await fetch(`${MESH_API_BASE}/view`);
       if (!res.ok) return;
       const view: MeshView = await res.json();
+      // Dropped when a LATER poll already applied its view, or the service stopped meanwhile —
+      // applying after stop() would reopen a controller socket for every source.
+      if (this.stopped || seq < this.appliedViewSeq) return;
+      this.appliedViewSeq = seq;
       this.applyView(view);
     } catch {
       // transient — keep last view; the tick timer still re-emits.
     }
     try {
       const res = await fetch(`${MESH_API_BASE}/neighbourhood`);
-      if (res.ok) this.neighbourhood = await res.json();
+      if (!res.ok) return;
+      const neighbourhood: Neighbourhood = await res.json();
+      if (this.stopped || seq < this.appliedNeighbourhoodSeq) return;
+      this.appliedNeighbourhoodSeq = seq;
+      this.applyNeighbourhood(neighbourhood);
     } catch {
       // discovery is optional; the mesh still renders without it.
     }
@@ -983,8 +1138,10 @@ export class SendspinDataService {
       });
       const parsed = await res.json().catch(() => ({}));
       void this.poll();
-      if (!res.ok) return { ok: false, message: parsed?.error || `request failed (${res.status})` };
-      return { ok: parsed?.ok !== false, message: parsed?.error };
+      // Only a string is a sentence. An object here became "[object Object]" in the dialog.
+      const error: string | undefined = typeof parsed?.error === 'string' ? parsed.error : undefined;
+      if (!res.ok) return { ok: false, message: error || `request failed (${res.status})` };
+      return { ok: parsed?.ok !== false, message: error };
     } catch {
       return { ok: false, message: 'Could not reach the unit' };
     }
@@ -994,12 +1151,30 @@ export class SendspinDataService {
     const host = this.unitHosts.get(unitId);
     // Prefer per-unit host (works cross-unit + open CORS); fall back to the proxied base.
     const base = host ? `http://${host}:${MESH_API_PORT}/api/mesh` : MESH_API_BASE;
-    const res = await fetch(`${base}${path}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) throw new Error(`mesh ${path} failed: ${res.status}`);
+    let res: Response;
+    try {
+      res = await fetch(`${base}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    } catch {
+      // fetch rejects with a bare TypeError ("Failed to fetch") — true, and useless to a user.
+      throw new MeshRequestError('Could not reach the unit', path);
+    }
+    if (!res.ok) {
+      // The unit answers a refusal with `{error}` — "unknown player", "unknown source". Carry that
+      // sentence to the caller: it is the only place the reason exists.
+      let reason: string | undefined;
+      try {
+        // Only a string is a sentence. An object here became "[object Object]" in the toast.
+        const error: unknown = (await res.json())?.error;
+        if (typeof error === 'string') reason = error;
+      } catch {
+        // no JSON body — the status is all we have
+      }
+      throw new MeshRequestError(reason || `Request failed (${res.status})`, path, res.status);
+    }
     void this.poll(); // reflect the change quickly
   }
 

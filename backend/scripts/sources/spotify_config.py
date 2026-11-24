@@ -27,6 +27,7 @@ import logging
 import os
 from dataclasses import dataclass
 
+from . import endpoint_config
 from .config_render import escape_yaml_double_quoted, write_atomic
 
 logger = logging.getLogger("plum.spotify_config")
@@ -78,16 +79,47 @@ def enabled_endpoints(settings: dict) -> list[dict]:
     # POST /api/settings can write) makes .get return None, and the next .get raises AttributeError.
     spotify = settings.get("integrations", {}).get("spotify", {}) or {}
     endpoints = spotify.get("endpoints", []) or []
-    return [e for e in endpoints[:MAX_ENDPOINTS] if e.get("enabled")]
+    if not isinstance(endpoints, list):
+        return []  # a raw settings write can put anything here
+    return [e for e in endpoints[:MAX_ENDPOINTS] if isinstance(e, dict) and e.get("enabled")]
+
+
+# desired() asks on every poll. One warning for each bad value, and the set stays small.
+_bitrate_warned: set[str] = set()
+_BITRATE_WARNED_MAX = 16
+
+
+def bitrate_from_settings(settings: dict) -> int:
+    """The Spotify bitrate, or DEFAULT_BITRATE with a warning when the stored value is not one.
+
+    The value lands unescaped in the template and it is part of the manager's signature. A value
+    that is not a real bitrate must not stop every endpoint, so it becomes the default.
+    """
+    spotify = settings.get("integrations", {}).get("spotify", {}) or {}
+    bitrate = spotify.get("bitrate", DEFAULT_BITRATE)
+    if isinstance(bitrate, int) and not isinstance(bitrate, bool) and bitrate in endpoint_config.SPOTIFY_BITRATES:
+        return bitrate
+    key = repr(bitrate)[:80]
+    if key not in _bitrate_warned:
+        if len(_bitrate_warned) >= _BITRATE_WARNED_MAX:
+            _bitrate_warned.clear()
+        _bitrate_warned.add(key)
+        logger.warning("spotify bitrate %s is not valid; using %d", key, DEFAULT_BITRATE)
+    return DEFAULT_BITRATE
 
 
 def _instance(endpoint: dict, config_root: str) -> SpotifyInstance:
-    instance_id = str(endpoint.get("id"))
+    """Resolve one endpoint, or raise `endpoint_config.InvalidEndpoint`.
+
+    The id names `config_dir` and the FIFO, and it lands unescaped in the YAML template with the
+    zeroconf port. Every sink below uses the CHECKED values, never `endpoint[...]` again.
+    """
+    instance_id = endpoint_config.checked_id(endpoint.get("id"))
     return SpotifyInstance(
         instance_id=instance_id,
-        device_name=endpoint.get("deviceName", f"Plum Audio {instance_id}"),
+        device_name=endpoint_config.checked_name(endpoint.get("deviceName"), f"Plum Audio {instance_id}"),
         fifo_path=fifo_path_for(instance_id),
-        zeroconf_port=int(endpoint.get("zeroconfPort", 5354)),
+        zeroconf_port=endpoint_config.checked_port(endpoint.get("zeroconfPort") or 5354, "zeroconfPort"),
         api_port=api_port_for(instance_id),
         config_dir=os.path.join(config_root, instance_id),
     )
@@ -97,9 +129,10 @@ def instances_from_settings(settings: dict, *, config_root: str = DEFAULT_CONFIG
     """Resolve enabled endpoints to SpotifyInstances WITHOUT writing any files.
 
     Used by spotify_manager to decide which sources to bring up; config rendering and the daemon
-    launch are separate concerns, so this stays pure.
+    launch are separate concerns, so this stays pure. An endpoint that fails `endpoint_config` is
+    skipped with a warning; the others still start.
     """
-    return [_instance(e, config_root) for e in enabled_endpoints(settings)]
+    return endpoint_config.resolve("spotify", enabled_endpoints(settings), lambda e: _instance(e, config_root))
 
 
 def render_configs(
@@ -109,14 +142,12 @@ def render_configs(
     config_root: str = DEFAULT_CONFIG_ROOT,
 ) -> list[SpotifyInstance]:
     """Write a config.yml into each enabled endpoint's config dir; return the instances to bring up."""
-    spotify = settings.get("integrations", {}).get("spotify", {})
-    bitrate = int(spotify.get("bitrate", DEFAULT_BITRATE))
+    bitrate = bitrate_from_settings(settings)
     with open(template_path, encoding="utf-8") as f:
         template = f.read()
 
     instances: list[SpotifyInstance] = []
-    for endpoint in enabled_endpoints(settings):
-        inst = _instance(endpoint, config_root)
+    for inst in instances_from_settings(settings, config_root=config_root):
         os.makedirs(inst.config_dir, exist_ok=True)
 
         # Escaped: this lands inside a double-quoted YAML scalar, where a raw quote or newline

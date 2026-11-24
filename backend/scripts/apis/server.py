@@ -17,7 +17,7 @@ import logging
 import os
 import sys
 
-from flask import Flask, request
+from flask import Flask, jsonify, request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/ on path
 import cors_policy  # noqa: E402
@@ -30,6 +30,53 @@ from settings_api import SettingsManager, create_settings_blueprint  # noqa: E40
 logger = logging.getLogger(__name__)
 
 
+def install_api_guard(app: Flask, hosts_provider=cors_policy.own_hosts) -> None:
+    """Refuse a cross-site or rebound request BEFORE its view runs, and add the CORS headers after.
+
+    The guard is `cors_policy.guard`, the same function the mesh API uses as aiohttp middleware.
+    The CORS headers alone only stop a page from reading the reply: the view had already run, so a
+    `text/plain` POST from any web page could rewrite settings.json blind.
+
+    `PLUM_API_GUARD=0` turns the guard off and leaves the CORS headers as they were.
+
+    `hosts_provider` is read per request (see `cors_policy.own_hosts` for why it is not cached).
+    """
+
+    @app.before_request
+    def _guard():
+        refusal = cors_policy.guard(
+            method=request.method,
+            origin=request.headers.get("Origin"),
+            host=request.headers.get("Host"),
+            content_type=request.headers.get("Content-Type"),
+            has_body=cors_policy.has_body(
+                request.headers.get("Content-Length"), request.headers.get("Transfer-Encoding")
+            ),
+            hosts=hosts_provider(),
+        )
+        if refusal is None:
+            return None
+        status, message = refusal
+        logger.warning("refused %s %s: %s", request.method, request.path, message)
+        return jsonify({"error": message}), status
+
+    @app.after_request
+    def _cors(response):
+        # No Origin: not a browser request. CORS never applied — add nothing, refuse nothing.
+        origin = request.headers.get("Origin")
+        allow = cors_policy.origin_header(origin, hosts_provider())
+        if allow is not None:
+            response.headers["Access-Control-Allow-Origin"] = allow
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+            response.headers["Access-Control-Max-Age"] = "600"
+            response.headers["Vary"] = "Origin"
+        elif origin and not cors_policy.guard_enabled():
+            # With the guard on, _guard already logged this refusal.
+            logger.warning("CORS: refused origin %r — set PLUM_ALLOWED_ORIGINS to allow it", origin)
+        return response
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
     # One SettingsManager shared across blueprints so settings + integrations read/write the same file.
@@ -40,21 +87,7 @@ def create_app() -> Flask:
     app.register_blueprint(create_calibration_blueprint(settings_manager))
     app.register_blueprint(create_about_blueprint())
 
-    @app.after_request
-    def _cors(response):
-        # No Origin: not a browser request. CORS never applied — add nothing, refuse nothing.
-        origin = request.headers.get("Origin")
-        allow = cors_policy.origin_header(origin, cors_policy.own_hosts())
-        if allow is not None:
-            response.headers["Access-Control-Allow-Origin"] = allow
-            response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-            response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-            response.headers["Access-Control-Max-Age"] = "600"
-            response.headers["Vary"] = "Origin"
-        elif origin:
-            logger.warning("CORS: refused origin %r — set PLUM_ALLOWED_ORIGINS to allow it", origin)
-        return response
-
+    install_api_guard(app)
     return app
 
 

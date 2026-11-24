@@ -44,6 +44,7 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any
 
 import numpy as np
 from aiosendspin.client.client import SendspinClient
@@ -71,6 +72,7 @@ except Exception:  # noqa: BLE001 - allows --probe-config / import without PortA
 import audio_devices
 import sendspin_identity
 import unit_identity
+from background_tasks import spawn
 from lifecycle import install_shutdown_handlers
 from mesh.avahi import CLIENT_SERVICE, AvahiClient
 from player_state import (
@@ -78,6 +80,7 @@ from player_state import (
     load_last_playing_server,
     load_render_state,
     save_active_output,
+    save_health_report,
     save_last_playing_server,
     save_player_health,
     save_render_state,
@@ -117,6 +120,174 @@ HEALTH_POLL_S = 3.0  # how often we re-evaluate whether to report client/state e
 STUCK_SESSION_WARN_S = 900.0
 
 
+# -- dead-peer watchdog ----------------------------------------------------------------------------
+# A server that vanishes without closing (power cut, cable pulled, `docker pause`) leaves a half-open
+# TCP session. aiosendspin's listener builds the inbound WebSocketResponse with NO heartbeat
+# (client/listener.py:139; the server side has heartbeat=30 — server/connection.py:270,
+# server/server.py:826), so nothing on our side ever notices, and the player sits inside
+# attach_websocket on a peer that is not there: RUNNING, port open, undialable.
+#
+# What "silent" means is taken from what the protocol sends while a session is IDLE, because a
+# parked, mute session is a normal steady state (CLAUDE.md: Music Assistant holds a released
+# speaker for as long as it likes). An admitted connection runs a time-sync loop for its whole life:
+# it sends client/time every 0.2 s until the filter converges and then every 0.5 to 3.0 s
+# (client/connection.py:1506-1527), and a server answers each one with server/time, unconditionally
+# (server/connection.py:1781-1791). So a live session delivers an inbound frame at least every 3 s,
+# audio or no audio, and "no audio" is never the signal.
+#
+# The signal is therefore: we kept SENDING and nothing came back. Both halves are needed. The loop
+# is paused during pairing (client/connection.py:521) and a pairing window legitimately waits up to
+# 300 s for an operator — but then we send nothing either, so the count of unanswered frames stays
+# near zero and the watchdog stays quiet.
+#
+# 30 s is ten consecutive unanswered time requests at the slowest cadence, and one full period of
+# the heartbeat the server runs against us. 0 disables the watchdog.
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+PEER_SILENCE_TIMEOUT_S = _env_seconds("PLUM_PEER_SILENCE_TIMEOUT_S", 30.0)
+# Frames we must have sent, unanswered, before silence counts. Five is 15 s of time requests at the
+# slowest cadence and well above the single frame a pairing step leaves waiting for an operator.
+PEER_SILENCE_MIN_UNANSWERED = 5
+# aiohttp's close() waits up to 10 s for the peer's close frame; give it that, then abort the socket.
+PEER_CLOSE_TIMEOUT_S = 12.0
+# After close() returns, how long the library gets to unwind attach_websocket before we abort the
+# TCP connection as well. The unwind is a few event-loop turns; this is generous.
+PEER_DETACH_WAIT_S = 2.0
+# How long after the close a session may still be attached before we stop trusting the close.
+PEER_CLOSE_GRACE_S = 20.0
+# "Audio is flowing" for the exit decision: a chunk arrived this recently, on any session.
+PEER_AUDIO_RECENT_S = 3.0
+EXIT_PEER_WEDGED = 4
+
+
+class _WatchedWebSocket:
+    """The inbound websocket, with the time of the last frame each way. Not a patch to the library.
+
+    aiosendspin takes the websocket as an argument and uses five things on it: `receive`,
+    `send_str` (the Noise handshake), `send_bytes` (everything after it — noise/wire.py:113),
+    `close` and `closed`. This forwards all of them and notes when a frame passed. It is the one
+    hook that sees EVERY inbound frame — time replies, chunks, metadata, handshake — where the
+    client's listeners see only the message types they were registered for and never server/time.
+
+    Only data frames count as inbound traffic. aiohttp answers a ping inside `receive()` without
+    returning it, and CLOSE/CLOSING/CLOSED/ERROR are the session ending, not the peer talking.
+    """
+
+    def __init__(self, ws) -> None:  # noqa: ANN001 - aiohttp.web.WebSocketResponse
+        self._ws = ws
+        now = time.monotonic()
+        self.opened = now
+        self.last_rx = now
+        self.rx_frames = 0
+        self.tx_frames = 0
+        self.unanswered_tx = 0  # frames sent since the last inbound frame
+        self.first_unanswered_tx: float | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._ws, name)  # closed, close_code, exception, close, ...
+
+    async def receive(self, *args, **kwargs):
+        msg = await self._ws.receive(*args, **kwargs)
+        if getattr(msg.type, "name", "") in ("TEXT", "BINARY"):
+            self.last_rx = time.monotonic()
+            self.rx_frames += 1
+            self.unanswered_tx = 0
+            self.first_unanswered_tx = None
+        return msg
+
+    def _note_tx(self) -> None:
+        # Counted BEFORE the send: a send that raises on a dying socket was still a frame the peer
+        # did not answer.
+        self.tx_frames += 1
+        self.unanswered_tx += 1
+        if self.first_unanswered_tx is None:
+            self.first_unanswered_tx = time.monotonic()
+
+    async def send_bytes(self, data, *args, **kwargs) -> None:
+        self._note_tx()
+        await self._ws.send_bytes(data, *args, **kwargs)
+
+    async def send_str(self, data, *args, **kwargs) -> None:
+        self._note_tx()
+        await self._ws.send_str(data, *args, **kwargs)
+
+    def silence(self, now: float, timeout: float) -> dict | None:
+        """The evidence that this peer is dead, or None while it is not (or cannot be judged)."""
+        if timeout <= 0 or self.first_unanswered_tx is None:
+            return None
+        if self.unanswered_tx < PEER_SILENCE_MIN_UNANSWERED:
+            return None
+        silent_for = now - self.last_rx
+        unanswered_for = now - self.first_unanswered_tx
+        if silent_for < timeout or unanswered_for < timeout:
+            return None
+        return {
+            "silent_for": silent_for,
+            "unanswered_tx": self.unanswered_tx,
+            "unanswered_for": unanswered_for,
+            "rx_frames": self.rx_frames,
+            "held": now - self.opened,
+            "remote": getattr(getattr(self._ws, "_req", None), "remote", None),
+        }
+
+    def abort(self) -> bool:
+        """Drop the TCP connection without waiting for anything. True if there was one to drop.
+
+        The last resort after close(): a transport with unsent bytes for a dead peer does not
+        finish a graceful close, and abort() does not need it to.
+        """
+        transport = getattr(getattr(self._ws, "_req", None), "transport", None)
+        if transport is None:
+            return False
+        transport.abort()
+        return True
+
+
+# Output-stream death. The PortAudio callback runs every ~10 ms for as long as the stream is open,
+# playing or not, so a counter that did not move across this many HEALTH_POLL_S polls means the
+# stream is dead even though PortAudio still calls it active. Two polls, so that at least one full
+# 3 s interval passed with no callback at all — one late poll cannot trip it.
+OUTPUT_STALL_POLLS = 2
+# Failed re-opens in a row before the process exits and supervisord starts a new one. A new process
+# is the complete PortAudio re-initialisation; three in-process tries cover a card that was only
+# briefly away (a USB DAC re-enumerating, an ALSA suspend) without holding a dead unit for long.
+OUTPUT_REOPEN_MAX = int(os.environ.get("PLUM_OUTPUT_REOPEN_MAX", "3"))
+# Kill switch, for the same reason PLUM_SYNC_LOCK has one: this acts on the audio path. If the
+# watchdog misreads an output on some rig, one env var and a restart turns it off without a rebuild.
+OUTPUT_WATCHDOG = os.environ.get("PLUM_OUTPUT_WATCHDOG", "1") != "0"
+# A re-open that SUCCEEDS and is followed by another fault, with no healthy poll between, did not
+# fix anything. Those are retried with a doubling delay up to this cap, and never end in an exit:
+# the process restart is for a card that will not OPEN, and restarting over a stream that opens and
+# then stalls would only move the same loop into supervisord.
+OUTPUT_FLAP_RETRY_MAX_S = 300.0
+# How often the health report in player_state.json is refreshed while nothing changes. Its age is
+# what the container healthcheck reads, so healthcheck.py must allow several of these.
+HEALTH_REPORT_S = 30.0
+# Exit codes for a deliberate self-restart. 2 is "configured for no output" (see main()).
+EXIT_OUTPUT_LOST = 3
+# Upper bound on one AlsaRenderer.recover() call. PortAudio's stop()/close() can block for ever on a
+# USB DAC that was unplugged, and the health loop awaits the call: without a bound, the peer-silence
+# check, the health report and request_exit all stop with it. 30 s is ten health polls, far above a
+# real re-open (1-2 s). 0 disables the bound.
+OUTPUT_RECOVER_TIMEOUT_S = _env_seconds("PLUM_OUTPUT_RECOVER_TIMEOUT_S", 30.0)
+# How long AlsaRenderer.stop() waits for the re-open lock. A worker thread that is stuck inside
+# PortAudio holds the lock and never gives it back, and stop() runs on the SIGTERM path, where
+# supervisord sends SIGKILL after `stopwaitsecs`.
+RENDERER_STOP_LOCK_TIMEOUT_S = 1.0
+
+# Upper bound on each network step of stop(). Three of them fit inside the supervisord
+# `stopwaitsecs` with room for the DAC release that follows.
+STOP_STEP_TIMEOUT_S = 2.5
+# Consume-relay reconnect delay: doubles from MIN on each consecutive failure, capped at MAX.
+RELAY_RETRY_MIN_S = 2.0
+RELAY_RETRY_MAX_S = 30.0
+
+
 # -- multi-room phase lock -------------------------------------------------------------------------
 # Off returns the renderer to the free-running drain it had from Phase 1 to 2026-09-13: audio is
 # played the moment it arrives and this unit's phase is whatever its first chunk happened to land
@@ -145,6 +316,11 @@ SYNC_STEP_LOG_GAP_S = 2.0  # throttle on the step log line, NOT on the step itse
 # reports 0, and a bogus huge value would schedule audio minutes out; both fall back to the latency
 # the stream reported at open, and only if THAT is unusable do we free-run.
 MAX_DAC_LEAD_US = 1_000_000
+
+
+def _relay_backoff(failures: int) -> float:
+    """Seconds to wait before relay attempt `failures + 1`: 2, 4, 8, 16, then 30 from there on."""
+    return min(RELAY_RETRY_MAX_S, RELAY_RETRY_MIN_S * 2 ** min(max(0, failures - 1), 16))
 
 
 @dataclass(slots=True)
@@ -189,6 +365,10 @@ class PlayerHealth(StrEnum):
 
     SYNCHRONIZED = "synchronized"
     ERROR = "error"
+    # The output stream itself stopped: nothing reaches the DAC, however healthy the buffer looks.
+    # Distinct from ERROR because the remedy differs — ERROR is "give me more lead time", this is
+    # "my card went away", and only this one ends in a process restart.
+    OUTPUT_LOST = "output_lost"
 
 
 class AlsaRenderer:
@@ -259,6 +439,22 @@ class AlsaRenderer:
         # volume as software gain (0..100) + mute
         self._gain = 1.0
         self._muted = False
+
+        # Stream liveness. `callbacks` counts every PortAudio callback and is the only proof the
+        # stream is really running: `stream.active` stays True for a stream whose device stopped
+        # asking for audio. `stream_finished` is PortAudio telling us it stopped the stream itself.
+        self.callbacks = 0
+        self.stream_finished = False
+        self._closing = False  # our own stop() is in progress — a finished callback is expected
+        # Serialises every stop/open pair. An output switch and a stream recovery both tear the
+        # stream down and re-open it, both from worker threads, and `_open` re-initialises
+        # PortAudio's process-global state on the way: two of them at once is the SIGSEGV that
+        # CLAUDE.md warns about. Reentrant because reopen() and recover() call stop().
+        self._reopen_lock = threading.RLock()
+        self.reopening = False  # a stop/open pair is in flight; liveness is meaningless until it ends
+        # The last spec that actually opened. recover() goes back to it when a failed switch left
+        # `device` as None, so a recovery never lands on PortAudio's default device by accident.
+        self._last_good_spec = device
 
         # metrics
         self.xruns = 0
@@ -334,7 +530,10 @@ class AlsaRenderer:
             blocksize=DAC_BLOCK_FRAMES,
             device=device_arg,
             callback=self._callback,
+            finished_callback=self._on_stream_finished,
         )
+        self.stream_finished = False
+        self._closing = False
         self._stream.start()
         # Fallback DAC lead for a callback whose time info PortAudio did not fill. `latency` is what
         # the host API settled on, in seconds; sounddevice reports it per stream after start.
@@ -352,6 +551,7 @@ class AlsaRenderer:
             self._aligned = False
             self._dac_time_warned = False
         self.device = spec
+        self._last_good_spec = spec
         # What we actually OPENED, as the stable <card_name>:<device> identity — distinct from the
         # spec we were ASKED for. `pending` upstream is "choice vs echo"; echoing the request back
         # compares a string to itself and is structurally unable to notice that resolution landed on
@@ -391,31 +591,109 @@ class AlsaRenderer:
             logger.info("output 'none' selected — keeping %r open until this unit restarts", self.device)
             return False
 
-        if spec == self.device and self._stream is not None:
-            return True
+        with self._reopen_lock:
+            if spec == self.device and self._stream is not None:
+                return True
 
-        previous = self.device
-        self.stop()
+            self.reopening = True
+            try:
+                previous = self.device
+                self.stop()
+                try:
+                    self._open(spec)
+                    return True
+                except Exception:  # noqa: BLE001 - any PortAudio/ALSA failure means "did not switch"
+                    logger.error("could not open output %r — restoring %r", spec, previous, exc_info=True)
+
+                try:
+                    self._open(previous)
+                except Exception:  # noqa: BLE001
+                    logger.error("restoring output %r ALSO failed — this unit is now silent", previous, exc_info=True)
+                    self.device = None
+                    self.open_device = None
+                return False
+            finally:
+                self.reopening = False
+
+    def recover(self) -> bool:
+        """Re-open the output after the stream died. True if a stream is running again.
+
+        The same stop/open pair as reopen(), under the same lock, so a recovery and an output
+        switch can never run their PortAudio re-initialisation at the same time. Called from a
+        worker thread for the same reason reopen() is: teardown and `aplay -l` both block.
+
+        Buffered audio and the gain are kept, as in reopen(). `_open` resets the phase-lock state,
+        so the first block after a recovery aligns to its deadline again instead of resuming at
+        whatever offset the dead stream left.
+        """
+        with self._reopen_lock:
+            self.reopening = True
+            try:
+                spec = self.device if self.device is not None else self._last_good_spec
+                self.stop()
+                try:
+                    self._open(spec)
+                    return True
+                except Exception:  # noqa: BLE001 - the card is still away; the caller counts this
+                    logger.error("could not re-open output %r after a stream failure", spec, exc_info=True)
+                    return False
+            finally:
+                self.reopening = False
+
+    def stream_fault(self) -> str | None:
+        """Why the output stream is not running, or None while it is (or while a re-open is busy).
+
+        Covers what PortAudio will ADMIT to. A stream whose device stopped pulling audio still
+        reports active, and for that the caller watches `callbacks` — see
+        SendspinPlayer._check_output.
+        """
+        if self.reopening:
+            return None
+        stream = self._stream
+        if stream is None:
+            return "no output stream is open"
+        if self.stream_finished:
+            return "PortAudio finished the stream (the callback raised, or the device was removed)"
         try:
-            self._open(spec)
-            return True
-        except Exception:  # noqa: BLE001 - any PortAudio/ALSA failure means "did not switch"
-            logger.error("could not open output %r — restoring %r", spec, previous, exc_info=True)
+            active = bool(stream.active)
+        except Exception as exc:  # noqa: BLE001 - a stream PortAudio cannot describe is not running
+            return f"the stream state is unreadable ({exc!r})"
+        return None if active else "the stream is open but not active"
 
+    def _on_stream_finished(self) -> None:
+        """PortAudio's finished callback: the stream went inactive. Runs in the audio thread.
+
+        It also fires for our own stop(), which is not a fault — `_closing` tells the two apart.
+        Only a flag is set here: the audio thread must not re-open anything, and the health loop
+        owns the recovery.
+        """
+        if not self._closing:
+            self.stream_finished = True
+
+    def stop(self) -> bool:
+        """Close the output stream. False if another thread holds the re-open lock and keeps it.
+
+        The lock is re-entrant, so reopen() and recover() pass straight through. A caller on a
+        different thread waits RENDERER_STOP_LOCK_TIMEOUT_S at most: the holder can be a worker
+        that PortAudio never returns to, and this is the last step of a SIGTERM shutdown.
+        """
+        if not self._reopen_lock.acquire(timeout=RENDERER_STOP_LOCK_TIMEOUT_S):
+            logger.error(
+                "stop: a re-open of %r did not release the output lock in %.1fs — the stream stays open",
+                self.device,
+                RENDERER_STOP_LOCK_TIMEOUT_S,
+            )
+            return False
         try:
-            self._open(previous)
-        except Exception:  # noqa: BLE001
-            logger.error("restoring output %r ALSO failed — this unit is now silent", previous, exc_info=True)
-            self.device = None
-            self.open_device = None
-        return False
-
-    def stop(self) -> None:
-        if self._stream is not None:
-            with contextlib.suppress(Exception):
-                self._stream.stop()
-                self._stream.close()
-            self._stream = None
+            if self._stream is not None:
+                self._closing = True
+                with contextlib.suppress(Exception):
+                    self._stream.stop()
+                    self._stream.close()
+                self._stream = None
+            return True
+        finally:
+            self._reopen_lock.release()
 
     # -- fill (asyncio thread) ----------------------------------------------
 
@@ -746,6 +1024,7 @@ class AlsaRenderer:
         return bytes(out[:need])
 
     def _callback(self, outdata, frames, time_info, status) -> None:  # noqa: ANN001
+        self.callbacks += 1  # liveness for the health loop; written here only, read anywhere
         if status and getattr(status, "output_underflow", False):
             with self._lock:
                 playing = self._playing
@@ -899,6 +1178,7 @@ class SendspinPlayer:
         self._sessions_warned: set[int] = set()
         self._report_task: asyncio.Task | None = None
         self._health_task: asyncio.Task | None = None
+        self._init_recovery_state()
         self.report_url = os.environ.get("PLUM_PLAYER_STATE_URL", "http://127.0.0.1:5001/api/mesh/player-state")
         # Consume relay: forward the group's controller state + visualizer frames (which we receive
         # as a MEMBER of whatever server serves us, foreign ones included) to our GUI, and take
@@ -920,12 +1200,287 @@ class SendspinPlayer:
         # the relay is loopback-only so it never leaves the unit.
         self._relay_pair: dict | None = None
         self._relay_pair_dirty = False
+        self._relay_failures = 0  # consecutive failed relay connections — drives backoff + logging
+        self._relay_down_since = 0.0
         self.relay_url = os.environ.get("PLUM_PLAYER_RELAY_URL", "ws://127.0.0.1:5001/api/mesh/consume?role=player")
         self.client.add_group_update_listener(self._on_group_update)
         self.client.add_metadata_listener(self._on_metadata)
         self.client.add_controller_state_listener(self._on_controller_state)
         self.client.add_visualizer_listener(self._on_visualizer)
         self.client.add_artwork_listener(self._on_artwork)
+
+    # -- self-recovery -------------------------------------------------------
+
+    def _init_recovery_state(self) -> None:
+        """State for the watchdogs in _health_loop. Separate so a test can build it on a fake."""
+        # Set when the process must be replaced. main() waits on it beside SIGTERM and returns
+        # `exit_code`, so supervisord (autorestart) starts a new process.
+        self.exit_requested = asyncio.Event()
+        self.exit_code: int | None = None
+        # Output-stream watchdog.
+        self._output_state = "ok"  # ok | recovering | lost
+        self._output_fault: str | None = None
+        self._output_reopens = 0  # successful recoveries since start
+        self._output_failed_reopens = 0  # consecutive failures — reaches OUTPUT_REOPEN_MAX, then exit
+        self._callbacks_seen = -1
+        self._callback_stalls = 0
+        self._output_unproven = 0  # successful re-opens in a row with no healthy poll after them
+        self._output_retry_after = 0.0  # monotonic time before which a flapping output is left alone
+        # Monotonic time of the last report write. -inf is "never": the monotonic clock starts near
+        # 0 at boot, so 0.0 read as "written just now" for the first HEALTH_REPORT_S of uptime.
+        self._health_report_at = float("-inf")
+        # False when stop() could not release the DAC because a worker thread holds the re-open
+        # lock. main() then leaves with os._exit, because asyncio.run() would join that thread.
+        self.renderer_released = True
+        # Dead-peer watchdog: the watched websocket of every open session, keyed like _sessions, and
+        # when we started closing the ones found silent.
+        self._session_ws: dict[int, _WatchedWebSocket] = {}
+        self._silence_closing: dict[int, float] = {}
+        self._silence_close_waiting: set[int] = set()  # close overdue but audio flowing — logged once
+        self._peer_silence_closes = 0
+
+    def request_exit(self, code: int, reason: str) -> None:
+        """Ask main() to shut down and exit non-zero, so supervisord replaces this process."""
+        if self.exit_code is not None:
+            return
+        self.exit_code = code
+        logger.error("exiting with code %d so supervisord restarts the player: %s", code, reason)
+        self.exit_requested.set()
+
+    def _check_peer_silence(self) -> None:
+        """Close any session whose peer stopped answering. Called on every health poll.
+
+        See the note on PEER_SILENCE_TIMEOUT_S for what is measured and why. Every open session is
+        checked, not the newest: connections overlap under 9.x, and the dead one is by definition
+        the old one that newer dials come and go beside.
+
+        Closing is enough to free the player: the library's reader is blocked in `receive()`, the
+        close wakes it, the connection tears itself down, `attach_websocket` returns and the listener
+        is ready for the next dial. If the session is STILL attached PEER_CLOSE_GRACE_S later, the
+        close did not work and the process exits for supervisord to replace — but only while no
+        audio is arriving, because another session may be playing and a restart would cut it.
+        """
+        if PEER_SILENCE_TIMEOUT_S <= 0:
+            return
+        now = time.monotonic()
+        for session, watched in list(self._session_ws.items()):
+            closing_since = self._silence_closing.get(session)
+            if closing_since is not None:
+                if now - closing_since >= PEER_CLOSE_GRACE_S:
+                    self._peer_close_overdue(session, now - closing_since)
+                continue
+            evidence = watched.silence(now, PEER_SILENCE_TIMEOUT_S)
+            if evidence is None:
+                continue
+            self._silence_closing[session] = now
+            self._peer_silence_closes += 1
+            logger.warning(
+                "session %d is held by a SILENT peer (%s): no inbound frame for %.0fs (threshold %.0fs) while "
+                "%d frames we sent went unanswered over %.0fs; held %.0fs, %d frames received in total, "
+                "%d sessions open, client.connected=%s, audio_flowing=%s — closing it so a new dial can attach",
+                session,
+                evidence["remote"] or "address unknown",
+                evidence["silent_for"],
+                PEER_SILENCE_TIMEOUT_S,
+                evidence["unanswered_tx"],
+                evidence["unanswered_for"],
+                evidence["held"],
+                evidence["rx_frames"],
+                len(self._session_ws),
+                self.client.connected,
+                self._audio_flowing,
+            )
+            spawn(self._close_silent_session(session, watched), f"close silent session {session}")
+
+    async def _close_silent_session(self, session: int, watched: _WatchedWebSocket) -> None:
+        """Close one silent session: a websocket close first, then a TCP abort if it is still held."""
+        try:
+            # 1001 "going away". close() wakes the reader at once; what can take time is its wait
+            # for the dead peer's close frame, which is why this runs as its own task.
+            await asyncio.wait_for(watched.close(code=1001, message=b"peer silent"), PEER_CLOSE_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001 - a close that fails is handled by the abort below
+            logger.warning("session %d: the websocket close did not complete (%r)", session, exc)
+        # close() returning is not yet the session ending: the reader has to wake, the connection
+        # has to tear itself down and attach_websocket has to return. Let that happen before
+        # deciding the close was not enough.
+        deadline = time.monotonic() + PEER_DETACH_WAIT_S
+        while session in self._session_ws and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        if session not in self._session_ws:
+            logger.info("session %d detached after the close; the listener can take a new dial", session)
+        elif watched.abort():
+            logger.warning("session %d was still attached after the close — aborted its TCP connection", session)
+
+    def _peer_close_overdue(self, session: int, waited: float) -> None:
+        """A silent session survived the close. Exit, unless audio is arriving on another session."""
+        if time.monotonic() - self._last_audio_mono < PEER_AUDIO_RECENT_S:
+            if session not in self._silence_close_waiting:
+                self._silence_close_waiting.add(session)
+                logger.warning(
+                    "session %d is still attached %.0fs after the close, but audio is flowing — "
+                    "not restarting; the check repeats when the audio stops",
+                    session,
+                    waited,
+                )
+            return
+        self.request_exit(
+            EXIT_PEER_WEDGED,
+            f"session {session} is held by a silent peer and is still attached {waited:.0f}s after the close",
+        )
+
+    async def _check_output(self) -> None:
+        """Detect a dead output stream and re-open it. Called on every health poll.
+
+        Two signals, because they fail in different ways. `stream_fault()` is what PortAudio admits
+        to: finished, inactive, or gone. The callback counter is what it does not: an ALSA device
+        that stopped asking for audio leaves the stream "active" and silent, and the only evidence
+        is that the callback is no longer being called. The stream is open for the whole life of
+        the process, playing or idle, so a counter that stops is a fault in both cases.
+
+        The re-open goes through AlsaRenderer.recover(), which shares one lock with an output
+        switch — never a second PortAudio re-initialisation beside a running one. After
+        OUTPUT_REOPEN_MAX failures in a row the process exits: a fresh process is the complete
+        re-initialisation, and supervisord applies a growing delay between starts while the card
+        stays away.
+        """
+        if not OUTPUT_WATCHDOG:
+            return
+        renderer = self.renderer
+        if renderer.reopening:
+            self._callbacks_seen = -1  # an output switch is in flight; start the count again after it
+            self._callback_stalls = 0
+            return
+        fault = renderer.stream_fault()
+        count = renderer.callbacks
+        if fault is None:
+            if count == self._callbacks_seen:
+                self._callback_stalls += 1
+                if self._callback_stalls >= OUTPUT_STALL_POLLS:
+                    fault = (
+                        f"the audio callback counter stalled at {count} for "
+                        f"{self._callback_stalls * HEALTH_POLL_S:.0f}s while PortAudio reports the stream active"
+                    )
+            else:
+                self._callback_stalls = 0
+                if self._callbacks_seen >= 0 and self._output_unproven:
+                    # The counter moved across a whole poll: the last re-open really took.
+                    logger.info("output stream is stable again on %r", renderer.device)
+                    self._output_unproven = 0
+                    if self._output_state != "ok":
+                        self._set_output_state("ok", None)
+            self._callbacks_seen = count
+        if fault is None:
+            return
+        now = time.monotonic()
+        if now < self._output_retry_after:
+            return  # flapping: the last re-open did not hold, so the next one waits its turn
+
+        logger.warning(
+            "output stream is DEAD on %r: %s — re-opening (failed opens %d of %d, re-opens that did not " "hold %d) %s",
+            renderer.device,
+            fault,
+            self._output_failed_reopens,
+            OUTPUT_REOPEN_MAX,
+            self._output_unproven,
+            renderer.stats(),
+        )
+        self._set_output_state("recovering", fault)
+        # shield: a timeout must not cancel the worker's future, only stop the wait for it. The
+        # thread cannot be interrupted, and `renderer.reopening` stays True while it is stuck, so
+        # the early return above keeps this method from starting a second re-open beside it.
+        attempt = asyncio.get_running_loop().run_in_executor(None, renderer.recover)
+        try:
+            recovered = await asyncio.wait_for(asyncio.shield(attempt), OUTPUT_RECOVER_TIMEOUT_S or None)
+        except TimeoutError:
+            self._set_output_state("lost", fault)
+            self.request_exit(
+                EXIT_OUTPUT_LOST,
+                f"the output re-open did not return in {OUTPUT_RECOVER_TIMEOUT_S:.0f}s ({fault})",
+            )
+            return
+        self._callbacks_seen = -1
+        self._callback_stalls = 0
+        if not recovered:
+            self._output_failed_reopens += 1
+            if self._output_failed_reopens >= OUTPUT_REOPEN_MAX:
+                self._set_output_state("lost", fault)
+                self.request_exit(
+                    EXIT_OUTPUT_LOST,
+                    f"the output stream did not re-open after {self._output_failed_reopens} attempts ({fault})",
+                )
+            return
+
+        self._output_reopens += 1
+        self._output_failed_reopens = 0
+        self._output_unproven += 1
+        if self._output_unproven == 1:
+            # First recovery: believe it. The next healthy poll confirms it; the next fault says not.
+            logger.warning("output stream re-opened on %r (recovery %d)", renderer.device, self._output_reopens)
+            self._set_output_state("ok", None)
+            return
+        wait = min(OUTPUT_FLAP_RETRY_MAX_S, HEALTH_POLL_S * 2 ** min(self._output_unproven, 16))
+        self._output_retry_after = time.monotonic() + wait
+        logger.warning(
+            "output stream re-opened on %r but the last %d re-opens did not hold — next attempt in %.0fs at the "
+            "earliest; the output stays reported as 'recovering'",
+            renderer.device,
+            self._output_unproven - 1,
+            wait,
+        )
+
+    def _set_output_state(self, state: str, fault: str | None) -> None:
+        """Record the output state and publish it at once — a transition must not wait 30 s."""
+        self._output_state = state
+        self._output_fault = fault
+        health = PlayerHealth.SYNCHRONIZED if state == "ok" else PlayerHealth.OUTPUT_LOST
+        if health is not self._last_reported_state:
+            self._last_reported_state = health
+            save_player_health(self._state_file, health.value)
+        self._write_health_report()
+
+    def _health_report(self) -> dict:
+        """What player_state.json `health` holds. `ts` is wall-clock: another process reads its age."""
+        return {
+            "ts": round(time.time(), 1),
+            "player_health": self._last_reported_state.value,
+            "output": {
+                "state": self._output_state,
+                "fault": self._output_fault,
+                "device": self.renderer.open_device or self.renderer.device,
+                "reopens": self._output_reopens,
+                "failed_reopens": self._output_failed_reopens,
+            },
+            "sessions_open": len(self._sessions),
+            "peer_silence_closes": self._peer_silence_closes,
+        }
+
+    def _report_startup_health(self) -> None:
+        """Write the first report of this process, at once, after the output opened.
+
+        A process that exits on a lost output leaves `output.state: lost` in the file. Without
+        this write the healthcheck reads that old verdict from the NEW process until its first
+        periodic report, HEALTH_REPORT_S later. `player_health` is written on a transition only,
+        so the old `output_lost` stays there too. Inline: nothing is playing yet.
+        """
+        save_player_health(self._state_file, self._last_reported_state.value)
+        self._write_health_report()
+
+    def _write_health_report(self) -> None:
+        self._health_report_at = time.monotonic()
+        save_health_report(self._state_file, self._health_report())
+
+    async def _refresh_health_report(self) -> None:
+        """Refresh the report every HEALTH_REPORT_S, in a worker thread.
+
+        The write is an fsync on the unit's SD card. That can take tens of milliseconds, and this
+        loop also carries the audio feed — so the periodic write stays off it. A transition writes
+        inline (_set_output_state): it is rare, and it must be on disk before a possible exit.
+        """
+        if time.monotonic() - self._health_report_at < HEALTH_REPORT_S:
+            return
+        self._health_report_at = time.monotonic()
+        report = self._health_report()
+        await asyncio.get_running_loop().run_in_executor(None, save_health_report, self._state_file, report)
 
     # -- self-report ---------------------------------------------------------
 
@@ -1097,6 +1652,9 @@ class SendspinPlayer:
             # reported, attached or not: `locked: false` on a unit that is playing is the whole
             # answer, and it is invisible from anywhere else.
             "sync": self.renderer.sync_report(),
+            # ok | recovering | lost. A unit whose DAC went away still answers on every port, so
+            # without this the mesh view shows a healthy speaker that renders nothing.
+            "output_state": self._output_state,
         }
         if attached and info is not None:
             # 9.x trimmed ServerInfo to (server_id, name) — `connection_reason` and `version` are
@@ -1131,28 +1689,71 @@ class SendspinPlayer:
 
     async def _relay_loop(self) -> None:
         """Producer side of the consume relay: push ctrl + viz to the mesh API, take commands back.
-        Best-effort; the audio path never waits on it."""
-        import aiohttp
+        Best-effort; the audio path never waits on it.
 
+        Retries with a doubling delay, RELAY_RETRY_MIN_S to RELAY_RETRY_MAX_S. The mesh API lives in
+        the server process, so "down" is either a restart (seconds) or a server that is not coming
+        back (hours) — a flat 2 s retry is right for the first and is 43 000 connection attempts a
+        day for the second. One WARNING per outage and one INFO when it ends: this relay carries the
+        pairing PIN and the transport controls, so a dead one must be visible at the default level,
+        and at DEBUG it was not.
+        """
         while True:
             try:
-                async with aiohttp.ClientSession() as session, session.ws_connect(self.relay_url, heartbeat=30) as ws:
-                    logger.info("consume relay connected (%s)", self.relay_url)
-                    sender = asyncio.ensure_future(self._relay_send(ws))
-                    try:
-                        async for msg in ws:
-                            if msg.type is aiohttp.WSMsgType.TEXT:
-                                with contextlib.suppress(Exception):
-                                    await self._relay_command(msg.json())
-                    finally:
-                        sender.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await sender
+                await self._relay_session()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - mesh API down / restarting; retry
-                logger.debug("consume relay error; retrying", exc_info=True)
-            await asyncio.sleep(2.0)
+            except Exception as exc:  # noqa: BLE001 - mesh API down / restarting; retry
+                self._relay_failures += 1
+                if self._relay_failures == 1:
+                    self._relay_down_since = time.monotonic()
+                    logger.warning(
+                        "consume relay to %s failed: %r — retrying with backoff up to %.0fs; the GUI gets "
+                        "no transport state, visualizer or pairing PIN from this player until it returns",
+                        self.relay_url,
+                        exc,
+                        RELAY_RETRY_MAX_S,
+                    )
+                else:
+                    logger.debug("consume relay still down (attempt %d)", self._relay_failures, exc_info=True)
+            else:
+                logger.info("consume relay closed by the mesh API; reconnecting")
+            await asyncio.sleep(_relay_backoff(max(1, self._relay_failures)))
+
+    def _relay_connected(self) -> None:
+        """The relay websocket is up: log it, and end the outage if there was one."""
+        if self._relay_failures:
+            logger.info(
+                "consume relay recovered after %d failed attempt(s) over %.0fs (%s)",
+                self._relay_failures,
+                time.monotonic() - self._relay_down_since,
+                self.relay_url,
+            )
+        else:
+            logger.info("consume relay connected (%s)", self.relay_url)
+        self._relay_failures = 0
+
+    async def _relay_session(self) -> None:
+        """One relay connection, for its whole life. Returns on a clean close, raises on a failure."""
+        import aiohttp
+
+        async with aiohttp.ClientSession() as session, session.ws_connect(self.relay_url, heartbeat=30) as ws:
+            self._relay_connected()
+            sender = spawn(self._relay_send(ws), "consume relay sender")
+            try:
+                async for msg in ws:
+                    if msg.type is not aiohttp.WSMsgType.TEXT:
+                        continue
+                    try:
+                        await self._relay_command(msg.json())
+                    except Exception as exc:  # noqa: BLE001 - one bad command must not end the relay
+                        # A transport button that does nothing is a user-visible fault, and the
+                        # blanket suppress that was here left no trace of it.
+                        logger.warning("consume relay: command %.200r failed: %r", msg.data, exc)
+            finally:
+                sender.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await sender
 
     async def _relay_send(self, ws) -> None:
         """~30 fps: emit the latest ctrl (on change) + latest viz frame (coalesced)."""
@@ -1239,9 +1840,9 @@ class SendspinPlayer:
             kwargs["volume"] = int(data["volume"])
         if cmd is MediaCommand.MUTE and data.get("mute") is not None:
             kwargs["mute"] = bool(data["mute"])
-        with contextlib.suppress(Exception):
-            await self.client.send_group_command(cmd, **kwargs)
-            logger.info("consume relay: sent %s to server", cmd.value)
+        # Raises on purpose: _relay_session logs the failure with the command that caused it.
+        await self.client.send_group_command(cmd, **kwargs)
+        logger.info("consume relay: sent %s to server", cmd.value)
 
     async def _health_loop(self) -> None:
         """Report client/state whenever our health changes, not only when the volume moves.
@@ -1253,14 +1854,28 @@ class SendspinPlayer:
         """
         while True:
             await asyncio.sleep(HEALTH_POLL_S)
-            self._remember_playing_server()
-            self._warn_if_session_is_stuck()
-            if not self.client.connected:
-                continue
-            state = self._health()
-            if state is not self._last_reported_state:
-                with contextlib.suppress(Exception):  # never break the render path over a report
-                    await self._send_client_state(state)
+            try:
+                await self._health_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - this loop IS the watchdog; one bad tick must not end it
+                logger.exception("health tick failed; the watchdogs keep running")
+
+    async def _health_tick(self) -> None:
+        """One pass of everything that watches this player. Order: local faults first."""
+        await self._check_output()
+        self._check_peer_silence()
+        await self._refresh_health_report()
+        self._remember_playing_server()
+        self._warn_if_session_is_stuck()
+        if not self.client.connected:
+            return
+        if self._output_state != "ok":
+            return  # OUTPUT_LOST is already recorded; _health() must not overwrite it with a buffer verdict
+        state = self._health()
+        if state is not self._last_reported_state:
+            with contextlib.suppress(Exception):  # never break the render path over a report
+                await self._send_client_state(state)
 
     def _warn_if_session_is_stuck(self) -> None:
         """Say so when a server connection has been held implausibly long.
@@ -1319,8 +1934,12 @@ class SendspinPlayer:
         server_id = getattr(info, "server_id", None)
         if server_id and server_id != self._last_playing_server:
             self._last_playing_server = server_id
-            save_last_playing_server(self._state_file, server_id)
+            spawn(self._save_last_playing_server(server_id), "last playing server save")
             logger.info("now playing for server %s (persisted)", server_id)
+
+    async def _save_last_playing_server(self, server_id: str) -> None:
+        """The write, in a worker thread. A coroutine, because `spawn` takes one and not a future."""
+        await asyncio.get_running_loop().run_in_executor(None, save_last_playing_server, self._state_file, server_id)
 
     async def _report_loop(self) -> None:
         """Push our state to this unit's mesh API. Best-effort: the audio path never waits on it."""
@@ -1338,6 +1957,7 @@ class SendspinPlayer:
 
     async def start(self, home_server_url: str | None = None, *, advertise: bool = True) -> None:
         self.renderer.start()
+        self._report_startup_health()
 
         async def on_connection(ws) -> None:
             """Serve one incoming server connection for its whole life.
@@ -1371,11 +1991,18 @@ class SendspinPlayer:
             logger.info(
                 "server dialed us [session %d, %d open] %s", session, len(self._sessions), self.renderer.stats()
             )
+            # The library gets the websocket through a wrapper that notes when a frame passed in
+            # each direction — the dead-peer watchdog's only input. See _WatchedWebSocket.
+            watched = _WatchedWebSocket(ws)
+            self._session_ws[session] = watched
             try:
-                await self.client.attach_websocket(ws)
+                await self.client.attach_websocket(watched)
             finally:
                 started = self._sessions.pop(session, None)
                 self._sessions_warned.discard(session)
+                self._session_ws.pop(session, None)
+                self._silence_closing.pop(session, None)
+                self._silence_close_waiting.discard(session)
                 held = time.monotonic() - started if started is not None else float("nan")
                 logger.info(
                     "detached from server [session %d after %.1fs, %d still open] %s",
@@ -1390,11 +2017,11 @@ class SendspinPlayer:
         )
         await self._listener.start()
         logger.info("player listening on :%d (id=%s)", self.port, self.player_id)
-        self._health_task = asyncio.ensure_future(self._health_loop())
+        self._health_task = spawn(self._health_loop(), "health loop")
         if self.report_url:
-            self._report_task = asyncio.ensure_future(self._report_loop())
+            self._report_task = spawn(self._report_loop(), "state report")
         if self.relay_url:
-            self._relay_task = asyncio.ensure_future(self._relay_loop())
+            self._relay_task = spawn(self._relay_loop(), "consume relay")
 
         # Advertise ourselves the way the spec says a server-dialed client should: _sendspin._tcp,
         # port 8928, TXT path + name. Published through the system Avahi rather than aiosendspin's
@@ -1427,22 +2054,60 @@ class SendspinPlayer:
                     logger.info("dialed home server %s", home_server_url)
 
     async def stop(self) -> None:
-        for task_attr in ("_report_task", "_relay_task", "_health_task"):
-            task = getattr(self, task_attr)
-            if task is not None:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-                setattr(self, task_attr, None)
-        if self._avahi is not None:
-            with contextlib.suppress(Exception):
-                await self._avahi.close()
-            self._avahi = None
-        with contextlib.suppress(Exception):
-            await self.client.disconnect()
-        if self._listener is not None:
-            await self._listener.stop()
-        self.renderer.stop()
+        """Shut down. Every step runs even if the one before it raised.
+
+        Order is by what a failure costs. The level goes to disk FIRST: it is the only step whose
+        loss outlives the process, it needs nothing else to be alive, and supervisord sends SIGKILL
+        `stopwaitsecs` after SIGTERM — so anything that can block must come after it. The DAC is
+        released LAST and in a `finally`, because a listener that failed to stop used to skip it.
+
+        The network steps are bounded. `client.disconnect()` sends a goodbye and then waits for the
+        peer's close frame, and on a half-open connection that wait is the full aiohttp close
+        timeout; unbounded, it uses the whole SIGTERM grace period on a peer that is not there.
+        """
+        try:
+            self._flush_render_state()
+            for task_attr in ("_report_task", "_relay_task", "_health_task"):
+                task = getattr(self, task_attr)
+                if task is not None:
+                    task.cancel()
+                    # Exception too: a task that died earlier re-raises here, and that must not
+                    # abort the shutdown. background_tasks.spawn already logged it.
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+                    setattr(self, task_attr, None)
+            if self._avahi is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(self._avahi.close(), STOP_STEP_TIMEOUT_S)
+                self._avahi = None
+            try:
+                await asyncio.wait_for(self.client.disconnect(), STOP_STEP_TIMEOUT_S)
+            except Exception as exc:
+                logger.warning("stop: the client did not disconnect cleanly: %r", exc)
+            if self._listener is not None:
+                try:
+                    await asyncio.wait_for(self._listener.stop(), STOP_STEP_TIMEOUT_S)
+                except Exception as exc:
+                    logger.warning("stop: the listener did not stop cleanly: %r", exc)
+                self._listener = None
+        finally:
+            # False only from AlsaRenderer.stop() when it could not take the lock.
+            self.renderer_released = self.renderer.stop() is not False
+
+    def _flush_render_state(self) -> None:
+        """Write a pending level NOW. Synchronous on purpose: this is the shutdown path.
+
+        `_publish_render_state` debounces the save by STATE_SAVE_DEBOUNCE_S so a slider drag is one
+        write. A SIGTERM inside that window used to cancel nothing and save nothing — the process
+        exited with the task still asleep, and the unit came back at the level from before the drag.
+        """
+        task = self._save_task
+        self._save_task = None
+        if task is None or task.done():
+            return  # nothing pending: the last change is already on disk
+        task.cancel()
+        save_render_state(self._state_file, self._volume, self._muted)
+        logger.info("stop: saved the pending level (volume=%d muted=%s)", self._volume, self._muted)
 
     # -- server → player events ---------------------------------------------
 
@@ -1512,14 +2177,14 @@ class SendspinPlayer:
         library's group-volume redistribution computes its delta from a baseline that is not real.
         """
         if self.client.connected:
-            asyncio.ensure_future(self._send_render_state())
+            spawn(self._send_render_state(), "render state echo")
         # Also keep the values the client reports on its NEXT connect in step: after a roam the
         # library re-sends its constructor-time initial_volume, which would otherwise hand the new
         # server a stale level.
         self.client._initial_volume = self._volume  # noqa: SLF001
         self.client._initial_muted = self._muted  # noqa: SLF001
         if self._save_task is None or self._save_task.done():
-            self._save_task = asyncio.ensure_future(self._save_render_state())
+            self._save_task = spawn(self._save_render_state(), "render state save")
 
     def _health(self) -> PlayerHealth:
         """SYNCHRONIZED, or ERROR while we are demonstrably failing to keep up.
@@ -1578,11 +2243,33 @@ class SendspinPlayer:
             # "this speaker is dropping out", now that the wire cannot carry it.
             logger.warning("player health=%s %s", state.value, self.renderer.stats())
             self._last_reported_state = state
-            save_player_health(self._state_file, state.value)
+            # In a worker thread: the write is an fsync, and this path runs exactly when the
+            # renderer is already short of audio — the loop that feeds it must not wait on a disk.
+            await asyncio.get_running_loop().run_in_executor(None, save_player_health, self._state_file, state.value)
 
     async def _save_render_state(self) -> None:
         await asyncio.sleep(STATE_SAVE_DEBOUNCE_S)
-        save_render_state(self._state_file, self._volume, self._muted)
+        # In a worker thread, for the fsync. A stop() during it is covered: _flush_render_state sees
+        # the task as not done and writes the level itself.
+        await asyncio.get_running_loop().run_in_executor(
+            None, save_render_state, self._state_file, self._volume, self._muted
+        )
+
+
+def _hard_exit_if_stuck(player) -> None:  # noqa: ANN001 - SendspinPlayer
+    """Leave with os._exit when a worker thread is stuck inside PortAudio.
+
+    asyncio.run() joins the default executor before it returns, and the interpreter joins its
+    threads again at exit. A thread inside PortAudio's stop()/close() on a removed USB DAC never
+    returns, so the process stays up until SIGKILL and supervisord never sees the exit code.
+    player.stop() ran before this: the level and the health report are on disk.
+    """
+    if player.renderer_released:
+        return
+    code = player.exit_code if player.exit_code is not None else 0
+    logger.error("a worker thread holds the output lock — leaving with os._exit(%d)", code)
+    logging.shutdown()  # flush the log handlers; os._exit runs no cleanup
+    os._exit(code)
 
 
 async def main() -> int | None:
@@ -1606,9 +2293,10 @@ async def main() -> int | None:
         # This unit is configured for no output, so it should have no player process: output_gate.py
         # removes sendspin_player.ini from supervisord's runtime set before any of this starts. Being
         # here means the gate was bypassed — a hand-run on the dev rig, or a stale program set. Exit
-        # rather than construct a renderer that cannot open anything; under supervisord this reaches
-        # FATAL after three tries, which is bounded and visible, unlike the crash-loop that a device
-        # named "none" would produce.
+        # rather than construct a renderer that cannot open anything. Under supervisord this is a
+        # failed start, retried with a delay that grows by 1 s each time (see the `startretries`
+        # note in supervisord/conf.d/sendspin_player.ini), and the container healthcheck reports
+        # the program as not RUNNING for as long as it lasts.
         logger.error("this unit is configured for no output — the player should not have been started")
         return 2
     rate = int(os.environ.get("PLUM_PLAYER_RATE", DEFAULT_RATE))
@@ -1665,7 +2353,9 @@ async def main() -> int | None:
                 player.player_id, CLIENT_SERVICE, player.port, {"path": "/sendspin", "name": new_name}
             )
 
-    rename_watch = asyncio.ensure_future(unit_identity.watch_device_name(_apply_player_name, fallback=env_player_name))
+    rename_watch = spawn(
+        unit_identity.watch_device_name(_apply_player_name, fallback=env_player_name), "device name watch"
+    )
 
     # Follow an output change from Settings. The swap runs in a worker thread: PortAudio teardown
     # and the `aplay -l` behind device resolution both block, and stalling the event loop would
@@ -1691,19 +2381,27 @@ async def main() -> int | None:
         return applied  # False keeps watch_output_device retrying this target
 
     save_active_output(state_file, renderer.open_device or renderer.device)
-    output_watch = asyncio.ensure_future(audio_devices.watch_output_device(_apply_output))
+    output_watch = spawn(audio_devices.watch_output_device(_apply_output), "output device watch")
 
     stop = install_shutdown_handlers()
+    # Run until SIGTERM, or until a watchdog asks for a new process (player.request_exit).
+    waiters = [
+        spawn(stop.wait(), "shutdown signal"),
+        spawn(player.exit_requested.wait(), "exit request"),
+    ]
     try:
-        await stop.wait()  # run until SIGTERM; supervisord manages the process lifecycle
+        await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
     except asyncio.CancelledError:
         pass
     finally:
-        for task in (rename_watch, output_watch):
+        for task in (*waiters, rename_watch, output_watch):
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         await player.stop()
+    _hard_exit_if_stuck(player)
+    # None on SIGTERM (exit 0). A watchdog's code otherwise, so supervisord logs an unexpected exit.
+    return player.exit_code
 
 
 if __name__ == "__main__":

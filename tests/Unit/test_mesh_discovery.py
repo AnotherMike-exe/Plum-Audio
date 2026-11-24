@@ -155,3 +155,92 @@ def test_a_trailing_path_difference_does_not_make_it_foreign():
     for byte."""
     n = _nbhd(own_client_ids=set(), own_player_url="ws://192.168.7.122:8928")
     assert n.is_own_player(_Svc("player-7122", "ws://192.168.7.122:8928/sendspin")) is True
+
+
+def test_the_neighbourhood_reports_a_foreign_player_but_not_our_own():
+    """`on_player_seen` is how the server learns an adopted speaker is back on the network."""
+    from mesh.avahi import CLIENT_SERVICE, DiscoveredService
+    from mesh.neighbourhood import Neighbourhood
+
+    hood = Neighbourhood("unit-a", "A", server_port=8927, own_player_url="ws://192.168.7.10:8928/sendspin")
+    seen = []
+    hood.on_player_seen = seen.append
+    hood._on_player(DiscoveredService("esp32", CLIENT_SERVICE, 8928, addresses=["192.168.7.201"]))
+    hood._on_player(DiscoveredService("ours", CLIENT_SERVICE, 8928, addresses=["192.168.7.10"]))
+    assert seen == ["ws://192.168.7.201:8928/sendspin"]
+
+
+def test_a_failing_player_listener_does_not_stop_discovery():
+    from mesh.avahi import CLIENT_SERVICE, DiscoveredService
+    from mesh.neighbourhood import Neighbourhood
+
+    hood = Neighbourhood("unit-a", "A", server_port=8927)
+
+    def boom(_url):
+        raise RuntimeError("listener bug")
+
+    hood.on_player_seen = boom
+    hood._on_player(DiscoveredService("esp32", CLIENT_SERVICE, 8928, addresses=["192.168.7.201"]))
+    assert len(hood.players()) == 1
+
+
+# --- start(): the socket on a failed start -----------------------------------
+
+
+def _start_with_tracked_socket(monkeypatch, *, fail_bind=False, fail_endpoint=False):
+    """Run MeshDiscovery.start() and return (the socket it made, the exception it raised)."""
+    import asyncio
+    import socket as real_socket
+
+    from mesh import discovery
+
+    made = []
+
+    class TrackedSocket(real_socket.socket):
+        def bind(self, addr):
+            if fail_bind:
+                raise OSError(98, "Address already in use")
+            return super().bind(addr)
+
+    def factory(*a, **kw):
+        sock = TrackedSocket(*a, **kw)
+        made.append(sock)
+        return sock
+
+    monkeypatch.setattr(discovery.socket, "socket", factory)
+
+    async def scenario():
+        d = MeshDiscovery(unit_id="us", unit_name="Us", beacon_port=0)
+        if fail_endpoint:
+
+            async def boom(*_a, **_kw):
+                raise RuntimeError("no endpoint")
+
+            monkeypatch.setattr(asyncio.get_running_loop(), "create_datagram_endpoint", boom)
+        try:
+            await d.start()
+        except (OSError, RuntimeError) as exc:
+            return exc
+        await d.stop()
+        return None
+
+    error = asyncio.run(scenario())
+    return made[0], error
+
+
+def test_a_failed_datagram_endpoint_closes_the_socket(monkeypatch):
+    sock, error = _start_with_tracked_socket(monkeypatch, fail_endpoint=True)
+    assert isinstance(error, RuntimeError)
+    assert sock.fileno() == -1  # closed
+
+
+def test_a_failed_bind_closes_the_socket(monkeypatch):
+    sock, error = _start_with_tracked_socket(monkeypatch, fail_bind=True)
+    assert isinstance(error, OSError)
+    assert sock.fileno() == -1
+
+
+def test_a_good_start_hands_the_socket_to_the_transport(monkeypatch):
+    sock, error = _start_with_tracked_socket(monkeypatch)
+    assert error is None
+    assert sock.fileno() == -1  # closed by stop(), through the transport

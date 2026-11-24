@@ -29,6 +29,7 @@ from flask import Blueprint, jsonify, request
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/ on path
 import audio_devices  # noqa: E402  — the sentinel's spelling has exactly one owner
 import unit_identity  # noqa: E402  — owns the per-unit token behind the default names
+from sources import endpoint_config  # noqa: E402  — the endpoint id/port/adapter rule has one home
 
 logger = logging.getLogger(__name__)
 
@@ -220,9 +221,13 @@ def _sanitize_device_names(settings: dict[str, Any]) -> None:
     POST /api/settings takes arbitrary JSON and never went through the endpoint CRUD's validation,
     so this is the only chokepoint both paths share.
     """
+    # A name with nothing usable in it was kept UNCHANGED here, so the raw text stayed in the file
+    # and reached mDNS and the mesh view. update_settings refuses such a name from a caller; this
+    # branch is for one that is already on disk.
     top = sanitize_device_name(settings.get("deviceName"))
-    if top:
-        settings["deviceName"] = top
+    if top is None:
+        logger.warning("deviceName %r has no usable characters; using the default", settings.get("deviceName"))
+    settings["deviceName"] = top or DEFAULT_DEVICE_NAME
 
     integrations = settings.get("integrations")
     if not isinstance(integrations, dict):
@@ -237,6 +242,28 @@ def _sanitize_device_names(settings: dict[str, Any]) -> None:
             if safe != endpoint.get("deviceName"):
                 logger.warning("sanitized endpoint deviceName %r -> %r", endpoint.get("deviceName"), safe)
             endpoint["deviceName"] = safe or DEFAULT_ENDPOINT_NAME
+
+
+def _validate_changed_endpoints(before: Any, settings: dict[str, Any]) -> None:
+    """Refuse a write that puts a bad endpoint id, port or adapter into the file. Raises ValueError.
+
+    An endpoint id names a directory and a FIFO and lands unescaped in two daemon templates; the
+    Bluetooth adapter reaches the bluealsa argv (sources/endpoint_config.py states the rule). The
+    renderers apply the same rule again and skip what fails.
+
+    Refuses, and does not rewrite: a repaired id would name a different endpoint from the one the
+    caller sent. Checks only the sections this write CHANGED, so one bad record that is already on
+    disk cannot make every later write fail, calibration and device rename included. `before` is
+    the `integrations` value from before the merge.
+    """
+    integrations = settings.get("integrations")
+    if not isinstance(integrations, dict):
+        raise ValueError("integrations must be an object")
+    previous = before if isinstance(before, dict) else {}
+    for source, section in integrations.items():
+        if source in previous and previous[source] == section:
+            continue
+        endpoint_config.validate_section(source, section)
 
 
 # An output spec is a `<card_name>:<device>` id, an `hw:C,D` address, a bare ALSA card name, or a
@@ -530,7 +557,13 @@ class SettingsManager:
         the GUI's poller sees nothing to reconcile. Failing the request is the only safe answer.
         """
         with _SETTINGS_LOCK:
+            if "deviceName" in new_settings and sanitize_device_name(new_settings["deviceName"]) is None:
+                # Refused, not replaced: a rename to an unusable name must fail where the user can
+                # see it, not rename the unit to its default.
+                raise ValueError("deviceName has no usable characters (letters, digits, space and . _ - ' ( ) & +)")
+
             current = self._load_merged()
+            integrations_before = copy.deepcopy(current.get("integrations"))
 
             for key in new_settings:
                 if key == "version":
@@ -540,6 +573,7 @@ class SettingsManager:
                 else:
                     current[key] = new_settings[key]
 
+            _validate_changed_endpoints(integrations_before, current)
             _sanitize_device_names(current)
             _validate_audio_output(current)
 
@@ -570,9 +604,11 @@ class SettingsManager:
         """
         with _SETTINGS_LOCK:
             current = self._load_merged()
+            integrations_before = copy.deepcopy(current.get("integrations"))
             if not apply(current):
                 return current
 
+            _validate_changed_endpoints(integrations_before, current)
             _sanitize_device_names(current)
             _validate_audio_output(current)
 
@@ -708,6 +744,8 @@ def create_settings_blueprint(settings_manager: SettingsManager = None) -> Bluep
             new_settings = request.get_json()
             if not new_settings:
                 return jsonify({"error": "No settings provided"}), 400
+            if not isinstance(new_settings, dict):
+                return jsonify({"error": "settings must be a JSON object"}), 400
             return jsonify(settings_manager.update_settings(new_settings))
         except ValueError as e:
             # A rejected value is the caller's fault, not ours — _validate_audio_output raises this.
@@ -722,7 +760,7 @@ def create_settings_blueprint(settings_manager: SettingsManager = None) -> Bluep
     def update_device_settings():
         try:
             data = request.get_json()
-            if not data:
+            if not data or not isinstance(data, dict):
                 return jsonify({"error": "No data provided"}), 400
 
             device_name = data.get("deviceName")
@@ -734,6 +772,8 @@ def create_settings_blueprint(settings_manager: SettingsManager = None) -> Bluep
             messages = []
 
             if device_name:
+                if sanitize_device_name(device_name) is None:
+                    return jsonify({"error": "Device name has no usable characters"}), 400
                 if not device_name.strip():
                     return jsonify({"error": "Device name cannot be empty"}), 400
                 if len(device_name) > 100:

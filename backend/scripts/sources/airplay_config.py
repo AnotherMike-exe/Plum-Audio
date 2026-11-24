@@ -19,6 +19,7 @@ import logging
 import os
 from dataclasses import dataclass
 
+from . import endpoint_config
 from .config_render import escape_libconfig, write_atomic
 
 logger = logging.getLogger("plum.airplay_config")
@@ -92,18 +93,27 @@ def enabled_endpoints(settings: dict) -> list[dict]:
     """Enabled AirPlay endpoints from a settings dict, capped at MAX_ENDPOINTS."""
     airplay = settings.get("integrations", {}).get("airplay", {}) or {}
     endpoints = airplay.get("endpoints", []) or []
-    return [e for e in endpoints[:MAX_ENDPOINTS] if e.get("enabled")]
+    if not isinstance(endpoints, list):
+        return []  # a raw settings write can put anything here
+    return [e for e in endpoints[:MAX_ENDPOINTS] if isinstance(e, dict) and e.get("enabled")]
 
 
 def _instance(endpoint: dict, config_root: str) -> AirplayInstance:
-    instance_id = str(endpoint.get("id"))
+    """Resolve one endpoint, or raise `endpoint_config.InvalidEndpoint`.
+
+    The id names `config_dir` and both FIFOs, and it lands unescaped in the template with the two
+    ports. Every sink below uses the CHECKED values, never `endpoint[...]` again.
+    """
+    instance_id = endpoint_config.checked_id(endpoint.get("id"))
     return AirplayInstance(
         instance_id=instance_id,
-        device_name=endpoint.get("deviceName", f"Plum Audio {instance_id}"),
+        device_name=endpoint_config.checked_name(endpoint.get("deviceName"), f"Plum Audio {instance_id}"),
         # Ports are stored per endpoint (the GUI shows them), but fall back to the derived block so
         # an endpoint written by an older build still lands somewhere unique.
-        port=int(endpoint.get("port") or port_for(instance_id)),
-        udp_port_base=int(endpoint.get("udpPortBase") or udp_port_base_for(instance_id)),
+        port=endpoint_config.checked_port(endpoint.get("port") or port_for(instance_id), "port"),
+        udp_port_base=endpoint_config.checked_port(
+            endpoint.get("udpPortBase") or udp_port_base_for(instance_id), "udpPortBase"
+        ),
         fifo_path=fifo_path_for(instance_id),
         metadata_fifo=metadata_fifo_for(instance_id),
         config_dir=os.path.join(config_root, instance_id),
@@ -111,8 +121,11 @@ def _instance(endpoint: dict, config_root: str) -> AirplayInstance:
 
 
 def instances_from_settings(settings: dict, *, config_root: str = DEFAULT_CONFIG_ROOT) -> list[AirplayInstance]:
-    """Resolve enabled endpoints to AirplayInstances WITHOUT writing any files."""
-    return [_instance(e, config_root) for e in enabled_endpoints(settings)]
+    """Resolve enabled endpoints to AirplayInstances WITHOUT writing any files.
+
+    An endpoint that fails `endpoint_config` is skipped with a warning; the others still start.
+    """
+    return endpoint_config.resolve("airplay", enabled_endpoints(settings), lambda e: _instance(e, config_root))
 
 
 def render_configs(
@@ -126,8 +139,7 @@ def render_configs(
         template = f.read()
 
     instances: list[AirplayInstance] = []
-    for endpoint in enabled_endpoints(settings):
-        inst = _instance(endpoint, config_root)
+    for inst in instances_from_settings(settings, config_root=config_root):
         os.makedirs(inst.config_dir, exist_ok=True)
 
         # escape_libconfig, not the raw name: this lands inside `name = "...";`, and shairport's

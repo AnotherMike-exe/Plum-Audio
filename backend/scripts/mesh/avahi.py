@@ -36,6 +36,7 @@ import socket
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from background_tasks import spawn
 from dbus_next.aio import MessageBus
 from dbus_next.constants import BusType
 
@@ -47,6 +48,12 @@ SERVER_IFACE = "org.freedesktop.Avahi.Server"
 SERVER2_IFACE = "org.freedesktop.Avahi.Server2"  # adds *Prepare: create a browser, THEN start it
 ENTRY_GROUP_IFACE = "org.freedesktop.Avahi.EntryGroup"
 BROWSER_IFACE = "org.freedesktop.Avahi.ServiceBrowser"
+DBUS_BUS = "org.freedesktop.DBus"
+DBUS_PATH = "/org/freedesktop/DBus"
+DBUS_IFACE = "org.freedesktop.DBus"
+# Waits before each attempt to put our records back after the Avahi daemon restarts. The daemon
+# takes its bus name before it can serve every call, so the first attempt can be too early.
+RESTORE_BACKOFF_S: tuple[float, ...] = (0.0, 1.0, 2.0, 4.0, 8.0, 16.0)
 
 IF_UNSPEC = -1  # AVAHI_IF_UNSPEC — all interfaces
 PROTO_UNSPEC = -1  # AVAHI_PROTO_UNSPEC — v4 and v6
@@ -152,12 +159,25 @@ class AvahiClient:
         self._browsers: list = []
         self._seen: dict[str, DiscoveredService] = {}  # key -> service (merged across interfaces)
         self._local_ip = local_ip()
+        # What the caller ASKED for, kept apart from the D-Bus objects that currently serve it. An
+        # EntryGroup or a ServiceBrowser lives inside the Avahi daemon and dies with it, so after a
+        # daemon restart these two lists are all that is left to rebuild from. See _restore.
+        self._published: list[tuple[str, str, int, dict[str, str]]] = []
+        self._browsing: list[tuple[str, Callable[[DiscoveredService], None], Callable[[str], None] | None]] = []
+        self._watching = False  # subscribed to NameOwnerChanged on the current bus
+        self._restore_lock = asyncio.Lock()
+        self._closed = False
 
     async def connect(self) -> bool:
         if self._server is not None:
             return True
         try:
-            self._bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            if self._bus is None:
+                self._bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+                self._watching = False
+            # Before the Avahi introspection, and kept when that fails: a daemon that is down now
+            # (or starts after us) is then picked up when it takes its name.
+            await self._watch_daemon()
             intro = await self._bus.introspect(AVAHI_BUS, AVAHI_PATH)
             obj = self._bus.get_proxy_object(AVAHI_BUS, AVAHI_PATH, intro)
             self._server = obj.get_interface(SERVER_IFACE)
@@ -165,11 +185,95 @@ class AvahiClient:
                 self._server2 = obj.get_interface(SERVER2_IFACE)
         except Exception:  # noqa: BLE001 - no Avahi here; discovery is optional, audio is not
             logger.warning("Avahi unavailable — Sendspin mDNS publish/browse disabled", exc_info=True)
-            self._bus = self._server = self._server2 = None
+            self._server = self._server2 = None
             return False
         return True
 
+    async def _watch_daemon(self) -> None:
+        """Subscribe to the bus daemon's NameOwnerChanged, to see the Avahi daemon come and go.
+
+        Best-effort: without it everything else still works, we only lose the recovery.
+        """
+        if self._watching or self._bus is None:
+            return
+        try:
+            intro = await self._bus.introspect(DBUS_BUS, DBUS_PATH)
+            dbus = self._bus.get_proxy_object(DBUS_BUS, DBUS_PATH, intro).get_interface(DBUS_IFACE)
+            dbus.on_name_owner_changed(self._on_name_owner_changed)
+            self._watching = True
+        except Exception:  # noqa: BLE001
+            logger.warning("cannot watch for an Avahi restart; records will not be restored after one", exc_info=True)
+
+    def _on_name_owner_changed(self, name: str, _old_owner: str, new_owner: str) -> None:
+        """The Avahi daemon stopped (new_owner empty) or started. Signal handler: no awaits here."""
+        if name != AVAHI_BUS or self._closed:
+            return
+        if not new_owner:
+            # Every EntryGroup and ServiceBrowser we held was an object inside that process. The
+            # proxies now point at nothing, so drop them: calling one only raises.
+            logger.warning("Avahi daemon went away; our mDNS records and browsers are gone until it returns")
+            self._server = self._server2 = None
+            self._groups.clear()
+            self._browsers.clear()
+            return
+        logger.info("Avahi daemon is back; restoring our mDNS records and browsers")
+        spawn(self._restore(), "avahi-restore")
+
+    async def _restore(self) -> None:
+        """Re-register every record and re-create every browser after an Avahi daemon restart.
+
+        Without this a `systemctl restart avahi-daemon` on the host (a package upgrade does one)
+        left the unit invisible to Music Assistant and blind to every speaker until our own process
+        restarted, with no error anywhere: the D-Bus connection stays up, only the objects are gone.
+        """
+        async with self._restore_lock:
+            for delay in RESTORE_BACKOFF_S:
+                if delay:
+                    await asyncio.sleep(delay)
+                if self._closed:
+                    return
+                # Free whatever an earlier attempt (or an earlier restore) created in THIS daemon,
+                # or a retry publishes the same name twice and Avahi answers with a collision.
+                await self._drop_objects()
+                self._server = self._server2 = None  # re-introspect: the new daemon may differ
+                if not await self.connect():
+                    continue
+                # A speaker that left while the daemon was down sends no remove. Flush what we knew,
+                # so the new browser's ItemNew events rebuild the list from what is really there.
+                for key in list(self._seen):
+                    del self._seen[key]
+                    for service_type, _on_add, on_remove in self._browsing:
+                        if on_remove is not None and key.startswith(service_type + "/"):
+                            with contextlib.suppress(Exception):
+                                on_remove(key)
+                ok = True
+                for record in list(self._published):
+                    ok = await self._publish_now(*record) and ok
+                for watch in list(self._browsing):
+                    ok = await self._browse_now(*watch) and ok
+                if ok:
+                    logger.info(
+                        "restored %d mDNS record(s) and %d browser(s)", len(self._published), len(self._browsing)
+                    )
+                    return
+            logger.error("could not restore our mDNS records after the Avahi restart; discovery is down")
+
+    async def _drop_objects(self) -> None:
+        """Free our EntryGroups and ServiceBrowsers in the daemon. Harmless when they are gone."""
+        for group in self._groups:
+            with contextlib.suppress(Exception):
+                await group.call_reset()
+                await group.call_free()
+        self._groups.clear()
+        for browser in self._browsers:
+            with contextlib.suppress(Exception):
+                await browser.call_free()
+        self._browsers.clear()
+
     async def close(self) -> None:
+        self._closed = True  # a restore in flight stops at its next step
+        self._published.clear()
+        self._browsing.clear()
         for group in self._groups:
             with contextlib.suppress(Exception):
                 await group.call_reset()
@@ -181,11 +285,22 @@ class AvahiClient:
         if self._bus is not None:
             self._bus.disconnect()
         self._bus = self._server = self._server2 = None
+        self._watching = False
 
     # -- publish -------------------------------------------------------------
 
     async def publish(self, name: str, service_type: str, port: int, txt: dict[str, str]) -> bool:
-        """Advertise one service. The record lives until close(); returns False if Avahi is absent."""
+        """Advertise one service. The record lives until close(); returns False if Avahi is absent.
+
+        The request is remembered even when it fails, so a daemon that starts later, or restarts,
+        gets the record (see _restore).
+        """
+        self._closed = False
+        self._published = [r for r in self._published if (r[0], r[1]) != (name, service_type)]
+        self._published.append((name, service_type, port, dict(txt)))
+        return await self._publish_now(name, service_type, port, txt)
+
+    async def _publish_now(self, name: str, service_type: str, port: int, txt: dict[str, str]) -> bool:
         if not await self.connect():
             return False
         assert self._server is not None and self._bus is not None
@@ -226,6 +341,7 @@ class AvahiClient:
                 await group.call_reset()
                 await group.call_free()
         self._groups.clear()
+        self._published.clear()
         return await self.publish(name, service_type, port, txt)
 
     # -- browse --------------------------------------------------------------
@@ -236,7 +352,21 @@ class AvahiClient:
         on_add: Callable[[DiscoveredService], None],
         on_remove: Callable[[str], None] | None = None,
     ) -> bool:
-        """Watch a service type. `on_add` gets resolved services; `on_remove` gets their key."""
+        """Watch a service type. `on_add` gets resolved services; `on_remove` gets their key.
+
+        Remembered like a publication, so the browser is re-created after an Avahi restart.
+        """
+        self._closed = False
+        self._browsing = [w for w in self._browsing if w[0] != service_type]
+        self._browsing.append((service_type, on_add, on_remove))
+        return await self._browse_now(service_type, on_add, on_remove)
+
+    async def _browse_now(
+        self,
+        service_type: str,
+        on_add: Callable[[DiscoveredService], None],
+        on_remove: Callable[[str], None] | None = None,
+    ) -> bool:
         if not await self.connect():
             return False
         assert self._server is not None and self._bus is not None
@@ -261,7 +391,7 @@ class AvahiClient:
 
         def _on_item_new(interface: int, protocol: int, name: str, stype: str, domain: str, flags: int) -> None:
             # Resolution is a round trip; do it off the signal handler.
-            asyncio.ensure_future(self._resolve(interface, protocol, name, stype, domain, on_add))
+            spawn(self._resolve(interface, protocol, name, stype, domain, on_add), f"mdns-resolve:{stype}/{name}")
 
         def _on_item_remove(_i: int, _p: int, name: str, stype: str, _d: str, _f: int) -> None:
             self._seen.pop(f"{stype}/{name}", None)
@@ -286,7 +416,8 @@ class AvahiClient:
         domain: str,
         on_add: Callable[[DiscoveredService], None],
     ) -> None:
-        assert self._server is not None
+        if self._server is None:
+            return  # the daemon went away between the announce and now; the restore browses again
         try:
             resolved = await self._server.call_resolve_service(
                 interface, protocol, name, service_type, domain, PROTO_UNSPEC, 0

@@ -51,19 +51,33 @@ export function useBrowserPlayer(): BrowserPlayerState {
     ref.current = p;
     setPlayerId(p.playerId); // expose the id up-front so the caller can watch its own row
     setStarting(true);
+    // `ref.current !== p` after an await means stop() ran meanwhile (and perhaps a new start()).
+    // This start then owns no state: it must not mark the tab active, and it must not clear the
+    // state of the player that replaced it.
     try {
-      await p.start();
+      const connected = await p.start();
+      if (!connected || ref.current !== p) {
+        p.stop('user_request');
+        if (ref.current === p) {
+          // Stopped from inside the player (its page-unload handler), not through this hook.
+          ref.current = null;
+          setPlayerId(null);
+          setStarting(false);
+        }
+        return null;
+      }
       setActive(true);
+      setStarting(false);
       return p.playerId;
     } catch (err) {
-      console.error('[BrowserPlayer] start failed:', err);
       p.stop('user_request');
+      if (ref.current !== p) return null; // stopped by the user: the failure is no longer news
+      console.error('[BrowserPlayer] start failed:', err);
       ref.current = null;
       setActive(false);
       setPlayerId(null);
-      throw err;
-    } finally {
       setStarting(false);
+      throw err;
     }
   }, []);
 

@@ -15,7 +15,39 @@ deliberately *not* duplicated here.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+
+
+def _optional_float(value: object) -> float | None:
+    """A number from a peer's snapshot, or None. A peer's JSON is not trusted to hold a number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+# One DNS label: what Avahi takes as a host name. Kept here and not imported from cors_policy, so
+# the model stays free of imports. cors_policy applies the same pattern to the settings value.
+_DNS_LABEL = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def _single_label(value: object) -> str | None:
+    """A peer's mDNS name as one lowercase DNS label, or None. A dotted name would add a domain."""
+    if not isinstance(value, str):
+        return None
+    name = value.strip().lower()
+    return name if _DNS_LABEL.fullmatch(name) else None
+
+
+def _host_label(value: object) -> str | None:
+    """A peer's kernel hostname as one lowercase DNS label, or None.
+
+    `socket.gethostname()` can be an FQDN, so the first label is taken and the rest is dropped:
+    the domain is the peer's claim, and it must not reach the allowed-host set.
+    """
+    if not isinstance(value, str):
+        return None
+    return _single_label(value.strip().split(".", 1)[0])
 
 
 @dataclass
@@ -172,6 +204,13 @@ class UnitSnapshot:
     # this a peer cannot recognise a page served BY this unit as a legitimate origin. See
     # cors_policy.known_hosts.
     hostname: str | None = None
+    # The mDNS name a user set from Settings -> Device (`settings.json` `hostname`, applied with
+    # Avahi SetHostName). The kernel hostname above never learns it, so a page opened at
+    # `http://<this-name>.local` was refused by every PEER. One DNS label, lowercase.
+    #
+    # DEFAULTS NONE: a peer on an older image sends no such field, and its `hostname` and IP still
+    # apply. A value that is not one label reads as None (see `_single_label`).
+    mdns_hostname: str | None = None
     # This unit's SENDSPIN server id, which under aiosendspin 9.x is its X25519 public key and is
     # NOT `unit_id`. They used to be the same string — we passed `server_id=unit_id` — and a good
     # deal of the mesh quietly relied on that, most importantly `follow`, which joins the server a
@@ -190,6 +229,28 @@ class UnitSnapshot:
     # GROUP — see calibration.merge_calibrations. Small (a few hundred bytes per endpoint) and
     # read-only for every consumer but the owning unit.
     calibration: dict = field(default_factory=dict)
+    # How old the `local_player` self-report is, in seconds, measured by the unit that received it.
+    # An AGE and not a timestamp on purpose: units have no RTC and their clocks differ, so a peer
+    # cannot compare a wall-clock time of ours against its own. None = unknown: the player never
+    # reported (boot, or a unit with no player), or the peer runs an older image without the field.
+    local_player_age_s: float | None = None
+    # The player process stopped reporting (mesh/aggregator.LOCAL_PLAYER_STALE_S). `local_player`
+    # then still carries the speaker's identity and URL, but with `attached` and `playing` forced
+    # False — a report from a dead player used to read `attached: true` for ever.
+    #
+    # DEFAULTS FALSE, for the same reason `has_player` defaults True: a peer on an older image
+    # sends no such field, and reading that as "offline" would mark every existing speaker dead.
+    local_player_offline: bool = False
+    # The container healthcheck's last result, read from /data/health.json and passed on verbatim.
+    # None = unknown (no file, unreadable, or an older image). The keys belong to the healthcheck
+    # and are not fixed here, so a consumer must treat a key it does not know as "unknown" too.
+    health: dict | None = None
+    # Seconds since the healthcheck last WROTE its verdict: from the file's `checked_at`, or from
+    # the file mtime when that key is not a sane time (mesh/aggregator._read_health). It is not
+    # "seconds since the check last ran". An unhealthy verdict is written on every run (30 s), but a
+    # healthy one is rewritten only every healthcheck.HEALTHY_REFRESH_S (300 s), so a healthy unit
+    # reads up to about 330 s here. A consumer must put its "the check stopped" limit above that.
+    health_age_s: float | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -201,13 +262,19 @@ class UnitSnapshot:
             "local_player": self.local_player,
             "has_player": self.has_player,
             "hostname": self.hostname,
+            "mdns_hostname": self.mdns_hostname,
             "server_id": self.server_id,
             "follows_unit_id": self.follows_unit_id,
             "calibration": self.calibration,
+            "local_player_age_s": self.local_player_age_s,
+            "local_player_offline": self.local_player_offline,
+            "health": self.health,
+            "health_age_s": self.health_age_s,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> UnitSnapshot:
+        health = d.get("health")
         return cls(
             unit_id=d["unit_id"],
             name=d.get("name", d["unit_id"]),
@@ -216,10 +283,15 @@ class UnitSnapshot:
             players=[PlayerState.from_dict(p) for p in d.get("players", [])],
             local_player=d.get("local_player"),
             has_player=bool(d.get("has_player", True)),
-            hostname=d.get("hostname"),
+            hostname=_host_label(d.get("hostname")),
+            mdns_hostname=_single_label(d.get("mdns_hostname")),
             server_id=d.get("server_id"),
             follows_unit_id=d.get("follows_unit_id"),
             calibration=d.get("calibration") or {},
+            local_player_age_s=_optional_float(d.get("local_player_age_s")),
+            local_player_offline=bool(d.get("local_player_offline", False)),
+            health=health if isinstance(health, dict) else None,
+            health_age_s=_optional_float(d.get("health_age_s")),
         )
 
 

@@ -49,7 +49,10 @@ def test_update_on_a_damaged_file_refuses_rather_than_resetting(manager):
 
     Path(manager.settings_file).write_text("{ this is not json")
 
-    with pytest.raises(Exception):
+    # The parse error itself, not any Exception: a bare `Exception` here also passes when the
+    # write fails for an unrelated reason (a TypeError in the merge, a refused value), and then
+    # this test stops proving that the DAMAGE is what stopped the write.
+    with pytest.raises(json.JSONDecodeError):
         manager.update_settings({"deviceName": "Hallway"})
 
     # The damaged file is left exactly as found — not silently replaced with defaults+patch.

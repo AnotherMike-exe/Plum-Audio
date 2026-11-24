@@ -1,0 +1,16 @@
+# Plum-Audio — run the health watchdog about once a minute.
+#
+# OnUnitActiveSec counts from the last run, so a slow restart does not stack runs. OnBootSec gives
+# the container time to start, and the watchdog also ignores a container that is up for less than
+# its limits. A restart needs the same finding on two runs in a row, so the period is part of the
+# rule: keep it well under 200 s (STRIKE_MAX_AGE_S in plum-updater.sh).
+[Unit]
+Description=Plum-Audio health watchdog timer
+
+[Timer]
+OnBootSec=180
+OnUnitActiveSec=60
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target

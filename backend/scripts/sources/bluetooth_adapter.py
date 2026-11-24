@@ -39,6 +39,7 @@ import subprocess
 import time
 from collections.abc import Callable
 
+from background_tasks import spawn
 from dbus_next import BusType, Message, MessageType, Variant
 from dbus_next.aio import MessageBus
 
@@ -105,6 +106,12 @@ class BluetoothAdapter:
         self._connected_at: dict[str, float] = {}  # device object path -> monotonic connect time
         self._carried_audio: set[str] = set()  # addresses whose CURRENT connection reached capture
         self._stale_strikes: dict[str, int] = {}  # address -> consecutive failed connections
+        # Held across every decision that starts, retargets or stops capture. See _on_device_props.
+        self._device_lock = asyncio.Lock()
+        # Set by stop() under that lock. A signal handler that waited for the lock behind stop()
+        # reads it and does nothing: without it, that handler starts a capture after stop() returned,
+        # and nothing owns the capture any more.
+        self._stopped = False
 
     # -- listener registration (bluetooth_avrcp hooks in here) ----------------
 
@@ -128,6 +135,7 @@ class BluetoothAdapter:
     # -- lifecycle -----------------------------------------------------------
 
     async def start(self) -> None:
+        self._stopped = False
         self._bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
         logger.info("[%s] connected to system D-Bus", self.instance.source_id)
         await self._subscribe()
@@ -136,7 +144,9 @@ class BluetoothAdapter:
         await self._scan_existing()
 
     async def stop(self) -> None:
-        await self._stop_capture()
+        async with self._device_lock:  # not underneath a signal handler that is mid-retarget
+            self._stopped = True
+            await self._stop_capture()
         await self._unregister_agent()
         # Stop advertising. We configured the radio on the way up, so leaving it discoverable and
         # pairable on the way down means disabling Bluetooth in the GUI silently leaves the unit
@@ -294,7 +304,7 @@ class BluetoothAdapter:
         except (ValueError, AttributeError):
             return None
         if iface == DEVICE_IFACE:
-            asyncio.ensure_future(self._on_device_props(msg.path, unwrapped))
+            spawn(self._on_device_props(msg.path, unwrapped), f"bt-device-props:{self.instance.source_id}")
         for cb in self._props_listeners:
             with contextlib.suppress(Exception):
                 cb(msg.path, iface, unwrapped)
@@ -303,14 +313,14 @@ class BluetoothAdapter:
     def _on_interfaces_added(self, path: str, interfaces: dict) -> None:
         names = list(interfaces)
         if DEVICE_IFACE in names:
-            asyncio.ensure_future(self._on_device_props(path, {}))
+            spawn(self._on_device_props(path, {}), f"bt-device-added:{self.instance.source_id}")
         for cb in self._object_listeners:
             with contextlib.suppress(Exception):
                 cb(path, names, True)
 
     def _on_interfaces_removed(self, path: str, interfaces: list[str]) -> None:
         if DEVICE_IFACE in interfaces and path in self._connected:
-            asyncio.ensure_future(self._drop_device(path))
+            spawn(self._drop_device(path), f"bt-device-removed:{self.instance.source_id}")
         for cb in self._object_listeners:
             with contextlib.suppress(Exception):
                 cb(path, list(interfaces), False)
@@ -341,30 +351,44 @@ class BluetoothAdapter:
         re-read Connected/UUIDs rather than trusting `changed`: UUIDs often arrive AFTER Connected
         (service discovery finishes late), which is the race Plum-Snapcast handled with a second
         'UUIDs' branch and a "known paired device reconnecting" special case.
+
+        Serialised with `_drop_device` under `_device_lock`. Each D-Bus signal runs this as its own
+        task, and everything below awaits: two signals back to back (Connected, then UUIDs) each
+        read `_connected`, each reached `_start_capture`, and while one sat in `_stop_capture`
+        killing the old arecord the other started a loop — then the first started a second. The
+        assignment to `_capture_task` kept one and orphaned the other, whose arecord went on
+        holding the bluealsa PCM so the kept one could never open it. One at a time, the second
+        signal finds the device already adopted and returns.
         """
+        async with self._device_lock:
+            if self._stopped:
+                return  # queued behind stop(): the adapter is down, and nothing may start a capture
+            await self._on_device_props_locked(path, changed)
+
+    async def _on_device_props_locked(self, path: str, changed: dict) -> None:
         if not path.startswith(self.instance.adapter_path + "/"):
             return  # a device on another adapter
         props = await self._props_iface(path)
         if props is None:
             if path in self._connected:
-                await self._drop_device(path)
+                await self._drop_device_locked(path)
             return
         try:
             connected = bool((await props.call_get(DEVICE_IFACE, "Connected")).value)
         except Exception:  # noqa: BLE001 - device vanished
             if path in self._connected:
-                await self._drop_device(path)
+                await self._drop_device_locked(path)
             return
 
         if not connected:
             if path in self._connected:
-                await self._drop_device(path)
+                await self._drop_device_locked(path)
             return
         if not await self._is_audio_source(props):
             # Connected but not (yet) an audio source. If we adopted it earlier on a partial UUID
             # list, let it go again.
             if path in self._connected:
-                await self._drop_device(path)
+                await self._drop_device_locked(path)
             return
         if path in self._connected:
             return  # already adopted; nothing changed that matters
@@ -380,6 +404,13 @@ class BluetoothAdapter:
         await self._start_capture(address)
 
     async def _drop_device(self, path: str) -> None:
+        """A device went away. Serialised with `_on_device_props` — see the note there."""
+        async with self._device_lock:
+            if self._stopped:
+                return  # a drop can hand capture to another phone, so it is refused too
+            await self._drop_device_locked(path)
+
+    async def _drop_device_locked(self, path: str) -> None:
         address = self._connected.pop(path, None)
         connected_at = self._connected_at.pop(path, None)
         if address is None:

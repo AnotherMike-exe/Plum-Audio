@@ -11,9 +11,10 @@
 # Debian release.
 
 # --- Frontend build: the React GUI nginx serves from /app/www ------------------------------------
-# Node 24 because it is the ACTIVE LTS, and checks.yml pins the same major — move BOTH together or
-# neither, or CI builds the GUI on a runtime the image never runs. Odd majors (25) are never LTS.
-FROM node:24-alpine AS webui
+# Node 26 because it is the ACTIVE LTS ("Lithium", from October 2026), and checks.yml pins the same
+# major — move BOTH together or neither, or CI builds the GUI on a runtime the image never runs.
+# Odd majors (25, 27) are never LTS. @types/node follows the same major.
+FROM node:26-alpine AS webui
 WORKDIR /ui
 COPY frontend/package*.json ./
 RUN npm ci
@@ -85,14 +86,24 @@ ARG GO_LIBRESPOT_VERSION=0.7.4
 # only if the binary doesn't answer. Unlike aiosendspin/shairport-sync there's no package metadata to
 # query, so without this the About page would have no way to say what got downloaded.
 ENV PLUM_GO_LIBRESPOT_VERSION=${GO_LIBRESPOT_VERSION}
+# SHA-256 of the release tarball for EACH built arch, pinned beside the version. The download is a
+# root-owned binary that then holds a user's Spotify credentials, and without this a replaced
+# release asset or a tampered transfer installs silently. These belong to v0.7.4 and to nothing
+# else: bump GO_LIBRESPOT_VERSION and both lines MUST be recomputed, or the build fails here — which
+# is the point. Upstream publishes no checksum file for this release, so these were computed from
+# the assets as downloaded on 2026-11-24 (trust on first use):
+#   curl -fsSLO <release url>/go-librespot_linux_{arm64,x86_64}.tar.gz && sha256sum *.tar.gz
+ARG GO_LIBRESPOT_SHA256_ARM64=62b6c7ebee6abb1f59fa3cf20a9374dd5e8c5c1ca5dab329dd312f66b59faa8d
+ARG GO_LIBRESPOT_SHA256_AMD64=ee521eed02100ee4aa9919a147304aed5afc908c5a0c99f515c3da0aed89acf7
 RUN set -eux; \
     case "$(dpkg --print-architecture)" in \
-        arm64) GLR_ARCH=arm64 ;; \
-        amd64) GLR_ARCH=x86_64 ;; \
+        arm64) GLR_ARCH=arm64; GLR_SHA256="${GO_LIBRESPOT_SHA256_ARM64}" ;; \
+        amd64) GLR_ARCH=x86_64; GLR_SHA256="${GO_LIBRESPOT_SHA256_AMD64}" ;; \
         *) echo "unsupported arch" >&2; exit 1 ;; \
     esac; \
     curl -fsSL -o /tmp/glr.tar.gz \
         "https://github.com/devgianlu/go-librespot/releases/download/v${GO_LIBRESPOT_VERSION}/go-librespot_linux_${GLR_ARCH}.tar.gz"; \
+    echo "${GLR_SHA256}  /tmp/glr.tar.gz" | sha256sum -c -; \
     tar -xzf /tmp/glr.tar.gz -C /usr/local/bin go-librespot; \
     rm /tmp/glr.tar.gz; \
     chmod +x /usr/local/bin/go-librespot
@@ -149,10 +160,16 @@ RUN mkdir -p /config /data /media
 # in practice (mDNS needs L2); EXPOSE is documentation here.
 EXPOSE 80 5001 5002 8927 8928 8929 5050 5354
 
-# The config API is the cheapest liveness proof for the whole tree: it is a separate process from
-# the audio loop, so a green healthcheck means supervisord itself is up and serving — the audio
-# side's own health is the mesh API's business (/api/mesh/view), not Docker's.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${PLUM_CONFIG_API_PORT:-5002}/api/settings" >/dev/null || exit 1
+# scripts/healthcheck.py: every supervisord program RUNNING, the config API answering, the player
+# port accepting TCP and the player's health report fresh. The last two are skipped on a unit with no
+# audio output, which has no player program at all. This replaced a curl against the config API
+# alone — a process separate from the audio path, so that probe stayed green while the player was
+# FATAL or wedged, which are the states that used to need a power cycle.
+#
+# Docker does not restart an unhealthy container and there is deliberately no Docker socket in
+# here, so the script also writes its verdict to /data/health.json for the mesh snapshot and for a
+# host agent to act on. --timeout is above the sum of the script's own timeouts (6 + 3 + 2 s).
+HEALTHCHECK --interval=30s --timeout=15s --start-period=60s --retries=3 \
+    CMD python3 /app/scripts/healthcheck.py || exit 1
 
 CMD ["/app/entrypoint.sh"]

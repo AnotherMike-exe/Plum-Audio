@@ -78,6 +78,7 @@ import time
 from dataclasses import replace
 
 from aiosendspin.models.types import RepeatMode
+from background_tasks import spawn
 from dbus_next import Variant
 
 logger = logging.getLogger("plum.bluetooth_avrcp")
@@ -325,7 +326,7 @@ class BluetoothAvrcp:
                 self._player_path = path
                 logger.info("[bluetooth-%s] AVRCP player bound: %s", self.instance_id, path)
                 self._ensure_ticker()
-                asyncio.ensure_future(self._seed_from_player())
+                spawn(self._seed_from_player(), f"avrcp-seed-player:{self.instance_id}")
             elif self._player_path == path:
                 logger.info("[bluetooth-%s] AVRCP player gone", self.instance_id)
                 self._player_path = None
@@ -334,7 +335,7 @@ class BluetoothAvrcp:
         if TRANSPORT_IFACE in interfaces:
             if present:
                 self._transport_path = path
-                asyncio.ensure_future(self._seed_from_transport())
+                spawn(self._seed_from_transport(), f"avrcp-seed-transport:{self.instance_id}")
             elif self._transport_path == path:
                 self._transport_path = None
 
@@ -358,7 +359,7 @@ class BluetoothAvrcp:
             self._player_path = path
             logger.info("[bluetooth-%s] AVRCP player adopted via PropertiesChanged: %s", self.instance_id, path)
             self._ensure_ticker()
-            asyncio.ensure_future(self._seed_from_player())
+            spawn(self._seed_from_player(), f"avrcp-seed-player:{self.instance_id}")
         if path != self._player_path:
             return
         if "Track" in changed:
@@ -674,13 +675,14 @@ class BluetoothAvrcp:
                 self._track_key = "|".join(str(values.get(k, "")) for k in ("Item", "Title", "Album", "TrackNumber"))
                 self.cover_art.note_track(self._track_key)
             if img_handle:
-                asyncio.ensure_future(
+                spawn(
                     self.cover_art.handle_track(
                         self.adapter.active_address,
                         self._obex_port,
                         str(img_handle),
                         self._track_key or "",
-                    )
+                    ),
+                    f"avrcp-cover-art:{self.instance_id}",
                 )
         # Do NOT assume position 0 here. BlueZ re-sends Track for reasons that are not a new track
         # (ImgHandle arriving late, a re-read when a controller joins), so anchoring 0 on every
@@ -694,7 +696,10 @@ class BluetoothAvrcp:
             is_new_track = bool(title) and title != self._last_title
             if title:
                 self._last_title = str(title)
-            asyncio.ensure_future(self._reanchor_now(fallback_freeze=False, new_track=is_new_track))
+            spawn(
+                self._reanchor_now(fallback_freeze=False, new_track=is_new_track),
+                f"avrcp-reanchor-track:{self.instance_id}",
+            )
 
     def _apply_status(self, status: str) -> None:
         playing = status.lower() in PLAYING_STATES
@@ -711,7 +716,10 @@ class BluetoothAvrcp:
         # place and, because the role clamps at track_duration, parks at 100%. This is the identical
         # trap spotify_golibrespot._apply_speed documents — BlueZ just makes it easier to hit,
         # because it reports Position sporadically. Async because it needs a D-Bus round trip.
-        asyncio.ensure_future(self._reanchor_now(fallback_freeze=not playing, known_position=position_now))
+        spawn(
+            self._reanchor_now(fallback_freeze=not playing, known_position=position_now),
+            f"avrcp-reanchor-status:{self.instance_id}",
+        )
 
     async def _reanchor_now(
         self, *, fallback_freeze: bool, new_track: bool = False, known_position: float | None = None

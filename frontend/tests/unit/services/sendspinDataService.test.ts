@@ -562,3 +562,39 @@ describe('the iOS slider double-fire guard', () => {
     expect(post).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('mapViewToModel: a unit whose own player stopped reporting', () => {
+  const LP = { player_id: 'player-210', name: 'Player-210', url: 'ws://192.0.2.10:8928/sendspin' };
+  const withUnit210 = (patch: Partial<MeshView['units'][number]>): MeshView => ({
+    units: [{ ...VIEW.units[0], ...patch }, VIEW.units[1]],
+  });
+  const offlineOf = (view: MeshView, id = 'player-210') =>
+    mapViewToModel(view, new Map(), new Map()).clients.find((c) => c.id === id)?.offline;
+
+  it('marks the speaker offline from the unit flag', () => {
+    expect(offlineOf(withUnit210({ local_player: { ...LP, attached: false }, local_player_offline: true }))).toBe(true);
+  });
+
+  it('marks the speaker offline from the self-report alone', () => {
+    expect(offlineOf(withUnit210({ local_player: { ...LP, attached: false, offline: true } }))).toBe(true);
+  });
+
+  it('marks a speaker that no unit lists', () => {
+    const view = withUnit210({ players: [], local_player: { ...LP, attached: false, offline: true }, local_player_offline: true });
+    expect(offlineOf(view)).toBe(true);
+  });
+
+  it('reads a missing field as not offline (a unit with an older image)', () => {
+    expect(offlineOf(withUnit210({ local_player: { ...LP, attached: true } }))).toBeFalsy();
+    expect(offlineOf(VIEW)).toBeFalsy();
+  });
+
+  it('does not mark the other players of that unit', () => {
+    const view = withUnit210({
+      players: [...VIEW.units[0].players, { player_id: 'guest-1', name: 'Guest', connected: true, group_id: 'gA', url: 'ws://192.0.2.50:8928/sendspin' }],
+      local_player: { ...LP, attached: false, offline: true },
+      local_player_offline: true,
+    });
+    expect(offlineOf(view, 'guest-1')).toBeFalsy();
+  });
+});

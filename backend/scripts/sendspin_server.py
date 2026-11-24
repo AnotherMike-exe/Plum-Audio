@@ -51,6 +51,7 @@ import socket
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 
+import cors_policy
 import fifo_paths
 import sendspin_identity
 import unit_identity
@@ -80,6 +81,7 @@ from aiosendspin.server.server import (
     ConnectionReason,
     SendspinServer,
 )
+from background_tasks import spawn
 from lifecycle import install_shutdown_handlers
 from mesh.model import PlayerState, SourceState, UnitSnapshot
 from sources import airplay_config, bluetooth_config, spotify_config
@@ -155,6 +157,10 @@ CANCEL_POLL_S = 0.25  # how long to wait between cancels of a dial task — see 
 # walking to a speaker to read it off a display. Bounded so an abandoned dialog cannot pin a
 # client in the pairing state forever, which would leave it unable to play.
 PAIRING_PIN_TIMEOUT_S = 180.0
+# Waits between attempts to attach the local player in _attach_local_player_once. Short and bounded:
+# the failures seen are group churn during connect, which clears in well under a second, and a unit
+# that cannot attach must release the player (see that method) rather than hold it for minutes.
+LOCAL_ATTACH_BACKOFF_S: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
 
 
 def _security_of(client) -> str | None:
@@ -341,7 +347,17 @@ class SourceFeeder:
             ValueError: the path does not name a file directly inside FIFO_DIR.
         """
         resolved = os.path.realpath(self.fifo_path)
-        if os.path.dirname(resolved) != os.path.realpath(fifo_paths.FIFO_DIR):
+        base = os.path.realpath(fifo_paths.FIFO_DIR)
+        if os.path.dirname(resolved) != base:
+            raise ValueError(f"FIFO path must be a file directly inside {fifo_paths.FIFO_DIR}")
+        # REDUNDANT, and it must stay that way. The `dirname` comparison above is the guard: it
+        # already implies this prefix test, which can therefore never fire and changes nothing. It
+        # is here only because a prefix test after a normalisation is the one sanitiser shape
+        # CodeQL's `py/path-injection` recognises. It is the WEAKER check by itself (a bare
+        # `startswith(base)` passes `/tmpfoo`), so never let it replace the line above — see
+        # HARD-WON-LESSONS. The separator is appended unless `base` is the root, which ends in one.
+        prefix = base if base.endswith(os.sep) else base + os.sep
+        if not resolved.startswith(prefix):
             raise ValueError(f"FIFO path must be a file directly inside {fifo_paths.FIFO_DIR}")
         return resolved
 
@@ -365,7 +381,11 @@ class SourceFeeder:
         # when the FIFO already exists.
         path = self._checked_fifo_path()
         loop = asyncio.get_running_loop()
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        # O_NOFOLLOW: `path` is already resolved, so its last component is not a symlink when the
+        # check runs. If something swaps one in between the check and this call, the open fails
+        # with ELOOP instead of following it out of FIFO_DIR. A FIFO opens the same with or without
+        # the flag.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
         pipe = os.fdopen(fd, "rb", buffering=0)
         reader = asyncio.StreamReader()
         protocol = asyncio.StreamReaderProtocol(reader)
@@ -548,6 +568,13 @@ class PlumSendspinServer:
         # is: a speaker that is idle or foreign-held must not be dialled just to carry a number, and
         # the value has to survive every reconnect or the room drifts out again on the next roam.
         self._player_delay_ms: dict[str, int] = {}
+        # Foreign speakers this unit adopted and did not release: listener URL -> the source the
+        # speaker renders, or None while it is routed to nothing. This is the record of user intent
+        # that lets a speaker that drops (an ESP32 reboot, a WiFi flap) come back with no user act.
+        # Keyed by URL because the URL is the one identity mDNS and the handshake share. An entry
+        # exists from a successful adopt until a release, or until the speaker leaves on purpose —
+        # see _forget_adoption_on_goodbye. Never persisted: a server restart starts with none.
+        self._adopted: dict[str, str | None] = {}
         self._metadata_readers: dict[str, AirplayMetadataReader] = {}  # source_id -> shairport pipe reader
         self._airplay_remotes: dict[str, AirplayRemote] = {}  # source_id -> per-instance MPRIS remote
         self._spotify_monitors: dict[str, SpotifyGoLibrespot] = {}  # source_id -> go-librespot event monitor
@@ -974,37 +1001,62 @@ class PlumSendspinServer:
         return True
 
     async def stop(self) -> None:
+        """Shut everything down. Every step runs, whatever the steps before it did.
+
+        This was a plain chain of awaits, so one step that raised — a D-Bus call on a bus that had
+        already gone, a monitor whose socket was closed — skipped everything after it, and the last
+        steps are the ones that matter: `stop_server()` and `close()` release port 8927 and tell
+        every client we are going. Skipping them leaves the next start to fail on a bound port.
+        """
         self._stop_evt.set()
-        for remote in self._airplay_remotes.values():
-            await remote.close()
+        for source_id, remote in list(self._airplay_remotes.items()):
+            await self._stop_step(f"airplay remote {source_id}", remote.close())
         self._airplay_remotes.clear()
-        for monitor in self._spotify_monitors.values():
-            await monitor.stop()
+        for source_id, monitor in list(self._spotify_monitors.items()):
+            await self._stop_step(f"spotify monitor {source_id}", monitor.stop())
         self._spotify_monitors.clear()
-        for avrcp in self._bluetooth_avrcp.values():
-            await avrcp.stop()
+        for source_id, avrcp in list(self._bluetooth_avrcp.items()):
+            await self._stop_step(f"bluetooth avrcp {source_id}", avrcp.stop())
         self._bluetooth_avrcp.clear()
-        for cover_art in self._bluetooth_coverart.values():
-            await cover_art.stop()
+        for source_id, cover_art in list(self._bluetooth_coverart.items()):
+            await self._stop_step(f"bluetooth cover art {source_id}", cover_art.stop())
         self._bluetooth_coverart.clear()
-        for adapter in self._bluetooth_adapters.values():
-            await adapter.stop()
+        for source_id, adapter in list(self._bluetooth_adapters.items()):
+            await self._stop_step(f"bluetooth adapter {source_id}", adapter.stop())
         self._bluetooth_adapters.clear()
         self._source_remotes.clear()
-        for reader in self._metadata_readers.values():
-            await reader.stop()
+        for source_id, reader in list(self._metadata_readers.items()):
+            await self._stop_step(f"metadata reader {source_id}", reader.stop())
         self._metadata_readers.clear()
         for task in self._local_player_tasks:
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        for task in self._local_player_tasks:
+            await self._stop_step("local player task", self._reap(task))
         self._local_player_tasks.clear()
         for source_id in list(self.sources):
-            await self.stop_source(source_id)
+            await self._stop_step(f"source {source_id}", self.stop_source(source_id))
         if self.server:
-            await self.server.stop_server()
-            await self.server.close()
-            self.server = None
+            server, self.server = self.server, None
+            await self._stop_step("sendspin server stop", server.stop_server())
+            await self._stop_step("sendspin server close", server.close())
+
+    @staticmethod
+    async def _reap(task: asyncio.Task) -> None:
+        """Wait for a task we cancelled. Its own CancelledError is the expected end, not a fault."""
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    @staticmethod
+    async def _stop_step(what: str, step: Awaitable[object]) -> None:
+        """Await one shutdown step. Log a failure and return, so the next step still runs.
+
+        Catches `Exception` only: a CancelledError is the shutdown itself being cancelled, and that
+        must go through.
+        """
+        try:
+            await step
+        except Exception:  # noqa: BLE001 - see docstring
+            logger.exception("shutdown: %s failed; continuing", what)
 
     def start_source(
         self, source_id: str, fifo_path: str, fmt: AudioFormat = DEFAULT_FORMAT, *, name: str = ""
@@ -1031,7 +1083,7 @@ class PlumSendspinServer:
         anchor = self.server.get_or_create_client(ANCHOR_PREFIX + source_id)
         group = anchor.group
         feeder = SourceFeeder(source_id, fifo_path, group, fmt)
-        feeder.on_idle = self.release_local_player
+        feeder.on_idle = functools.partial(self._on_source_idle, source_id)
         handle = SourceHandle(source_id, group, feeder, name=name)
         self.sources[source_id] = handle
         if self._primary_source is None:
@@ -1094,6 +1146,7 @@ class PlumSendspinServer:
             if player.group is not None:
                 await player.group.remove_client(player)
             await handle.group.add_client(player)
+        self._note_adopted_route(player_id, source_id)
         logger.info("[%s] attached player %s", source_id, player_id)
 
     async def detach_player(self, source_id: str, player_id: str) -> None:
@@ -1104,6 +1157,7 @@ class PlumSendspinServer:
         player = self.server.get_client(player_id)
         if player is not None:
             await handle.group.remove_client(player)
+            self._note_adopted_route(player_id, None)
             logger.info("[%s] detached player %s", source_id, player_id)
             # Setting a player to "none" must release it, exactly as a source going idle does —
             # otherwise "idle" depends on HOW it got there, and an unrouted speaker stays invisible
@@ -1136,6 +1190,12 @@ class PlumSendspinServer:
             logger.info(
                 "client %s %s", event.client_id, "removed" if isinstance(event, ClientRemovedEvent) else "disconnected"
             )
+            if isinstance(event, ClientDisconnectedEvent):
+                self._forget_adoption_on_goodbye(event.client_id, event.goodbye_reason)
+        if isinstance(event, (ClientAddedEvent, ClientConnectedEvent)) and self._adopted:
+            # An adopted speaker that came back. Off the event handler: the registry entry and the
+            # negotiated roles can land a beat after this event (see ClientConnectedEvent's note).
+            spawn(self._reattach_adopted(event.client_id), "reattach-adopted")
         if isinstance(event, (ClientAddedEvent, ClientUpdatedEvent)):
             # BEFORE anything else: a player asking for more buffer than the feeder can hold starves
             # the whole group, so cap it while it is still joining rather than after it has taken the
@@ -1143,9 +1203,9 @@ class PlumSendspinServer:
             # min_buffer_ms from every client/state and would otherwise undo this on the next one.
             self._clamp_player_min_buffer(event.client_id)
             self._apply_player_delay(event.client_id)
-            asyncio.ensure_future(self._maybe_group_controller(event.client_id))
-            asyncio.ensure_future(self._maybe_pair_via_shared_psk(event.client_id))
-            asyncio.ensure_future(self._apply_pending_volume(event.client_id))
+            spawn(self._maybe_group_controller(event.client_id), "group-controller")
+            spawn(self._maybe_pair_via_shared_psk(event.client_id), "pair-shared-psk")
+            spawn(self._apply_pending_volume(event.client_id), "apply-pending-volume")
 
     def _clamp_player_min_buffer(self, client_id: str) -> None:
         """Cap a player's `min_buffer_ms` at what this feeder can actually serve.
@@ -1527,6 +1587,8 @@ class PlumSendspinServer:
         existing = self._connected_player_at(url)
         if existing is not None:
             await self.attach_player(source_id, existing)
+            # Recorded after the attach, as on the dial path below: a failed attach is not an adoption.
+            self._adopted[url] = source_id
             logger.info("[%s] foreign speaker %s (%s) already connected; kept the dial", source_id, existing, url)
             return existing
         # Otherwise the registration is stale, and a stale one must be torn down before we redial:
@@ -1535,8 +1597,11 @@ class PlumSendspinServer:
         # device whose port is plainly open. Measured on .100.21 against a Home Assistant Voice PE,
         # seconds apart on the same URL: adopt alone -> ok:false; release (whose only extra step is
         # this teardown) then adopt -> ok:true.
+        # Not adopted while the old dial dies and the new one lands: note_speaker_seen must not
+        # dial in that window.
+        self._adopted.pop(url, None)
         await self._stop_dialing(url)
-        self.server.connect_to_client(url, connection_reason=ConnectionReason.PLAYBACK, retry_initial_connection=True)
+        self._dial_adopted(url)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
         while loop.time() < deadline:
@@ -1554,12 +1619,153 @@ class PlumSendspinServer:
                 registered = self.server.get_client_url(client.client_id)
                 if registered == url or client.client_id == player_id or client.client_id not in before:
                     self.server.register_client_url(client.client_id, url)
-                    await self.attach_player(source_id, client.client_id)  # defuses the eviction timer
+                    try:
+                        await self.attach_player(source_id, client.client_id)  # defuses the eviction timer
+                    except Exception:
+                        # Same reason as the timeout below: a failed adopt keeps no immortal dialer.
+                        await self._stop_dialing(url)
+                        raise
+                    # Recorded only now, after OUR attach: the reconnect handler (_reattach_adopted)
+                    # reads this table, and two attaches racing for one speaker would restart the
+                    # stream twice for the whole group.
+                    self._adopted[url] = source_id
                     logger.info("[%s] adopted foreign speaker %s (%s)", source_id, client.client_id, url)
                     return client.client_id
             await asyncio.sleep(0.1)
         logger.warning("[%s] foreign speaker at %s never connected", source_id, url)
+        # The dial retries without limit now, so a failed adopt must not leave it behind: the caller
+        # was told "no", and an immortal dialer would take the speaker minutes or hours later and
+        # hold it, routed to nothing.
+        self._adopted.pop(url, None)
+        await self._stop_dialing(url)
         return None
+
+    def _dial_adopted(self, url: str) -> None:
+        """Dial an adopted speaker for playback, with a dial task that never gives up.
+
+        `retry_indefinitely` is the fix for a speaker that drops and stays lost. Without it the
+        library ends the dial task once its backoff reaches 300 s — about 8.5 minutes of outage —
+        and nothing dials the speaker again: the only caller of adopt is a GUI act.
+
+        It does not break the re-dial rule (CLAUDE.md), and the reason is worth stating. The rule
+        forbids a SECOND registration for a URL. This is still one `connect_to_client` per adopt,
+        made only after `_stop_dialing` proved the old task dead, or by note_speaker_seen when no
+        task exists. A dial task that retries is one dialer, not many. And it still ends where it
+        must: `_stop_dialing` (release, re-adopt, failed adopt) calls `disconnect_from_client`,
+        which drops the stored options, and the library itself stops on a goodbye that means the
+        speaker left on purpose (`another_server`, `user_request`, `shutdown`).
+        """
+        assert self.server is not None
+        self.server.connect_to_client(
+            url,
+            connection_reason=ConnectionReason.PLAYBACK,
+            retry_initial_connection=True,
+            retry_indefinitely=True,
+        )
+
+    def _note_adopted_route(self, player_id: str, source_id: str | None) -> None:
+        """Keep an adopted speaker's remembered source in step with where it was last routed."""
+        if not self._adopted or self.server is None:
+            return
+        url = self.server.get_client_url(player_id)
+        if url in self._adopted:
+            self._adopted[url] = source_id
+
+    async def _on_source_idle(self, source_id: str) -> None:
+        """A source went idle and detached every player (true none, ROUTING-MODEL rule 1).
+
+        An adopted speaker stays adopted — we still hold it — but it is now routed to nothing, so a
+        later reconnect must not put it back on this source. Then release our own player, which is
+        what this hook has always done.
+        """
+        for url, routed in self._adopted.items():
+            if routed == source_id:
+                self._adopted[url] = None
+        await self.release_local_player()
+
+    def _forget_adoption_on_goodbye(self, client_id: str, reason: GoodbyeReason | None) -> None:
+        """Drop an adoption when the speaker says it left on purpose.
+
+        No goodbye (power loss, WiFi flap), `restart` and `shutdown` are a speaker that went away
+        and may return: keep the adoption. Every other reason is a decision — another server took
+        it, a user disconnected it, it refuses us — and dialling it again would start the fight
+        over the one websocket that the routing rules exist to prevent. `concurrent_attempt` is in
+        that set on purpose: our PLAYBACK dial loses only to a connection that outranks it.
+        """
+        if not self._adopted or self.server is None:
+            return
+        if reason in (None, GoodbyeReason.RESTART, GoodbyeReason.SHUTDOWN):
+            return
+        url = self.server.get_client_url(client_id)
+        if url is None or url not in self._adopted:
+            return
+        del self._adopted[url]
+        logger.info("speaker %s left with goodbye %s; it is no longer adopted", client_id, reason.value)
+        if reason is GoodbyeReason.CONCURRENT_ATTEMPT:
+            # The library keeps retrying after this reason. Stop it: whoever holds the speaker won.
+            spawn(self._stop_dialing(url), "stop-dial-after-concurrent-attempt")
+
+    async def _reattach_adopted(self, client_id: str, settle_s: float = 5.0) -> None:
+        """Put an adopted speaker that reconnected back on the source it was rendering.
+
+        A short drop needs nothing: the client object is still in its group and the handshake
+        hands it the live stream. A long one does — the library evicts a disconnected client from
+        the registry, so the speaker returns as a NEW client in a solo group: connected, in the
+        GUI, and silent. `attach_player` is idempotent, so the short case costs nothing here.
+        """
+        assert self.server is not None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + settle_s
+        while True:
+            client = self.server.get_client(client_id)
+            if client is not None and client.is_connected and has_role_family("player", client.negotiated_role_ids):
+                break
+            if loop.time() >= deadline:
+                return  # not a speaker, or it did not stay
+            await asyncio.sleep(0.1)
+        url = self.server.get_client_url(client_id)
+        source_id = self._adopted.get(url) if url else None
+        if source_id is None or source_id not in self.sources:
+            return  # not adopted, or adopted and routed to nothing
+        if any(client.group is handle.group for handle in self.sources.values()):
+            # Already on a source. Ours: the short-drop case, nothing to do but defuse the timer the
+            # drop armed. Another: something routed it there in the meantime, which is newer intent.
+            self._cancel_pending_cleanup(client_id)
+            return
+        await self.attach_player(source_id, client_id)
+        if self._adopted.get(url) != source_id:
+            # The adoption ended while the attach awaited (a release, or a goodbye). The release
+            # ran its detach before our add landed, so this attach would undo it: take it back.
+            player = self.server.get_client(client_id)
+            handle = self.sources.get(source_id)
+            if player is not None and handle is not None and player.group is handle.group:
+                await self.detach_player(source_id, client_id)
+            logger.info(
+                "[%s] speaker %s (%s) was released during its re-attach; left detached", source_id, client_id, url
+            )
+            return
+        logger.info("[%s] adopted speaker %s (%s) came back; re-attached", source_id, client_id, url)
+
+    def note_speaker_seen(self, url: str) -> None:
+        """mDNS shows a speaker at `url`. If we adopted it and do not hold it, dial it now.
+
+        Called by the neighbourhood for every resolved `_sendspin._tcp` record, so it must be cheap
+        and safe to repeat. Two cases, and neither adds a registration to one that exists:
+
+          - A dial task is alive and sleeping in its backoff (up to 300 s). `connect_to_client` on
+            an existing task only wakes it, so the speaker is back in about a second, not minutes.
+          - No dial task (the library ended it on a `shutdown` goodbye, or it died). Then there is
+            no registration for the URL, and one new dial is the single registration the rule
+            allows.
+
+        A released speaker is not in `_adopted`, so it is never dialled from here.
+        """
+        if self.server is None or url not in self._adopted:
+            return
+        if self._connected_player_at(url) is not None:
+            return  # we hold it; never re-dial a speaker we already hold
+        logger.info("adopted speaker at %s is on mDNS again; dialling", url)
+        self._dial_adopted(url)
 
     def _connected_player_at(self, url: str) -> str | None:
         """The client id of the render endpoint we already hold a live connection to at `url`.
@@ -1672,6 +1878,11 @@ class PlumSendspinServer:
         does not actually stop the dialer, so a release would hand the speaker back and then redial
         it about a second later, which reads as a release that silently did nothing.
         """
+        # Forget the adoption FIRST, under both URLs we might know it by. Everything that dials an
+        # adopted speaker again reads this table, and a released speaker must stay released.
+        for known in (url, self.server.get_client_url(player_id) if self.server is not None else None):
+            if known:
+                self._adopted.pop(known, None)
         await self.detach_player(source_id, player_id)
         if self.server is not None:
             target = url or self.server.get_client_url(player_id)
@@ -1802,6 +2013,9 @@ class PlumSendspinServer:
             players=players,
             has_player=self.has_player,
             hostname=socket.gethostname(),
+            # The name from Settings -> Device, which the kernel hostname never carries. Read per
+            # snapshot (one stat when the file did not change), so a rename reaches peers live.
+            mdns_hostname=cors_policy.mdns_hostname(),
             # Our Sendspin id (an X25519 pubkey under 9.x), so peers can map the server a roamed
             # player reports itself attached to back onto a unit. Without this `follow` cannot tell
             # one of our servers from Music Assistant. None until start() has run.
@@ -2051,32 +2265,31 @@ class PlumSendspinServer:
             return
         reader = self._metadata_readers.get(source_id)  # AirPlay only; None for Spotify
         if isinstance(event, ControllerPlayEvent):
-            asyncio.ensure_future(remote.play())
+            spawn(remote.play(), f"transport-play:{source_id}")
             if reader is not None:
                 reader.apply_command("play")
         elif isinstance(event, ControllerPauseEvent):
-            asyncio.ensure_future(remote.pause())
+            spawn(remote.pause(), f"transport-pause:{source_id}")
             if reader is not None:
                 reader.apply_command("pause")
         elif isinstance(event, ControllerNextEvent):
-            asyncio.ensure_future(remote.next_track())
+            spawn(remote.next_track(), f"transport-next:{source_id}")
         elif isinstance(event, ControllerPreviousEvent):
-            asyncio.ensure_future(remote.previous_track())
+            spawn(remote.previous_track(), f"transport-previous:{source_id}")
         elif isinstance(event, ControllerRepeatEvent):
             # Only sources whose remote can honour it advertise repeat (so a conformant controller
             # never sends this to AirPlay); guard anyway. Drive the source, and optimistically reflect
             # the new mode to every GUI on the group — the daemon's own event stream re-confirms it.
             if hasattr(remote, "set_repeat"):
-                asyncio.ensure_future(remote.set_repeat(event.mode))
+                spawn(remote.set_repeat(event.mode), f"transport-repeat:{source_id}")
                 controller = _group.group_role("controller")
                 if controller is not None:
                     controller.set_repeat(event.mode)
-        elif isinstance(event, ControllerShuffleEvent):
-            if hasattr(remote, "set_shuffle"):
-                asyncio.ensure_future(remote.set_shuffle(event.shuffle))
-                controller = _group.group_role("controller")
-                if controller is not None:
-                    controller.set_shuffle(event.shuffle)
+        elif isinstance(event, ControllerShuffleEvent) and hasattr(remote, "set_shuffle"):
+            spawn(remote.set_shuffle(event.shuffle), f"transport-shuffle:{source_id}")
+            controller = _group.group_role("controller")
+            if controller is not None:
+                controller.set_shuffle(event.shuffle)
 
     def register_player(self, player_id: str, player_url: str) -> None:
         """Register this unit's player as routable, WITHOUT holding a connection to it.
@@ -2136,9 +2349,31 @@ class PlumSendspinServer:
         if not await self._await_source(source_id, timeout_s=30.0):
             logger.warning("[%s] source never appeared; local player left unattached", source_id)
             return
-        with contextlib.suppress(Exception):
-            await self.attach_player(source_id, player_id)
-            logger.info("[%s] local player %s attached (mesh-owned)", source_id, player_id)
+        # Bounded retry. A failure here used to be swallowed, which left the player connected,
+        # unattached and silent with nothing in the log. One attempt, then one more after each
+        # backoff step.
+        for delay in (*LOCAL_ATTACH_BACKOFF_S, None):
+            try:
+                await self.attach_player(source_id, player_id)
+            except Exception:  # noqa: BLE001 - transient during connect/route churn; retried below
+                logger.exception("[%s] local player attach failed", source_id)
+            else:
+                logger.info("[%s] local player %s attached (mesh-owned)", source_id, player_id)
+                return
+            if delay is None:
+                break
+            await asyncio.sleep(delay)
+            client = self.server.get_client(player_id) if self.server is not None else None
+            if self._stop_evt.is_set() or client is None or not client.is_connected:
+                # It left between attempts (a peer reclaimed it, or the process is stopping). A
+                # retry would dial nothing, and pulling a roamed player back is not our call.
+                logger.info("[%s] local player %s went away; attach retry stopped", source_id, player_id)
+                return
+        # Out of attempts. A unit does not hold its own player while that player is attached to
+        # nothing: the websocket we keep is what stops any other server claiming the speaker. Let
+        # go, so the router's idle-speaker fallback dials it back on the next route.
+        logger.error("[%s] gave up attaching local player %s; releasing it", source_id, player_id)
+        await self.release_local_player()
 
     async def _await_source(self, source_id: str, timeout_s: float) -> bool:
         """Poll until a source exists. Sources are brought up asynchronously by their manager, so
@@ -2280,6 +2515,8 @@ async def main() -> None:
             local_player_id=local_player_id,
             local_player_url=local_player_url,
         )
+        # mDNS is what tells us an adopted speaker is back; the server decides whether to dial.
+        mesh.neighbourhood.on_player_seen = srv.note_speaker_seen
         await mesh.start()
 
     # Auto-route-on-connect + auto-follow ("slave" mode) — only meaningful with the mesh present, and

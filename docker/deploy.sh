@@ -186,13 +186,45 @@ retry_ssh_() {
         sleep 3
     done
 }
-ssh_()  { retry_ssh_ sshpass -p "$PW" ssh $SSH_OPTS "${USER_}@$1" "${@:2}"; }
+# The login password goes to sshpass in the ENVIRONMENT (`sshpass -e` reads SSHPASS), never as
+# with the `-p` option: an argument is in the process list of this workstation for every
+# connection, and any local user can read it there. Set for the one command, not exported, so no
+# other child of this script inherits it.
+sshpass_() { SSHPASS="$PW" sshpass -e "$@"; }
+ssh_()  { retry_ssh_ sshpass_ ssh $SSH_OPTS "${USER_}@$1" "${@:2}"; }
+# Run the script on stdin on a unit, with the sudo password as its "$1".
+#
+# The password used to be a remote ARGUMENT (`bash -s -- <password>`), so it was in the unit's process
+# list for the whole run, and in this workstation's as part of the ssh command. Now it is the
+# second LINE of stdin. `bash -s` reads its script from a pipe one byte at a time, so the first line
+# (`read`) takes the next line and nothing else. `set --` then puts it back at "$1", in shell
+# memory only, so every remote block still starts `PW="$1"` unchanged.
+#
+# The script is read into a variable first, so a retry sends the WHOLE script again. Before this, a
+# retry ran with stdin already at end-of-file: `bash -s` then ran nothing and returned 0, which
+# reported success for a block that did not run. Retries on 255 only (ssh's own failure), never on
+# the remote block's status: a state-changing block must not run twice because it failed once.
+ssh_sudo_() {
+    local host="$1" script n=0 rc
+    script="$(cat)"
+    while :; do
+        rc=0
+        # PIPESTATUS[1], not $?: under pipefail a remote block that ends before it read all of
+        # stdin gives printf a SIGPIPE, and that is not a failure.
+        printf '%s\n%s\n%s\n' 'IFS= read -r PW; set -- "$PW" "$@"' "$PW" "$script" \
+            | sshpass_ ssh $SSH_OPTS "${USER_}@${host}" "${@:2}" || rc="${PIPESTATUS[1]}"
+        [[ $rc -ne 255 ]] && return "$rc"
+        n=$((n + 1))
+        [[ $n -ge 3 ]] && return "$rc"
+        sleep 3
+    done
+}
 # scp keeps the blanket retry: it moves 200 MB and an interrupted transfer is genuinely worth
 # re-running, with no remote state to leave half-changed.
-scp_()  { retry_ sshpass -p "$PW" scp $SSH_OPTS "$1" "${USER_}@$2:$3"; }
+scp_()  { retry_ sshpass_ scp $SSH_OPTS "$1" "${USER_}@$2:$3"; }
 # Send a local file over an existing-style ssh session instead of a second scp auth. Used for the
 # small config files; the image tarball still goes by scp (scp is far faster for 200 MB).
-put_()  { retry_ssh_ sshpass -p "$PW" ssh $SSH_OPTS "${USER_}@$1" "cat > '$3'" < "$2"; }
+put_()  { retry_ssh_ sshpass_ ssh $SSH_OPTS "${USER_}@$1" "cat > '$3'" < "$2"; }
 say()   { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 warn()  { printf '\033[33m    !! %s\033[0m\n' "$*"; }
 
@@ -355,6 +387,19 @@ fi
 
 # --- fleet pairing secret, part two: recover it before inventing one -------------------------------
 
+# Mode 600 BEFORE the content. `printf >>` on a file that does not exist creates it with the
+# default umask, which is 644 on most workstations. An existing file gets 600 too: it also holds
+# PLUM_TEST_PW.
+save_fleet_psk() {
+    local file="${HERE}/.deploy.env"
+    if [[ -e "$file" ]]; then
+        chmod 600 "$file"
+    else
+        install -m 600 /dev/null "$file"
+    fi
+    printf 'PLUM_FLEET_PSK=%s\n' "$1" >> "$file"
+}
+
 if [[ "$NEED_PSK" == 1 ]]; then
     say "no fleet pairing secret on this workstation — asking the units"
     # EVERY unit in the table, not just the ones being deployed. A peer that is not part of this run
@@ -386,7 +431,7 @@ if [[ "$NEED_PSK" == 1 ]]; then
 
     if [[ -n "$_found" ]]; then
         PLUM_FLEET_PSK="$_found"
-        printf 'PLUM_FLEET_PSK=%s\n' "$PLUM_FLEET_PSK" >> "${HERE}/.deploy.env"
+        save_fleet_psk "$PLUM_FLEET_PSK"
         say "recovered the fleet pairing secret from ${_found_on} and restored it to docker/.deploy.env"
     elif [[ -n "$_unreachable" && "$FORCE_NEW_PSK" != 1 ]]; then
         # Refusing beats a silent split. A new secret here would leave the units that ARE up unable
@@ -399,7 +444,7 @@ if [[ "$NEED_PSK" == 1 ]]; then
         exit 1
     else
         PLUM_FLEET_PSK="$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')"
-        printf 'PLUM_FLEET_PSK=%s\n' "$PLUM_FLEET_PSK" >> "${HERE}/.deploy.env"
+        save_fleet_psk "$PLUM_FLEET_PSK"
         say "minted a fleet pairing secret into docker/.deploy.env (shared by every unit)"
         [[ "$FORCE_NEW_PSK" == 1 ]] && warn "--new-fleet-psk: redeploy EVERY unit so they all get this value"
     fi
@@ -425,7 +470,7 @@ deploy_one() {
     say "$host — ${unit_name}"
 
     # 1. Preflight: reachable, arm64, sudo, and the host daemons this container depends on.
-    ssh_ "$host" "bash -s -- '$PW'" <<'EOS' || return 1
+    ssh_sudo_ "$host" "bash -s --" <<'EOS' || return 1
 set -euo pipefail
 PW="$1"
 s() { echo "$PW" | sudo -S -p '' "$@"; }
@@ -508,7 +553,7 @@ EOS
     #    layout onto every unit. NOTE: trixie has no `docker-compose-v2`; the package is
     #    `docker-compose` and it is compose v2, not the retired Python v1.
     say "$host — docker"
-    ssh_ "$host" "bash -s -- '$PW'" <<'EOS' || return 1
+    ssh_sudo_ "$host" "bash -s --" <<'EOS' || return 1
 set -euo pipefail
 PW="$1"
 s() { echo "$PW" | sudo -S -p '' "$@"; }
@@ -533,7 +578,7 @@ EOS
     # 3. Stop what would fight the container for ports, ALSA, D-Bus names and the radio: the
     #    pre-container dev stack, and any old container generation.
     say "$host — stopping the pre-container stack"
-    ssh_ "$host" "bash -s -- '$PW'" <<'EOS' || return 1
+    ssh_sudo_ "$host" "bash -s --" <<'EOS' || return 1
 set -uo pipefail
 PW="$1"
 s() { echo "$PW" | sudo -S -p '' "$@"; }
@@ -610,7 +655,7 @@ EOS
 
     # 4. Volume layout + first-deploy state import.
     say "$host — ${REMOTE_ROOT} + state"
-    ssh_ "$host" "bash -s -- '$PW' '$REMOTE_ROOT' '$MIGRATE'" <<'EOS' || return 1
+    ssh_sudo_ "$host" "bash -s -- '$REMOTE_ROOT' '$MIGRATE'" <<'EOS' || return 1
 set -euo pipefail
 PW="$1"; ROOT="$2"; MIGRATE="$3"
 s() { echo "$PW" | sudo -S -p '' "$@"; }
@@ -650,7 +695,7 @@ EOS
     # 5. Image — either scp+load a local build, or have the unit pull a published one.
     if [[ -n "$IMAGE_REF" ]]; then
         say "$host — pulling ${IMAGE_REF}"
-        ssh_ "$host" "bash -s -- '$PW' '$IMAGE_REF'" <<'EOS' || return 1
+        ssh_sudo_ "$host" "bash -s -- '$IMAGE_REF'" <<'EOS' || return 1
 set -euo pipefail
 PW="$1"; REF="$2"
 s() { echo "$PW" | sudo -S -p '' "$@"; }
@@ -668,7 +713,7 @@ EOS
         # afternoon. The failure is nasty rather than obvious: the image loads, the compose file is
         # truncated to nothing, and the unit ends up with no container. Keep the tag being deployed
         # plus KEEP_IMAGES previous ones, and fail loudly if there is still no room afterwards.
-        ssh_ "$host" "bash -s -- '$PW' '$PLUM_IMAGE_NAME' '$PLUM_IMAGE_TAG' '$KEEP_IMAGES'" <<'EOS' || return 1
+        ssh_sudo_ "$host" "bash -s -- '$PLUM_IMAGE_NAME' '$PLUM_IMAGE_TAG' '$KEEP_IMAGES'" <<'EOS' || return 1
 set -euo pipefail
 PW="$1"; IMAGE_NAME="$2"; IMAGE_TAG="$3"; KEEP="$4"
 s() { echo "$PW" | sudo -S -p '' "$@"; }
@@ -705,18 +750,29 @@ EOS
     #    /opt/plum-audio stay owned by the account that administers it.
     say "$host — config"
     put_ "$host" "${HERE}/docker-compose.yml" "/tmp/plum-audio-compose.yml" || return 1
-    ssh_ "$host" "bash -s -- '$PW' '$REMOTE_ROOT' '$unit_id' '$unit_name' '$player_id' '$player_name' '$dac' '$profile' '$player_enabled' '$PLUM_IMAGE_NAME' '$PLUM_IMAGE_TAG' '${PLUM_FLEET_PSK:-}'" <<'EOS' || return 1
+    # The fleet PSK goes on STDIN, as the first line of the remote script. It used to be the last
+    # remote ARGUMENT, so it was in the process list of this workstation and of the unit. `%q`
+    # quotes it for the remote bash. ssh_sudo_ reads all of stdin first, so a retry sends it again.
+    { printf 'FLEET_PSK=%q\n' "${PLUM_FLEET_PSK:-}"; cat; } <<'EOS' | ssh_sudo_ "$host" "bash -s -- '$REMOTE_ROOT' '$unit_id' '$unit_name' '$player_id' '$player_name' '$dac' '$profile' '$player_enabled' '$PLUM_IMAGE_NAME' '$PLUM_IMAGE_TAG'" || return 1
 set -euo pipefail
 PW="$1"; ROOT="$2"; UNIT_ID="$3"; UNIT_NAME="$4"; PLAYER_ID="$5"; PLAYER_NAME="$6"; DAC="$7"
 PROFILE="$8"; PLAYER_ENABLED="$9"; IMAGE_NAME="${10}"; IMAGE_TAG="${11}"
-# Passed as an ARG, not referenced in the heredoc below. The heredoc is expanded on the REMOTE host,
-# where a local-only variable is unbound — and under `set -u` that aborts AFTER `cat >` has already
-# truncated the file, leaving a unit with an EMPTY plum-audio.env. It then boots on entrypoint
-# defaults with no DAC device and no unit id, which reads as a broken image rather than a bad deploy.
-FLEET_PSK="${12:-}"
+# FLEET_PSK is set by the line the workstation puts BEFORE this script (see the call above). It is
+# never referenced as a local variable here: this heredoc is expanded on the REMOTE host, where a
+# local-only variable is unbound, and under `set -u` that aborts AFTER `cat >` truncated the file.
+# That leaves a unit with an EMPTY plum-audio.env, which boots on entrypoint defaults with no DAC
+# device and no unit id. The default below keeps `set -u` quiet if the first line is ever lost.
+FLEET_PSK="${FLEET_PSK:-}"
 s() { echo "$PW" | sudo -S -p '' "$@"; }
 mv /tmp/plum-audio-compose.yml "$ROOT/docker-compose.yml"
 TZ_HOST="$(timedatectl show -p Timezone --value 2>/dev/null || echo UTC)"
+# Mode 600 BEFORE the content: this file holds PLUM_FLEET_PSK, the secret every unit pairs with.
+# `install` replaces an existing 644 file too, which a umask alone does not. Compose reads it as
+# root, and the deploy user owns it, so nothing else needs to read it.
+# Keep the operator's own lines. This script writes the file again on every run, and without this
+# a redeploy removes PLUM_API_GUARD=0 or PLUM_ALLOWED_ORIGINS, so the GUI gets 403 again.
+KEEP="$(grep -E '^(PLUM_ALLOWED_ORIGINS|PLUM_API_GUARD|PLUM_PEER_SILENCE_TIMEOUT_S|PLUM_OUTPUT_WATCHDOG|PLUM_OUTPUT_REOPEN_MAX|PLUM_OUTPUT_RECOVER_TIMEOUT_S|PLUM_HEALTH_STALE_S)=' "$ROOT/plum-audio.env" 2>/dev/null || true)"
+install -m 600 /dev/null "$ROOT/plum-audio.env"
 cat > "$ROOT/plum-audio.env" <<ENV
 # Generated by docker/deploy.sh — edit units.conf and redeploy rather than hand-editing.
 PUID=$(id -u)
@@ -769,6 +825,7 @@ PLUM_FLEET_PSK=${FLEET_PSK}
 # so this is convenience, not unattended pairing — someone still confirms in the GUI.
 #PLUM_STATIC_PIN=
 ENV
+[[ -z "$KEEP" ]] || printf '\n# Operator settings kept from the previous file.\n%s\n' "$KEEP" >> "$ROOT/plum-audio.env"
 # COMPOSE_PROFILES has to be here, not in plum-audio.env: env_file is container environment, while
 # this is compose INTERPOLATION. Written beside the compose file so a bare `docker compose up -d` or
 # `restart` run by hand in this directory selects the same service deploy.sh does.
@@ -804,7 +861,7 @@ EOS
     # compose refused it as an "empty compose file", and the run still printed "all units deployed"
     # while BOTH units were left with no container at all. Any step that can leave a unit down has
     # to be able to fail that unit.
-    ssh_ "$host" "bash -s -- '$PW' '$REMOTE_ROOT' '$expected_programs' '$profile' '$PLUM_IMAGE_NAME' '$PLUM_IMAGE_TAG'" <<'EOS' || return 1
+    ssh_sudo_ "$host" "bash -s -- '$REMOTE_ROOT' '$expected_programs' '$profile' '$PLUM_IMAGE_NAME' '$PLUM_IMAGE_TAG'" <<'EOS' || return 1
 set -euo pipefail
 PW="$1"; ROOT="$2"; WANT="$3"; PROFILE="$4"; IMAGE_NAME="$5"; IMAGE_TAG="$6"
 # Belt and braces alongside $ROOT/.env: compose v1 (the Debian units) and v2 (the Docker-CE one)

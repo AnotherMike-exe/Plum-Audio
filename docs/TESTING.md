@@ -21,19 +21,28 @@ weights integration and interop over breadth of unit coverage.
 | Suite | Runs | Covers |
 |---|---|---|
 | `tests/Integration/t0_sendspin_protocol.py` (**tier 0**) | `<venv>/bin/python tests/Integration/t0_sendspin_protocol.py` | the aiosendspin VERSION GATE — real protocol, no rig; run before any pin bump |
-| `tests/Unit/**` (pytest, **463**) | `PYTHONPATH=backend/scripts pytest tests/Unit` | see the breakdown below |
-| `frontend/tests/unit/**` (vitest, **133**) | `cd frontend && npx vitest run` | view→model mapping, local-player-by-host, progress extrapolation, `TimeFilter` clock sync, audio + settings + integrations services |
+| `tests/Integration/t0_player_peer_watchdog.py` (**tier 0**) | `<venv>/bin/python tests/Integration/t0_player_peer_watchdog.py` | the peer-silence watchdog — a real server dials the player through a TCP proxy that freezes without closing; loopback only, about 45 s |
+| `tests/Unit/**` (pytest, **1347** in 46 files, counted 2026-11-24) | `PYTHONPATH=backend/scripts pytest tests/Unit` | see the breakdown below |
+| `frontend/tests/unit/**` (vitest, **289** in 21 files, counted 2026-11-24) | `cd frontend && npx vitest run` | view→model mapping, local-player-by-host, progress extrapolation, `TimeFilter` clock sync, audio + settings + integrations services |
 
-Backend, by file: `audio_devices` 31 · `bluetooth_avrcp` 27 · `audio_api` 21 · `follow_reconciler`
-21 · `configure_audio_hat` 17 · `audio_output_apply` 14 · `settings_store` 14 · `volume` 12 ·
-`bluetooth_config` 11 · `mesh_routing` 11 · `mesh_discovery` 10 · `source_manager` 10 ·
-`client_state_conformance` 9 · `source_config` 9.
+Both counts are from the working tree of `feature/maintenance-2026-11`, which held changes that
+were not yet committed. Run the two commands for the current numbers.
+
+Backend, the largest files: `sendspin_server` 112 · `api_guard` 86 · `plum_watchdog` 78 ·
+`calibration` 63 · `endpoint_validation` 60 · `audio_devices` 59 · `settings_store` 56 ·
+`player_recovery` 50 · `follow_reconciler` 49 · `deploy_secrets` 46 · `healthcheck` 45 ·
+`calibration_api` 43 · `plum_updater_agent` 32. The other 33 files hold 39 tests or fewer each.
+
+Three files run the real host scripts with stub `docker` and `flock` commands on the `PATH`:
+`plum_watchdog`, `plum_updater_agent` and `deploy_secrets`. They need `bash` and no hardware.
 
 `SourceFeeder` idle transitions can't be unit-tested (they need a real FIFO + group, and
 `sendspin_server` imports aiosendspin) — `t2_source_lifecycle.sh` covers them. `integrations_api`
 CRUD is covered live by `t2_endpoint_crud.sh`.
 
-> **Read the frontend number with suspicion.** Of the six vitest files, only `audioService` (12) and
+> **Read the frontend number with suspicion.** This note describes the suite when it held six
+> files. Nobody checked the 21 files of 2026-11-24 against it (OPEN-ITEMS #2).
+> Of the six vitest files, only `audioService` (12) and
 > `sendspinDataService` (23) import a production module at all. The other four — `NowPlaying` (13),
 > `PlayerControls` (18), `integrationsService` (27), `settingsService` (19) — assert against MSW
 > handlers or against mock components declared inside the test file, so **77 of the 112 would stay
@@ -164,7 +173,7 @@ non-negotiable for tier 4's live third-party devices. `run.sh` drives a whole ri
 | `t2_calibration_tone.sh` | ✅ passing (both `.7` units, 2026-08-22) — the tone reaches the audio path; needs no meter or speaker |
 | `t3_loudness_match.sh` | ✅ passing (mesh pair, 2026-08-22) — cross-unit curve merge, causal rev, and matching driven live |
 | `t4_player_wedge_soak.sh` | ran 2026-08-24, **did not reproduce** in 80 cycles across two churn profiles (OPEN-ITEMS #23) |
-| `t4_player_halfopen.sh` | ✅ passing (mesh pair, 2026-08-24) — freezes a peer mid-connection; the half-open state is real but does not wedge |
+| `t4_player_halfopen.sh` | **not run since its rewrite (2026-11-24).** Freezes a peer mid-connection. The default run expects the peer-silence watchdog to log the silent peer inside 45 s, to end the session, and to let the next dial attach. `T4_WEDGE=1` runs unit A with `PLUM_PEER_SILENCE_TIMEOUT_S=0` and keeps the old wedge reproducer. That older form passed on the mesh pair on 2026-08-24: the half-open state is real but does not wedge. |
 | `t3_phase_lock.sh` | ✅ passing 12/12 (all four `.7` units, 2026-09-13) — settled spread 2.7 ms across bcm2835 + 3x HiFiBerry, 0 xruns |
 
 **Remaining:** add `t2_airplay_mpris.sh` (per-endpoint private-bus MPRIS ownership) and a
@@ -198,6 +207,11 @@ The two tier-4 wedge tests are a HUNT, not an assertion. `t4_player_wedge_soak.s
 in its own output. `t4_player_halfopen.sh` is the targeted counterpart: it freezes a peer with
 `docker pause` — the only way to get a peer that stops answering WITHOUT closing — and it always
 unfreezes, because a paused container is invisible in the `docker ps` output people skim.
+
+Since the peer-silence watchdog (`4375afd`), the default run of `t4_player_halfopen.sh` IS an
+assertion: the player must close the frozen session and take the next dial. Only `T4_WEDGE=1` is
+still a hunt. That mode recreates the container of unit A two times, with about 10 s of silence
+each time, and it restores `plum-audio.env` on exit.
 
 ### A test that runs on a configured rig must leave it as it found it
 

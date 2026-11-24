@@ -20,7 +20,7 @@ source "$(dirname "$0")/lib.sh"
 UNIT="${1:?usage: t2_bt_avrcp_position.sh <unit-host>}"
 
 # btmon and dbus-monitor both need root on the host; lib.sh only gives us the login.
-sudo_() { ssh_ "$UNIT" "printf '%s\n' '$PW' | sudo -S -p '' $1"; }
+sudo_() { sudo_ssh_ "$UNIT" "$1"; }
 
 AVRCP_REMOTE_UUID="0000110e-0000-1000-8000-00805f9b34fb"
 # 12 s is six AVRCP_POSITION_POLL periods (2 s), so a working poll cannot miss it, and it leaves room

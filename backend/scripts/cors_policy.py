@@ -31,8 +31,11 @@ worse than one whose GUI is reachable from the wrong page.
 from __future__ import annotations
 
 import contextlib
+import ipaddress
+import json
 import logging
 import os
+import re
 import socket
 from urllib.parse import urlsplit
 
@@ -110,33 +113,128 @@ def own_hosts() -> set[str]:
         hosts.add(ip)
     with contextlib.suppress(OSError):
         hosts |= name_forms(socket.gethostname())
-    return hosts
+    return hosts | mdns_hosts()
+
+
+_SETTINGS_FILE_DEFAULT = "/data/settings.json"
+_HOSTNAME_LABEL = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+# (path, st_mtime_ns) -> name. One stat per request; the file is read again only when it changed.
+_mdns_cache: tuple[tuple[str, int], str | None] | None = None
+
+
+def mdns_hostname() -> str | None:
+    """The mDNS hostname a user set from Settings (`settings.json` `hostname`), or None.
+
+    One lowercase DNS label. This is the value the unit publishes as `UnitSnapshot.mdns_hostname`,
+    so that its peers allow a page opened at that name.
+
+    It is the name the user ASKED for, not the live Avahi name. Avahi can append `-2` on a name
+    conflict. A read of the live name is a D-Bus call from the audio loop for each snapshot, which
+    is not cheap, so it is not made here.
+
+    Read from the file and not through SettingsManager: the audio process loads this module, and
+    it must not import Flask. Read-only, and never raises.
+    """
+    global _mdns_cache
+    path = os.environ.get("PLUM_SETTINGS_FILE", _SETTINGS_FILE_DEFAULT)
+    try:
+        key = (path, os.stat(path).st_mtime_ns)
+    except OSError:
+        return None
+    if _mdns_cache is not None and _mdns_cache[0] == key:
+        return _mdns_cache[1]
+    name: str | None = None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            hostname = json.load(fh).get("hostname")
+        if isinstance(hostname, str) and _HOSTNAME_LABEL.fullmatch(hostname.lower()):
+            name = hostname.lower()
+    except (OSError, ValueError, AttributeError):
+        name = None  # torn or damaged file: the next change to it is read again
+    _mdns_cache = (key, name)
+    return name
+
+
+def mdns_hosts() -> set[str]:
+    """The name forms of the mDNS hostname a user set from Settings (`settings.json` `hostname`).
+
+    `socket.gethostname()` is the HOST's name. Settings -> Device can give Avahi a different name
+    at runtime (`SetHostName`), and the page is then at `http://<that-name>.local`. The kernel
+    hostname never learns it, so without this the guard refuses the page the user just renamed.
+    """
+    name = mdns_hostname()
+    return name_forms(name) if name else set()
 
 
 def known_hosts(units) -> set[str]:
     """Every host form the units in a mesh view can legitimately serve a GUI from.
 
-    `units` is any iterable of objects with `.host` and (optionally) `.hostname` — a MeshView's
-    units, in practice. Both are included: the IP is how peers reach each other, the hostname is how
-    a person reaches the page.
+    `units` is any iterable of objects with `.host` and (optionally) `.hostname` and
+    `.mdns_hostname` — a MeshView's units, in practice. All are included: the IP is how peers reach
+    each other, the two names are how a person reaches the page.
     """
     hosts: set[str] = set(LOOPBACK_HOSTS)
     for unit in units:
-        host = (getattr(unit, "host", None) or "").strip().lower()
-        if host:
-            hosts.add(host)
-        name = (getattr(unit, "hostname", None) or "").strip()
-        if name:
-            hosts |= name_forms(name)
+        # Every value here arrives in a peer's JSON. A value that is not a string is skipped: a
+        # `.strip()` on it raised, and one bad peer then dropped every peer's host.
+        host = getattr(unit, "host", None)
+        if isinstance(host, str) and host.strip():
+            hosts.add(host.strip().lower())
+        # The kernel hostname, which can be an FQDN. Only its FIRST label is a name of the unit:
+        # the whole value would put the peer's domain in the set. Same rule as mesh/model.py.
+        name = getattr(unit, "hostname", None)
+        if isinstance(name, str):
+            label = name.strip().lower().split(".", 1)[0]
+            if _HOSTNAME_LABEL.fullmatch(label):
+                hosts |= name_forms(label)
+        # The name from Settings -> Device. It arrives in a peer's JSON, so it must be ONE label:
+        # a dotted value would put a whole domain in the set.
+        mdns = getattr(unit, "mdns_hostname", None)
+        if isinstance(mdns, str) and _HOSTNAME_LABEL.fullmatch(mdns.strip().lower()):
+            hosts |= name_forms(mdns.strip())
     return hosts
 
 
-def is_allowed(origin: str | None, hosts: set[str], extras: list[str] | None = None) -> bool:
+def _ip_of(name: str | None):
+    """`name` as an ip_address object, or None when it is not an IP literal."""
+    if not name:
+        return None
+    try:
+        return ipaddress.ip_address(name.split("%", 1)[0])  # drop an IPv6 zone id
+    except ValueError:
+        return None
+
+
+def same_ip_origin(origin: str | None, request_host: str | None) -> bool:
+    """Is `origin` an IP literal that is also the `Host` the request was sent to?
+
+    That is a same-origin request to an address of this box. A unit on ethernet and WiFi has two
+    addresses and knows one (`local_ip` is the default route), and a browser sends `Origin` on a
+    same-origin POST, so a page opened at the other address got 403 on every write.
+
+    It is safe because a DNS-rebinding attack needs a NAME: the browser puts the attacker's name
+    in both headers, and a name never passes here. A page at some OTHER IP has that IP as its
+    Origin and the unit's address as Host, and the two do not match. Compared as addresses, so
+    two spellings of one IPv6 address are equal. Ports are ignored, as everywhere in this module.
+    """
+    if not origin or not request_host:
+        return False
+    origin_ip = _ip_of(_host_of(origin))
+    return origin_ip is not None and origin_ip == _ip_of(_host_header_name(request_host))
+
+
+def is_allowed(
+    origin: str | None, hosts: set[str], extras: list[str] | None = None, *, request_host: str | None = None
+) -> bool:
     """May `origin` call us?
 
     A None/empty origin is NOT decided here — see `origin_header`. This answers only the browser
     question, and is deliberately port-agnostic: the GUI is served on :80, dev runs on :5173, and a
     unit that is reachable at all is reachable on any of its own ports anyway.
+
+    `request_host` is the request's `Host` header. With it, an IP-literal origin that equals the
+    Host passes without being in `hosts` (see `same_ip_origin`). A name still needs `hosts` or
+    `PLUM_ALLOWED_ORIGINS`.
     """
     if not origin:
         return False
@@ -148,7 +246,7 @@ def is_allowed(origin: str | None, hosts: set[str], extras: list[str] | None = N
     host = _host_of(origin)
     if host is None:
         return False
-    return host in hosts
+    return host in hosts or same_ip_origin(origin, request_host)
 
 
 def origin_header(origin: str | None, hosts: set[str], extras: list[str] | None = None) -> str | None:
@@ -158,9 +256,9 @@ def origin_header(origin: str | None, hosts: set[str], extras: list[str] | None 
 
     - No `Origin`: not a browser request (a peer, the loopback player). CORS never applied; adding
       headers would be noise, and refusing would break the mesh from the inside.
-    - A rejected origin: the response still returns normally, but with no CORS headers the browser
-      refuses to hand it to the calling page. That is how CORS denies — it is not our job to 403,
-      and doing so would change what a same-origin caller sees.
+    - A rejected origin: no CORS headers, so the browser refuses to hand the reply to the calling
+      page. That is how CORS denies a READ. It does not stop the handler, so `guard` below also
+      answers 403 before the handler runs. With `PLUM_API_GUARD=0` only this half applies.
 
     Echoes the exact origin rather than `*`: `*` is what we are moving away from, and an echo is
     also required if credentials are ever added.
@@ -168,3 +266,115 @@ def origin_header(origin: str | None, hosts: set[str], extras: list[str] | None 
     if not origin:
         return None
     return origin if is_allowed(origin, hosts, extras) else None
+
+
+# -- the request guard ------------------------------------------------------------------------------
+#
+# Everything above decides which CORS headers a reply carries. CORS only stops a page from READING
+# a reply: the handler still ran. So a `text/plain` POST from any web page (a "simple" request, no
+# preflight) re-routed audio blind, and a websocket upgrade, which CORS does not cover at all, read
+# the cached pairing PIN from /api/mesh/consume. The guard refuses BEFORE the handler. Both APIs
+# call it: mesh/api.py as aiohttp middleware, apis/server.py as a Flask `before_request`.
+#
+# PLUM_API_GUARD=0 turns the guard off and leaves the CORS headers as they were. It exists for the
+# same reason PLUM_ALLOWED_ORIGINS=* does: this change needs a rig test, and a unit whose GUI is
+# dead is worse than one that is reachable from the wrong page. Set it in plum-audio.env and
+# restart the container. PLUM_ALLOWED_ORIGINS is the narrower fix for one refused origin or host.
+
+BODY_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
+
+
+def guard_enabled() -> bool:
+    """False only when `PLUM_API_GUARD` is `0`, `false`, `no` or `off`."""
+    return (os.environ.get("PLUM_API_GUARD") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _host_header_name(host: str) -> str | None:
+    """The bare hostname of a `Host` header, lowercased, without port. None if it is not parseable."""
+    if not host or host != host.strip() or any(ch in host for ch in "/@?# \t"):
+        return None
+    try:
+        parts = urlsplit(f"//{host}")
+        _ = parts.port  # raises ValueError on a port that is not a number
+        name = parts.hostname
+    except ValueError:
+        return None
+    return name.lower().rstrip(".") if name else None
+
+
+def _is_ip_literal(name: str) -> bool:
+    try:
+        ipaddress.ip_address(name.split("%", 1)[0])  # drop an IPv6 zone id
+    except ValueError:
+        return False
+    return True
+
+
+def host_is_trusted(host: str | None, hosts: set[str], extras: list[str] | None = None) -> bool:
+    """May a request with NO `Origin` and this `Host` header reach a handler?
+
+    This is the DNS-rebinding check. A page at evil.example whose name now resolves to the unit is
+    same-origin to the browser, so its GETs carry no Origin, and the only trace of the attacker's
+    name is the Host header. An IP literal cannot be rebound, so it always passes. That is also
+    what every server-side caller sends (peers, the loopback player, Home Assistant by IP).
+
+    An absent Host passes: only a browser can be rebound, and a browser always sends one.
+    """
+    if host is None:
+        return True
+    extras = extras if extras is not None else configured_extra_origins()
+    if _WILDCARD in extras:
+        return True
+    name = _host_header_name(host)
+    if name is None:
+        return False
+    if _is_ip_literal(name) or name in LOOPBACK_HOSTS or name in hosts:
+        return True
+    # A reverse proxy or an alias named in PLUM_ALLOWED_ORIGINS: its same-origin GETs carry that
+    # name in Host and no Origin.
+    return any(_host_of(extra) == name for extra in extras)
+
+
+def guard(
+    *,
+    method: str,
+    origin: str | None,
+    host: str | None,
+    content_type: str | None,
+    has_body: bool,
+    hosts: set[str],
+    extras: list[str] | None = None,
+) -> tuple[int, str] | None:
+    """Decide if a request may reach its handler. None to pass, else (HTTP status, message).
+
+    (a) `Origin` present and not allowed: 403, for every method. A websocket upgrade is a GET with
+        an Origin, so this is the check that covers it. An Origin that is an IP literal and equals
+        the `Host` is allowed: a same-origin request at an address the unit does not list.
+    (b) `Origin` absent: the `Host` must be an IP literal, loopback, or a name we know. See
+        `host_is_trusted`. An allowed Origin needs no Host check: its host is in the same set.
+    (c) A POST, PUT or DELETE with a body must be `application/json`. A cross-site page can send
+        `text/plain` with no preflight, and it cannot send JSON without one.
+    """
+    if not guard_enabled():
+        return None
+    extras = extras if extras is not None else configured_extra_origins()
+    if origin:
+        if not is_allowed(origin, hosts, extras, request_host=host):
+            return 403, f"origin {origin[:200]!r} is not allowed (set PLUM_ALLOWED_ORIGINS to allow it)"
+    elif not host_is_trusted(host, hosts, extras):
+        return 403, f"host {str(host)[:200]!r} is not a name of this unit (set PLUM_ALLOWED_ORIGINS to allow it)"
+    if method.upper() in BODY_METHODS and has_body:
+        mimetype = (content_type or "").split(";", 1)[0].strip().lower()
+        if mimetype != "application/json":
+            return 415, "a request body must be Content-Type: application/json"
+    return None
+
+
+def has_body(content_length: str | int | None, transfer_encoding: str | None) -> bool:
+    """Does a request carry a body, from its framing headers? Both APIs ask the same way."""
+    if transfer_encoding:
+        return True
+    try:
+        return int(content_length or 0) > 0
+    except (TypeError, ValueError):
+        return True  # an unreadable length is not proof of an empty body
