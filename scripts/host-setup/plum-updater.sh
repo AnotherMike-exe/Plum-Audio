@@ -43,6 +43,26 @@ now_iso() { date -Is 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%S+00:00; }
 
 log() { printf '%s plum-updater: %s\n' "$(now_iso)" "$*"; }
 
+# A channel is an image TAG, and nothing else. It comes from $CONFIG/update.request, which the
+# container can write, and this script runs as root. The container's own allowlist (updater.py) is
+# no defence: anything that can write the file skips it. The value is printed into $ROOT/.env, so a
+# channel with a newline added a `PLUM_IMAGE=` line and the next `up -d` ran that image as root.
+#
+# The pattern is the OCI tag grammar, capped at 64. The first character is not `.` or `-`, so a tag
+# is never an option to a command. Bash matches `=~` against the WHOLE string: `$` is the end of the
+# string, never the end of a line, so a newline anywhere fails the bracket expression.
+valid_channel() {
+    [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$ ]]
+}
+
+# A temp file in $ROOT, never in $CONFIG. $CONFIG is the container's bind mount, so a predictable
+# name there (`update.state.<pid>.tmp`) is a name the container can make a symlink first, and root
+# then writes through it. $ROOT is not mounted into the container. mktemp creates the file with
+# O_EXCL and mode 0600 and never follows a link. Same filesystem as $CONFIG, so the mv is a rename.
+make_temp() {
+    mktemp "${ROOT}/.${1}.XXXXXXXX"
+}
+
 # --- state ----------------------------------------------------------------------------------------
 # One JSON object, written atomically, read by the container through the bind mount. Atomic because
 # the container polls this file straight through the window where it is being recreated, so a reader
@@ -93,13 +113,14 @@ PY
 
 save_state() {
     mkdir -p "$CONFIG" 2>/dev/null || true
-    local tmp="${STATE}.$$.tmp"
+    local tmp
+    tmp="$(make_temp update.state)" || { log "could not create a temp file in ${ROOT}"; return 1; }
     # Values go in as ARGV, never interpolated into the script body. lastUpdate is itself a JSON
     # document built by record_result, so interpolating it would put quotes and backslashes straight
     # into Python source — a message containing an apostrophe would be a syntax error, and the state
     # file would silently stop updating mid-run.
     python3 - "$tmp" "$AGENT_VERSION" "$(now_iso)" "$S_PHASE" "$S_CHANNEL" "$S_IMAGE" \
-        "$S_DIGEST" "$S_AVAILABLE" "$S_LAST_CHECK" "$S_PREVIOUS" "$S_LAST_UPDATE" <<'PY' || return 1
+        "$S_DIGEST" "$S_AVAILABLE" "$S_LAST_CHECK" "$S_PREVIOUS" "$S_LAST_UPDATE" <<'PY' || { rm -f "$tmp"; return 1; }
 import json, sys
 (out, agent, written, phase, channel, image,
  digest, available, last_check, previous, last_update) = sys.argv[1:12]
@@ -122,11 +143,21 @@ with open(out, "w", encoding="utf-8") as fh:
     json.dump(payload, fh, indent=2)
     fh.write("\n")
 PY
-    mv -f "$tmp" "$STATE" || return 1
     # The container runs as a non-root user and only READS this, but /config is its own mount and a
     # root-owned 0600 file there is invisible to it. World-readable is correct: it holds a version
     # and a digest, nothing secret.
-    chmod 0644 "$STATE" 2>/dev/null || true
+    #
+    # chmod the TEMP, before the move. A chmod on $STATE after the move follows a symlink, and the
+    # container can put one there between the two calls.
+    chmod 0644 "$tmp" 2>/dev/null || true
+    # A rename replaces a symlink at $STATE and does not follow it. A real directory there would
+    # take the file INSIDE it, so refuse that.
+    if [[ -d "$STATE" && ! -L "$STATE" ]]; then
+        rm -f "$tmp"
+        log "state path ${STATE} is a directory — not writing"
+        return 1
+    fi
+    mv -f "$tmp" "$STATE" || { rm -f "$tmp"; return 1; }
     return 0
 }
 
@@ -168,8 +199,12 @@ set_tag() {
     # tag never moves and the unit quietly reinstalls the image it already had. The move is also
     # atomic, which matters because compose may read this file at any moment.
     local tag="$1" tmp
+    # Checked HERE as well as by every caller: this is the line that reaches the file.
+    valid_channel "$tag" || { log "set_tag: ignoring a tag that is not valid"; return 1; }
     [[ -f "$ENV_FILE" ]] || return 1
-    tmp="${ENV_FILE}.$$.tmp"
+    tmp="$(make_temp env)" || return 1
+    # mktemp gives 0600. Keep the mode the file had, so compose and the deploy user still read it.
+    chmod --reference="$ENV_FILE" "$tmp" 2>/dev/null || chmod 0644 "$tmp" 2>/dev/null || true
     if grep -qE '^PLUM_TAG=' "$ENV_FILE"; then
         grep -vE '^PLUM_TAG=' "$ENV_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
     else
@@ -225,6 +260,7 @@ compose() {
 do_check() {
     local name tag remote
     name="$(image_name)"; tag="${1:-$(current_tag)}"
+    valid_channel "$tag" || { log "check: ignoring a channel that is not a valid tag"; return 2; }
     S_CHANNEL="$tag"; S_IMAGE="${name}:${tag}"; S_DIGEST="$(local_digest)"
     S_LAST_CHECK="$(now_iso)"
     if remote="$(remote_digest "$name" "$tag")" && [[ -n "$remote" ]]; then
@@ -242,6 +278,7 @@ do_check() {
 
 do_update() {
     local channel="${1:-$(current_tag)}" name
+    valid_channel "$channel" || { log "update: ignoring a channel that is not a valid tag"; return 2; }
     name="$(image_name)"
     S_CHANNEL="$channel"
     S_IMAGE="${name}:${channel}"
@@ -298,25 +335,36 @@ do_update() {
 do_watch() {
     [[ -f "$REQUEST" ]] || { log "watch: no request"; return 0; }
     local channel check_only
+    # Prints `-` for a channel that is present and not a string, so it fails valid_channel below
+    # and is not read as "no channel given".
     channel="$(python3 -c '
 import json, sys
 try:
     d = json.load(open(sys.argv[1], encoding="utf-8"))
 except Exception:
     d = {}
-print(d.get("channel") or "")' "$REQUEST" 2>/dev/null)"
+c = d.get("channel") if isinstance(d, dict) else "-"
+print(c if isinstance(c, str) else ("" if c is None else "-"))' "$REQUEST" 2>/dev/null)"
     check_only="$(python3 -c '
 import json, sys
 try:
     d = json.load(open(sys.argv[1], encoding="utf-8"))
 except Exception:
     d = {}
-print("1" if d.get("checkOnly") else "0")' "$REQUEST" 2>/dev/null)"
+print("1" if isinstance(d, dict) and d.get("checkOnly") else "0")' "$REQUEST" 2>/dev/null)"
 
     # Consume the request BEFORE acting. `up -d` kills the container that wrote it, and a request
     # still on disk after a successful update would be replayed by the .path unit the moment the
     # container comes back — an update loop that looks like a unit restarting forever.
     rm -f "$REQUEST"
+
+    # An absent channel means "the tag this unit already runs". Anything else must be a tag.
+    # Ignored, with no fallback: a request that carried a bad channel is not a request to trust
+    # for anything else. The value itself is not logged, because it can hold control characters.
+    if [[ -n "$channel" ]] && ! valid_channel "$channel"; then
+        log "watch: ignoring a request whose channel is not a valid tag (${#channel} characters)"
+        return 0
+    fi
 
     if [[ "$check_only" == "1" ]]; then
         do_check "${channel:-$(current_tag)}"
