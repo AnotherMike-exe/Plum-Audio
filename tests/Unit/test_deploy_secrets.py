@@ -48,8 +48,11 @@ def _harness(script: Path, tmp_path: Path, body: str, sshpass_body: str) -> subp
     program = (
         f'set -euo pipefail\nPW="$PLUM_TEST_PW"\nUSER_=pi\nSSH_OPTS="-o X=y"\nsleep() {{ :; }}\n{functions}\n{body}\n'
     )
+    # A file, not `bash -c`: Linux limits ONE argument to 128 KiB, and a padded body is larger.
+    program_file = tmp_path / "program.sh"
+    program_file.write_text(program)
     return subprocess.run(
-        ["bash", "-c", program],
+        ["bash", str(program_file)],
         env={"PATH": f"{stub.parent}:/usr/bin:/bin", "PLUM_TEST_PW": PASSWORD, "OUT": str(tmp_path)},
         capture_output=True,
         text=True,
@@ -175,8 +178,11 @@ def _lib_harness(tmp_path: Path, body: str, sshpass_body: str) -> subprocess.Com
     names = ["retry_ssh_", "ssh_", "sudo_ssh_", "dexec_", "feed_fifo_", "stop_feed_"]
     functions = "\n".join(_function(text, name) for name in names)
     program = f'set -uo pipefail\nPW="$PLUM_TEST_PW"\nUSER_=pi\nSSH_OPTS="-o X=y"\nsleep() {{ :; }}\n{functions}\n{body}\n'
+    # A file, not `bash -c`: Linux limits ONE argument to 128 KiB, and a padded body is larger.
+    program_file = tmp_path / "program.sh"
+    program_file.write_text(program)
     return subprocess.run(
-        ["bash", "-c", program],
+        ["bash", str(program_file)],
         env={"PATH": f"{stub.parent}:/usr/bin:/bin", "PLUM_TEST_PW": PASSWORD, "OUT": str(tmp_path)},
         capture_output=True,
         text=True,
