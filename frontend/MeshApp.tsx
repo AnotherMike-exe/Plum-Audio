@@ -109,6 +109,37 @@ export const playerControlsPropsEqual = (
     a.onVolumeChange === b.onVolumeChange &&
     a.onSourceVolumeChange === b.onSourceVolumeChange;
 
+/**
+ * The identity of the device lists. `stableClients` — and so ClientManager and SyncedDevices, which
+ * are memoised on it — changes only when this string does.
+ *
+ * Every field a device row RENDERS or the lists FILTER on must be here; one that is missing gives a
+ * row that stays stale until some other field moves, with no error anywhere. It happened twice:
+ *   - pairingState: a device that finished pairing kept its Pair button. Silent, and
+ *     indistinguishable from pairing having failed.
+ *   - foreignServer (name, title, artist), url, isForeign, isLocal: the idle row's "Music Assistant
+ *     · Track — Artist" line kept the track that was playing when the speaker was claimed, and a
+ *     speaker that changed hands kept the old owner's name.
+ *
+ * JSON, not a joined string: a separator inside a name must not make two different lists equal.
+ * Exported for tests, for the same reason as playerControlsPropsEqual above.
+ */
+export const clientsSignature = (clients: Client[]): string =>
+  JSON.stringify(
+    clients.map((c) => [
+      c.id,
+      c.name,
+      c.currentStreamId ?? '',
+      c.volume,
+      c.connected,
+      c.pairingState ?? '',
+      c.url ?? '',
+      !!c.isForeign,
+      !!c.isLocal,
+      c.foreignServer ? [c.foreignServer.name, c.foreignServer.title ?? '', c.foreignServer.artist ?? ''] : null,
+    ]),
+  );
+
 const MemoPlayerControls = React.memo(PlayerControls, playerControlsPropsEqual);
 const MemoStreamSelector = React.memo(StreamSelector);
 const MemoSyncedDevices = React.memo(SyncedDevices);
@@ -279,12 +310,7 @@ export default function MeshApp(): React.ReactElement {
     .map((s) =>
       `${s.id}|${s.name}|${s.serverName ?? ''}|${s.isPlaying}|${s.volume ?? ''}|${s.sourceVolume ?? ''}|${s.active}`)
     .join(';');
-  const clientsSig = viewClients
-    // pairingState is in here deliberately: ClientManager is memoised on this string, so a device
-    // that finishes pairing would keep rendering its Pair button until some OTHER field happened to
-    // change. Silent, and indistinguishable from pairing having failed.
-    .map((c) => `${c.id}|${c.name}|${c.currentStreamId ?? ''}|${c.volume}|${c.connected}|${c.pairingState ?? ''}`)
-    .join(';');
+  const clientsSig = clientsSignature(viewClients);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const stableStreams = useMemo(() => model.streams, [streamsSig]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
