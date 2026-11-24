@@ -26,6 +26,9 @@
 2. **Four frontend test suites assert nothing about production code** (`NowPlaying`,
    `PlayerControls`, `integrationsService`, `settingsService`). `PlayerControls` now has a real
    counterpart beside it (`PlayerControlsSourceVolume`); the other three do not. See TESTING.md.
+   *2026-11-24:* the controller client, the browser player, the data service's reliability paths,
+   the pair dialog and the action error toast have suites now (`frontend/tests/unit/`). `MeshApp`
+   has tests for its pure helpers only, not for the component.
 3. ~~`sendspin_server.py` has no unit coverage~~ — **done 2026-08-06**,
    `tests/Unit/test_sendspin_server.py` (29 tests). `refresh_stream` and its `attach_player` caller
    are pinned in call order against fakes; deleting the refresh fails two tests. Also covers the
@@ -149,10 +152,14 @@
    now excludes every URL the mesh knows as a `local_player`. Worth remembering before reading any
    neighbourhood-driven result: `is_own` no longer means "not one of ours".
 7. **amd64 has never been built.**
-8. **The APIs are unauthenticated with blanket CORS** (`CORS(app)`, `Access-Control-Allow-Origin: *`,
-   both bound to `0.0.0.0`). The injection chain behind it is closed at three layers, but any page on
-   the LAN can still change a unit's settings. Deliberately deferred 2026-08-05: restricting CORS
-   needs a rig test, because peers and the GUI both call peer `:5001` cross-origin.
+8. **The APIs are unauthenticated.** Both bind `0.0.0.0`. The injection chain behind them is closed
+   at three layers. *Changed 2026-11-24* (`c3e3828`): `backend/scripts/cors_policy.py` now guards
+   both APIs. It answers 403 for an `Origin` that is not allowed, and for a `Host` that is not a
+   name of this unit when no `Origin` is sent. It answers 415 for a POST, PUT or DELETE body that
+   is not `application/json`. CORS echoes only the allowed origins. `PLUM_ALLOWED_ORIGINS` adds
+   origins and hosts (`*` allows all). `PLUM_API_GUARD=0` turns the guard off. A LAN client that
+   sends no `Origin` and an IP `Host` still reaches every route. Authentication is not in place.
+   The commit body says the guard needs a rig test before it ships. This branch records no such run.
 9. ~~`_primary_source` is set but never cleared~~ — **fixed 2026-08-06**. Confirmed real by reading:
    `stop_source` popped `sources` and left the id behind, so `_maybe_group_controller` resolved a
    dead source and returned early — a controller with no `ctrl:<source>:` hint silently stopped
@@ -302,7 +309,7 @@
      in an executor, but the first Play may still feel sluggish.
    - `sets` scope has a GUI editor but no rig test.
    - Tone-then-restore has never raced a real roam or a follow tick.
-28. **`docs/CLAUDE.md` is over its own ~280-line budget** (371 as of 2026-08-24).
+28. **`docs/CLAUDE.md` is over its own ~280-line budget** (450 as of 2026-11-24; 371 on 2026-08-24).
     *(Numbered 20 when written, which collided with the resolved item 20 above; renumbered
     2026-08-24.)* It was already 333
    before the calibration rules landed. The three new bullets each meet the file's own bar ("an agent
@@ -360,6 +367,16 @@
 
 23. **`.7.122`'s own player can wedge into "connected but undialable" under sustained mixed churn.**
     **STILL OPEN. Investigation 2026-08-24 — two hypotheses tested, both dead; three facts gained.**
+
+    *2026-11-24 — the half-open case now has a recovery path (`4375afd`).* The player's
+    peer-silence watchdog closes a session whose peer stopped answering. It acts after
+    `PLUM_PEER_SILENCE_TIMEOUT_S` (default 30 s, 0 disables). It closes the websocket with code
+    1001, aborts the TCP connection if the session is still attached 2 s later, and exits 4 if it
+    stays attached 20 s after that, while no audio arrives. This answers Fact 2 in the mechanism
+    sense: a frozen peer no longer holds the player. It does not explain the trigger, and the
+    `stream_end -> idle` signature above is still unattributed. `t4_player_halfopen.sh` step 2
+    expects the session to survive the freeze, so it now reports the opposite result (see
+    TESTING.md). No rig run of this change is recorded.
 
     *What the tools now show.* The player numbers each attached session and logs its duration, and
     warns once for any session held past `STUCK_SESSION_WARN_S`. That instrumentation was itself
@@ -514,4 +531,54 @@
     the one whose absence is catastrophic and silent. `--check` already handles both gracefully;
     the provisioning path should too. Also: `rfkill` is assumed present on the unit and never
     stated as a prerequisite.
+
+32. **No ESLint or Prettier config is committed.** `docs/CLAUDE.md` names both as the TypeScript
+    convention. `frontend/` has no config file for either tool, and `package.json` lists neither
+    package. Add the config, or change the convention. Found 2026-11-24.
+
+33. **`msw` 3 and `@testing-library/jest-dom` 8 are not taken.** `msw` 3 removes
+    `onUnhandledRequest` from `server.listen()`, and `tsc` fails in four test files (`951cf24`).
+    It needs a test migration first. `jest-dom` is on 7.0.1. npm lists 8.0.0 (checked 2026-11-24).
+    No commit gives a reason for the hold.
+
+34. **go-librespot is pinned at 0.7.4.** Upstream's latest release is v0.10.7 (GitHub, checked
+    2026-11-24). `backend/Dockerfile` pins one SHA-256 for each arch (`ebcf8f1`). Upstream publishes
+    no checksum file, so the two values are trust on first use. They came from the assets
+    downloaded on 2026-11-24. A version change recomputes both values.
+
+35. **The adopted-speaker table is in memory only.** `sendspin_server.py` keeps `_adopted`, keyed
+    by the registered URL, and writes it nowhere. A server restart loses every adoption. The mDNS
+    path dials only adopted URLs, so a speaker that changes IP is not found again.
+
+36. **`scripts/plum-init.sh` falls back to an unpinned `curl` from `main`.** When the image does
+    not carry a payload file, the script fetches it from `RAW_BASE`, which defaults to `main`. It
+    warns, but the fetched file can differ from the image. Pin the fetch to the image tag.
+
+37. **`/var/run/dbus` is mounted into a root container.** `docker/docker-compose.yml` mounts the
+    host's system D-Bus socket. `backend/supervisord/supervisord.conf` runs supervisord as
+    `user=root`, so that process holds the mount.
+
+38. **Base images are tag-pinned, not digest-pinned.** `backend/Dockerfile` uses `node:26-alpine`
+    and `python:3.13-slim-trixie`. A tag can move under the build. Pin a digest, or record the
+    digest of each published image.
+
+39. **The deploy scripts turn off host-key checks.** `docker/deploy.sh`, `docker/hotpatch.sh` and
+    `scripts/host-setup/provision.sh` set `StrictHostKeyChecking=no`. `deploy.sh` and
+    `provision.sh` also set `UserKnownHostsFile=/dev/null`, because a reimaged unit presents a new
+    key (OPERATIONS.md). `hotpatch.sh` sets only the first option.
+
+40. **No host WiFi watchdog.** No script in `scripts/host-setup/` checks `wlan0` or restarts the
+    link. NetworkManager owns the interface (`docs/CLAUDE.md`). Nothing on the host verifies that
+    the unit is reachable after a WiFi drop.
+
+41. **The Home Assistant integration lives in the separate `HA-Sendspin` repository.** It calls
+    `POST /api/mesh/volume` and `POST /api/mesh/release` (`4d8a46b`), and it names a speaker by its
+    listener URL. No test in this repository covers it. A change to either route can break it
+    without a failing test here.
+
+42. **A dial without `retry_indefinitely` ends at the 300 s backoff ceiling.** The library ends such
+    a dial task once its backoff reaches about 300 s (`3f6d158`). Adopted speakers set
+    `retry_indefinitely=True`. Two other dials in `sendspin_server.py` do not: the one near line 910
+    (`retry_initial_connection=False`) and the one near line 2619 (`retry_initial_connection=True`).
+    No rig run shows whether either one gives up in practice.
 
