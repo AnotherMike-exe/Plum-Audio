@@ -42,6 +42,9 @@ def state_file_path() -> str:
 # run before the player exists, so a thread lock is the whole of the contention.
 _WRITE_LOCK = threading.Lock()
 _write_failing = False  # one WARNING for a run of failed writes, one INFO when they stop
+# One ERROR for a damaged file that cannot be replaced. Each failed write finds the same damaged
+# file again, and the health report writes every 30 s.
+_damage_reported = False
 
 
 def _read_checked(path: str) -> tuple[dict, str | None]:
@@ -98,6 +101,10 @@ def _write_atomic(path: str, data: dict) -> None:
             json.dump(data, fh)
             fh.flush()
             os.fsync(fh.fileno())
+        # mkstemp makes the file 0600 and the rename keeps that mode. The container healthcheck
+        # and a host agent read this file, and they do not always run as its owner. Same as
+        # healthcheck.write_report.
+        os.chmod(tmp, 0o644)
         os.replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -122,29 +129,52 @@ def _merge_write(path: str, changes: dict) -> None:
     A DAMAGED file is kept, not overwritten in silence. Merging onto `{}` and renaming over it would
     replace the room's level with whichever single key this call carries, and the only trace would
     be a unit that comes back at the default level after its next restart. So the damaged file moves
-    to `<file>.corrupt` and the loss is logged at ERROR, once, at the moment it happens.
+    is copied to `<file>.corrupt` and the loss is logged at ERROR, once, at the moment it happens.
+
+    The log line says only what happened. The copy can fail and the write can fail (a read-only
+    or full /data does both), and then there is no copy and the damaged file is still in place.
+    While the write keeps failing the damage is reported once, not on every call.
     """
-    global _write_failing
+    global _write_failing, _damage_reported
     try:
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
         with _WRITE_LOCK:
             data, problem = _read_checked(path)
+            copy_note = ""
             if problem:
                 kept = f"{path}.corrupt"
-                with contextlib.suppress(OSError):
+                try:
                     shutil.copyfile(path, kept)
+                    copy_note = f"a copy is at {kept}"
+                except OSError as exc:
+                    copy_note = f"no copy could be made ({exc})"
+            data.update(changes)
+            try:
+                _write_atomic(path, data)
+            except Exception as exc:
+                if problem and not _damage_reported:
+                    _damage_reported = True
+                    logger.error(
+                        "player state %s is %s and could not be replaced (%s) — every key it held is LOST "
+                        "(volume, mute, active output); %s",
+                        path,
+                        problem,
+                        exc,
+                        copy_note,
+                    )
+                raise
+            if problem:
                 logger.error(
                     "player state %s is %s — every key it held is LOST (volume, mute, active output); "
-                    "a copy is at %s and the file now restarts from %s",
+                    "%s and the file now restarts from %s",
                     path,
                     problem,
-                    kept,
+                    copy_note,
                     sorted(changes),
                 )
-            data.update(changes)
-            _write_atomic(path, data)
+            _damage_reported = False
         if _write_failing:
             _write_failing = False
             logger.info("player state %s is writable again", path)

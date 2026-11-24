@@ -141,3 +141,54 @@ def test_the_health_report_round_trips(tmp_path):
     assert player_state.load_health_report(path) == {"ts": 123.0, "output": "ok"}
     assert player_state.load_render_state(path, default_volume=100) == (37, False)
     assert player_state.load_health_report(str(tmp_path / "absent.json")) is None
+
+
+def test_the_file_is_readable_by_other_users(tmp_path):
+    """mkstemp makes the temp file 0600, and the rename keeps that mode."""
+    path = _state(tmp_path)
+    player_state.save_render_state(path, 37, False)
+    assert os.stat(path).st_mode & 0o777 == 0o644
+
+
+def _refuse(*args, **kwargs):
+    raise OSError(30, "Read-only file system")
+
+
+def test_a_copy_that_failed_is_not_claimed(tmp_path, monkeypatch, caplog):
+    path = _state(tmp_path)
+    Path(path).write_text('{"volume": 4')
+    monkeypatch.setattr(player_state.shutil, "copyfile", _refuse)
+    with caplog.at_level(logging.DEBUG, logger="plum.player_state"):
+        player_state.save_player_health(path, "error")
+    text = " | ".join(r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)
+    assert "a copy is at" not in text
+    assert "no copy" in text and "Read-only file system" in text
+    assert "restarts from" in text, "the write itself succeeded"
+    assert not os.path.exists(f"{path}.corrupt")
+
+
+def test_a_damaged_file_in_a_read_only_directory_is_reported_once(tmp_path, monkeypatch, caplog):
+    """The health report writes every 30 s: 2880 identical ERROR lines a day, each one wrong."""
+    path = _state(tmp_path)
+    Path(path).write_text('{"volume": 4')
+    monkeypatch.setattr(player_state, "_write_failing", False)
+    monkeypatch.setattr(player_state.shutil, "copyfile", _refuse)
+    monkeypatch.setattr(os, "replace", _refuse)
+    with caplog.at_level(logging.DEBUG, logger="plum.player_state"):
+        for _ in range(5):
+            player_state.save_health_report(path, {"ts": 1.0})
+    loud = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1 and len(loud) == 2, loud
+    assert "a copy is at" not in errors[0] and "restarts from" not in errors[0]
+    assert "could not be replaced" in errors[0]
+    assert Path(path).read_text() == '{"volume": 4', "the damaged file is still what is on disk"
+
+    # The directory is writable again: the loss is reported once more, with what happened this time.
+    monkeypatch.undo()
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="plum.player_state"):
+        player_state.save_health_report(path, {"ts": 2.0})
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1 and "a copy is at" in errors[0] and "restarts from" in errors[0]
+    assert Path(f"{path}.corrupt").read_text() == '{"volume": 4'
