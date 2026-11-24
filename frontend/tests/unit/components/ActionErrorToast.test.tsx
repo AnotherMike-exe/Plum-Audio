@@ -103,3 +103,16 @@ describe('a failed command reaches the user', () => {
     expect(screen.getByRole('status')).toBeEmptyDOMElement();
   });
 });
+
+describe('useActionError after unmount', () => {
+  it('starts no timer for a rejection that lands late', async () => {
+    vi.useFakeTimers();
+    let reject: (err: Error) => void = () => {};
+    const run = () => new Promise<void>((_resolve, rej) => { reject = rej; });
+    const { unmount } = render(<Harness run={run} />);
+    await clickAct();
+    unmount();
+    await act(async () => { reject(new Error('unknown player')); });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});

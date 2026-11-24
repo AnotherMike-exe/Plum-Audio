@@ -31,6 +31,9 @@ export interface ActionErrorState {
 export function useActionError(): ActionErrorState {
   const [error, setError] = useState<string | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // A guarded promise can reject after the component is gone. `report` then started an 8 s timer
+  // that no cleanup was left to clear.
+  const unmounted = useRef(false);
 
   const clearTimer = useCallback(() => {
     if (timer.current) clearTimeout(timer.current);
@@ -52,10 +55,18 @@ export function useActionError(): ActionErrorState {
   }, [clearTimer]);
 
   const guard = useCallback((promise: Promise<unknown>, action: string) => {
-    promise.catch((err) => report(action, err));
+    promise.catch((err) => {
+      if (!unmounted.current) report(action, err);
+    });
   }, [report]);
 
-  useEffect(() => clearTimer, [clearTimer]);
+  useEffect(() => {
+    unmounted.current = false;
+    return () => {
+      unmounted.current = true;
+      clearTimer();
+    };
+  }, [clearTimer]);
 
   return { error, report, guard, dismiss };
 }
