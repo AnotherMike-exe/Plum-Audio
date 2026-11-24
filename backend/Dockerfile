@@ -150,10 +150,16 @@ RUN mkdir -p /config /data /media
 # in practice (mDNS needs L2); EXPOSE is documentation here.
 EXPOSE 80 5001 5002 8927 8928 8929 5050 5354
 
-# The config API is the cheapest liveness proof for the whole tree: it is a separate process from
-# the audio loop, so a green healthcheck means supervisord itself is up and serving — the audio
-# side's own health is the mesh API's business (/api/mesh/view), not Docker's.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${PLUM_CONFIG_API_PORT:-5002}/api/settings" >/dev/null || exit 1
+# scripts/healthcheck.py: every supervisord program RUNNING, the config API answering, the player
+# port accepting TCP and the player's health report fresh. The last two are skipped on a unit with no
+# audio output, which has no player program at all. This replaced a curl against the config API
+# alone — a process separate from the audio path, so that probe stayed green while the player was
+# FATAL or wedged, which are the states that used to need a power cycle.
+#
+# Docker does not restart an unhealthy container and there is deliberately no Docker socket in
+# here, so the script also writes its verdict to /data/health.json for the mesh snapshot and for a
+# host agent to act on. --timeout is above the sum of the script's own timeouts (6 + 3 + 2 s).
+HEALTHCHECK --interval=30s --timeout=15s --start-period=60s --retries=3 \
+    CMD python3 /app/scripts/healthcheck.py || exit 1
 
 CMD ["/app/entrypoint.sh"]
