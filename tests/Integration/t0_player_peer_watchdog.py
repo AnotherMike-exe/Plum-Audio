@@ -187,4 +187,5 @@ async def main():
     return 0 if all(results.values()) else 1
 
 
-raise SystemExit(asyncio.run(main()))
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(main()))
