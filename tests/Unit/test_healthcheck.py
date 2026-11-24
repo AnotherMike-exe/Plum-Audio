@@ -13,6 +13,8 @@ import socket
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "backend" / "scripts"))
 
@@ -188,6 +190,7 @@ def test_a_recovery_restarts_the_clock():
         "checked_at": 160.0,
         "consecutive_failures": 0,
         "programs": {"nginx": "RUNNING"},
+        "restart_advised": False,
     }
 
 
@@ -296,7 +299,8 @@ def test_the_mesh_probe_passes_the_api_guard():
 def test_a_wedged_server_loop_is_unhealthy(monkeypatch, tmp_path):
     _patch(monkeypatch, tmp_path, programs=FOUR, status=STATUS_ALL_RUNNING, mesh_problem="mesh API does not answer")
     _player_state(tmp_path, ts=1000.0)
-    assert healthcheck.evaluate(1010.0)[0] == ["mesh API does not answer"]
+    problems, _states, advised = healthcheck.evaluate(1010.0)
+    assert problems == ["mesh API does not answer"] and advised is True
 
 
 def test_the_probe_timeouts_fit_inside_the_docker_healthcheck_timeout():
@@ -311,3 +315,113 @@ def test_the_probe_timeouts_fit_inside_the_docker_healthcheck_timeout():
         + healthcheck.PLAYER_PORT_TIMEOUT_S
         + healthcheck.MESH_API_TIMEOUT_S
     )
+
+
+# -- restart_advised ---------------------------------------------------------------------------------
+# The host watchdog restarts the whole container. That is right only for a fault a restart can fix
+# and supervisord is not already handling.
+
+
+def _status(**states):
+    lines = STATUS_ALL_RUNNING.splitlines()
+    for name, state in states.items():
+        lines = [f"{name:<33}{state:<10}detail" if line.startswith(name + " ") else line for line in lines]
+    return "\n".join(lines) + "\n"
+
+
+def _advised(monkeypatch, tmp_path, *, status=STATUS_ALL_RUNNING, output_state="ok", ts=1000.0, **problems):
+    _patch(monkeypatch, tmp_path, programs=FOUR, status=status, **problems)
+    _player_state(tmp_path, ts=ts, output_state=output_state)
+    found, _states, advised = healthcheck.evaluate(1010.0)
+    return found, advised
+
+
+def test_a_healthy_unit_advises_no_restart(monkeypatch, tmp_path):
+    assert _advised(monkeypatch, tmp_path) == ([], False)
+
+
+@pytest.mark.parametrize("state", ["BACKOFF", "STARTING"])
+def test_a_program_that_supervisord_is_retrying_advises_no_restart(monkeypatch, tmp_path, state):
+    """A unit whose DAC is absent sits in BACKOFF. A restart cuts its sources for nothing."""
+    found, advised = _advised(
+        monkeypatch, tmp_path, status=_status(sendspin_player=state), port_problem="player port 8928 refused"
+    )
+    assert found and advised is False
+
+
+@pytest.mark.parametrize("state", ["FATAL", "EXITED", "UNKNOWN"])
+def test_a_program_that_supervisord_gave_up_on_advises_a_restart(monkeypatch, tmp_path, state):
+    found, advised = _advised(monkeypatch, tmp_path, status=_status(sendspin_player=state))
+    assert found and advised is True
+
+
+def test_a_program_that_an_operator_stopped_advises_no_restart(monkeypatch, tmp_path):
+    found, advised = _advised(monkeypatch, tmp_path, status=_status(nginx="STOPPED"))
+    assert found and advised is False
+
+
+def test_a_missing_program_advises_a_restart(monkeypatch, tmp_path):
+    status = "\n".join(line for line in STATUS_ALL_RUNNING.splitlines() if "nginx" not in line)
+    found, advised = _advised(monkeypatch, tmp_path, status=status)
+    assert found == ["program nginx is MISSING, not RUNNING"] and advised is True
+
+
+def test_a_lost_output_on_a_live_player_advises_no_restart(monkeypatch, tmp_path):
+    found, advised = _advised(monkeypatch, tmp_path, output_state="lost")
+    assert found == ["player output is lost (device removed)"] and advised is False
+
+
+def test_a_running_player_with_a_closed_port_advises_a_restart(monkeypatch, tmp_path):
+    found, advised = _advised(monkeypatch, tmp_path, port_problem="player port 8928 refused")
+    assert found and advised is True
+
+
+def test_a_running_player_with_a_stale_report_advises_a_restart(monkeypatch, tmp_path):
+    found, advised = _advised(monkeypatch, tmp_path, ts=10.0, output_state="lost")
+    assert len(found) == 2 and advised is True
+
+
+def test_a_running_config_api_that_does_not_answer_advises_a_restart(monkeypatch, tmp_path):
+    found, advised = _advised(monkeypatch, tmp_path, api_problem="config API does not answer")
+    assert found and advised is True
+
+
+def test_a_config_api_in_backoff_advises_no_restart(monkeypatch, tmp_path):
+    found, advised = _advised(
+        monkeypatch, tmp_path, status=_status(config_api="BACKOFF"), api_problem="config API does not answer"
+    )
+    assert len(found) == 2 and advised is False
+
+
+def test_the_mesh_probe_is_skipped_while_the_server_is_not_running(monkeypatch, tmp_path):
+    found, advised = _advised(
+        monkeypatch, tmp_path, status=_status(sendspin_server="BACKOFF"), mesh_problem="mesh API does not answer"
+    )
+    assert found == ["program sendspin_server is BACKOFF, not RUNNING"] and advised is False
+
+
+def test_one_fault_that_needs_a_restart_wins_over_one_that_does_not(monkeypatch, tmp_path):
+    found, advised = _advised(monkeypatch, tmp_path, status=_status(sendspin_player="BACKOFF", nginx="FATAL"))
+    assert len(found) == 2 and advised is True
+
+
+def test_a_supervisord_that_does_not_answer_advises_a_restart(monkeypatch, tmp_path):
+    _patch(monkeypatch, tmp_path, programs=FOUR, status="")
+    monkeypatch.setattr(healthcheck, "supervisor_status", lambda: ({}, "supervisord did not answer (x)"))
+    found, _states, advised = healthcheck.evaluate(1010.0)
+    assert "supervisord did not answer (x)" in found and advised is True
+
+
+def test_the_report_carries_restart_advised():
+    bad = healthcheck.build_report(None, ["x"], {}, 100.0, restart_advised=False)
+    assert bad["healthy"] is False and bad["restart_advised"] is False
+    assert healthcheck.build_report(None, ["x"], {}, 100.0, restart_advised=True)["restart_advised"] is True
+    assert healthcheck.build_report(None, [], {}, 100.0, restart_advised=True)["restart_advised"] is False
+
+
+def test_main_writes_restart_advised(monkeypatch, tmp_path):
+    _patch(monkeypatch, tmp_path, programs=FOUR, status=_status(sendspin_player="BACKOFF"))
+    monkeypatch.setattr(healthcheck, "HEALTH_FILE", str(tmp_path / "health.json"))
+    assert healthcheck.main() == 1
+    report = json.loads((tmp_path / "health.json").read_text())
+    assert report["healthy"] is False and report["restart_advised"] is False

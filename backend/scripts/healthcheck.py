@@ -31,11 +31,34 @@ Docker does NOT restart an unhealthy container, and there is deliberately no Doc
 it from the bind mount and act:
 
     {"healthy": false, "problems": ["..."], "since": <epoch>, "checked_at": <epoch>,
-     "consecutive_failures": 4, "programs": {"sendspin_player": "FATAL", ...}}
+     "consecutive_failures": 4, "programs": {"sendspin_player": "FATAL", ...},
+     "restart_advised": true}
 
 `since` is when the CURRENT verdict began, so "unhealthy for longer than N seconds" is one
 subtraction. `checked_at` proves the check itself still runs: a stale one means the container, or
 its healthcheck, is gone, and says nothing about health.
+
+`restart_advised` tells the host agent if a CONTAINER RESTART is the right answer. `healthy` does
+not: a unit whose configured DAC is absent keeps the player in BACKOFF and stays unhealthy for as
+long as the DAC is away, and a restart of the container changes nothing there. It only cuts the
+sources this unit serves to other rooms. The key is a boolean, and it is false on a healthy unit.
+It is true when at least one of these holds:
+
+  - supervisord does not answer.
+  - A program is in a state that supervisord does not leave by itself: FATAL, EXITED (every
+    program has `autorestart=true`, so an exit that stays is one supervisord gave up on), UNKNOWN,
+    or absent from its status.
+  - A program is RUNNING and does not do its job: the config API or the mesh API gives no reply,
+    the player port is closed, or the player's health report is stale, absent or unreadable.
+
+It is false when every problem is one of these:
+
+  - A program in STARTING or BACKOFF (supervisord is retrying it), in STOPPING, or in STOPPED
+    (an operator stopped it), and the probes that fail because of that program.
+  - An output that the player reports as lost while the player is RUNNING with a fresh report.
+    The player retries the output, then exits, and supervisord starts it again.
+
+A reader must treat an absent key as true: an older image does not write it.
 
 Standard library only, and no import of the rest of this tree: a healthcheck that needs the thing
 it is checking to import cleanly reports nothing exactly when it matters.
@@ -62,6 +85,7 @@ HEALTH_FILE = os.environ.get("PLUM_HEALTH_FILE", "/data/health.json")
 PLAYER_STATE_FILE = os.environ.get("PLUM_PLAYER_STATE_FILE", "/data/player_state.json")
 PLAYER_PROGRAM = "sendspin_player"
 SERVER_PROGRAM = "sendspin_server"
+CONFIG_API_PROGRAM = "config_api"
 # One timeout for each probe. They run in sequence, so the worst case is the sum, and the sum must
 # stay under the Dockerfile HEALTHCHECK `--timeout` (15 s). tests/Unit/test_healthcheck.py reads
 # the Dockerfile and holds this to it.
@@ -121,19 +145,26 @@ def supervisor_status() -> tuple[dict[str, str], str | None]:
     return states, None
 
 
-def check_programs(expected: list[str], states: dict[str, str]) -> list[str]:
-    problems = [
-        f"program {name} is {states.get(name, 'MISSING')}, not RUNNING"
-        for name in expected
-        if states.get(name) != "RUNNING"
-    ]
+# States that end without a container restart. STARTING and BACKOFF: supervisord is retrying.
+# STOPPING is on its way to another state. STOPPED is an operator's `supervisorctl stop`.
+SELF_RESOLVING_STATES = frozenset({"STARTING", "BACKOFF", "STOPPING", "STOPPED"})
+
+
+def programs_not_running(expected: list[str], states: dict[str, str]) -> dict[str, str]:
+    """{program: state} for each program that is not RUNNING. An expected one with no row is MISSING."""
+    found = {name: states.get(name, "MISSING") for name in expected if states.get(name) != "RUNNING"}
     # A program supervisord knows that the runtime set does not name: still judged, never skipped.
-    problems += [
-        f"program {name} is {state}, not RUNNING"
-        for name, state in states.items()
-        if name not in expected and state != "RUNNING"
-    ]
-    return problems
+    found.update({name: state for name, state in states.items() if name not in expected and state != "RUNNING"})
+    return found
+
+
+def check_programs(expected: list[str], states: dict[str, str]) -> list[str]:
+    return [f"program {name} is {state}, not RUNNING" for name, state in programs_not_running(expected, states).items()]
+
+
+def program_needs_restart(state: str) -> bool:
+    """True for a state that supervisord does not leave by itself (FATAL, EXITED, MISSING, ...)."""
+    return state not in SELF_RESOLVING_STATES
 
 
 def check_port(host: str, port: int, *, timeout: float = PLAYER_PORT_TIMEOUT_S) -> str | None:
@@ -182,59 +213,100 @@ def check_mesh_api(port: int, *, timeout: float = MESH_API_TIMEOUT_S) -> str | N
         return f"mesh API does not answer on :{port} ({exc})"
 
 
-def check_player_health(path: str, now: float, *, stale_s: float = PLAYER_STALE_S) -> list[str]:
-    """The player's own report: is it recent, and does it say the output is gone?"""
+def player_health_findings(path: str, now: float, *, stale_s: float = PLAYER_STALE_S) -> list[tuple[str, bool]]:
+    """(problem, needs a container restart) for each fault in the player's own report.
+
+    A report that is stale, absent or unreadable comes from a RUNNING player that stopped doing
+    its job, and supervisord sees nothing wrong: that needs a restart. A lost output with a fresh
+    report does not. The player is alive, and it retries the output and then exits by itself.
+    """
     try:
         with open(path, encoding="utf-8") as fh:
             state = json.load(fh)
     except FileNotFoundError:
-        return [f"player state file {path} does not exist"]
+        return [(f"player state file {path} does not exist", True)]
     except (OSError, ValueError) as exc:
-        return [f"player state file {path} is unreadable ({exc})"]
+        return [(f"player state file {path} is unreadable ({exc})", True)]
     report = state.get("health") if isinstance(state, dict) else None
     if not isinstance(report, dict) or not isinstance(report.get("ts"), (int, float)):
-        return ["player wrote no health report"]
-    problems: list[str] = []
+        return [("player wrote no health report", True)]
+    findings: list[tuple[str, bool]] = []
     age = now - report["ts"]
     if age > stale_s:
-        problems.append(f"player health report is stale ({age:.0f}s old, limit {stale_s:.0f}s)")
+        findings.append((f"player health report is stale ({age:.0f}s old, limit {stale_s:.0f}s)", True))
     output = report.get("output")
     if isinstance(output, dict) and output.get("state") == "lost":
-        problems.append(f"player output is lost ({output.get('fault') or 'no detail'})")
-    return problems
+        findings.append((f"player output is lost ({output.get('fault') or 'no detail'})", False))
+    return findings
 
 
-def evaluate(now: float) -> tuple[list[str], dict[str, str]]:
-    """Run every check. Returns (problems, program states)."""
+def check_player_health(path: str, now: float, *, stale_s: float = PLAYER_STALE_S) -> list[str]:
+    """The player's own report: is it recent, and does it say the output is gone?"""
+    return [problem for problem, _restart in player_health_findings(path, now, stale_s=stale_s)]
+
+
+def evaluate(now: float) -> tuple[list[str], dict[str, str], bool]:
+    """Run every check. Returns (problems, program states, restart advised).
+
+    The third value is the rule in the module docstring. A probe that fails counts toward it only
+    while supervisord reports that probe's program as RUNNING: the same failure behind a program
+    in BACKOFF is that program's fault said twice, and supervisord is already at work on it.
+    """
     problems: list[str] = []
+    advised = False
     expected = expected_programs(PROGRAM_DIR)
     states, error = supervisor_status()
     if error:
         problems.append(error)
+        advised = True
     else:
         problems += check_programs(expected, states)
+        advised = any(program_needs_restart(state) for state in programs_not_running(expected, states).values())
+
+    def running(program: str) -> bool:
+        return states.get(program) == "RUNNING"
+
     api_problem = check_config_api(int(os.environ.get("PLUM_CONFIG_API_PORT", "5002")))
     if api_problem:
         problems.append(api_problem)
+        advised = advised or running(CONFIG_API_PROGRAM)
     # A server that is not RUNNING is already reported above. An unknown state is still probed.
-    if error or states.get(SERVER_PROGRAM) == "RUNNING":
+    if error or running(SERVER_PROGRAM):
         mesh_problem = check_mesh_api(int(os.environ.get("PLUM_MESH_API_PORT", "5001")))
         if mesh_problem:
             problems.append(mesh_problem)
+            advised = True  # a RUNNING server with a stopped loop, or no supervisord at all
     # The gate's decision, as entrypoint.sh applied it: no program file, no player to check.
     if PLAYER_PROGRAM in expected:
         port_problem = check_port("127.0.0.1", int(os.environ.get("PLUM_PLAYER_PORT", "8928")))
         if port_problem:
             problems.append(port_problem)
+            advised = advised or running(PLAYER_PROGRAM)
         # A player that is not RUNNING is already reported above; its stale report is the same
         # fault said twice, and a fresh process has not written one yet.
-        if states.get(PLAYER_PROGRAM) == "RUNNING":
-            problems += check_player_health(PLAYER_STATE_FILE, now)
-    return problems, states
+        if running(PLAYER_PROGRAM):
+            for problem, needs_restart in player_health_findings(PLAYER_STATE_FILE, now):
+                problems.append(problem)
+                advised = advised or needs_restart
+    return problems, states, advised
 
 
-def build_report(previous: dict | None, problems: list[str], states: dict[str, str], now: float) -> dict:
+def build_report(
+    previous: dict | None,
+    problems: list[str],
+    states: dict[str, str],
+    now: float,
+    *,
+    restart_advised: bool | None = None,
+) -> dict:
+    """The verdict as /data/health.json holds it. `restart_advised` None means "not judged".
+
+    Not judged is true on an unhealthy unit, which is also how a reader takes an absent key. A
+    healthy unit never advises a restart.
+    """
     healthy = not problems
+    if restart_advised is None:
+        restart_advised = True
     same_verdict = isinstance(previous, dict) and previous.get("healthy") is healthy
     since = previous.get("since") if same_verdict and isinstance(previous.get("since"), (int, float)) else now
     failures = 0
@@ -248,6 +320,7 @@ def build_report(previous: dict | None, problems: list[str], states: dict[str, s
         "checked_at": round(now, 1),
         "consecutive_failures": failures,
         "programs": states,
+        "restart_advised": bool(restart_advised) and not healthy,
     }
 
 
@@ -291,9 +364,9 @@ def write_report(path: str, report: dict) -> None:
 
 def main() -> int:
     now = time.time()
-    problems, states = evaluate(now)
+    problems, states, restart_advised = evaluate(now)
     previous = read_report(HEALTH_FILE)
-    report = build_report(previous, problems, states, now)
+    report = build_report(previous, problems, states, now, restart_advised=restart_advised)
     if should_write(previous, report, now):
         write_report(HEALTH_FILE, report)
     for problem in problems:
