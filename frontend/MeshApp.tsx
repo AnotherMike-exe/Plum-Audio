@@ -40,10 +40,16 @@ import { aboutService } from './services/aboutService';
 import { useThemeSettings } from './hooks/useThemeSettings';
 import { useBrowserPlayer } from './hooks/useBrowserPlayer';
 import { useActionError } from './hooks/useActionError';
+import { RetryBackoff } from './utils/retryBackoff';
 
 const service = new SendspinDataService();
 const EMPTY: Model = { servers: [], streams: [], clients: [], localPlayerIds: [] };
 const clampVol = (v: number) => Math.max(0, Math.min(100, v));
+// Browser-player route retry: 1 s, 2 s, 4 s ... capped at 30 s. The first failures are expected (the
+// unit's own view lags the row we can already see), so only this many in a row are worth a message.
+const BROWSER_ROUTE_RETRY_BASE_MS = 1_000;
+const BROWSER_ROUTE_RETRY_MAX_MS = 30_000;
+const BROWSER_ROUTE_FAILURES_TO_REPORT = 4;
 
 /**
  * Which stream the main card features.
@@ -429,6 +435,10 @@ export default function MeshApp(): React.ReactElement {
   const browserTargetRef = useRef<string | null>(null);
   const browserRoutedRef = useRef(false);
   const browserHandledReconnectRef = useRef(0);
+  // Paces the reconciler's route request. The effect below runs on every model emit — twice a
+  // second, because `model.clients` is a new array each time — so without this a route that kept
+  // failing was re-sent twice a second for as long as the tab stayed open.
+  const browserRouteBackoffRef = useRef(new RetryBackoff(BROWSER_ROUTE_RETRY_BASE_MS, BROWSER_ROUTE_RETRY_MAX_MS));
 
   const onStartBrowserAudio = useCallback(() => {
     const m = modelRef.current;
@@ -451,6 +461,7 @@ export default function MeshApp(): React.ReactElement {
     browserTargetRef.current = validTarget;
     browserRoutedRef.current = false;
     browserHandledReconnectRef.current = 0;
+    browserRouteBackoffRef.current.reset();
     void browserStart(host).catch((err) => {
       browserTargetRef.current = null;
       reportError('Could not start audio in this browser', err);
@@ -459,6 +470,7 @@ export default function MeshApp(): React.ReactElement {
 
   const onStopBrowserAudio = useCallback(() => {
     browserTargetRef.current = null;
+    browserRouteBackoffRef.current.reset();
     browserStop();
   }, [browserStop]);
 
@@ -482,26 +494,41 @@ export default function MeshApp(): React.ReactElement {
 
     if (cur && !cur.startsWith(FOREIGN_PREFIX) && cur !== target) {
       browserTargetRef.current = cur; // (3) user moved it — follow, so reconnects restore THAT
+      browserRouteBackoffRef.current.reset();
       browserRoutedRef.current = true;
       browserHandledReconnectRef.current = browserReconnectSeq;
       return;
     }
     if (cur && cur === target) {
       browserRoutedRef.current = true; // landed / still on target
+      browserRouteBackoffRef.current.reset();
       browserHandledReconnectRef.current = browserReconnectSeq;
       return;
     }
     // cur is null → idle
     if (!target) return; // (started idle — unit had nothing active)
     if (!browserRoutedRef.current || reconnected) {
-      void service.routeClient(browserPlayerId, target).catch(() => {
-        /* view lag — retry next tick */
-      }); // (1) initial or (2) reconnect recovery
+      // (1) initial or (2) reconnect recovery. One request at a time, and a growing wait after each
+      // failure: this effect runs twice a second, and it must not POST twice a second.
+      const backoff = browserRouteBackoffRef.current;
+      if (!backoff.ready()) return;
+      backoff.begin();
+      service.routeClient(browserPlayerId, target).then(
+        () => backoff.succeed(),
+        (err) => {
+          backoff.fail();
+          // The first failures are view lag and clear by themselves. A run of them is a real
+          // fault, and the tab plays nothing meanwhile — say so, once.
+          if (backoff.failures === BROWSER_ROUTE_FAILURES_TO_REPORT) {
+            reportError('Could not put this browser on the stream', err);
+          }
+        },
+      );
       return;
     }
     browserTargetRef.current = null; // (4) unrouted by the user → tear down
     browserStop();
-  }, [model.clients, browserActive, browserPlayerId, browserReconnectSeq, browserStop]);
+  }, [model.clients, browserActive, browserPlayerId, browserReconnectSeq, browserStop, reportError]);
   const adjustStreamVolume = useCallback((streamId: string, dir: 'up' | 'down') => {
     const s = modelRef.current.streams.find((x) => x.id === streamId);
     service.setStreamVolume(streamId, clampVol((s?.volume ?? 100) + (dir === 'up' ? 5 : -5)));
