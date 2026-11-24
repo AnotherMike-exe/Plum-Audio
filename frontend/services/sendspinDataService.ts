@@ -32,6 +32,7 @@ const DUPLICATE_VOLUME_MS = 250;
 // that is idle when the page opens still reads the way it does when it is playing.
 const NAME_MEMO_KEY = 'plum.speakerNames';
 const CLIENT_NONCE_PREFIX = 'plum.ctrlNonce.';
+const CONSUME_RECONNECT_MS = 2000;
 
 // ---- Mesh REST wire shapes (backend/scripts/mesh/model.py) ----
 interface WirePlayer {
@@ -423,6 +424,23 @@ function stableClientNonce(sourceId: string): string {
 
 type Listener = (model: Model) => void;
 
+/**
+ * A mesh command that did not apply. `message` is a sentence fit to show the user: the unit's own
+ * `{error}` text when it sent one, else the HTTP status, else "could not reach".
+ */
+export class MeshRequestError extends Error {
+  readonly path: string;
+  /** HTTP status, or undefined when the request never got an answer (unit down, CORS, offline). */
+  readonly status?: number;
+
+  constructor(message: string, path: string, status?: number) {
+    super(message);
+    this.name = 'MeshRequestError';
+    this.path = path;
+    this.status = status;
+  }
+}
+
 export class SendspinDataService {
   // Federated stream id ("<unitId>::<sourceId>") -> controller client. ONE PER SOURCE, not per
   // unit: a Sendspin client holds a single websocket and therefore sits in a single group, so a
@@ -457,6 +475,18 @@ export class SendspinDataService {
   private listeners = new Set<Listener>();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
+  /** Pending consume reconnect. Tracked so stop() can cancel it — an untracked one reopened the
+   *  relay socket after the service had stopped. */
+  private consumeTimer: ReturnType<typeof setTimeout> | null = null;
+  /** True between stop() and the next start(). Every async completion checks it before it writes. */
+  private stopped = false;
+  // Poll ordering. Polls overlap: the 3 s interval does not wait for the previous response, and every
+  // command fires one more. Each poll takes a number at SEND time, and a response older than the one
+  // already applied is dropped — otherwise a slow reply overwrote a newer view, and a device that
+  // had just moved jumped back for a poll.
+  private pollSeq = 0;
+  private appliedViewSeq = 0;
+  private appliedNeighbourhoodSeq = 0;
   // Volume the user just set, held over the polled value until the round trip completes (set →
   // player applies → player reports → our next /view poll). Without it a drag fights the poll.
   // Player volume only; group volume needs none — the controller WS echoes it back immediately.
@@ -468,6 +498,10 @@ export class SendspinDataService {
   private nameByUrl = new Map<string, string>(loadNameMemo());
 
   start(): void {
+    // Idempotent: a second start() must not leave the first one's timers running untracked.
+    if (this.pollTimer) clearInterval(this.pollTimer);
+    if (this.tickTimer) clearInterval(this.tickTimer);
+    this.stopped = false;
     void this.poll();
     this.pollTimer = setInterval(() => void this.poll(), POLL_INTERVAL_MS);
     // Re-emit ~2x/s so extrapolated position advances even without new WS messages.
@@ -479,15 +513,34 @@ export class SendspinDataService {
     if (this.pollTimer) clearInterval(this.pollTimer);
     if (this.tickTimer) clearInterval(this.tickTimer);
     this.pollTimer = this.tickTimer = null;
+    this.stopped = true;
     for (const c of this.controllers.values()) c.close();
     this.controllers.clear();
-    this.consumeWs?.close();
+    if (this.consumeTimer) clearTimeout(this.consumeTimer);
+    this.consumeTimer = null;
+    // Forget the socket BEFORE closing it, so its close event reads as stale and does nothing.
+    const ws = this.consumeWs;
     this.consumeWs = null;
+    this.clearConsumeState();
+    ws?.close();
+  }
+
+  private clearConsumeState(): void {
+    this.consumeCtrl = null;
+    this.consumeViz = null;
+    this.consumeArt = null;
+    this.consumePair = null;
   }
 
   private openConsume(): void {
     // ws(s):// same-origin /api/mesh/consume (nginx proxies it). In dev, VITE_MESH_API_URL is a full
     // http URL → swap the scheme. Auto-reconnects; the relay is optional, the mesh renders without it.
+    if (this.stopped) return;
+    if (this.consumeTimer) clearTimeout(this.consumeTimer);
+    this.consumeTimer = null;
+    // One relay socket at a time. React StrictMode runs start → stop → start, and without this the
+    // second start opened a socket beside one that was still connecting.
+    if (this.consumeWs && this.consumeWs.readyState !== WebSocket.CLOSED) return;
     let url: string;
     if (MESH_API_BASE.startsWith('http')) url = MESH_API_BASE.replace(/^http/, 'ws') + '/consume';
     else url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + MESH_API_BASE + '/consume';
@@ -499,6 +552,7 @@ export class SendspinDataService {
     }
     this.consumeWs = ws;
     ws.onmessage = (ev) => {
+      if (this.consumeWs !== ws) return; // a socket we already replaced or dropped
       let m: any;
       try { m = JSON.parse(ev.data); } catch { return; }
       if (m.t === 'ctrl') {
@@ -536,11 +590,17 @@ export class SendspinDataService {
       }
     };
     ws.onclose = () => {
-      this.consumeCtrl = null;
-      this.consumeViz = null;
-      this.consumeArt = null;
-      this.consumePair = null;
-      if (this.pollTimer) setTimeout(() => this.openConsume(), 2000); // still running → reconnect
+      // A STALE socket's close must not touch the state of the socket that replaced it. A browser
+      // delivers `close` asynchronously, so under StrictMode the first socket's event arrived after
+      // the second start() — it blanked the live relay state and scheduled one more socket.
+      if (this.consumeWs !== ws) return;
+      this.consumeWs = null;
+      this.clearConsumeState();
+      if (this.stopped) return;
+      this.consumeTimer = setTimeout(() => {
+        this.consumeTimer = null;
+        this.openConsume();
+      }, CONSUME_RECONNECT_MS);
     };
     ws.onerror = () => ws.close();
   }
@@ -725,7 +785,16 @@ export class SendspinDataService {
     // Hold what the user just chose until the poll catches up: the round trip is player → server
     // → next /view poll, so without this a drag fights the last polled value and the knob jumps.
     this.pendingVolume.set(playerId, { volume, muted, at: now });
-    await this.post(unitId, '/volume', { player_id: playerId, volume, muted });
+    try {
+      await this.post(unitId, '/volume', { player_id: playerId, volume, muted });
+    } catch (err) {
+      // The level did not apply. Release the hold now, so the slider shows the real level at once
+      // instead of the refused one for VOLUME_HOLD_MS — and let an immediate retry through.
+      this.pendingVolume.delete(playerId);
+      this.lastVolumeSent.delete(playerId);
+      this.emit();
+      throw err;
+    }
   }
 
   /**
@@ -737,7 +806,13 @@ export class SendspinDataService {
     if (federatedStreamId.startsWith(FOREIGN_PREFIX)) return; // a foreign server owns its own sender
     const { unitId, sourceId } = parseStreamId(federatedStreamId);
     this.pendingSourceVolume.set(federatedStreamId, { volume, at: Date.now() });
-    await this.post(unitId, '/source-volume', { source_id: sourceId, volume, muted });
+    try {
+      await this.post(unitId, '/source-volume', { source_id: sourceId, volume, muted });
+    } catch (err) {
+      this.pendingSourceVolume.delete(federatedStreamId); // same reason as setVolume
+      this.emit();
+      throw err;
+    }
   }
 
   controlStream(federatedStreamId: string, command: ControllerCommand): void {
@@ -821,17 +896,26 @@ export class SendspinDataService {
   // -- internals ----------------------------------------------------------
 
   private async poll(): Promise<void> {
+    const seq = ++this.pollSeq;
     try {
       const res = await fetch(`${MESH_API_BASE}/view`);
       if (!res.ok) return;
       const view: MeshView = await res.json();
+      // Dropped when a LATER poll already applied its view, or the service stopped meanwhile —
+      // applying after stop() would reopen a controller socket for every source.
+      if (this.stopped || seq < this.appliedViewSeq) return;
+      this.appliedViewSeq = seq;
       this.applyView(view);
     } catch {
       // transient — keep last view; the tick timer still re-emits.
     }
     try {
       const res = await fetch(`${MESH_API_BASE}/neighbourhood`);
-      if (res.ok) this.neighbourhood = await res.json();
+      if (!res.ok) return;
+      const neighbourhood: Neighbourhood = await res.json();
+      if (this.stopped || seq < this.appliedNeighbourhoodSeq) return;
+      this.appliedNeighbourhoodSeq = seq;
+      this.neighbourhood = neighbourhood;
     } catch {
       // discovery is optional; the mesh still renders without it.
     }
@@ -994,12 +1078,28 @@ export class SendspinDataService {
     const host = this.unitHosts.get(unitId);
     // Prefer per-unit host (works cross-unit + open CORS); fall back to the proxied base.
     const base = host ? `http://${host}:${MESH_API_PORT}/api/mesh` : MESH_API_BASE;
-    const res = await fetch(`${base}${path}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) throw new Error(`mesh ${path} failed: ${res.status}`);
+    let res: Response;
+    try {
+      res = await fetch(`${base}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    } catch {
+      // fetch rejects with a bare TypeError ("Failed to fetch") — true, and useless to a user.
+      throw new MeshRequestError('Could not reach the unit', path);
+    }
+    if (!res.ok) {
+      // The unit answers a refusal with `{error}` — "unknown player", "unknown source". Carry that
+      // sentence to the caller: it is the only place the reason exists.
+      let reason: string | undefined;
+      try {
+        reason = (await res.json())?.error;
+      } catch {
+        // no JSON body — the status is all we have
+      }
+      throw new MeshRequestError(reason || `Request failed (${res.status})`, path, res.status);
+    }
     void this.poll(); // reflect the change quickly
   }
 
