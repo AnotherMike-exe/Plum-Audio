@@ -43,6 +43,40 @@ image compares as different across units.
 
 ## Phase 3 — remaining sources, GUI, container (`feature/phase3-sources-gui`, in progress)
 
+### Maintenance and hardening — 2026-11-24 (`feature/maintenance-2026-11`)
+
+A maintenance batch of 45 commits on `feature/maintenance-2026-11`, not yet merged to `dev`. It
+covers API hardening, player recovery, frontend fixes, and the dependency and build update. The
+commit bodies record no rig run for this batch.
+
+**API and deploy hardening.** A request guard refuses cross-site and rebound requests before the
+handler runs (`c3e3828`). Endpoint ids, ports and adapters pass one validation rule (`b905cf7`). The
+FIFO opens with `O_NOFOLLOW` (`e882ce5`). The nginx replies carry `nosniff`, `Referrer-Policy` and
+`X-Frame-Options` (`3dbe6a8`). The host updater accepts only a valid channel tag (`2a45018`). The
+rig password stays out of the process lists, and the env file is mode 600 (`e88b1cb`). The
+go-librespot tarball checks a pinned SHA-256 (`ebcf8f1`).
+
+**Player recovery.** A player whose peer stops answering closes that session. It exits 4 when the
+close does not free it (`4375afd`). A dead output stream re-opens. A re-open that does not hold
+backs off, and three failed re-opens in a row exit 3 (`2b7e1a2`, `720b7ab`). supervisord retries a
+failed start for about 50 hours (`04db777`). The container healthcheck writes its verdict to
+`/data/health.json` (`fd16aae`). `player_state.json` writes are durable and do not block the audio
+loop (`10230b7`, `a2aec27`). The relay retry backs off, and shutdown runs every step (`9a907f3`,
+`122db79`, `0932e69`).
+
+**Mesh and server.** The mesh restores its mDNS records after an Avahi restart (`7ab6842`). A stale
+player self-report expires (`1c064ce`). An adopted speaker dials again after it drops (`3f6d158`).
+Background tasks keep a reference and log their exception (`540a4cb`).
+
+**Frontend.** A failed command shows its reason to the user (`af22b1f`). The pair dialog is a modal,
+with one poll at a time (`30d9220`). The controller client keeps one socket and one clock loop
+(`5669603`). The browser route retry backs off (`faad516`).
+
+**Build and dependencies.** The frontend build stage and CI move to Node 26 LTS (`3bf440d`). Vite
+moves to 8.3.8, Vitest to 5.1.1 and jsdom to 31 (`9b0a22e`, `951cf24`). The Python floors move, and
+aiosendspin stays pinned at 9.1.1 (`a874a19`). The frontend suite passed 189 vitest tests at
+`951cf24`. `msw` 3 and `jest-dom` 8 are not taken (OPEN-ITEMS #33).
+
 ### main catches up, and the first security sweep — 2026-09-13/14
 
 `main` was 108 commits behind `dev` and carried only the Phase 0 scaffold. Phase 2 and Phase 3
