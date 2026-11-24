@@ -31,8 +31,11 @@ worse than one whose GUI is reachable from the wrong page.
 from __future__ import annotations
 
 import contextlib
+import ipaddress
+import json
 import logging
 import os
+import re
 import socket
 from urllib.parse import urlsplit
 
@@ -110,7 +113,43 @@ def own_hosts() -> set[str]:
         hosts.add(ip)
     with contextlib.suppress(OSError):
         hosts |= name_forms(socket.gethostname())
-    return hosts
+    return hosts | mdns_hosts()
+
+
+_SETTINGS_FILE_DEFAULT = "/data/settings.json"
+_HOSTNAME_LABEL = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+# (path, st_mtime_ns) -> names. One stat per request; the file is read again only when it changed.
+_mdns_cache: tuple[tuple[str, int], set[str]] | None = None
+
+
+def mdns_hosts() -> set[str]:
+    """The name forms of the mDNS hostname a user set from Settings (`settings.json` `hostname`).
+
+    `socket.gethostname()` is the HOST's name. Settings -> Device can give Avahi a different name
+    at runtime (`SetHostName`), and the page is then at `http://<that-name>.local`. The kernel
+    hostname never learns it, so without this the guard refuses the page the user just renamed.
+
+    Read from the file and not through SettingsManager: the audio process loads this module, and
+    it must not import Flask. Read-only, and never raises.
+    """
+    global _mdns_cache
+    path = os.environ.get("PLUM_SETTINGS_FILE", _SETTINGS_FILE_DEFAULT)
+    try:
+        key = (path, os.stat(path).st_mtime_ns)
+    except OSError:
+        return set()
+    if _mdns_cache is not None and _mdns_cache[0] == key:
+        return set(_mdns_cache[1])
+    names: set[str] = set()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            hostname = json.load(fh).get("hostname")
+        if isinstance(hostname, str) and _HOSTNAME_LABEL.fullmatch(hostname.lower()):
+            names = name_forms(hostname)
+    except (OSError, ValueError, AttributeError):
+        names = set()  # torn or damaged file: the next change to it is read again
+    _mdns_cache = (key, names)
+    return set(names)
 
 
 def known_hosts(units) -> set[str]:
@@ -158,9 +197,9 @@ def origin_header(origin: str | None, hosts: set[str], extras: list[str] | None 
 
     - No `Origin`: not a browser request (a peer, the loopback player). CORS never applied; adding
       headers would be noise, and refusing would break the mesh from the inside.
-    - A rejected origin: the response still returns normally, but with no CORS headers the browser
-      refuses to hand it to the calling page. That is how CORS denies — it is not our job to 403,
-      and doing so would change what a same-origin caller sees.
+    - A rejected origin: no CORS headers, so the browser refuses to hand the reply to the calling
+      page. That is how CORS denies a READ. It does not stop the handler, so `guard` below also
+      answers 403 before the handler runs. With `PLUM_API_GUARD=0` only this half applies.
 
     Echoes the exact origin rather than `*`: `*` is what we are moving away from, and an echo is
     also required if credentials are ever added.
@@ -168,3 +207,114 @@ def origin_header(origin: str | None, hosts: set[str], extras: list[str] | None 
     if not origin:
         return None
     return origin if is_allowed(origin, hosts, extras) else None
+
+
+# -- the request guard ------------------------------------------------------------------------------
+#
+# Everything above decides which CORS headers a reply carries. CORS only stops a page from READING
+# a reply: the handler still ran. So a `text/plain` POST from any web page (a "simple" request, no
+# preflight) re-routed audio blind, and a websocket upgrade, which CORS does not cover at all, read
+# the cached pairing PIN from /api/mesh/consume. The guard refuses BEFORE the handler. Both APIs
+# call it: mesh/api.py as aiohttp middleware, apis/server.py as a Flask `before_request`.
+#
+# PLUM_API_GUARD=0 turns the guard off and leaves the CORS headers as they were. It exists for the
+# same reason PLUM_ALLOWED_ORIGINS=* does: this change needs a rig test, and a unit whose GUI is
+# dead is worse than one that is reachable from the wrong page. Set it in plum-audio.env and
+# restart the container. PLUM_ALLOWED_ORIGINS is the narrower fix for one refused origin or host.
+
+BODY_METHODS = frozenset({"POST", "PUT", "DELETE", "PATCH"})
+
+
+def guard_enabled() -> bool:
+    """False only when `PLUM_API_GUARD` is `0`, `false`, `no` or `off`."""
+    return (os.environ.get("PLUM_API_GUARD") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _host_header_name(host: str) -> str | None:
+    """The bare hostname of a `Host` header, lowercased, without port. None if it is not parseable."""
+    if not host or host != host.strip() or any(ch in host for ch in "/@?# \t"):
+        return None
+    try:
+        parts = urlsplit(f"//{host}")
+        _ = parts.port  # raises ValueError on a port that is not a number
+        name = parts.hostname
+    except ValueError:
+        return None
+    return name.lower().rstrip(".") if name else None
+
+
+def _is_ip_literal(name: str) -> bool:
+    try:
+        ipaddress.ip_address(name.split("%", 1)[0])  # drop an IPv6 zone id
+    except ValueError:
+        return False
+    return True
+
+
+def host_is_trusted(host: str | None, hosts: set[str], extras: list[str] | None = None) -> bool:
+    """May a request with NO `Origin` and this `Host` header reach a handler?
+
+    This is the DNS-rebinding check. A page at evil.example whose name now resolves to the unit is
+    same-origin to the browser, so its GETs carry no Origin, and the only trace of the attacker's
+    name is the Host header. An IP literal cannot be rebound, so it always passes. That is also
+    what every server-side caller sends (peers, the loopback player, Home Assistant by IP).
+
+    An absent Host passes: only a browser can be rebound, and a browser always sends one.
+    """
+    if host is None:
+        return True
+    extras = extras if extras is not None else configured_extra_origins()
+    if _WILDCARD in extras:
+        return True
+    name = _host_header_name(host)
+    if name is None:
+        return False
+    if _is_ip_literal(name) or name in LOOPBACK_HOSTS or name in hosts:
+        return True
+    # A reverse proxy or an alias named in PLUM_ALLOWED_ORIGINS: its same-origin GETs carry that
+    # name in Host and no Origin.
+    return any(_host_of(extra) == name for extra in extras)
+
+
+def guard(
+    *,
+    method: str,
+    origin: str | None,
+    host: str | None,
+    content_type: str | None,
+    has_body: bool,
+    hosts: set[str],
+    extras: list[str] | None = None,
+) -> tuple[int, str] | None:
+    """Decide if a request may reach its handler. None to pass, else (HTTP status, message).
+
+    (a) `Origin` present and not allowed: 403, for every method. A websocket upgrade is a GET with
+        an Origin, so this is the check that covers it.
+    (b) `Origin` absent: the `Host` must be an IP literal, loopback, or a name we know. See
+        `host_is_trusted`. An allowed Origin needs no Host check: its host is in the same set.
+    (c) A POST, PUT or DELETE with a body must be `application/json`. A cross-site page can send
+        `text/plain` with no preflight, and it cannot send JSON without one.
+    """
+    if not guard_enabled():
+        return None
+    extras = extras if extras is not None else configured_extra_origins()
+    if origin:
+        if not is_allowed(origin, hosts, extras):
+            return 403, f"origin {origin[:200]!r} is not allowed (set PLUM_ALLOWED_ORIGINS to allow it)"
+    elif not host_is_trusted(host, hosts, extras):
+        return 403, f"host {str(host)[:200]!r} is not a name of this unit (set PLUM_ALLOWED_ORIGINS to allow it)"
+    if method.upper() in BODY_METHODS and has_body:
+        mimetype = (content_type or "").split(";", 1)[0].strip().lower()
+        if mimetype != "application/json":
+            return 415, "a request body must be Content-Type: application/json"
+    return None
+
+
+def has_body(content_length: str | int | None, transfer_encoding: str | None) -> bool:
+    """Does a request carry a body, from its framing headers? Both APIs ask the same way."""
+    if transfer_encoding:
+        return True
+    try:
+        return int(content_length or 0) > 0
+    except (TypeError, ValueError):
+        return True  # an unreadable length is not proof of an empty body

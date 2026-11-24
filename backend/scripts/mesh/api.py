@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import contextlib
 import hmac
+import json
 import logging
 import os
 from collections.abc import Awaitable, Callable
@@ -90,17 +91,48 @@ def make_cors_middleware(hosts_provider) -> _Middleware:
     Requests with NO Origin — peer snapshot polls, delegated routes, the loopback player-state POST —
     pass through untouched. They are not browser requests and CORS never applied to them; refusing
     them would break mesh aggregation from the inside with nothing visible in any browser.
+
+    The request GUARD runs first (`cors_policy.guard`, shared with the Flask API). The CORS headers
+    only stop a page from reading the reply; before the guard, the handler had already run for a
+    refused origin, and a websocket upgrade was never checked at all. `PLUM_API_GUARD=0` turns the
+    guard off and leaves the headers as they were.
     """
 
     @web.middleware
     async def _cors(request: web.Request, handler):
         origin = request.headers.get("Origin")
-        allow = cors_policy.origin_header(origin, hosts_provider())
+        hosts = hosts_provider()
+        allow = cors_policy.origin_header(origin, hosts)
 
-        if request.method == "OPTIONS":
+        refusal = cors_policy.guard(
+            method=request.method,
+            origin=origin,
+            host=request.headers.get("Host"),
+            content_type=request.headers.get("Content-Type"),
+            has_body=cors_policy.has_body(
+                request.headers.get("Content-Length"), request.headers.get("Transfer-Encoding")
+            ),
+            hosts=hosts,
+        )
+        if refusal is not None:
+            status, message = refusal
+            logger.warning(
+                "refused %s %s: %s (known hosts: %s)",
+                request.method,
+                request.path,
+                message,
+                ", ".join(sorted(hosts)) or "none",
+            )
+            resp = web.json_response({"error": message}, status=status)
+        elif request.method == "OPTIONS":
             resp = web.Response()
         else:
-            resp = await handler(request)
+            try:
+                resp = await handler(request)
+            except web.HTTPException as exc:
+                # An aiohttp error is a response. Keep it on this path so it gets the CORS headers:
+                # without them the GUI cannot read WHY a request failed, only that it did.
+                resp = exc
 
         if allow is not None:
             resp.headers["Access-Control-Allow-Origin"] = allow
@@ -177,9 +209,14 @@ class MeshApi:
         this unit's OWN host (which the peer table never does — a unit ignores its own beacon), and
         that entry is exactly the one whose absence would break the page being looked at.
         """
+        # own_hosts() as well: the request guard checks the Host header against this set, and the
+        # view knows a unit by `socket.gethostname()` only. A unit whose mDNS name was changed from
+        # Settings is reached at a name the view never carries. It also keeps this unit's own names
+        # in the set while the view is not ready.
+        hosts = cors_policy.own_hosts()
         with contextlib.suppress(Exception):
-            return cors_policy.known_hosts(self._agg.view().units)
-        return set(cors_policy.LOOPBACK_HOSTS)
+            hosts |= cors_policy.known_hosts(self._agg.view().units)
+        return hosts
 
     async def start(self) -> None:
         app = web.Application(middlewares=[make_cors_middleware(self._known_hosts)])
@@ -741,7 +778,18 @@ class MeshApi:
 
     @staticmethod
     async def _json(request: web.Request) -> dict:
+        """The request body as a dict. An empty or malformed body is `{}`; a non-object is 400.
+
+        Every handler calls `body.get(...)`, so a JSON array or string was an AttributeError and a
+        500 with a traceback. The Content-Type is checked before this, by the request guard.
+        """
         try:
-            return await request.json()
+            body = await request.json()
         except Exception:  # noqa: BLE001 - tolerate empty/malformed bodies as {}
             return {}
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest(
+                text=json.dumps({"error": "the request body must be a JSON object"}),
+                content_type="application/json",
+            )
+        return body
