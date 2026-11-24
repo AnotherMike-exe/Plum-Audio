@@ -42,6 +42,7 @@ describe('clientsSignature', () => {
     ['isForeign', { isForeign: true }],
     ['isLocal', { isLocal: true }],
     ['foreignServer appearing', { foreignServer: { name: 'Music Assistant' } }],
+    ['offline', { offline: true }],
   ])('changes with %s', (_field, patch) => {
     expect(changes(patch)).toBe(true);
   });

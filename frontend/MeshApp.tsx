@@ -136,6 +136,7 @@ export const clientsSignature = (clients: Client[]): string =>
       c.url ?? '',
       !!c.isForeign,
       !!c.isLocal,
+      !!c.offline,
       c.foreignServer ? [c.foreignServer.name, c.foreignServer.title ?? '', c.foreignServer.artist ?? ''] : null,
     ]),
   );

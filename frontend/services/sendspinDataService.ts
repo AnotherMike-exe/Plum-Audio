@@ -86,7 +86,12 @@ interface WireUnit {
     playback_state?: string;
     title?: string;
     artist?: string;
+    /** The unit set this: the report went stale, and `attached` is then forced false. */
+    offline?: boolean;
   } | null;
+  /** The unit's own player stopped reporting. Absent from a peer running an older image — treat
+   *  that as "not offline", never as a dead speaker. */
+  local_player_offline?: boolean;
   /** Absent from a peer running an older image — treat that as "has one", never as playerless. */
   has_player?: boolean;
   /** This unit's SENDSPIN server id — an X25519 public key under aiosendspin 9.x, and NOT `unit_id`.
@@ -300,9 +305,15 @@ export function mapViewToModel(
     const foreignServer = claimedByOutsider
       ? { name: lp.server_name || lp.server_id!, title: lp.title, artist: lp.artist }
       : undefined;
+    // The player process stopped reporting. Strict `true` on both: a unit with an older image
+    // sends neither field, and that must not read as offline.
+    const offline = unit.local_player_offline === true || lp.offline === true;
     const existing = clients.find((c) => c.id === lp.player_id);
     if (existing) {
+      // `existing` can be a row from ANOTHER unit's `players` (a roamed speaker), so the flag is
+      // set here by player id and not in the loop above by unit.
       if (foreignServer) existing.foreignServer = foreignServer;
+      if (offline) existing.offline = true;
       continue;
     }
     // Not listed by any unit: it is attached elsewhere (or nowhere). Synthesize it from the report.
@@ -318,6 +329,7 @@ export function mapViewToModel(
       connected: !!lp.attached,
       isLocal,
       foreignServer,
+      offline: offline || undefined,
       url: lp.url,  // how we dial it back: the router can't reclaim what it cannot see
       // The self-report carries no role or security fields — a speaker attached to a FOREIGN server
       // has no roles we can see at all. Unknown is the truthful answer, and it renders no button.

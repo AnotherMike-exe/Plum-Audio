@@ -20,6 +20,21 @@ interface ClientManagerProps {
     onPairClient?: (client: Client) => void;
 }
 
+/**
+ * Marks a speaker whose unit says its player process stopped reporting. A label only: the row keeps
+ * its controls, because the unit can be wrong for a moment and a route can bring the speaker back.
+ * The hidden text names the device, so the badge makes sense when a screen reader reads it alone.
+ */
+export const OfflineBadge: React.FC<{ name: string }> = ({name}) => (
+    <span
+        className="shrink-0 text-xs text-(--text-secondary) border border-(--border-color) rounded-full px-2 py-0.5"
+        title={`${name} has stopped reporting`}
+    >
+        <span aria-hidden="true">Offline</span>
+        <span className="sr-only">{name} is offline</span>
+    </span>
+);
+
 const ClientDevice: React.FC<{
     client: Client;
     streams: Stream[];
@@ -34,7 +49,10 @@ const ClientDevice: React.FC<{
 
     return (
         <div className="flex items-center gap-3">
-            <span className="flex-1 truncate font-semibold">{client.name}</span>
+            <span className="flex-1 min-w-0 flex items-center gap-2">
+                <span className="truncate font-semibold">{client.name}</span>
+                {client.offline && <OfflineBadge name={client.name} />}
+            </span>
             <div className="flex items-center gap-2 w-40">
                 <Icon name="volume-high" className="w-4 text-(--text-secondary)" style={{ color: 'inherit' }} />
                 <input
@@ -167,6 +185,7 @@ export const ClientManager: React.FC<ClientManagerProps> = ({
                                     and what it is playing. Join Stream still pulls it back. */}
                                 <span className="truncate flex-1">
                                     <span className="font-semibold">{client.name}</span>
+                                    {client.offline && <span className="ml-2"><OfflineBadge name={client.name} /></span>}
                                     {client.foreignServer && (
                                         <span className="block text-xs text-(--text-secondary) truncate">
                                             <Icon name="tower-broadcast" className="mr-1 text-(--text-muted)" />

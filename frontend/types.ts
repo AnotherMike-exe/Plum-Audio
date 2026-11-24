@@ -173,6 +173,9 @@ export interface Client {
     // A Sendspin speaker on the network that is not one of ours — found by mDNS, not by a unit
     // snapshot. Routing it uses adopt/release (dial its URL) rather than the mesh router.
     isForeign?: boolean;
+    // The unit that owns this speaker says its player process stopped reporting. Missing means
+    // not offline: a unit with an older image does not send the field. The row keeps its controls.
+    offline?: boolean;
     url?: string;
     /** Whether this device needs Sendspin pairing before it can play.
      *

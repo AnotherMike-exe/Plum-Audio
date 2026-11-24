@@ -3,6 +3,7 @@ import type {Client, Stream} from '../types';
 import {GroupVolumeControl} from './GroupVolumeControl';
 import {StreamPickerButton} from './StreamPickerButton';
 import { Icon } from './Icon';
+import { OfflineBadge } from './ClientManager';
 
 interface SyncedDevicesProps {
     clients: Client[];
@@ -26,7 +27,10 @@ const SyncedDevice: React.FC<{
 
     return (
         <div className="flex items-center justify-between gap-4 p-2 rounded-lg hover:bg-(--bg-tertiary)">
-            <span className="font-semibold truncate">{client.name}</span>
+            <span className="min-w-0 flex items-center gap-2">
+                <span className="font-semibold truncate">{client.name}</span>
+                {client.offline && <OfflineBadge name={client.name} />}
+            </span>
             <div className="flex items-center gap-3">
                 <div className="flex items-center gap-3 w-full max-w-[180px]">
                     <Icon name="volume-high" className="w-4 text-(--text-secondary)" style={{ color: 'inherit' }} />
