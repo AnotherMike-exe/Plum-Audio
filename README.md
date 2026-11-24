@@ -119,7 +119,7 @@ Allow about 10 minutes on a fresh card. Most of that is the Docker install and t
 must get the same value, or the units cannot pair with each other's speakers:
 
 ```bash
-sudo ./plum-init.sh "Living Room" --fleet-psk <the value the first unit printed>
+sudo ./plum-init.sh "Living Room" --fleet-psk-file /root/fleet.psk
 ```
 
 Adding a unit later and no longer have the value? Any running unit still holds it. Point the new
@@ -140,7 +140,7 @@ What it decides for you, and how to override each one:
 | Audio output | reads the Pi's cards, preferring a HAT or USB DAC over the onboard jack over HDMI | `--output <PortAudio name fragment>` |
 | Audio or headless | headless when the Pi has no sound card | `--output none` forces headless |
 | Which image | `ghcr.io/anothermike-exe/plum-audio:latest` | `--image <ref>` or `--tarball <file>` |
-| Fleet secret | mints one on the first unit | `--fleet-psk <value>` |
+| Fleet secret | mints one on the first unit | `--fleet-psk-file <path>` |
 
 Two things stay opt-in, because neither can be inferred:
 

@@ -540,9 +540,12 @@ change fails. Do these steps on each unit that the page drives:
 The value is a list of absolute origins (`http://host` or `http://host:port`) with a comma between
 them. `PLUM_ALLOWED_ORIGINS=*` allows each origin and each `Host`.
 
-**A deploy removes the line.** `docker/deploy.sh` and `scripts/plum-init.sh` write
-`plum-audio.env` again on each run, and neither one writes `PLUM_ALLOWED_ORIGINS` or
-`PLUM_API_GUARD`. Do steps 1 to 3 again after each deploy.
+**A deploy keeps the line.** `docker/deploy.sh` and `scripts/plum-init.sh` write
+`plum-audio.env` again on each run. Both copy `PLUM_ALLOWED_ORIGINS`, `PLUM_API_GUARD` and the
+recovery settings from the old file to the end of the new one.
+
+**An IP address needs no entry.** A page opened at any IP address of the unit is same-origin, and
+the guard accepts it. Only a name that the units do not know needs `PLUM_ALLOWED_ORIGINS`.
 
 **`PLUM_API_GUARD=0` turns the guard off.** The values `false`, `no` and `off` do the same. The 403
 and 415 answers stop. The CORS headers stay as they are, so a browser still blocks a page at an
