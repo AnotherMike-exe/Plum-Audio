@@ -79,6 +79,7 @@ from player_state import (
     load_last_playing_server,
     load_render_state,
     save_active_output,
+    save_health_report,
     save_last_playing_server,
     save_player_health,
     save_render_state,
@@ -116,6 +117,21 @@ HEALTH_POLL_S = 3.0  # how often we re-evaluate whether to report client/state e
 # than any normal roam or listening session boundary, so a healthy player never trips it — this is
 # only meant to make a connection nobody is on the other end of visible after the fact.
 STUCK_SESSION_WARN_S = 900.0
+# Output-stream death. The PortAudio callback runs every ~10 ms for as long as the stream is open,
+# playing or not, so a counter that did not move across this many HEALTH_POLL_S polls means the
+# stream is dead even though PortAudio still calls it active. Two polls, so that at least one full
+# 3 s interval passed with no callback at all — one late poll cannot trip it.
+OUTPUT_STALL_POLLS = 2
+# Failed re-opens in a row before the process exits and supervisord starts a new one. A new process
+# is the complete PortAudio re-initialisation; three in-process tries cover a card that was only
+# briefly away (a USB DAC re-enumerating, an ALSA suspend) without holding a dead unit for long.
+OUTPUT_REOPEN_MAX = int(os.environ.get("PLUM_OUTPUT_REOPEN_MAX", "3"))
+# How often the health report in player_state.json is refreshed while nothing changes. Its age is
+# what the container healthcheck reads, so healthcheck.py must allow several of these.
+HEALTH_REPORT_S = 30.0
+# Exit codes for a deliberate self-restart. 2 is "configured for no output" (see main()).
+EXIT_OUTPUT_LOST = 3
+
 # Upper bound on each network step of stop(). Three of them fit inside the supervisord
 # `stopwaitsecs` with room for the DAC release that follows.
 STOP_STEP_TIMEOUT_S = 2.5
@@ -227,6 +243,10 @@ class PlayerHealth(StrEnum):
 
     SYNCHRONIZED = "synchronized"
     ERROR = "error"
+    # The output stream itself stopped: nothing reaches the DAC, however healthy the buffer looks.
+    # Distinct from ERROR because the remedy differs — ERROR is "give me more lead time", this is
+    # "my card went away", and only this one ends in a process restart.
+    OUTPUT_LOST = "output_lost"
 
 
 class AlsaRenderer:
@@ -297,6 +317,22 @@ class AlsaRenderer:
         # volume as software gain (0..100) + mute
         self._gain = 1.0
         self._muted = False
+
+        # Stream liveness. `callbacks` counts every PortAudio callback and is the only proof the
+        # stream is really running: `stream.active` stays True for a stream whose device stopped
+        # asking for audio. `stream_finished` is PortAudio telling us it stopped the stream itself.
+        self.callbacks = 0
+        self.stream_finished = False
+        self._closing = False  # our own stop() is in progress — a finished callback is expected
+        # Serialises every stop/open pair. An output switch and a stream recovery both tear the
+        # stream down and re-open it, both from worker threads, and `_open` re-initialises
+        # PortAudio's process-global state on the way: two of them at once is the SIGSEGV that
+        # CLAUDE.md warns about. Reentrant because reopen() and recover() call stop().
+        self._reopen_lock = threading.RLock()
+        self.reopening = False  # a stop/open pair is in flight; liveness is meaningless until it ends
+        # The last spec that actually opened. recover() goes back to it when a failed switch left
+        # `device` as None, so a recovery never lands on PortAudio's default device by accident.
+        self._last_good_spec = device
 
         # metrics
         self.xruns = 0
@@ -372,7 +408,10 @@ class AlsaRenderer:
             blocksize=DAC_BLOCK_FRAMES,
             device=device_arg,
             callback=self._callback,
+            finished_callback=self._on_stream_finished,
         )
+        self.stream_finished = False
+        self._closing = False
         self._stream.start()
         # Fallback DAC lead for a callback whose time info PortAudio did not fill. `latency` is what
         # the host API settled on, in seconds; sounddevice reports it per stream after start.
@@ -390,6 +429,7 @@ class AlsaRenderer:
             self._aligned = False
             self._dac_time_warned = False
         self.device = spec
+        self._last_good_spec = spec
         # What we actually OPENED, as the stable <card_name>:<device> identity — distinct from the
         # spec we were ASKED for. `pending` upstream is "choice vs echo"; echoing the request back
         # compares a string to itself and is structurally unable to notice that resolution landed on
@@ -429,31 +469,93 @@ class AlsaRenderer:
             logger.info("output 'none' selected — keeping %r open until this unit restarts", self.device)
             return False
 
-        if spec == self.device and self._stream is not None:
-            return True
+        with self._reopen_lock:
+            if spec == self.device and self._stream is not None:
+                return True
 
-        previous = self.device
-        self.stop()
-        try:
-            self._open(spec)
-            return True
-        except Exception:  # noqa: BLE001 - any PortAudio/ALSA failure means "did not switch"
-            logger.error("could not open output %r — restoring %r", spec, previous, exc_info=True)
+            self.reopening = True
+            try:
+                previous = self.device
+                self.stop()
+                try:
+                    self._open(spec)
+                    return True
+                except Exception:  # noqa: BLE001 - any PortAudio/ALSA failure means "did not switch"
+                    logger.error("could not open output %r — restoring %r", spec, previous, exc_info=True)
 
+                try:
+                    self._open(previous)
+                except Exception:  # noqa: BLE001
+                    logger.error("restoring output %r ALSO failed — this unit is now silent", previous, exc_info=True)
+                    self.device = None
+                    self.open_device = None
+                return False
+            finally:
+                self.reopening = False
+
+    def recover(self) -> bool:
+        """Re-open the output after the stream died. True if a stream is running again.
+
+        The same stop/open pair as reopen(), under the same lock, so a recovery and an output
+        switch can never run their PortAudio re-initialisation at the same time. Called from a
+        worker thread for the same reason reopen() is: teardown and `aplay -l` both block.
+
+        Buffered audio and the gain are kept, as in reopen(). `_open` resets the phase-lock state,
+        so the first block after a recovery aligns to its deadline again instead of resuming at
+        whatever offset the dead stream left.
+        """
+        with self._reopen_lock:
+            self.reopening = True
+            try:
+                spec = self.device if self.device is not None else self._last_good_spec
+                self.stop()
+                try:
+                    self._open(spec)
+                    return True
+                except Exception:  # noqa: BLE001 - the card is still away; the caller counts this
+                    logger.error("could not re-open output %r after a stream failure", spec, exc_info=True)
+                    return False
+            finally:
+                self.reopening = False
+
+    def stream_fault(self) -> str | None:
+        """Why the output stream is not running, or None while it is (or while a re-open is busy).
+
+        Covers what PortAudio will ADMIT to. A stream whose device stopped pulling audio still
+        reports active, and for that the caller watches `callbacks` — see
+        SendspinPlayer._check_output.
+        """
+        if self.reopening:
+            return None
+        stream = self._stream
+        if stream is None:
+            return "no output stream is open"
+        if self.stream_finished:
+            return "PortAudio finished the stream (the callback raised, or the device was removed)"
         try:
-            self._open(previous)
-        except Exception:  # noqa: BLE001
-            logger.error("restoring output %r ALSO failed — this unit is now silent", previous, exc_info=True)
-            self.device = None
-            self.open_device = None
-        return False
+            active = bool(stream.active)
+        except Exception as exc:  # noqa: BLE001 - a stream PortAudio cannot describe is not running
+            return f"the stream state is unreadable ({exc!r})"
+        return None if active else "the stream is open but not active"
+
+    def _on_stream_finished(self) -> None:
+        """PortAudio's finished callback: the stream went inactive. Runs in the audio thread.
+
+        It also fires for our own stop(), which is not a fault — `_closing` tells the two apart.
+        Only a flag is set here: the audio thread must not re-open anything, and the health loop
+        owns the recovery.
+        """
+        if not self._closing:
+            self.stream_finished = True
 
     def stop(self) -> None:
-        if self._stream is not None:
-            with contextlib.suppress(Exception):
-                self._stream.stop()
-                self._stream.close()
-            self._stream = None
+        with self._reopen_lock:
+            if self._stream is not None:
+                self._closing = True
+                with contextlib.suppress(Exception):
+                    self._stream.stop()
+                    self._stream.close()
+                self._stream = None
 
     # -- fill (asyncio thread) ----------------------------------------------
 
@@ -784,6 +886,7 @@ class AlsaRenderer:
         return bytes(out[:need])
 
     def _callback(self, outdata, frames, time_info, status) -> None:  # noqa: ANN001
+        self.callbacks += 1  # liveness for the health loop; written here only, read anywhere
         if status and getattr(status, "output_underflow", False):
             with self._lock:
                 playing = self._playing
@@ -937,6 +1040,7 @@ class SendspinPlayer:
         self._sessions_warned: set[int] = set()
         self._report_task: asyncio.Task | None = None
         self._health_task: asyncio.Task | None = None
+        self._init_recovery_state()
         self.report_url = os.environ.get("PLUM_PLAYER_STATE_URL", "http://127.0.0.1:5001/api/mesh/player-state")
         # Consume relay: forward the group's controller state + visualizer frames (which we receive
         # as a MEMBER of whatever server serves us, foreign ones included) to our GUI, and take
@@ -966,6 +1070,135 @@ class SendspinPlayer:
         self.client.add_controller_state_listener(self._on_controller_state)
         self.client.add_visualizer_listener(self._on_visualizer)
         self.client.add_artwork_listener(self._on_artwork)
+
+    # -- self-recovery -------------------------------------------------------
+
+    def _init_recovery_state(self) -> None:
+        """State for the watchdogs in _health_loop. Separate so a test can build it on a fake."""
+        # Set when the process must be replaced. main() waits on it beside SIGTERM and returns
+        # `exit_code`, so supervisord (autorestart) starts a new process.
+        self.exit_requested = asyncio.Event()
+        self.exit_code: int | None = None
+        # Output-stream watchdog.
+        self._output_state = "ok"  # ok | recovering | lost
+        self._output_fault: str | None = None
+        self._output_reopens = 0  # successful recoveries since start
+        self._output_failed_reopens = 0  # consecutive failures — reaches OUTPUT_REOPEN_MAX, then exit
+        self._callbacks_seen = -1
+        self._callback_stalls = 0
+        self._health_report_at = 0.0  # monotonic time of the last periodic report write
+
+    def request_exit(self, code: int, reason: str) -> None:
+        """Ask main() to shut down and exit non-zero, so supervisord replaces this process."""
+        if self.exit_code is not None:
+            return
+        self.exit_code = code
+        logger.error("exiting with code %d so supervisord restarts the player: %s", code, reason)
+        self.exit_requested.set()
+
+    async def _check_output(self) -> None:
+        """Detect a dead output stream and re-open it. Called on every health poll.
+
+        Two signals, because they fail in different ways. `stream_fault()` is what PortAudio admits
+        to: finished, inactive, or gone. The callback counter is what it does not: an ALSA device
+        that stopped asking for audio leaves the stream "active" and silent, and the only evidence
+        is that the callback is no longer being called. The stream is open for the whole life of
+        the process, playing or idle, so a counter that stops is a fault in both cases.
+
+        The re-open goes through AlsaRenderer.recover(), which shares one lock with an output
+        switch — never a second PortAudio re-initialisation beside a running one. After
+        OUTPUT_REOPEN_MAX failures in a row the process exits: a fresh process is the complete
+        re-initialisation, and supervisord applies a growing delay between starts while the card
+        stays away.
+        """
+        renderer = self.renderer
+        if renderer.reopening:
+            self._callbacks_seen = -1  # an output switch is in flight; start the count again after it
+            self._callback_stalls = 0
+            return
+        fault = renderer.stream_fault()
+        count = renderer.callbacks
+        if fault is None:
+            if count == self._callbacks_seen:
+                self._callback_stalls += 1
+                if self._callback_stalls >= OUTPUT_STALL_POLLS:
+                    fault = (
+                        f"the audio callback counter stalled at {count} for "
+                        f"{self._callback_stalls * HEALTH_POLL_S:.0f}s while PortAudio reports the stream active"
+                    )
+            else:
+                self._callback_stalls = 0
+            self._callbacks_seen = count
+        if fault is None:
+            return
+
+        logger.warning(
+            "output stream is DEAD on %r: %s — re-opening (attempt %d of %d) %s",
+            renderer.device,
+            fault,
+            self._output_failed_reopens + 1,
+            OUTPUT_REOPEN_MAX,
+            renderer.stats(),
+        )
+        self._set_output_state("recovering", fault)
+        recovered = await asyncio.get_running_loop().run_in_executor(None, renderer.recover)
+        self._callbacks_seen = -1
+        self._callback_stalls = 0
+        if recovered:
+            self._output_reopens += 1
+            self._output_failed_reopens = 0
+            logger.warning("output stream re-opened on %r (recovery %d)", renderer.device, self._output_reopens)
+            self._set_output_state("ok", None)
+            return
+        self._output_failed_reopens += 1
+        if self._output_failed_reopens >= OUTPUT_REOPEN_MAX:
+            self._set_output_state("lost", fault)
+            self.request_exit(
+                EXIT_OUTPUT_LOST,
+                f"the output stream did not re-open after {self._output_failed_reopens} attempts ({fault})",
+            )
+
+    def _set_output_state(self, state: str, fault: str | None) -> None:
+        """Record the output state and publish it at once — a transition must not wait 30 s."""
+        self._output_state = state
+        self._output_fault = fault
+        health = PlayerHealth.SYNCHRONIZED if state == "ok" else PlayerHealth.OUTPUT_LOST
+        if health is not self._last_reported_state:
+            self._last_reported_state = health
+            save_player_health(self._state_file, health.value)
+        self._write_health_report()
+
+    def _health_report(self) -> dict:
+        """What player_state.json `health` holds. `ts` is wall-clock: another process reads its age."""
+        return {
+            "ts": round(time.time(), 1),
+            "player_health": self._last_reported_state.value,
+            "output": {
+                "state": self._output_state,
+                "fault": self._output_fault,
+                "device": self.renderer.open_device or self.renderer.device,
+                "reopens": self._output_reopens,
+                "failed_reopens": self._output_failed_reopens,
+            },
+            "sessions_open": len(self._sessions),
+        }
+
+    def _write_health_report(self) -> None:
+        self._health_report_at = time.monotonic()
+        save_health_report(self._state_file, self._health_report())
+
+    async def _refresh_health_report(self) -> None:
+        """Refresh the report every HEALTH_REPORT_S, in a worker thread.
+
+        The write is an fsync on the unit's SD card. That can take tens of milliseconds, and this
+        loop also carries the audio feed — so the periodic write stays off it. A transition writes
+        inline (_set_output_state): it is rare, and it must be on disk before a possible exit.
+        """
+        if time.monotonic() - self._health_report_at < HEALTH_REPORT_S:
+            return
+        self._health_report_at = time.monotonic()
+        report = self._health_report()
+        await asyncio.get_running_loop().run_in_executor(None, save_health_report, self._state_file, report)
 
     # -- self-report ---------------------------------------------------------
 
@@ -1137,6 +1370,9 @@ class SendspinPlayer:
             # reported, attached or not: `locked: false` on a unit that is playing is the whole
             # answer, and it is invisible from anywhere else.
             "sync": self.renderer.sync_report(),
+            # ok | recovering | lost. A unit whose DAC went away still answers on every port, so
+            # without this the mesh view shows a healthy speaker that renders nothing.
+            "output_state": self._output_state,
         }
         if attached and info is not None:
             # 9.x trimmed ServerInfo to (server_id, name) — `connection_reason` and `version` are
@@ -1336,14 +1572,27 @@ class SendspinPlayer:
         """
         while True:
             await asyncio.sleep(HEALTH_POLL_S)
-            self._remember_playing_server()
-            self._warn_if_session_is_stuck()
-            if not self.client.connected:
-                continue
-            state = self._health()
-            if state is not self._last_reported_state:
-                with contextlib.suppress(Exception):  # never break the render path over a report
-                    await self._send_client_state(state)
+            try:
+                await self._health_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - this loop IS the watchdog; one bad tick must not end it
+                logger.exception("health tick failed; the watchdogs keep running")
+
+    async def _health_tick(self) -> None:
+        """One pass of everything that watches this player. Order: local faults first."""
+        await self._check_output()
+        await self._refresh_health_report()
+        self._remember_playing_server()
+        self._warn_if_session_is_stuck()
+        if not self.client.connected:
+            return
+        if self._output_state != "ok":
+            return  # OUTPUT_LOST is already recorded; _health() must not overwrite it with a buffer verdict
+        state = self._health()
+        if state is not self._last_reported_state:
+            with contextlib.suppress(Exception):  # never break the render path over a report
+                await self._send_client_state(state)
 
     def _warn_if_session_is_stuck(self) -> None:
         """Say so when a server connection has been held implausibly long.
@@ -1726,9 +1975,10 @@ async def main() -> int | None:
         # This unit is configured for no output, so it should have no player process: output_gate.py
         # removes sendspin_player.ini from supervisord's runtime set before any of this starts. Being
         # here means the gate was bypassed — a hand-run on the dev rig, or a stale program set. Exit
-        # rather than construct a renderer that cannot open anything; under supervisord this reaches
-        # FATAL after three tries, which is bounded and visible, unlike the crash-loop that a device
-        # named "none" would produce.
+        # rather than construct a renderer that cannot open anything. Under supervisord this is a
+        # failed start, retried with a delay that grows by 1 s each time (see the `startretries`
+        # note in supervisord/conf.d/sendspin_player.ini), and the container healthcheck reports
+        # the program as not RUNNING for as long as it lasts.
         logger.error("this unit is configured for no output — the player should not have been started")
         return 2
     rate = int(os.environ.get("PLUM_PLAYER_RATE", DEFAULT_RATE))
@@ -1816,16 +2066,23 @@ async def main() -> int | None:
     output_watch = _spawn(audio_devices.watch_output_device(_apply_output), name="output device watch")
 
     stop = install_shutdown_handlers()
+    # Run until SIGTERM, or until a watchdog asks for a new process (player.request_exit).
+    waiters = [
+        _spawn(stop.wait(), name="shutdown signal"),
+        _spawn(player.exit_requested.wait(), name="exit request"),
+    ]
     try:
-        await stop.wait()  # run until SIGTERM; supervisord manages the process lifecycle
+        await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
     except asyncio.CancelledError:
         pass
     finally:
-        for task in (rename_watch, output_watch):
+        for task in (*waiters, rename_watch, output_watch):
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         await player.stop()
+    # None on SIGTERM (exit 0). A watchdog's code otherwise, so supervisord logs an unexpected exit.
+    return player.exit_code
 
 
 if __name__ == "__main__":

@@ -182,6 +182,7 @@ class FakeReportingPlayer:
         # The self-report also carries the phase lock, so four units can be compared over the mesh
         # API rather than by ear. See test_render_sync.py for the lock itself.
         self.renderer = FakeRenderer()
+        self._output_state = "ok"  # the output-stream watchdog's verdict, also in the self-report
 
     def _host_hint(self):
         return "10.0.0.5"
