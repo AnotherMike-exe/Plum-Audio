@@ -505,6 +505,54 @@ def test_a_recovery_resets_the_failure_count(tmp_path):
     assert p.exit_code is None and p._output_failed_reopens == 0 and p._output_state == "ok"
 
 
+def test_a_reopen_that_does_not_hold_backs_off_and_never_exits(tmp_path, monkeypatch):
+    """An output that opens and then stalls again (HDMI with no sink is the likely one).
+
+    Re-opening it every few seconds forever is a PortAudio re-initialisation loop, and exiting over
+    it only moves the loop into supervisord. So: a doubling delay, a state that stays 'recovering',
+    and no exit — the exit is for a card that will not OPEN.
+    """
+    clock = [1000.0]
+    monkeypatch.setattr(sendspin_player.time, "monotonic", lambda: clock[0])
+    p = _OutputPlayer(tmp_path, _WatchedRenderer(recover_results=[True] * 50))
+
+    async def run(polls):
+        for _ in range(polls):
+            clock[0] += sendspin_player.HEALTH_POLL_S
+            await p._check_output()  # the counter never moves: every re-open stalls again
+
+    asyncio.run(run(400))  # 20 minutes
+    assert p.exit_code is None
+    assert p._output_state == "recovering"
+    assert 5 <= p.renderer.recover_calls <= 12, "bounded: not one re-open every 9 s for 20 minutes"
+
+
+def test_a_reopen_that_holds_ends_the_backoff(tmp_path, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(sendspin_player.time, "monotonic", lambda: clock[0])
+    p = _OutputPlayer(tmp_path, _WatchedRenderer(recover_results=[True] * 50))
+
+    async def run(polls, *, advance):
+        for _ in range(polls):
+            clock[0] += sendspin_player.HEALTH_POLL_S
+            if advance:
+                p.renderer.callbacks += 300
+            await p._check_output()
+
+    asyncio.run(run(40, advance=False))
+    assert p._output_state == "recovering" and p._output_unproven >= 2
+    asyncio.run(run(3, advance=True))
+    assert p._output_state == "ok" and p._output_unproven == 0
+
+
+def test_the_output_watchdog_has_a_kill_switch(tmp_path, monkeypatch):
+    monkeypatch.setattr(sendspin_player, "OUTPUT_WATCHDOG", False)
+    p = _OutputPlayer(tmp_path, _WatchedRenderer())
+    p.renderer.fault = "no output stream is open"
+    _ticks(p, 10)
+    assert p.renderer.recover_calls == 0 and p.exit_code is None
+
+
 def test_an_output_switch_in_flight_is_not_a_stall(tmp_path):
     p = _OutputPlayer(tmp_path, _WatchedRenderer())
     _ticks(p, 1)

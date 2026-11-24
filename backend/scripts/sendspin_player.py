@@ -257,6 +257,14 @@ OUTPUT_STALL_POLLS = 2
 # is the complete PortAudio re-initialisation; three in-process tries cover a card that was only
 # briefly away (a USB DAC re-enumerating, an ALSA suspend) without holding a dead unit for long.
 OUTPUT_REOPEN_MAX = int(os.environ.get("PLUM_OUTPUT_REOPEN_MAX", "3"))
+# Kill switch, for the same reason PLUM_SYNC_LOCK has one: this acts on the audio path. If the
+# watchdog misreads an output on some rig, one env var and a restart turns it off without a rebuild.
+OUTPUT_WATCHDOG = os.environ.get("PLUM_OUTPUT_WATCHDOG", "1") != "0"
+# A re-open that SUCCEEDS and is followed by another fault, with no healthy poll between, did not
+# fix anything. Those are retried with a doubling delay up to this cap, and never end in an exit:
+# the process restart is for a card that will not OPEN, and restarting over a stream that opens and
+# then stalls would only move the same loop into supervisord.
+OUTPUT_FLAP_RETRY_MAX_S = 300.0
 # How often the health report in player_state.json is refreshed while nothing changes. Its age is
 # what the container healthcheck reads, so healthcheck.py must allow several of these.
 HEALTH_REPORT_S = 30.0
@@ -1217,6 +1225,8 @@ class SendspinPlayer:
         self._output_failed_reopens = 0  # consecutive failures — reaches OUTPUT_REOPEN_MAX, then exit
         self._callbacks_seen = -1
         self._callback_stalls = 0
+        self._output_unproven = 0  # successful re-opens in a row with no healthy poll after them
+        self._output_retry_after = 0.0  # monotonic time before which a flapping output is left alone
         self._health_report_at = 0.0  # monotonic time of the last periodic report write
         # Dead-peer watchdog: the watched websocket of every open session, keyed like _sessions, and
         # when we started closing the ones found silent.
@@ -1329,6 +1339,8 @@ class SendspinPlayer:
         re-initialisation, and supervisord applies a growing delay between starts while the card
         stays away.
         """
+        if not OUTPUT_WATCHDOG:
+            return
         renderer = self.renderer
         if renderer.reopening:
             self._callbacks_seen = -1  # an output switch is in flight; start the count again after it
@@ -1346,35 +1358,59 @@ class SendspinPlayer:
                     )
             else:
                 self._callback_stalls = 0
+                if self._callbacks_seen >= 0 and self._output_unproven:
+                    # The counter moved across a whole poll: the last re-open really took.
+                    logger.info("output stream is stable again on %r", renderer.device)
+                    self._output_unproven = 0
+                    if self._output_state != "ok":
+                        self._set_output_state("ok", None)
             self._callbacks_seen = count
         if fault is None:
             return
+        now = time.monotonic()
+        if now < self._output_retry_after:
+            return  # flapping: the last re-open did not hold, so the next one waits its turn
 
         logger.warning(
-            "output stream is DEAD on %r: %s — re-opening (attempt %d of %d) %s",
+            "output stream is DEAD on %r: %s — re-opening (failed opens %d of %d, re-opens that did not " "hold %d) %s",
             renderer.device,
             fault,
-            self._output_failed_reopens + 1,
+            self._output_failed_reopens,
             OUTPUT_REOPEN_MAX,
+            self._output_unproven,
             renderer.stats(),
         )
         self._set_output_state("recovering", fault)
         recovered = await asyncio.get_running_loop().run_in_executor(None, renderer.recover)
         self._callbacks_seen = -1
         self._callback_stalls = 0
-        if recovered:
-            self._output_reopens += 1
-            self._output_failed_reopens = 0
+        if not recovered:
+            self._output_failed_reopens += 1
+            if self._output_failed_reopens >= OUTPUT_REOPEN_MAX:
+                self._set_output_state("lost", fault)
+                self.request_exit(
+                    EXIT_OUTPUT_LOST,
+                    f"the output stream did not re-open after {self._output_failed_reopens} attempts ({fault})",
+                )
+            return
+
+        self._output_reopens += 1
+        self._output_failed_reopens = 0
+        self._output_unproven += 1
+        if self._output_unproven == 1:
+            # First recovery: believe it. The next healthy poll confirms it; the next fault says not.
             logger.warning("output stream re-opened on %r (recovery %d)", renderer.device, self._output_reopens)
             self._set_output_state("ok", None)
             return
-        self._output_failed_reopens += 1
-        if self._output_failed_reopens >= OUTPUT_REOPEN_MAX:
-            self._set_output_state("lost", fault)
-            self.request_exit(
-                EXIT_OUTPUT_LOST,
-                f"the output stream did not re-open after {self._output_failed_reopens} attempts ({fault})",
-            )
+        wait = min(OUTPUT_FLAP_RETRY_MAX_S, HEALTH_POLL_S * 2 ** min(self._output_unproven, 16))
+        self._output_retry_after = time.monotonic() + wait
+        logger.warning(
+            "output stream re-opened on %r but the last %d re-opens did not hold — next attempt in %.0fs at the "
+            "earliest; the output stays reported as 'recovering'",
+            renderer.device,
+            self._output_unproven - 1,
+            wait,
+        )
 
     def _set_output_state(self, state: str, fault: str | None) -> None:
         """Record the output state and publish it at once — a transition must not wait 30 s."""
