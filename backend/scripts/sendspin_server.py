@@ -51,6 +51,7 @@ import socket
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 
+import cors_policy
 import fifo_paths
 import sendspin_identity
 import unit_identity
@@ -2000,6 +2001,9 @@ class PlumSendspinServer:
             players=players,
             has_player=self.has_player,
             hostname=socket.gethostname(),
+            # The name from Settings -> Device, which the kernel hostname never carries. Read per
+            # snapshot (one stat when the file did not change), so a rename reaches peers live.
+            mdns_hostname=cors_policy.mdns_hostname(),
             # Our Sendspin id (an X25519 pubkey under 9.x), so peers can map the server a roamed
             # player reports itself attached to back onto a unit. Without this `follow` cannot tell
             # one of our servers from Music Assistant. None until start() has run.

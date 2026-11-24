@@ -118,16 +118,19 @@ def own_hosts() -> set[str]:
 
 _SETTINGS_FILE_DEFAULT = "/data/settings.json"
 _HOSTNAME_LABEL = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
-# (path, st_mtime_ns) -> names. One stat per request; the file is read again only when it changed.
-_mdns_cache: tuple[tuple[str, int], set[str]] | None = None
+# (path, st_mtime_ns) -> name. One stat per request; the file is read again only when it changed.
+_mdns_cache: tuple[tuple[str, int], str | None] | None = None
 
 
-def mdns_hosts() -> set[str]:
-    """The name forms of the mDNS hostname a user set from Settings (`settings.json` `hostname`).
+def mdns_hostname() -> str | None:
+    """The mDNS hostname a user set from Settings (`settings.json` `hostname`), or None.
 
-    `socket.gethostname()` is the HOST's name. Settings -> Device can give Avahi a different name
-    at runtime (`SetHostName`), and the page is then at `http://<that-name>.local`. The kernel
-    hostname never learns it, so without this the guard refuses the page the user just renamed.
+    One lowercase DNS label. This is the value the unit publishes as `UnitSnapshot.mdns_hostname`,
+    so that its peers allow a page opened at that name.
+
+    It is the name the user ASKED for, not the live Avahi name. Avahi can append `-2` on a name
+    conflict. A read of the live name is a D-Bus call from the audio loop for each snapshot, which
+    is not cheap, so it is not made here.
 
     Read from the file and not through SettingsManager: the audio process loads this module, and
     it must not import Flask. Read-only, and never raises.
@@ -137,27 +140,38 @@ def mdns_hosts() -> set[str]:
     try:
         key = (path, os.stat(path).st_mtime_ns)
     except OSError:
-        return set()
+        return None
     if _mdns_cache is not None and _mdns_cache[0] == key:
-        return set(_mdns_cache[1])
-    names: set[str] = set()
+        return _mdns_cache[1]
+    name: str | None = None
     try:
         with open(path, encoding="utf-8") as fh:
             hostname = json.load(fh).get("hostname")
         if isinstance(hostname, str) and _HOSTNAME_LABEL.fullmatch(hostname.lower()):
-            names = name_forms(hostname)
+            name = hostname.lower()
     except (OSError, ValueError, AttributeError):
-        names = set()  # torn or damaged file: the next change to it is read again
-    _mdns_cache = (key, names)
-    return set(names)
+        name = None  # torn or damaged file: the next change to it is read again
+    _mdns_cache = (key, name)
+    return name
+
+
+def mdns_hosts() -> set[str]:
+    """The name forms of the mDNS hostname a user set from Settings (`settings.json` `hostname`).
+
+    `socket.gethostname()` is the HOST's name. Settings -> Device can give Avahi a different name
+    at runtime (`SetHostName`), and the page is then at `http://<that-name>.local`. The kernel
+    hostname never learns it, so without this the guard refuses the page the user just renamed.
+    """
+    name = mdns_hostname()
+    return name_forms(name) if name else set()
 
 
 def known_hosts(units) -> set[str]:
     """Every host form the units in a mesh view can legitimately serve a GUI from.
 
-    `units` is any iterable of objects with `.host` and (optionally) `.hostname` — a MeshView's
-    units, in practice. Both are included: the IP is how peers reach each other, the hostname is how
-    a person reaches the page.
+    `units` is any iterable of objects with `.host` and (optionally) `.hostname` and
+    `.mdns_hostname` — a MeshView's units, in practice. All are included: the IP is how peers reach
+    each other, the two names are how a person reaches the page.
     """
     hosts: set[str] = set(LOOPBACK_HOSTS)
     for unit in units:
@@ -167,6 +181,11 @@ def known_hosts(units) -> set[str]:
         name = (getattr(unit, "hostname", None) or "").strip()
         if name:
             hosts |= name_forms(name)
+        # The name from Settings -> Device. It arrives in a peer's JSON, so it must be ONE label:
+        # a dotted value would put a whole domain in the set.
+        mdns = getattr(unit, "mdns_hostname", None)
+        if isinstance(mdns, str) and _HOSTNAME_LABEL.fullmatch(mdns.strip().lower()):
+            hosts |= name_forms(mdns.strip())
     return hosts
 
 

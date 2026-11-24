@@ -15,6 +15,7 @@ deliberately *not* duplicated here.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 
@@ -23,6 +24,19 @@ def _optional_float(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
+
+
+# One DNS label: what Avahi takes as a host name. Kept here and not imported from cors_policy, so
+# the model stays free of imports. cors_policy applies the same pattern to the settings value.
+_DNS_LABEL = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def _single_label(value: object) -> str | None:
+    """A peer's mDNS name as one lowercase DNS label, or None. A dotted name would add a domain."""
+    if not isinstance(value, str):
+        return None
+    name = value.strip().lower()
+    return name if _DNS_LABEL.fullmatch(name) else None
 
 
 @dataclass
@@ -179,6 +193,13 @@ class UnitSnapshot:
     # this a peer cannot recognise a page served BY this unit as a legitimate origin. See
     # cors_policy.known_hosts.
     hostname: str | None = None
+    # The mDNS name a user set from Settings -> Device (`settings.json` `hostname`, applied with
+    # Avahi SetHostName). The kernel hostname above never learns it, so a page opened at
+    # `http://<this-name>.local` was refused by every PEER. One DNS label, lowercase.
+    #
+    # DEFAULTS NONE: a peer on an older image sends no such field, and its `hostname` and IP still
+    # apply. A value that is not one label reads as None (see `_single_label`).
+    mdns_hostname: str | None = None
     # This unit's SENDSPIN server id, which under aiosendspin 9.x is its X25519 public key and is
     # NOT `unit_id`. They used to be the same string — we passed `server_id=unit_id` — and a good
     # deal of the mesh quietly relied on that, most importantly `follow`, which joins the server a
@@ -226,6 +247,7 @@ class UnitSnapshot:
             "local_player": self.local_player,
             "has_player": self.has_player,
             "hostname": self.hostname,
+            "mdns_hostname": self.mdns_hostname,
             "server_id": self.server_id,
             "follows_unit_id": self.follows_unit_id,
             "calibration": self.calibration,
@@ -247,6 +269,7 @@ class UnitSnapshot:
             local_player=d.get("local_player"),
             has_player=bool(d.get("has_player", True)),
             hostname=d.get("hostname"),
+            mdns_hostname=_single_label(d.get("mdns_hostname")),
             server_id=d.get("server_id"),
             follows_unit_id=d.get("follows_unit_id"),
             calibration=d.get("calibration") or {},

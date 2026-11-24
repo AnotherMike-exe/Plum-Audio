@@ -884,6 +884,21 @@ def test_a_playerless_unit_still_reports_its_sources():
     assert snapshot.players == []
 
 
+# -- the snapshot publishes the mDNS name from Settings -------------------------------------------
+
+
+def test_the_snapshot_publishes_the_mdns_name_from_settings(tmp_path, monkeypatch):
+    """Peers know a unit by its kernel hostname. A page at the Settings name needs this field."""
+    import json
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"hostname": "Kitchen-Amp"}))
+    monkeypatch.setenv("PLUM_SETTINGS_FILE", str(settings))
+    assert make_unit("airplay-1").snapshot().mdns_hostname == "kitchen-amp"
+    monkeypatch.setenv("PLUM_SETTINGS_FILE", str(tmp_path / "absent.json"))
+    assert make_unit("airplay-1").snapshot().mdns_hostname is None
+
+
 # -- the snapshot publishes ACTIVE roles, not just negotiated ones ---------------------------------
 
 

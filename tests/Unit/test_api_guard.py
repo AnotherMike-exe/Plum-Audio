@@ -50,14 +50,16 @@ def _guard_on(monkeypatch):
     monkeypatch.delenv("PLUM_ALLOWED_ORIGINS", raising=False)
 
 
-def check(method="GET", origin=None, host="198.51.100.21:5001", content_type=None, has_body=False, extras=None):
+def check(
+    method="GET", origin=None, host="198.51.100.21:5001", content_type=None, has_body=False, extras=None, hosts=None
+):
     return guard(
         method=method,
         origin=origin,
         host=host,
         content_type=content_type,
         has_body=has_body,
-        hosts=HOSTS,
+        hosts=HOSTS if hosts is None else hosts,
         extras=[] if extras is None else extras,
     )
 
@@ -210,6 +212,71 @@ def test_own_hosts_never_raises_on_a_bad_settings_file(tmp_path, monkeypatch, co
     assert "localhost" in cors_policy.own_hosts()
     monkeypatch.setenv("PLUM_SETTINGS_FILE", str(tmp_path / "absent.json"))
     assert "localhost" in cors_policy.own_hosts()
+
+
+# -- a peer's custom mDNS name ------------------------------------------------------------------
+#
+# `hostname` on the snapshot is socket.gethostname(). Settings -> Device gives Avahi a different
+# name (SetHostName) and stores it in settings.json. The page is then at http://<that-name>.local,
+# and a PEER refused every call from it (403): the peer knew the unit by its kernel name only.
+
+
+def _renamed_peer(**kwargs):
+    return UnitSnapshot("unit-10022", "Kitchen", host="198.51.100.22", hostname="plum-pi4-02", **kwargs)
+
+
+def test_a_peer_with_a_custom_mdns_name_is_allowed_as_origin():
+    hosts = known_hosts([_renamed_peer(mdns_hostname="Kitchen-Amp")])
+    for origin in ("http://kitchen-amp.local", "http://kitchen-amp", "http://kitchen-amp.local:5173"):
+        assert check(method="POST", origin=origin, content_type=JSON, has_body=True, hosts=hosts) is None, origin
+    # The same page's same-origin GET carries the name in Host and no Origin.
+    assert check(host="kitchen-amp.local", hosts=hosts) is None
+
+
+def test_an_unknown_name_is_still_refused_beside_a_custom_name():
+    hosts = known_hosts([_renamed_peer(mdns_hostname="kitchen-amp")])
+    for origin in ("http://evil.example", "http://kitchen-amp.evil.example", "http://kitchen.local"):
+        verdict = check(origin=origin, hosts=hosts)
+        assert verdict is not None and verdict[0] == 403, origin
+    assert check(host="evil.example", hosts=hosts)[0] == 403
+
+
+@pytest.mark.parametrize("junk", ["evil.example", "a b", "-lead", "x" * 64, "", 7, ["kitchen"], {"a": 1}, None])
+def test_a_peers_mdns_name_that_is_not_one_label_adds_nothing(junk):
+    """A snapshot is a peer's JSON. Only one DNS label is a name, so a peer cannot add a domain."""
+    snap = UnitSnapshot.from_dict({"unit_id": "unit-x", "host": "198.51.100.30", "mdns_hostname": junk})
+    assert known_hosts([snap]) == set(cors_policy.LOOPBACK_HOSTS) | {"198.51.100.30"}
+    # The same value on an object that did not come through from_dict.
+    direct = UnitSnapshot("unit-x", "X", host="198.51.100.30", mdns_hostname=junk)
+    assert known_hosts([direct]) == set(cors_policy.LOOPBACK_HOSTS) | {"198.51.100.30"}
+
+
+def test_an_old_snapshot_without_the_field_still_parses():
+    """A peer on an older image sends no `mdns_hostname`. Its IP and kernel name stay allowed."""
+    old = {"unit_id": "unit-old", "name": "Old", "host": "198.51.100.11", "hostname": "plum-old"}
+    snap = UnitSnapshot.from_dict(old)
+    assert snap.mdns_hostname is None
+    assert {"198.51.100.11", "plum-old.local"} <= known_hosts([snap])
+
+
+def test_the_mdns_name_survives_the_wire():
+    snap = _renamed_peer(mdns_hostname="kitchen-amp")
+    assert snap.to_dict()["mdns_hostname"] == "kitchen-amp"
+    assert UnitSnapshot.from_dict(snap.to_dict()).mdns_hostname == "kitchen-amp"
+
+
+def test_mdns_hostname_reads_the_settings_value(tmp_path, monkeypatch):
+    import os
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"hostname": "Kitchen-Amp"}))
+    monkeypatch.setenv("PLUM_SETTINGS_FILE", str(settings))
+    assert cors_policy.mdns_hostname() == "kitchen-amp"
+    settings.write_text(json.dumps({"hostname": "a b"}))
+    os.utime(settings, ns=(2, 2))
+    assert cors_policy.mdns_hostname() is None
+    monkeypatch.setenv("PLUM_SETTINGS_FILE", str(tmp_path / "absent.json"))
+    assert cors_policy.mdns_hostname() is None
 
 
 # -- the aiohttp middleware ---------------------------------------------------------------------

@@ -212,10 +212,9 @@ class MeshApi:
         this unit's OWN host (which the peer table never does — a unit ignores its own beacon), and
         that entry is exactly the one whose absence would break the page being looked at.
         """
-        # own_hosts() as well: the request guard checks the Host header against this set, and the
-        # view knows a unit by `socket.gethostname()` only. A unit whose mDNS name was changed from
-        # Settings is reached at a name the view never carries. It also keeps this unit's own names
-        # in the set while the view is not ready.
+        # own_hosts() as well: it keeps this unit's own names in the set while the view is not
+        # ready, and it reads this unit's Settings name with no wait for a snapshot. A PEER's
+        # Settings name comes from the view (`UnitSnapshot.mdns_hostname`).
         hosts = cors_policy.own_hosts()
         with contextlib.suppress(Exception):
             hosts |= cors_policy.known_hosts(self._agg.view().units)
