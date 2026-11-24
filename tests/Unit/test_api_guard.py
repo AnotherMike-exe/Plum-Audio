@@ -478,3 +478,47 @@ def test_one_peer_with_a_bad_hostname_does_not_drop_the_other_peers():
     ]
     hosts = known_hosts([bad, *good])
     assert {"198.51.100.21", "plum-amp100.local", "plum-interop.lan"} <= hosts
+
+
+# -- a same-origin POST at an address the unit does not list ----------------------------------------
+# A Pi on ethernet and WiFi has two addresses and lists one. A browser sends `Origin` on a
+# same-origin POST, so the page at the other address got 403 on every write. A DNS-rebinding attack
+# needs a NAME: an Origin that is an IP literal and equals the request Host cannot be one.
+
+_POST = {"method": "POST", "content_type": JSON, "has_body": True}
+
+
+@pytest.mark.parametrize(
+    ("origin", "host"),
+    [
+        ("http://10.9.9.9", "10.9.9.9"),
+        ("http://10.9.9.9", "10.9.9.9:80"),
+        ("http://10.9.9.9:8080", "10.9.9.9:8080"),
+        ("http://[fd00::5]", "[fd00::5]"),
+        ("http://[fd00::5]:8080", "[fd00::5]:8080"),
+        ("http://[FD00:0:0:0:0:0:0:5]", "[fd00::5]"),
+    ],
+)
+def test_a_same_origin_post_at_an_unlisted_ip_passes(origin, host):
+    assert check(origin=origin, host=host, **_POST) is None
+    assert cors_policy.is_allowed(origin, HOSTS, [], request_host=host) is True
+    assert cors_policy.is_allowed(origin, HOSTS, []) is False, "the Host is what makes it same-origin"
+
+
+@pytest.mark.parametrize(
+    ("origin", "host"),
+    [
+        ("http://10.9.9.9", "10.9.9.8"),  # another site on the LAN, aimed at the unit
+        ("http://10.9.9.9", "198.51.100.21"),
+        ("http://10.9.9.9", None),
+        ("http://[fd00::5]", "[fd00::6]"),
+        ("http://[fd00::5]", "10.9.9.9"),
+        ("http://unknown-name.local", "unknown-name.local"),  # a NAME can be rebound
+        ("http://evil.example", "evil.example"),
+        ("http://evil.example", "10.9.9.9"),
+        ("http://10.9.9.9", "evil.example"),
+    ],
+)
+def test_an_unlisted_origin_that_is_not_the_same_ip_as_the_host_is_refused(origin, host):
+    verdict = check(origin=origin, host=host, **_POST)
+    assert verdict is not None and verdict[0] == 403

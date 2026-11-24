@@ -195,12 +195,46 @@ def known_hosts(units) -> set[str]:
     return hosts
 
 
-def is_allowed(origin: str | None, hosts: set[str], extras: list[str] | None = None) -> bool:
+def _ip_of(name: str | None):
+    """`name` as an ip_address object, or None when it is not an IP literal."""
+    if not name:
+        return None
+    try:
+        return ipaddress.ip_address(name.split("%", 1)[0])  # drop an IPv6 zone id
+    except ValueError:
+        return None
+
+
+def same_ip_origin(origin: str | None, request_host: str | None) -> bool:
+    """Is `origin` an IP literal that is also the `Host` the request was sent to?
+
+    That is a same-origin request to an address of this box. A unit on ethernet and WiFi has two
+    addresses and knows one (`local_ip` is the default route), and a browser sends `Origin` on a
+    same-origin POST, so a page opened at the other address got 403 on every write.
+
+    It is safe because a DNS-rebinding attack needs a NAME: the browser puts the attacker's name
+    in both headers, and a name never passes here. A page at some OTHER IP has that IP as its
+    Origin and the unit's address as Host, and the two do not match. Compared as addresses, so
+    two spellings of one IPv6 address are equal. Ports are ignored, as everywhere in this module.
+    """
+    if not origin or not request_host:
+        return False
+    origin_ip = _ip_of(_host_of(origin))
+    return origin_ip is not None and origin_ip == _ip_of(_host_header_name(request_host))
+
+
+def is_allowed(
+    origin: str | None, hosts: set[str], extras: list[str] | None = None, *, request_host: str | None = None
+) -> bool:
     """May `origin` call us?
 
     A None/empty origin is NOT decided here — see `origin_header`. This answers only the browser
     question, and is deliberately port-agnostic: the GUI is served on :80, dev runs on :5173, and a
     unit that is reachable at all is reachable on any of its own ports anyway.
+
+    `request_host` is the request's `Host` header. With it, an IP-literal origin that equals the
+    Host passes without being in `hosts` (see `same_ip_origin`). A name still needs `hosts` or
+    `PLUM_ALLOWED_ORIGINS`.
     """
     if not origin:
         return False
@@ -212,7 +246,7 @@ def is_allowed(origin: str | None, hosts: set[str], extras: list[str] | None = N
     host = _host_of(origin)
     if host is None:
         return False
-    return host in hosts
+    return host in hosts or same_ip_origin(origin, request_host)
 
 
 def origin_header(origin: str | None, hosts: set[str], extras: list[str] | None = None) -> str | None:
@@ -314,7 +348,8 @@ def guard(
     """Decide if a request may reach its handler. None to pass, else (HTTP status, message).
 
     (a) `Origin` present and not allowed: 403, for every method. A websocket upgrade is a GET with
-        an Origin, so this is the check that covers it.
+        an Origin, so this is the check that covers it. An Origin that is an IP literal and equals
+        the `Host` is allowed: a same-origin request at an address the unit does not list.
     (b) `Origin` absent: the `Host` must be an IP literal, loopback, or a name we know. See
         `host_is_trusted`. An allowed Origin needs no Host check: its host is in the same set.
     (c) A POST, PUT or DELETE with a body must be `application/json`. A cross-site page can send
@@ -324,7 +359,7 @@ def guard(
         return None
     extras = extras if extras is not None else configured_extra_origins()
     if origin:
-        if not is_allowed(origin, hosts, extras):
+        if not is_allowed(origin, hosts, extras, request_host=host):
             return 403, f"origin {origin[:200]!r} is not allowed (set PLUM_ALLOWED_ORIGINS to allow it)"
     elif not host_is_trusted(host, hosts, extras):
         return 403, f"host {str(host)[:200]!r} is not a name of this unit (set PLUM_ALLOWED_ORIGINS to allow it)"
