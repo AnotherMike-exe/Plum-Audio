@@ -175,3 +175,86 @@ def test_the_temp_file_is_not_made_in_the_container_writable_directory(root):
     assert "${STATE}.$$" not in text
     assert "${ENV_FILE}.$$" not in text
     assert "mktemp" in text
+
+
+# -- update.request and update.state are files the container can replace -----------------------
+#
+# Root read both with a plain `open()`. A symlink to a large host file made root read all of it,
+# and `watch` and `health` read update.state on every run.
+
+
+def test_a_symlink_at_the_request_path_is_consumed_and_not_followed(root):
+    real = root.parent / "elsewhere.json"
+    real.write_text(json.dumps({"channel": "latest"}))
+    os.symlink(real, root / "config" / "update.request")
+    result = run(root, "watch")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert stub_log(root) == "", "a request read through a link must not start a pull"
+    assert (root / ".env").read_text() == ENV
+    assert not os.path.lexists(root / "config" / "update.request"), "consumed, so it is not replayed"
+    assert real.exists(), "rm removes the link and not its target"
+    assert "ignor" in result.stdout
+
+
+def test_a_dangling_symlink_at_the_request_path_is_consumed(root):
+    os.symlink(root.parent / "nothing-here", root / "config" / "update.request")
+    assert run(root, "watch").returncode == 0
+    assert not os.path.lexists(root / "config" / "update.request")
+    assert stub_log(root) == ""
+
+
+def test_a_fifo_at_the_request_path_does_not_hang_the_agent(root):
+    os.mkfifo(root / "config" / "update.request")
+    assert run(root, "watch").returncode == 0
+    assert not os.path.lexists(root / "config" / "update.request")
+    assert stub_log(root) == ""
+
+
+def test_a_very_large_request_is_ignored(root):
+    (root / "config" / "update.request").write_text(json.dumps({"channel": "latest", "pad": "x" * 300_000}))
+    result = run(root, "watch")
+    assert stub_log(root) == ""
+    assert "ignor" in result.stdout
+
+
+def test_a_request_that_is_not_json_still_means_the_current_tag(root):
+    """The behaviour before the reader changed: damaged content is a request with no channel."""
+    (root / "config" / "update.request").write_text("{ not json")
+    assert run(root, "watch").returncode == 0
+    assert "PLUM_TAG=dev\n" in (root / ".env").read_text()
+    assert "pull" in stub_log(root)
+
+
+def test_the_state_is_still_read_from_a_regular_file(root):
+    run(root, "init")
+    state = root / "config" / "update.state"
+    data = json.loads(state.read_text())
+    data["available"] = "sha256:" + "a" * 64
+    state.write_text(json.dumps(data))
+    run(root, "init")
+    assert json.loads(state.read_text())["available"] == "sha256:" + "a" * 64
+
+
+def test_a_symlink_at_the_state_path_is_not_read(root):
+    """The value in the link's target must not come back in the state the agent writes."""
+    real = root.parent / "elsewhere.json"
+    real.write_text(json.dumps({"available": "sha256:from-the-link", "channel": "latest"}))
+    os.symlink(real, root / "config" / "update.state")
+    assert run(root, "init").returncode == 0
+    state = root / "config" / "update.state"
+    assert not state.is_symlink()
+    assert "from-the-link" not in state.read_text()
+    assert "from-the-link" in real.read_text(), "the target is not written"
+
+
+def test_a_fifo_at_the_state_path_does_not_hang_the_agent(root):
+    os.mkfifo(root / "config" / "update.state")
+    assert run(root, "init").returncode == 0
+
+
+def test_one_reader_serves_all_three_files():
+    text = SCRIPT.read_text()
+    assert text.count("O_NOFOLLOW") == 2, "the reader, and the comment that names it"
+    assert text.count("read_capped(sys.argv[1]") == 2
+    assert 'read_capped(health_path, "health file")' in text
+    assert "open(sys.argv[1]" not in text

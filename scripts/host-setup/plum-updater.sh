@@ -86,6 +86,50 @@ make_temp() {
     mktemp "${ROOT}/.${1}.XXXXXXXX"
 }
 
+# --- reading a file the container can write -------------------------------------------------------
+# $CONFIG and the data directory are bind mounts, and this script is root. The container can put a
+# symlink to any host file at a path this script reads, or a FIFO that blocks a reader, or a very
+# large file. So every such file (update.state, update.request, health.json) goes through ONE
+# reader: O_NOFOLLOW and O_NONBLOCK, a regular file only, and a size cap.
+#
+# `read_capped(path, what)` gives `(bytes, None)` or `(None, why)`. `what` names the file in `why`.
+# shellcheck disable=SC2016  # Python source, not a shell string: nothing in it must expand.
+READER_PY='
+import os as _os, stat as _stat
+
+MAX_BYTES = 65536        # each real file is a few hundred bytes
+
+
+def read_capped(path, what):
+    try:
+        fd = _os.open(path, _os.O_RDONLY | _os.O_NOFOLLOW | _os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None, f"no {what}"
+    except OSError:
+        return None, f"the {what} cannot be opened (a link, or no permission)"
+    try:
+        info = _os.fstat(fd)
+        if not _stat.S_ISREG(info.st_mode):
+            return None, f"the {what} is not a regular file"
+        if info.st_size > MAX_BYTES:
+            return None, f"the {what} is too large"
+        raw = _os.read(fd, MAX_BYTES + 1)
+    except OSError:
+        return None, f"the {what} cannot be read"
+    finally:
+        _os.close(fd)
+    if len(raw) > MAX_BYTES:
+        return None, f"the {what} is too large"
+    return raw, None
+'
+
+# python_with_reader ARG... <<'PY' — run the Python on stdin with `read_capped` defined before it.
+# The arguments are `sys.argv[1:]`, as with `python3 - ARG...`.
+python_with_reader() {
+    python3 -c "${READER_PY}
+$(cat)" "$@"
+}
+
 # --- state ----------------------------------------------------------------------------------------
 # One JSON object, written atomically, read by the container through the bind mount. Atomic because
 # the container polls this file straight through the window where it is being recreated, so a reader
@@ -104,14 +148,17 @@ S_LAST_UPDATE=""
 S_PREVIOUS=""
 
 load_state() {
-    [[ -f "$STATE" ]] || return 0
     # Read with python3 rather than jq: jq is not on a Pi OS Lite image and python3 always is.
+    # The container can replace this file, so it goes through `read_capped`. A state that cannot be
+    # read that way is the same as no state.
     local dump
-    dump="$(python3 - "$STATE" <<'PY' 2>/dev/null || true
+    dump="$(python_with_reader "$STATE" <<'PY' 2>/dev/null || true
 import json, shlex, sys
+raw, _why = read_capped(sys.argv[1], "state file")
+if raw is None:
+    sys.exit(0)
 try:
-    with open(sys.argv[1], encoding="utf-8") as fh:
-        d = json.load(fh)
+    d = json.loads(raw.decode("utf-8"))
 except Exception:
     sys.exit(0)
 if not isinstance(d, dict):
@@ -361,8 +408,7 @@ do_update() {
 #     Nothing from the file is evaluated, and nothing from it is an argument to docker.
 #   - The message holds the `problems` list for the journal only. Python cuts it to printable ASCII
 #     on one line, and bash prints it with `printf '%s'`.
-#   - The file is opened with O_NOFOLLOW and O_NONBLOCK, must be a regular file, and has a size cap.
-#     The container can put a symlink to any host file there, or a FIFO that blocks a reader.
+#   - The file is read with `read_capped` (see READER_PY): no link, no FIFO, a size cap.
 #
 # A restart needs ALL of these:
 #   - `restart_advised` in the file is not `false`. The healthcheck sets it to `false` when a
@@ -401,15 +447,14 @@ do_health() {
         plum-audio 2>/dev/null | head -1)" || line=""
     read -r running started docker_health <<<"$line" || true
 
-    out="$(python3 - "$HEALTH_FILE" "$WATCHDOG_STATE_DIR" "$disabled" "$pending" \
+    out="$(python_with_reader "$HEALTH_FILE" "$WATCHDOG_STATE_DIR" "$disabled" "$pending" \
         "${running:-}" "${started:-}" "${docker_health:-}" \
         "$WATCHDOG_UNHEALTHY_S" "$WATCHDOG_STALE_S" "$WATCHDOG_MAX_RESTARTS" "$WATCHDOG_WINDOW_S" <<'PY'
-import calendar, json, math, os, re, stat, sys, tempfile, time
+import calendar, json, math, os, re, sys, tempfile, time
 
 (health_path, state_dir, disabled, pending, running, started, docker_health,
  unhealthy_s, stale_s, max_restarts, window_s) = sys.argv[1:12]
 
-MAX_BYTES = 65536        # the real file is a few hundred bytes
 STRIKE_MAX_AGE_S = 200   # "two runs in a row" on a 60 s timer, with room for a slow run
 state_path = os.path.join(state_dir, "watchdog.state")
 now = time.time()
@@ -448,25 +493,9 @@ def clean(text, cap):
 
 def read_health():
     """(report, None) or (None, why). Never follows a link, never blocks, never reads a big file."""
-    try:
-        fd = os.open(health_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError:
-        return None, "no health file"
-    except OSError:
-        return None, "the health file cannot be opened (a link, or no permission)"
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            return None, "the health file is not a regular file"
-        if info.st_size > MAX_BYTES:
-            return None, "the health file is too large"
-        raw = os.read(fd, MAX_BYTES + 1)
-    except OSError:
-        return None, "the health file cannot be read"
-    finally:
-        os.close(fd)
-    if len(raw) > MAX_BYTES:
-        return None, "the health file is too large"
+    raw, why = read_capped(health_path, "health file")
+    if raw is None:
+        return None, why
     try:
         data = json.loads(raw.decode("utf-8"))
     except (ValueError, RecursionError):
@@ -650,30 +679,48 @@ PY
 }
 
 do_watch() {
-    [[ -f "$REQUEST" ]] || { log "watch: no request"; return 0; }
-    local channel check_only
-    # Prints `-` for a channel that is present and not a string, so it fails valid_channel below
-    # and is not read as "no channel given".
-    channel="$(python3 -c '
+    # -L as well: a dangling symlink fails -e, and it must still be consumed.
+    [[ -e "$REQUEST" || -L "$REQUEST" ]] || { log "watch: no request"; return 0; }
+    local out status="" channel="" check_only="0"
+    # The container writes this file, so it goes through `read_capped`. Three lines come back:
+    #   - `ok`, or `unreadable` for a link, a FIFO, a directory or a file over the size cap.
+    #   - the channel. `-` for a channel that is present and not a string, so it fails
+    #     valid_channel below and is not read as "no channel given".
+    #   - 1 for a check-only request, else 0.
+    out="$(python_with_reader "$REQUEST" <<'PY' 2>/dev/null || true
 import json, sys
+raw, why = read_capped(sys.argv[1], "request file")
+if raw is None:
+    print("unreadable")
+    sys.exit(0)
 try:
-    d = json.load(open(sys.argv[1], encoding="utf-8"))
+    d = json.loads(raw.decode("utf-8"))
 except Exception:
     d = {}
 c = d.get("channel") if isinstance(d, dict) else "-"
-print(c if isinstance(c, str) else ("" if c is None else "-"))' "$REQUEST" 2>/dev/null)"
-    check_only="$(python3 -c '
-import json, sys
-try:
-    d = json.load(open(sys.argv[1], encoding="utf-8"))
-except Exception:
-    d = {}
-print("1" if isinstance(d, dict) and d.get("checkOnly") else "0")' "$REQUEST" 2>/dev/null)"
+print("ok")
+if isinstance(c, str):
+    # One line for each answer. A channel with a newline is not a tag, and it must not become
+    # the next answer.
+    print("-" if "\n" in c else c)
+else:
+    print("" if c is None else "-")
+print("1" if isinstance(d, dict) and d.get("checkOnly") else "0")
+PY
+)"
+    { IFS= read -r status; IFS= read -r channel; IFS= read -r check_only; } <<<"$out" || true
 
     # Consume the request BEFORE acting. `up -d` kills the container that wrote it, and a request
     # still on disk after a successful update would be replayed by the .path unit the moment the
     # container comes back — an update loop that looks like a unit restarting forever.
     rm -f "$REQUEST"
+
+    # A request that is a link, a FIFO or a very large file is not a request. It is gone now (`rm`
+    # removes a link and not its target), and nothing more runs.
+    if [[ "$status" != "ok" ]]; then
+        log "watch: ignoring a request that is not a small regular file"
+        return 0
+    fi
 
     # An absent channel means "the tag this unit already runs". Anything else must be a tag.
     # Ignored, with no fallback: a request that carried a bad channel is not a request to trust
