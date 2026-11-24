@@ -39,6 +39,7 @@ import subprocess
 import time
 from collections.abc import Callable
 
+from background_tasks import spawn
 from dbus_next import BusType, Message, MessageType, Variant
 from dbus_next.aio import MessageBus
 
@@ -294,7 +295,7 @@ class BluetoothAdapter:
         except (ValueError, AttributeError):
             return None
         if iface == DEVICE_IFACE:
-            asyncio.ensure_future(self._on_device_props(msg.path, unwrapped))
+            spawn(self._on_device_props(msg.path, unwrapped), f"bt-device-props:{self.instance.source_id}")
         for cb in self._props_listeners:
             with contextlib.suppress(Exception):
                 cb(msg.path, iface, unwrapped)
@@ -303,14 +304,14 @@ class BluetoothAdapter:
     def _on_interfaces_added(self, path: str, interfaces: dict) -> None:
         names = list(interfaces)
         if DEVICE_IFACE in names:
-            asyncio.ensure_future(self._on_device_props(path, {}))
+            spawn(self._on_device_props(path, {}), f"bt-device-added:{self.instance.source_id}")
         for cb in self._object_listeners:
             with contextlib.suppress(Exception):
                 cb(path, names, True)
 
     def _on_interfaces_removed(self, path: str, interfaces: list[str]) -> None:
         if DEVICE_IFACE in interfaces and path in self._connected:
-            asyncio.ensure_future(self._drop_device(path))
+            spawn(self._drop_device(path), f"bt-device-removed:{self.instance.source_id}")
         for cb in self._object_listeners:
             with contextlib.suppress(Exception):
                 cb(path, list(interfaces), False)

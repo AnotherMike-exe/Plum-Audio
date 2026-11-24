@@ -28,7 +28,6 @@ so the audio path never depends on discovery being available.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import ipaddress
 import logging
@@ -36,6 +35,7 @@ import socket
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from background_tasks import spawn
 from dbus_next.aio import MessageBus
 from dbus_next.constants import BusType
 
@@ -261,7 +261,7 @@ class AvahiClient:
 
         def _on_item_new(interface: int, protocol: int, name: str, stype: str, domain: str, flags: int) -> None:
             # Resolution is a round trip; do it off the signal handler.
-            asyncio.ensure_future(self._resolve(interface, protocol, name, stype, domain, on_add))
+            spawn(self._resolve(interface, protocol, name, stype, domain, on_add), f"mdns-resolve:{stype}/{name}")
 
         def _on_item_remove(_i: int, _p: int, name: str, stype: str, _d: str, _f: int) -> None:
             self._seen.pop(f"{stype}/{name}", None)

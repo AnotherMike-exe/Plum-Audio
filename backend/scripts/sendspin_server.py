@@ -80,6 +80,7 @@ from aiosendspin.server.server import (
     ConnectionReason,
     SendspinServer,
 )
+from background_tasks import spawn
 from lifecycle import install_shutdown_handlers
 from mesh.model import PlayerState, SourceState, UnitSnapshot
 from sources import airplay_config, bluetooth_config, spotify_config
@@ -1143,9 +1144,9 @@ class PlumSendspinServer:
             # min_buffer_ms from every client/state and would otherwise undo this on the next one.
             self._clamp_player_min_buffer(event.client_id)
             self._apply_player_delay(event.client_id)
-            asyncio.ensure_future(self._maybe_group_controller(event.client_id))
-            asyncio.ensure_future(self._maybe_pair_via_shared_psk(event.client_id))
-            asyncio.ensure_future(self._apply_pending_volume(event.client_id))
+            spawn(self._maybe_group_controller(event.client_id), "group-controller")
+            spawn(self._maybe_pair_via_shared_psk(event.client_id), "pair-shared-psk")
+            spawn(self._apply_pending_volume(event.client_id), "apply-pending-volume")
 
     def _clamp_player_min_buffer(self, client_id: str) -> None:
         """Cap a player's `min_buffer_ms` at what this feeder can actually serve.
@@ -2051,28 +2052,28 @@ class PlumSendspinServer:
             return
         reader = self._metadata_readers.get(source_id)  # AirPlay only; None for Spotify
         if isinstance(event, ControllerPlayEvent):
-            asyncio.ensure_future(remote.play())
+            spawn(remote.play(), f"transport-play:{source_id}")
             if reader is not None:
                 reader.apply_command("play")
         elif isinstance(event, ControllerPauseEvent):
-            asyncio.ensure_future(remote.pause())
+            spawn(remote.pause(), f"transport-pause:{source_id}")
             if reader is not None:
                 reader.apply_command("pause")
         elif isinstance(event, ControllerNextEvent):
-            asyncio.ensure_future(remote.next_track())
+            spawn(remote.next_track(), f"transport-next:{source_id}")
         elif isinstance(event, ControllerPreviousEvent):
-            asyncio.ensure_future(remote.previous_track())
+            spawn(remote.previous_track(), f"transport-previous:{source_id}")
         elif isinstance(event, ControllerRepeatEvent):
             # Only sources whose remote can honour it advertise repeat (so a conformant controller
             # never sends this to AirPlay); guard anyway. Drive the source, and optimistically reflect
             # the new mode to every GUI on the group — the daemon's own event stream re-confirms it.
             if hasattr(remote, "set_repeat"):
-                asyncio.ensure_future(remote.set_repeat(event.mode))
+                spawn(remote.set_repeat(event.mode), f"transport-repeat:{source_id}")
                 controller = _group.group_role("controller")
                 if controller is not None:
                     controller.set_repeat(event.mode)
         elif isinstance(event, ControllerShuffleEvent) and hasattr(remote, "set_shuffle"):
-            asyncio.ensure_future(remote.set_shuffle(event.shuffle))
+            spawn(remote.set_shuffle(event.shuffle), f"transport-shuffle:{source_id}")
             controller = _group.group_role("controller")
             if controller is not None:
                 controller.set_shuffle(event.shuffle)
