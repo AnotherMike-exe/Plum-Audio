@@ -190,6 +190,60 @@ Readiness is checked on **supervisord's own view**, not on a port: under host ne
 be answered by something that is not this container, which is exactly how a stale host nginx passed
 a GUI check. Since 9.x that is necessary but no longer sufficient — see failure 3.
 
+## An endpoint is down
+
+A power cycle clears the fault and the evidence with it. Capture the state first. Power cycle the
+unit only after step 17.
+
+### Capture the state
+
+Run each step in order. Steps 1 to 4 run on the workstation. The other steps run on the unit.
+
+1. Export the unit address. Run `export IP=<unit-ip>`.
+2. Test the network path. Run `ping -c3 $IP`.
+3. Test the player port. Run `nc -zv $IP 8928`.
+4. Test the mesh API. Run `curl -sm5 $IP:5001/api/mesh/snapshot`.
+5. Log in to the unit. Run `ssh <user>@$IP`.
+6. List the containers. Confirm that `plum-audio` shows `Up`. Run `docker ps`.
+7. Read the container health. Run `docker inspect -f '{{.State.Health.Status}}' plum-audio`.
+8. Read the program states. Run `docker exec plum-audio supervisorctl -c /app/supervisord/supervisord.conf status`.
+9. Read the health verdict. Run `cat /opt/plum-audio/data/health.json`.
+10. Read the player sockets. Run `ss -tnpi | grep -E '8927|8928'`.
+11. Read the output state. Run `cat /proc/asound/card*/pcm*p/sub0/status`.
+12. Read the player log. Run `grep -E 'SILENT|DEAD|exiting with code|re-opened|stable again' /opt/plum-audio/config/logs/sendspin_player.log | tail -50`.
+13. Read the supervisord log. Run `tail -50 /opt/plum-audio/config/supervisord.log`.
+14. Read the WiFi power save state. Run `iw dev wlan0 get power_save`.
+15. Read the throttle flags. Run `vcgencmd get_throttled`.
+16. Copy the logs and state files aside. Run `CAP=/var/tmp/plum-capture-$(date -u +%Y%m%dT%H%M%SZ) && sudo mkdir -p "$CAP" && sudo cp -a /opt/plum-audio/config/logs /opt/plum-audio/config/supervisord.log /opt/plum-audio/data/health.json /opt/plum-audio/data/player_state.json "$CAP"/`.
+17. Copy the capture to the workstation. Run `scp -r <user>@$IP:/var/tmp/plum-capture-<UTC-time> ./`.
+
+Do not copy `/opt/plum-audio/config/identity`. It holds the device keys of this unit.
+
+### Read the symptom
+
+| Symptom | Meaning |
+|---|---|
+| Ping fails (step 2) | The host or the network is down. The player is not the first suspect. |
+| Port 8928 closed (step 3) | The player is not running. Step 8 shows which program stopped. |
+| Port 8928 open, dials time out | A half-open session. The player holds a dead peer's connection. |
+
+### What recovers on its own
+
+The unit recovers without a power cycle in these cases. Each row names the log line or the exit code
+that the mechanism leaves. Set the `PLUM_*` variables in `/opt/plum-audio/plum-audio.env`. Then
+restart the container.
+
+| Mechanism | Trigger | Action | Log line or exit code |
+|---|---|---|---|
+| Peer-silence watchdog | No inbound frame for `PLUM_PEER_SILENCE_TIMEOUT_S` (default 30 s, 0 disables). At least five frames sent went unanswered. | Closes the session with code 1001. Aborts its TCP connection if it is still attached 2 s later. | WARNING `is held by a SILENT peer`, then `detached after the close` or `aborted its TCP connection` |
+| Peer-silence exit | The session is still attached 20 s after the close, and no audio arrived in the last 3 s. | Exits with code 4. supervisord starts the player again. | ERROR `exiting with code 4` |
+| Output watchdog | The stream is finished or inactive, or its callback counter stops for two 3 s polls. `PLUM_OUTPUT_WATCHDOG=0` disables it. | Re-opens the output. A re-open that does not hold backs off, up to 300 s. | WARNING `output stream is DEAD`, then `re-opened on`. INFO `stable again` when it holds. |
+| Output exit | `PLUM_OUTPUT_REOPEN_MAX` re-opens (default 3) fail in a row. | Exits with code 3. supervisord starts the player again. | ERROR `exiting with code 3` |
+| supervisord restart | Any exit of a running program. A failed start counts against `startretries=600`. | Restarts at once. Failed starts wait longer each time, up to 10 minutes between tries. | `/opt/plum-audio/config/supervisord.log` |
+| Healthcheck | Docker `HEALTHCHECK`, every 30 s. The player report is stale after `PLUM_HEALTH_STALE_S` (default 120 s). | Writes `/opt/plum-audio/data/health.json` (`PLUM_HEALTH_FILE`). Docker does not restart an unhealthy container. | Each problem as one line in `docker inspect` health log, and in the `problems` list of `health.json` |
+
+The healthcheck does not repair anything. It reports. A host agent or a person acts on the report.
+
 ## Debugging cookbook
 
 ```bash
