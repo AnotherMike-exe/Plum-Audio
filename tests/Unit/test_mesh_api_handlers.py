@@ -95,7 +95,9 @@ def call(handler, body=None):
 
 
 def player(player_id, *, volume=100, muted=False, url=None):
-    return PlayerState(player_id=player_id, name=player_id, url=url, volume=volume, muted=muted)
+    return PlayerState(
+        player_id=player_id, name=player_id, connected=True, group_id=None, url=url, volume=volume, muted=muted
+    )
 
 
 # -- GET /api/mesh/neighbourhood: friendly names -------------------------------------------------
@@ -127,3 +129,140 @@ def test_neighbourhood_matches_a_name_by_host_and_port(names_file):
 def test_neighbourhood_without_mdns_is_empty(names_file):
     api, _, _ = make_api()
     assert call(api._neighbours) == (200, {"players": [], "servers": []})
+
+
+# -- POST /api/mesh/volume ---------------------------------------------------------------------
+#
+# The Home Assistant integration sends `volume` alone from a slider and `muted` alone from a mute
+# button. Before: `muted` alone was a 400, and `volume` alone CLEARED mute (it defaulted to False),
+# so moving the slider on a muted speaker made it play.
+
+
+def _unit_with(*players, local_player=None):
+    unit = UnitSnapshot("unit-1", "Unit 1", host="198.51.100.21", players=list(players))
+    unit.local_player = local_player
+    return [unit]
+
+
+def test_volume_alone_keeps_the_current_mute(names_file):
+    api, _, router = make_api(units=_unit_with(player("p1", volume=40, muted=True)))
+    assert call(api._volume, {"player_id": "p1", "volume": 55}) == (200, {"ok": True})
+    assert router.volumes == [("p1", 55, True)]
+
+
+def test_volume_alone_on_a_player_that_is_not_muted_stays_not_muted(names_file):
+    api, _, router = make_api(units=_unit_with(player("p1", volume=40, muted=False)))
+    call(api._volume, {"player_id": "p1", "volume": 55})
+    assert router.volumes == [("p1", 55, False)]
+
+
+def test_muted_alone_keeps_the_current_volume(names_file):
+    api, _, router = make_api(units=_unit_with(player("p1", volume=40, muted=False)))
+    assert call(api._volume, {"player_id": "p1", "muted": True}) == (200, {"ok": True})
+    assert call(api._volume, {"player_id": "p1", "muted": False}) == (200, {"ok": True})
+    assert router.volumes == [("p1", 40, True), ("p1", 40, False)]
+
+
+def test_the_old_request_shape_still_works(names_file):
+    """The GUI sends all three fields. An explicit `muted: false` must still clear mute."""
+    api, _, router = make_api(units=_unit_with(player("p1", volume=40, muted=True)))
+    assert call(api._volume, {"player_id": "p1", "volume": 70, "muted": False}) == (200, {"ok": True})
+    assert call(api._volume, {"player_id": "p1", "volume": 70, "muted": True}) == (200, {"ok": True})
+    assert router.volumes == [("p1", 70, False), ("p1", 70, True)]
+
+
+def test_a_null_field_reads_as_absent(names_file):
+    api, _, router = make_api(units=_unit_with(player("p1", volume=40, muted=True)))
+    call(api._volume, {"player_id": "p1", "volume": 30, "muted": None})
+    call(api._volume, {"player_id": "p1", "volume": None, "muted": False})
+    assert router.volumes == [("p1", 30, True), ("p1", 40, False)]
+
+
+def test_the_level_of_a_player_on_a_peer_comes_from_the_mesh_view(names_file):
+    units = [
+        UnitSnapshot("unit-1", "Unit 1", host="198.51.100.21"),
+        UnitSnapshot("unit-2", "Unit 2", host="198.51.100.22", players=[player("p9", volume=25, muted=True)]),
+    ]
+    api, _, router = make_api(units=units)
+    call(api._volume, {"player_id": "p9", "volume": 60})
+    assert router.volumes == [("p9", 60, True)]
+
+
+def test_volume_alone_for_a_player_nobody_reports_keeps_the_old_default(names_file):
+    """A released speaker is in no `players` list. Its level is held for the next connect."""
+    api, _, router = make_api()
+    assert call(api._volume, {"player_id": "idle", "volume": 60}) == (200, {"ok": True})
+    assert router.volumes == [("idle", 60, False)]
+
+
+def test_muted_alone_for_a_player_nobody_reports_is_refused(names_file):
+    """There is no current volume to keep, and an invented one would move a real speaker."""
+    api, _, router = make_api()
+    status, payload = call(api._volume, {"player_id": "idle", "muted": True})
+    assert status == 400
+    assert "volume" in payload["error"]
+    assert router.volumes == []
+
+
+@pytest.mark.parametrize(
+    "body", [{}, {"player_id": "p1"}, {"volume": 50}, {"muted": True}, {"player_id": "p1", "volume": "loud"}]
+)
+def test_a_volume_request_with_nothing_usable_is_refused(names_file, body):
+    api, _, router = make_api(units=_unit_with(player("p1")))
+    status, payload = call(api._volume, body)
+    assert status == 400
+    assert payload["error"]
+    assert router.volumes == []
+
+
+def test_the_loudness_matcher_hears_a_volume_change_but_not_a_mute(names_file):
+    api, _, _ = make_api(units=_unit_with(player("p1", volume=40)))
+    heard = []
+    api.on_user_volume = lambda player_id, volume: heard.append((player_id, volume))
+    call(api._volume, {"player_id": "p1", "muted": True})
+    assert heard == []  # a mute is not a new level for the group to follow
+    call(api._volume, {"player_id": "p1", "volume": 55})
+    assert heard == [("p1", 55)]
+
+
+# -- POST /api/mesh/release --------------------------------------------------------------------
+#
+# Home Assistant knows a speaker by its listener URL. It learns the handshake id only from the
+# reply to an adopt, and it does not have that after a restart.
+
+
+def test_release_by_url_alone_resolves_the_player(names_file):
+    api, engine, _ = make_api(
+        units=_unit_with(player("AA:BB", url=URL), player("other", url="ws://198.51.100.9:8928/x"))
+    )
+    assert call(api._release, {"source_id": "airplay-1", "url": URL}) == (200, {"ok": True, "player_id": "AA:BB"})
+    assert engine.released == [("airplay-1", "AA:BB", URL)]
+
+
+def test_release_by_url_matches_on_host_and_port(names_file):
+    api, engine, _ = make_api(units=_unit_with(player("AA:BB", url=URL)))
+    status, _ = call(api._release, {"source_id": "airplay-1", "url": "ws://198.51.100.31:8928"})
+    assert status == 200
+    assert engine.released == [("airplay-1", "AA:BB", "ws://198.51.100.31:8928")]
+
+
+def test_the_old_release_shapes_still_work(names_file):
+    api, engine, _ = make_api()
+    assert call(api._release, {"source_id": "s", "player_id": "p1"})[0] == 200
+    assert call(api._release, {"source_id": "s", "player_id": "p1", "url": URL})[0] == 200
+    assert engine.released == [("s", "p1", None), ("s", "p1", URL)]
+
+
+def test_release_by_a_url_no_attached_player_has_is_not_found(names_file):
+    api, engine, _ = make_api(units=_unit_with(player("AA:BB", url=URL)))
+    status, payload = call(api._release, {"source_id": "s", "url": "ws://198.51.100.77:8928/sendspin"})
+    assert status == 404
+    assert payload["error"]
+    assert engine.released == []
+
+
+@pytest.mark.parametrize("body", [{}, {"source_id": "s"}, {"url": URL}, {"player_id": "p1"}])
+def test_a_release_with_nothing_to_identify_the_speaker_is_refused(names_file, body):
+    api, engine, _ = make_api(units=_unit_with(player("AA:BB", url=URL)))
+    assert call(api._release, body)[0] == 400
+    assert engine.released == []
