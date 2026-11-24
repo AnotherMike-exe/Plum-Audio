@@ -213,6 +213,19 @@ else
     bad "update agent" "not installed — Settings -> Updates will report this host as unprovisioned"
 fi
 
+# The health watchdog rides the same agent. Docker never restarts an unhealthy container, so with
+# no timer a FATAL player stays down until a person power-cycles the unit.
+if systemctl is-active --quiet plum-updater-health.timer; then
+    if [[ -e /opt/plum-audio/watchdog.disabled ]] \
+       || grep -qsE '^PLUM_WATCHDOG=(0|false|off|no)$' /etc/default/plum-updater; then
+        note "health watchdog" "timer active, but DISABLED by the operator switch"
+    else
+        ok "health watchdog" "timer active"
+    fi
+else
+    bad "health watchdog" "plum-updater-health.timer is not active — an unhealthy container is never restarted"
+fi
+
 note "onboard audio" "$(grep -E '^dtparam=audio' /boot/firmware/config.txt 2>/dev/null || echo 'no dtparam=audio line')"
 for c in Digital PCM Master; do
     if amixer -c 0 sget "$c" >/dev/null 2>&1; then
@@ -246,6 +259,7 @@ provision_one() {
     retry_ sshpass_ scp $SSH_OPTS \
         "${HERE}/plum-updater.sh" "${HERE}/plum-updater.path" "${HERE}/plum-updater.service" \
         "${HERE}/plum-updater-check.timer" "${HERE}/plum-updater-check.service" \
+        "${HERE}/plum-updater-health.timer" "${HERE}/plum-updater-health.service" \
         "${USER_}@${host}:${PAYLOAD}/" || return 1
     ssh_ "$host" "chmod +x '$PAYLOAD/configure-audio-hat.sh' '$PAYLOAD/bluez/install_patched_bluez.sh' '$PAYLOAD/plum-updater.sh'" || return 1
 
@@ -323,7 +337,8 @@ else
     echo "    update agent: installing"
     s install -m 0755 "$PAYLOAD/plum-updater.sh" /usr/local/bin/plum-updater.sh
 fi
-for unit in plum-updater.path plum-updater.service plum-updater-check.timer plum-updater-check.service; do
+for unit in plum-updater.path plum-updater.service plum-updater-check.timer plum-updater-check.service \
+            plum-updater-health.timer plum-updater-health.service; do
     s install -m 0644 "$PAYLOAD/$unit" /etc/systemd/system/
 done
 s systemctl daemon-reload
@@ -331,6 +346,10 @@ s systemctl daemon-reload
 # those two trigger, and enabling a oneshot would run it at every boot.
 s systemctl enable --now plum-updater.path >/dev/null 2>&1 || true
 s systemctl enable --now plum-updater-check.timer >/dev/null 2>&1 || true
+# The health watchdog: restarts a container whose healthcheck says unhealthy. Docker does not. A
+# unit provisioned before the watchdog existed gets it here, on a re-run. `enable --now` on a timer
+# that is already active changes nothing.
+s systemctl enable --now plum-updater-health.timer >/dev/null 2>&1 || true
 # Register the agent so the container knows one exists. Harmless before /opt/plum-audio is created:
 # the state file lands once the deploy makes the directory, and a re-run is idempotent.
 if [[ -d /opt/plum-audio ]]; then

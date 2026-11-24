@@ -18,6 +18,7 @@
 #   plum-updater.sh check      refresh "what is available", install nothing  (the .timer calls this)
 #   plum-updater.sh update     pull and recreate now  (what a human runs to test it by hand)
 #   plum-updater.sh state      print the state file
+#   plum-updater.sh health     restart an unhealthy container  (plum-updater-health.timer calls this)
 #
 # WHY THE ORDER IS WHAT IT IS. `pull` runs first and `up -d` runs ONLY if it succeeded. A failed
 # pull — no internet on an isolated AV VLAN is the normal case, not the exotic one — must leave the
@@ -25,7 +26,7 @@
 # whether a replacement exists.
 set -uo pipefail
 
-AGENT_VERSION="1.0.0"
+AGENT_VERSION="1.1.0"
 
 ROOT="${PLUM_ROOT:-/opt/plum-audio}"
 CONFIG="${PLUM_CONFIG:-${ROOT}/config}"
@@ -33,6 +34,26 @@ REQUEST="${CONFIG}/update.request"
 STATE="${CONFIG}/update.state"
 LOCK="${ROOT}/.update.lock"
 ENV_FILE="${ROOT}/.env"
+
+# --- the health watchdog (`health`) ---------------------------------------------------------------
+# The container's healthcheck writes its verdict to /data/health.json. Docker does not restart an
+# unhealthy container, and the container holds no Docker socket, so this agent reads the verdict
+# from the bind mount and restarts the container.
+HEALTH_FILE="${PLUM_DATA:-${ROOT}/data}/health.json"
+# The restart count lives here, NOT under $ROOT/config or $ROOT/data: the container can write
+# those, and a container that can edit the count has no rate limit. Root-owned, mode 0700.
+WATCHDOG_STATE_DIR="${PLUM_WATCHDOG_STATE_DIR:-/var/lib/plum-audio}"
+# Two switches turn the watchdog off: PLUM_WATCHDOG=0 (the service reads /etc/default/plum-updater),
+# or this file. $ROOT is not mounted into the container, so the container cannot make the file.
+WATCHDOG_DISABLE_FILE="${ROOT}/watchdog.disabled"
+# Restart when the verdict was "unhealthy" for longer than this.
+WATCHDOG_UNHEALTHY_S="${PLUM_WATCHDOG_UNHEALTHY_S:-180}"
+# A verdict older than this means the healthcheck itself stopped. It is 600 and not 300, because
+# healthcheck.py writes a HEALTHY verdict only once in 300 s (HEALTHY_REFRESH_S) to save the SD
+# card. A healthy unit thus shows a `checked_at` up to about 330 s old.
+WATCHDOG_STALE_S="${PLUM_WATCHDOG_STALE_S:-600}"
+WATCHDOG_MAX_RESTARTS="${PLUM_WATCHDOG_MAX_RESTARTS:-3}"
+WATCHDOG_WINDOW_S="${PLUM_WATCHDOG_WINDOW_S:-3600}"
 
 DEFAULT_REGISTRY="ghcr.io/anothermike-exe/plum-audio"
 
@@ -332,6 +353,291 @@ do_update() {
     return 0
 }
 
+# --- the health watchdog --------------------------------------------------------------------------
+# $HEALTH_FILE is UNTRUSTED. The container writes it and this script is root. So:
+#   - Python parses it and prints three lines: an action from a fixed set, a 0/1 flag and a message.
+#     Nothing from the file is evaluated, and nothing from it is an argument to docker.
+#   - The message holds the `problems` list for the journal only. Python cuts it to printable ASCII
+#     on one line, and bash prints it with `printf '%s'`.
+#   - The file is opened with O_NOFOLLOW and O_NONBLOCK, must be a regular file, and has a size cap.
+#     The container can put a symlink to any host file there, or a FIFO that blocks a reader.
+#
+# A restart needs ALL of these:
+#   - the verdict is unhealthy for more than WATCHDOG_UNHEALTHY_S, and `checked_at` is fresh. Or
+#     `checked_at` is older than WATCHDOG_STALE_S while the container runs and Docker's own health
+#     status is not "healthy" (a check that passes and cannot write its file needs no restart).
+#   - the container is up for longer than the same limit. After a restart the file holds the old
+#     `since` until the first check runs, and after a boot it holds the verdict from before.
+#   - the same finding on two runs in a row. A Pi has no RTC, so the clock steps at boot, and one
+#     run can see an age that is wrong by days. The two runs are compared on the monotonic clock.
+#   - fewer than WATCHDOG_MAX_RESTARTS restarts in WATCHDOG_WINDOW_S.
+#
+# A missing or unreadable file means "unknown", and the watchdog does nothing. A container that is
+# not running is brought up with `up -d` when its last verdict is fresh and unhealthy. A stale
+# verdict from a stopped container means an operator stopped it, and the watchdog leaves it alone.
+watchdog_disabled() {
+    case "$(printf '%s' "${PLUM_WATCHDOG:-1}" | tr '[:upper:]' '[:lower:]')" in
+        0|false|off|no) return 0 ;;
+    esac
+    [[ -e "$WATCHDOG_DISABLE_FILE" ]]
+}
+
+do_health() {
+    local disabled=0 pending=0 line running="" started="" docker_health="" out
+    local action="" quiet="" message=""
+    watchdog_disabled && disabled=1
+    # A request that waits for the .path unit is an update that starts in a moment. main() already
+    # holds the update lock, so no update runs at this instant.
+    [[ -e "$REQUEST" ]] && pending=1
+
+    # Docker's output, not the container's: this part is trusted. Empty when there is no container.
+    line="$(docker inspect -f \
+        '{{.State.Running}} {{.State.StartedAt}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' \
+        plum-audio 2>/dev/null | head -1)" || line=""
+    read -r running started docker_health <<<"$line" || true
+
+    out="$(python3 - "$HEALTH_FILE" "$WATCHDOG_STATE_DIR" "$disabled" "$pending" \
+        "${running:-}" "${started:-}" "${docker_health:-}" \
+        "$WATCHDOG_UNHEALTHY_S" "$WATCHDOG_STALE_S" "$WATCHDOG_MAX_RESTARTS" "$WATCHDOG_WINDOW_S" <<'PY'
+import calendar, json, math, os, re, stat, sys, tempfile, time
+
+(health_path, state_dir, disabled, pending, running, started, docker_health,
+ unhealthy_s, stale_s, max_restarts, window_s) = sys.argv[1:12]
+
+MAX_BYTES = 65536        # the real file is a few hundred bytes
+STRIKE_MAX_AGE_S = 200   # "two runs in a row" on a 60 s timer, with room for a slow run
+state_path = os.path.join(state_dir, "watchdog.state")
+now = time.time()
+# The system-wide clock that a wall-clock step does not move. NOT time.monotonic(): its zero is
+# not defined, and on some platforms it is the start of this process, so two runs cannot compare.
+mono = time.clock_gettime(getattr(time, "CLOCK_BOOTTIME", time.CLOCK_MONOTONIC))
+
+
+def limit(text, default):
+    try:
+        value = float(text)
+    except ValueError:
+        return default
+    return value if math.isfinite(value) and value >= 0 else default
+
+
+unhealthy_s, stale_s = limit(unhealthy_s, 180.0), limit(stale_s, 600.0)
+max_restarts, window_s = int(limit(max_restarts, 3.0)), limit(window_s, 3600.0)
+
+
+def number(value):
+    """A finite JSON number, or None. A bool is not a number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        value = float(value)
+    except OverflowError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def clean(text, cap):
+    """Printable ASCII on one line. The journal is the only place this text goes."""
+    return "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in str(text)[:cap])
+
+
+def read_health():
+    """(report, None) or (None, why). Never follows a link, never blocks, never reads a big file."""
+    try:
+        fd = os.open(health_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None, "no health file"
+    except OSError:
+        return None, "the health file cannot be opened (a link, or no permission)"
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return None, "the health file is not a regular file"
+        if info.st_size > MAX_BYTES:
+            return None, "the health file is too large"
+        raw = os.read(fd, MAX_BYTES + 1)
+    except OSError:
+        return None, "the health file cannot be read"
+    finally:
+        os.close(fd)
+    if len(raw) > MAX_BYTES:
+        return None, "the health file is too large"
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return None, "the health file is not JSON"
+    if not isinstance(data, dict) or not isinstance(data.get("healthy"), bool):
+        return None, "the health file holds no verdict"
+    since, checked = number(data.get("since")), number(data.get("checked_at"))
+    if since is None or checked is None:
+        return None, "the health file holds no valid times"
+    problems = data.get("problems")
+    problems = problems if isinstance(problems, list) else []
+    shown = "; ".join(clean(item, 160) for item in problems[:6])
+    if len(problems) > 6:
+        shown += f"; and {len(problems) - 6} more"
+    return {
+        "healthy": data["healthy"],
+        "since_age": max(0.0, now - since),
+        "checked_age": max(0.0, now - checked),
+        "problems": clean(shown, 1100) or "none listed",
+    }, None
+
+
+def uptime():
+    """Seconds since Docker started the container, or None."""
+    match = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)", started)
+    if not match:
+        return None
+    try:
+        return max(0.0, now - calendar.timegm(time.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S")))
+    except (ValueError, OverflowError):
+        return None
+
+
+def load_state():
+    try:
+        with open(state_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_state(new):
+    """True when the state is on disk. Root-owned directory, mode 0700, atomic replace."""
+    try:
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".watchdog-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(new, fh)
+            os.replace(tmp, state_path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        return False
+    return True
+
+
+old = load_state()
+restarts = old.get("restarts")
+restarts = [float(t) for t in restarts if number(t) is not None] if isinstance(restarts, list) else []
+# An entry from the future (the clock went back) still counts.
+restarts = [t for t in restarts if now - t < window_s]
+strike = old.get("strike") if isinstance(old.get("strike"), dict) else None
+new = {"restarts": restarts, "strike": None, "last": None}
+
+
+def finish(action, key, message, repeat_quiet=False):
+    """Print the answer and stop. A state that did not change is not written (SD card)."""
+    new["last"] = key
+    quiet = 1 if repeat_quiet and old.get("last") == key else 0
+    if new != {k: old.get(k) for k in new} and not save_state(new):
+        if action == "restart":
+            # A restart that cannot be counted has no rate limit.
+            action, message = "none", message + " [NOT restarted: cannot write the state file]"
+        quiet = 0 if action == "restart" or not repeat_quiet else 1
+    print(action)
+    print(quiet)
+    print(message)
+    sys.exit(0)
+
+
+if disabled == "1":
+    finish("none", "disabled", "watchdog: disabled (PLUM_WATCHDOG=0 or watchdog.disabled)", True)
+
+report, why = read_health()
+if report is None:
+    finish("none", "unknown:" + why, f"watchdog: health unknown ({why}) - no action", True)
+
+is_running = running == "true"
+up = uptime() if is_running else None
+problems = report["problems"]
+reason = None
+if report["checked_age"] > stale_s:
+    if not is_running:
+        finish("none", "stale-stopped",
+               "watchdog: the verdict is stale and the container is not running - no action", True)
+    if docker_health == "healthy":
+        finish("none", "stale-docker-healthy",
+               f"watchdog: the verdict is stale ({report['checked_age']:.0f}s) but Docker reports healthy - "
+               "the check cannot write its file, no action", True)
+    if up is None or up <= stale_s:
+        finish("none", "stale-young",
+               "watchdog: the verdict is stale, the container started a short time ago - wait", True)
+    kind = "stale"
+    reason = (f"the verdict is stale: checked {report['checked_age']:.0f}s ago "
+              f"(limit {stale_s:.0f}s), the healthcheck stopped")
+elif report["healthy"]:
+    finish("none", "healthy", "watchdog: healthy", True)
+elif report["since_age"] <= unhealthy_s:
+    finish("none", "unhealthy-wait",
+           f"watchdog: unhealthy for {report['since_age']:.0f}s (limit {unhealthy_s:.0f}s) - wait. "
+           f"problems: {problems}")
+elif is_running and (up is None or up <= unhealthy_s):
+    finish("none", "unhealthy-young",
+           f"watchdog: unhealthy, but the container started a short time ago - wait. problems: {problems}")
+else:
+    kind = "unhealthy"
+    reason = f"unhealthy for {report['since_age']:.0f}s (limit {unhealthy_s:.0f}s)"
+
+tail = f"{reason}. problems: {problems}"
+if pending == "1":
+    finish("none", "update-pending", f"watchdog: {tail} - an update request waits, no restart")
+
+strike_mono = number(strike.get("mono")) if strike else None
+confirmed = (
+    strike is not None
+    and strike.get("kind") == kind
+    and strike_mono is not None
+    and 0 <= mono - strike_mono <= STRIKE_MAX_AGE_S
+)
+if not confirmed:
+    new["strike"] = {"kind": kind, "mono": mono}
+    finish("none", "strike", f"watchdog: {tail} - first sighting, the next run restarts it")
+
+if len(restarts) >= max_restarts:
+    new["strike"] = {"kind": kind, "mono": mono}  # stays confirmed: restart when the window opens
+    finish("none", "rate-limit",
+           f"watchdog: {tail} - rate limit, {len(restarts)} restarts in the last {window_s:.0f}s, no restart")
+
+restarts.append(now)
+verb = "restart" if is_running else "up -d (the container is not running)"
+finish("restart", "restart",
+       f"watchdog: {tail} - {verb}, restart {len(restarts)} of {max_restarts} in {window_s:.0f}s")
+PY
+)" || { log "watchdog: the decision step failed - no action"; return 0; }
+
+    { IFS= read -r action; IFS= read -r quiet; IFS= read -r message; } <<<"$out" || true
+    case "$action" in
+        none)
+            [[ "$quiet" == "1" ]] || log "$message"
+            return 0 ;;
+        restart) log "$message" ;;
+        *)  log "watchdog: the decision step gave no answer - no action"; return 0 ;;
+    esac
+
+    # The command is fixed text. Nothing from the health file reaches it.
+    if [[ "$running" == "true" ]]; then
+        if ! compose restart 2>&1 | sed 's/^/    /'; then
+            log "watchdog: docker compose restart FAILED"
+            return 1
+        fi
+    else
+        if ! compose up -d 2>&1 | sed 's/^/    /'; then
+            log "watchdog: docker compose up -d FAILED"
+            return 1
+        fi
+    fi
+    log "watchdog: done"
+    return 0
+}
+
 do_watch() {
     [[ -f "$REQUEST" ]] || { log "watch: no request"; return 0; }
     local channel check_only
@@ -382,6 +688,8 @@ main() {
     # not run two pulls against the same compose project.
     exec 9>"$LOCK"
     if ! flock -n 9; then
+        # For `health` this is the "no restart while an update runs" rule: an update holds this lock
+        # from its pull to the end of its `up -d`.
         log "another run holds the lock — skipping"
         return 0
     fi
@@ -395,7 +703,8 @@ main() {
         # what tells the container an agent EXISTS at all. Without it the API refuses every request
         # and the GUI correctly reports the host as unprovisioned.
         init)   save_state; log "agent ${AGENT_VERSION} registered" ;;
-        *)      echo "usage: plum-updater.sh [watch|check|update|state|init] [channel]" >&2; return 2 ;;
+        health) do_health ;;
+        *)      echo "usage: plum-updater.sh [watch|check|update|state|init|health] [channel]" >&2; return 2 ;;
     esac
 }
 

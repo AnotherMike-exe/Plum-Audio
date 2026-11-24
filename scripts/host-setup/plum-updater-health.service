@@ -1,0 +1,22 @@
+# Plum-Audio — the health watchdog. Triggered by plum-updater-health.timer, or run by hand.
+#
+# Docker does not restart an unhealthy container, and the container holds no Docker socket. The
+# container's healthcheck writes /opt/plum-audio/data/health.json, and `plum-updater.sh health`
+# reads it and restarts the container: unhealthy for more than 180 s, or a verdict older than 600 s
+# from a running container. At most 3 restarts in an hour, counted in /var/lib/plum-audio.
+#
+# To turn it off: put PLUM_WATCHDOG=0 in /etc/default/plum-updater, or
+# `touch /opt/plum-audio/watchdog.disabled`. Neither needs a daemon-reload.
+[Unit]
+Description=Plum-Audio health watchdog
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/plum-updater
+ExecStart=/usr/local/bin/plum-updater.sh health
+# `docker compose restart` waits for the container to stop (10 s by default) and then starts it.
+TimeoutStartSec=180
+StandardOutput=journal
+StandardError=journal

@@ -665,6 +665,19 @@ if fetch_payload "scripts/host-setup/plum-updater.sh" "$PAYLOAD/plum-updater.sh"
         s systemctl enable --now plum-updater-check.timer >/dev/null 2>&1 || true
         s /usr/local/bin/plum-updater.sh init >/dev/null 2>&1 || true
         echo "    installed and registered — Settings -> Updates can drive this unit"
+        # The health watchdog: restarts a container whose healthcheck says unhealthy. Its two units
+        # are fetched apart from the four above, because an image built before the watchdog does
+        # not carry them, and their absence must not stop the update agent.
+        if fetch_payload "scripts/host-setup/plum-updater-health.service" "$PAYLOAD/plum-updater-health.service" \
+           && fetch_payload "scripts/host-setup/plum-updater-health.timer" "$PAYLOAD/plum-updater-health.timer"; then
+            s install -m 0644 "$PAYLOAD/plum-updater-health.service" "$PAYLOAD/plum-updater-health.timer" \
+                /etc/systemd/system/
+            s systemctl daemon-reload
+            s systemctl enable --now plum-updater-health.timer >/dev/null 2>&1 || true
+            echo "    health watchdog timer enabled — an unhealthy container is restarted"
+        else
+            warn "no health watchdog units in the payload — an unhealthy container is not restarted"
+        fi
     else
         warn "some systemd units were missing — the agent is installed but not scheduled"
     fi
