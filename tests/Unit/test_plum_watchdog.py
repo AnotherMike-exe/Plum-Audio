@@ -39,6 +39,12 @@ exit 0
 """
 
 
+FLOCK_STUB = """#!/bin/sh
+echo "flock $*" >> "$STUB_LOG"
+exit ${STUB_FLOCK:-0}
+"""
+
+
 def started(seconds_ago):
     """`.State.StartedAt` as Docker prints it: RFC 3339, nanoseconds, Z."""
     moment = datetime.fromtimestamp(time.time() - seconds_ago, tz=UTC)
@@ -58,13 +64,13 @@ def root(tmp_path):
     (root / ".env").write_text("PLUM_IMAGE=ghcr.io/anothermike-exe/plum-audio\nPLUM_TAG=dev\n")
     stubs = tmp_path / "bin"
     stubs.mkdir()
-    for name, body in {"docker": DOCKER_STUB, "flock": "#!/bin/sh\nexit ${STUB_FLOCK:-0}\n"}.items():
+    for name, body in {"docker": DOCKER_STUB, "flock": FLOCK_STUB}.items():
         (stubs / name).write_text(body)
         (stubs / name).chmod(0o755)
     return root
 
 
-def run(root, inspect_line=None, **extra):
+def run(root, inspect_line=None, action="health", **extra):
     env = {
         "PATH": f"{root.parent / 'bin'}:/usr/bin:/bin:/usr/sbin:/sbin",
         "PLUM_ROOT": str(root),
@@ -74,7 +80,7 @@ def run(root, inspect_line=None, **extra):
         **extra,
     }
     return subprocess.run(
-        ["bash", str(SCRIPT), "health"], cwd=root.parent, env=env, capture_output=True, text=True, timeout=60
+        ["bash", str(SCRIPT), action], cwd=root.parent, env=env, capture_output=True, text=True, timeout=60
     )
 
 
@@ -285,6 +291,33 @@ def test_the_file_switch_disables_the_watchdog(root):
 def test_no_restart_while_an_update_holds_the_lock(root):
     health(root)
     result = twice(root, STUB_FLOCK="1")
+    assert compose_calls(root) == []
+    assert "lock" in result.stdout
+
+
+def flock_calls(root):
+    log = root.parent / "stub.log"
+    return [line for line in log.read_text().splitlines() if line.startswith("flock ")]
+
+
+def test_the_watchdog_does_not_wait_for_the_lock(root):
+    health(root)
+    run(root)
+    assert flock_calls(root) == ["flock -n 9"]
+
+
+@pytest.mark.parametrize("action", ["watch", "update"])
+def test_an_update_waits_for_the_lock_the_watchdog_holds(root, action):
+    """The watchdog takes the lock once a minute. A `watch` that does not wait leaves the request."""
+    run(root, action=action)
+    assert flock_calls(root) == ["flock -w 60 9"]
+
+
+def test_a_watch_that_cannot_get_the_lock_leaves_the_request(root):
+    (root / "config" / "update.request").write_text('{"channel": "dev"}')
+    result = run(root, action="watch", STUB_FLOCK="1")
+    assert result.returncode == 0
+    assert (root / "config" / "update.request").exists()
     assert compose_calls(root) == []
     assert "lock" in result.stdout
 

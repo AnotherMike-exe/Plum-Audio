@@ -34,6 +34,8 @@ REQUEST="${CONFIG}/update.request"
 STATE="${CONFIG}/update.state"
 LOCK="${ROOT}/.update.lock"
 ENV_FILE="${ROOT}/.env"
+# How long `watch` and `update` wait for the lock. Well under the 420 s start limit of the service.
+LOCK_WAIT_S=60
 
 # --- the health watchdog (`health`) ---------------------------------------------------------------
 # The container's healthcheck writes its verdict to /data/health.json. Docker does not restart an
@@ -682,17 +684,33 @@ print("1" if isinstance(d, dict) and d.get("checkOnly") else "0")' "$REQUEST" 2>
 main() {
     local action="${1:-watch}"
     mkdir -p "$CONFIG" 2>/dev/null || true
-    load_state
 
     # One at a time. Two clicks in the GUI, or a .path trigger landing on top of a timer check, must
     # not run two pulls against the same compose project.
     exec 9>"$LOCK"
-    if ! flock -n 9; then
-        # For `health` this is the "no restart while an update runs" rule: an update holds this lock
-        # from its pull to the end of its `up -d`.
-        log "another run holds the lock — skipping"
-        return 0
-    fi
+    case "$action" in
+        watch|update)
+            # WAIT for the lock. The health timer takes it once a minute, and holds it for 10-20 s
+            # during a restart. A `watch` that gives up at once leaves update.request on disk. The
+            # PathExists unit then starts the service again immediately, and five starts in 10 s
+            # reach systemd's start limit: no update runs until `systemctl reset-failed`. The
+            # leftover request also makes the watchdog answer "update-pending" on every run.
+            if ! flock -w "$LOCK_WAIT_S" 9; then
+                log "another run held the lock for ${LOCK_WAIT_S}s — skipping"
+                return 0
+            fi
+            ;;
+        *)
+            # Do not wait. For `health` this is the "no restart while an update runs" rule: an
+            # update holds this lock from its pull to the end of its `up -d`.
+            if ! flock -n 9; then
+                log "another run holds the lock — skipping"
+                return 0
+            fi
+            ;;
+    esac
+    # Read the state AFTER the wait: the run that held the lock wrote it.
+    load_state
 
     case "$action" in
         watch)  do_watch ;;
