@@ -8,7 +8,7 @@ Why this replaced `curl :5002/api/settings`. That probe proved one thing: the co
 The config API is a separate process from everything that makes sound, so the probe stayed green
 through every failure that needs a power cycle today — a player that supervisord gave up on
 (FATAL, while PID 1 stays up), a player that is RUNNING and no longer accepts a dial, and a player
-whose event loop stopped. Four checks, each for one of those:
+whose event loop stopped. Five checks, each for one of those:
 
   1. Every supervisord program is RUNNING. "Every" means the RUNTIME set in /run/plum-supervisor.d,
      which entrypoint.sh composes: a unit with no audio output has no sendspin_player program at
@@ -17,6 +17,13 @@ whose event loop stopped. Four checks, each for one of those:
   3. The player port accepts TCP — only on a unit that has a player.
   4. The player refreshed its health report recently (`health.ts` in player_state.json, written
      every 30 s from the player's own health loop) and does not report its output as lost.
+  5. The mesh API answers a GET on :5001. sendspin_server hosts :5001 and the Sendspin port :8927
+     in ONE event loop, so a loop that stopped leaves the program RUNNING and both ports open in
+     the kernel. Only a request that gets no reply shows it. Skipped while supervisord reports the
+     server as not RUNNING: check 1 already says so.
+
+The timeouts of the probes add up to PROBE_TIMEOUT_TOTAL_S. That total must stay under the
+`--timeout` of the Dockerfile HEALTHCHECK, or Docker ends the check before it can write a verdict.
 
 Docker does NOT restart an unhealthy container, and there is deliberately no Docker socket in here
 (CLAUDE.md), so "unhealthy" alone changes nothing. The verdict therefore also goes to
@@ -46,6 +53,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 
 SUPERVISOR_CONF = os.environ.get("PLUM_SUPERVISOR_CONF", "/app/supervisord/supervisord.conf")
@@ -53,6 +61,15 @@ PROGRAM_DIR = os.environ.get("PLUM_SUPERVISOR_PROGRAM_DIR", "/run/plum-superviso
 HEALTH_FILE = os.environ.get("PLUM_HEALTH_FILE", "/data/health.json")
 PLAYER_STATE_FILE = os.environ.get("PLUM_PLAYER_STATE_FILE", "/data/player_state.json")
 PLAYER_PROGRAM = "sendspin_player"
+SERVER_PROGRAM = "sendspin_server"
+# One timeout for each probe. They run in sequence, so the worst case is the sum, and the sum must
+# stay under the Dockerfile HEALTHCHECK `--timeout` (15 s). tests/Unit/test_healthcheck.py reads
+# the Dockerfile and holds this to it.
+SUPERVISOR_TIMEOUT_S = 5.0
+CONFIG_API_TIMEOUT_S = 3.0
+PLAYER_PORT_TIMEOUT_S = 2.0
+MESH_API_TIMEOUT_S = 3.0
+PROBE_TIMEOUT_TOTAL_S = SUPERVISOR_TIMEOUT_S + CONFIG_API_TIMEOUT_S + PLAYER_PORT_TIMEOUT_S + MESH_API_TIMEOUT_S
 # The player refreshes its report every 30 s (sendspin_player.HEALTH_REPORT_S). Four missed
 # refreshes is a stopped event loop, not a slow SD card.
 PLAYER_STALE_S = float(os.environ.get("PLUM_HEALTH_STALE_S", "120"))
@@ -92,7 +109,7 @@ def supervisor_status() -> tuple[dict[str, str], str | None]:
             ["supervisorctl", "-c", SUPERVISOR_CONF, "status"],
             capture_output=True,
             text=True,
-            timeout=6,
+            timeout=SUPERVISOR_TIMEOUT_S,
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -119,7 +136,7 @@ def check_programs(expected: list[str], states: dict[str, str]) -> list[str]:
     return problems
 
 
-def check_port(host: str, port: int, *, timeout: float = 2.0) -> str | None:
+def check_port(host: str, port: int, *, timeout: float = PLAYER_PORT_TIMEOUT_S) -> str | None:
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return None
@@ -127,7 +144,7 @@ def check_port(host: str, port: int, *, timeout: float = 2.0) -> str | None:
         return f"player port {port} does not accept TCP ({exc})"
 
 
-def check_config_api(port: int, *, timeout: float = 3.0) -> str | None:
+def check_config_api(port: int, *, timeout: float = CONFIG_API_TIMEOUT_S) -> str | None:
     url = f"http://127.0.0.1:{port}/api/settings"
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
@@ -136,6 +153,33 @@ def check_config_api(port: int, *, timeout: float = 3.0) -> str | None:
             return None
     except Exception as exc:  # noqa: BLE001 - every failure here is the same verdict
         return f"config API does not answer on :{port} ({exc})"
+
+
+def mesh_probe_host(port: int) -> str:
+    """The `Host` header the mesh probe sends.
+
+    The mesh API guard (cors_policy.guard) refuses a request with no `Origin` unless its `Host` is
+    an IP literal, loopback or a name of this unit. An IP literal always passes, with any
+    PLUM_ALLOWED_ORIGINS, so the probe names the address it connects to and sends no `Origin`.
+    """
+    return f"127.0.0.1:{port}"
+
+
+def check_mesh_api(port: int, *, timeout: float = MESH_API_TIMEOUT_S) -> str | None:
+    """Does the sendspin_server event loop answer? GET /api/mesh/view on loopback.
+
+    Any HTTP reply proves that the loop runs, an error status included: the question here is a
+    stopped loop, and a handler fault is not one. No reply inside `timeout` is the problem.
+    """
+    url = f"http://127.0.0.1:{port}/api/mesh/view"
+    request = urllib.request.Request(url, headers={"Host": mesh_probe_host(port)})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout):
+            return None
+    except urllib.error.HTTPError:
+        return None
+    except Exception as exc:  # noqa: BLE001 - refused, reset or timed out: the loop gave no reply
+        return f"mesh API does not answer on :{port} ({exc})"
 
 
 def check_player_health(path: str, now: float, *, stale_s: float = PLAYER_STALE_S) -> list[str]:
@@ -172,6 +216,11 @@ def evaluate(now: float) -> tuple[list[str], dict[str, str]]:
     api_problem = check_config_api(int(os.environ.get("PLUM_CONFIG_API_PORT", "5002")))
     if api_problem:
         problems.append(api_problem)
+    # A server that is not RUNNING is already reported above. An unknown state is still probed.
+    if error or states.get(SERVER_PROGRAM) == "RUNNING":
+        mesh_problem = check_mesh_api(int(os.environ.get("PLUM_MESH_API_PORT", "5001")))
+        if mesh_problem:
+            problems.append(mesh_problem)
     # The gate's decision, as entrypoint.sh applied it: no program file, no player to check.
     if PLAYER_PROGRAM in expected:
         port_problem = check_port("127.0.0.1", int(os.environ.get("PLUM_PLAYER_PORT", "8928")))

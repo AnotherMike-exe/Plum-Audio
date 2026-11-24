@@ -78,11 +78,14 @@ def test_a_unit_with_no_output_is_healthy_with_three_programs():
     assert healthcheck.check_programs(THREE, states) == []
 
 
-def _patch(monkeypatch, tmp_path, *, programs, status, port_problem=None, api_problem=None, calls=None):
+def _patch(
+    monkeypatch, tmp_path, *, programs, status, port_problem=None, api_problem=None, mesh_problem=None, calls=None
+):
     monkeypatch.setattr(healthcheck, "PROGRAM_DIR", _program_dir(tmp_path, programs))
     monkeypatch.setattr(healthcheck, "PLAYER_STATE_FILE", str(tmp_path / "player_state.json"))
     monkeypatch.setattr(healthcheck, "supervisor_status", lambda: (healthcheck.parse_status(status), None))
     monkeypatch.setattr(healthcheck, "check_config_api", lambda port: api_problem)
+    monkeypatch.setattr(healthcheck, "check_mesh_api", lambda port: mesh_problem)
 
     def fake_port(host, port, **kwargs):
         if calls is not None:
@@ -224,3 +227,87 @@ def test_main_exits_zero_when_healthy(monkeypatch, tmp_path):
     monkeypatch.setattr(healthcheck, "HEALTH_FILE", str(tmp_path / "health.json"))
     assert healthcheck.main() == 0
     assert json.loads((tmp_path / "health.json").read_text())["healthy"] is True
+
+
+# -- the server event loop ---------------------------------------------------------------------------
+# sendspin_server hosts :5001 and :8927 in ONE loop. A loop that stopped leaves the process RUNNING.
+
+
+def _http_server(handler):
+    import http.server
+    import threading
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def test_the_mesh_probe_passes_when_the_loop_answers():
+    import http.server
+
+    seen = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen["path"], seen["host"], seen["origin"] = self.path, self.headers["Host"], self.headers["Origin"]
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *args):
+            pass
+
+    server = _http_server(Handler)
+    try:
+        port = server.server_address[1]
+        assert healthcheck.check_mesh_api(port, timeout=2.0) is None
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert seen == {"path": "/api/mesh/view", "host": f"127.0.0.1:{port}", "origin": None}
+
+
+def test_the_mesh_probe_reports_a_loop_that_accepts_and_never_answers():
+    """The kernel completes the TCP handshake for a wedged loop. Only the missing reply shows it."""
+    with socket.socket() as wedged:
+        wedged.bind(("127.0.0.1", 0))
+        wedged.listen(1)
+        problem = healthcheck.check_mesh_api(wedged.getsockname()[1], timeout=0.3)
+    assert problem is not None and "mesh API does not answer" in problem
+
+
+def test_the_mesh_probe_passes_the_api_guard():
+    """No Origin and an IP literal as Host: the guard lets that through with an empty host set."""
+    import cors_policy
+
+    refusal = cors_policy.guard(
+        method="GET",
+        origin=None,
+        host=healthcheck.mesh_probe_host(5001),
+        content_type=None,
+        has_body=False,
+        hosts=set(),
+        extras=[],
+    )
+    assert refusal is None
+
+
+def test_a_wedged_server_loop_is_unhealthy(monkeypatch, tmp_path):
+    _patch(monkeypatch, tmp_path, programs=FOUR, status=STATUS_ALL_RUNNING, mesh_problem="mesh API does not answer")
+    _player_state(tmp_path, ts=1000.0)
+    assert healthcheck.evaluate(1010.0)[0] == ["mesh API does not answer"]
+
+
+def test_the_probe_timeouts_fit_inside_the_docker_healthcheck_timeout():
+    import re
+
+    dockerfile = (REPO / "backend" / "Dockerfile").read_text()
+    limit = float(re.search(r"HEALTHCHECK[^\n]*--timeout=(\d+)s", dockerfile).group(1))
+    assert healthcheck.PROBE_TIMEOUT_TOTAL_S < limit
+    assert healthcheck.PROBE_TIMEOUT_TOTAL_S == (
+        healthcheck.SUPERVISOR_TIMEOUT_S
+        + healthcheck.CONFIG_API_TIMEOUT_S
+        + healthcheck.PLAYER_PORT_TIMEOUT_S
+        + healthcheck.MESH_API_TIMEOUT_S
+    )
