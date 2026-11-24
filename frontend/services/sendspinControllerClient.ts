@@ -235,7 +235,8 @@ export class SendspinControllerClient {
 
   /** Send client/time. Restarts the adaptive loop: fast until synced, then backs off. */
   private sendTime(): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    // helloSeen: nothing but client/hello goes on the wire before server/hello, whoever calls this.
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.helloSeen) return;
     this.ws.send(JSON.stringify({ type: 'client/time', payload: { client_transmitted: this.nowUs() } }));
     // Match aiosendspin's cadence: 200 ms until the clock settles, then ease off to 3 s.
     const err = this.clock.errorUs;
@@ -315,10 +316,22 @@ export class SendspinControllerClient {
   // -- internals ----------------------------------------------------------
 
   private open(): void {
+    // One socket at a time. connect() twice (React StrictMode, or a caller that does not track
+    // state) used to open two: the server saw one client id on two connections, and both sockets
+    // wrote the same now-playing state.
+    if (this.ws && (this.ws.readyState === WebSocket.CONNECTING || this.ws.readyState === WebSocket.OPEN)) return;
+    // A reconnect timer that this open() overtook must not open one more socket later.
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    // The clock loop belongs to the PREVIOUS socket. Left running, it fired after the new socket
+    // opened and put client/time on the wire before server/hello. onServerHello starts it again.
+    if (this.timeTimer) clearTimeout(this.timeTimer);
+    this.timeTimer = null;
     const ws = new WebSocket(this.url);
     ws.binaryType = 'arraybuffer';
     this.ws = ws;
     ws.onopen = () => {
+      if (this.ws !== ws) return; // a socket we already replaced
       // NOT reset here — see RECONNECT_STABLE_MS. A socket that opens and immediately dies would
       // otherwise retry at a flat 1s forever.
       if (this.stableTimer) clearTimeout(this.stableTimer);
@@ -368,13 +381,20 @@ export class SendspinControllerClient {
       // into the source group (a command sent while still in our solo group would go nowhere).
       if (this.pendingCommands.length > 0) setTimeout(() => this.flushPending(), 600);
     };
-    ws.onmessage = (ev) => this.onMessage(ev);
-    ws.onclose = () => this.scheduleReconnect();
+    ws.onmessage = (ev) => {
+      if (this.ws === ws) this.onMessage(ev);
+    };
+    ws.onclose = () => {
+      // Only the CURRENT socket's close may schedule a reconnect or stop the clock loop.
+      if (this.ws !== ws) return;
+      this.scheduleReconnect();
+    };
     ws.onerror = () => ws.close();
   }
 
   private scheduleReconnect(): void {
     if (this.stableTimer) { clearTimeout(this.stableTimer); this.stableTimer = null; }
+    if (this.timeTimer) { clearTimeout(this.timeTimer); this.timeTimer = null; }
     if (this.closed) return;
     // Keep the last-known now-playing through brief blips — a healthy reconnect (server restart,
     // roam) is sub-second and the reconnected socket re-emits full state, so blanking immediately
@@ -386,7 +406,11 @@ export class SendspinControllerClient {
     this.emit();
     const delay = Math.min(RECONNECT_BASE_MS * 2 ** this.reconnectAttempts, RECONNECT_MAX_MS);
     this.reconnectAttempts++;
-    this.reconnectTimer = setTimeout(() => this.open(), delay);
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.open();
+    }, delay);
   }
 
   /**
