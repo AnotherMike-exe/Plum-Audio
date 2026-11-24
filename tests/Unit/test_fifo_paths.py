@@ -127,3 +127,66 @@ def test_the_feeder_refuses_a_bad_path_at_the_syscall_itself():
 
     feeder.fifo_path = f"{fifo_paths.FIFO_DIR}/sub/../airplay-1-fifo"
     assert feeder._checked_fifo_path() == expected  # noqa: SLF001
+
+
+def _feeder_in(tmp_path, monkeypatch, name="airplay-1-fifo"):
+    pytest.importorskip("numpy", reason="sendspin_server imports numpy at module scope")
+    pytest.importorskip("aiosendspin", reason="sendspin_server imports aiosendspin at module scope")
+    import sendspin_server
+
+    monkeypatch.setattr(fifo_paths, "FIFO_DIR", str(tmp_path))
+    feeder = sendspin_server.SourceFeeder.__new__(sendspin_server.SourceFeeder)
+    feeder.source_id = "airplay-1"
+    feeder.fifo_path = str(tmp_path / name)
+    return feeder
+
+
+def test_the_fifo_still_opens_with_o_nofollow(tmp_path, monkeypatch):
+    """O_NOFOLLOW must not break the ordinary case: create the FIFO, open its read end."""
+    import asyncio
+    import stat
+
+    feeder = _feeder_in(tmp_path, monkeypatch)
+
+    async def scenario():
+        _reader, transport = await feeder._open_reader()  # noqa: SLF001
+        transport.close()
+
+    asyncio.run(scenario())
+    assert stat.S_ISFIFO(os.stat(feeder.fifo_path).st_mode)
+
+
+def test_a_symlink_swapped_in_after_the_check_is_not_followed(tmp_path, monkeypatch):
+    """The race the flag closes: the path was checked, then its last component became a symlink."""
+    import asyncio
+
+    feeder = _feeder_in(tmp_path, monkeypatch)
+    outside = tmp_path.parent / "outside-target"
+    outside.write_text("not ours")
+    link = tmp_path / "airplay-1-fifo"
+    os.symlink(outside, link)
+    # Stand in for "the check ran before the swap": the guard returns the path it approved.
+    monkeypatch.setattr(feeder, "_checked_fifo_path", lambda: str(link))
+
+    async def scenario():
+        with pytest.raises(OSError):
+            await feeder._open_reader()  # noqa: SLF001
+
+    asyncio.run(scenario())
+
+
+def test_a_symlink_inside_the_fifo_dir_that_points_outside_is_refused_by_the_guard(tmp_path, monkeypatch):
+    feeder = _feeder_in(tmp_path, monkeypatch)
+    os.symlink("/etc/passwd", tmp_path / "airplay-1-fifo")
+    with pytest.raises(ValueError, match="directly inside"):
+        feeder._checked_fifo_path()  # noqa: SLF001
+
+
+def test_a_sibling_directory_that_shares_the_prefix_is_refused(tmp_path, monkeypatch):
+    """`/tmp/x` against `/tmp/xfoo/…`: the case a bare prefix test passes and the guard must not."""
+    feeder = _feeder_in(tmp_path, monkeypatch)
+    sibling = tmp_path.parent / (tmp_path.name + "foo")
+    sibling.mkdir()
+    feeder.fifo_path = str(sibling / "airplay-1-fifo")
+    with pytest.raises(ValueError, match="directly inside"):
+        feeder._checked_fifo_path()  # noqa: SLF001

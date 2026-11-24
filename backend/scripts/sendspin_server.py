@@ -346,7 +346,17 @@ class SourceFeeder:
             ValueError: the path does not name a file directly inside FIFO_DIR.
         """
         resolved = os.path.realpath(self.fifo_path)
-        if os.path.dirname(resolved) != os.path.realpath(fifo_paths.FIFO_DIR):
+        base = os.path.realpath(fifo_paths.FIFO_DIR)
+        if os.path.dirname(resolved) != base:
+            raise ValueError(f"FIFO path must be a file directly inside {fifo_paths.FIFO_DIR}")
+        # REDUNDANT, and it must stay that way. The `dirname` comparison above is the guard: it
+        # already implies this prefix test, which can therefore never fire and changes nothing. It
+        # is here only because a prefix test after a normalisation is the one sanitiser shape
+        # CodeQL's `py/path-injection` recognises. It is the WEAKER check by itself (a bare
+        # `startswith(base)` passes `/tmpfoo`), so never let it replace the line above — see
+        # HARD-WON-LESSONS. The separator is appended unless `base` is the root, which ends in one.
+        prefix = base if base.endswith(os.sep) else base + os.sep
+        if not resolved.startswith(prefix):
             raise ValueError(f"FIFO path must be a file directly inside {fifo_paths.FIFO_DIR}")
         return resolved
 
@@ -370,7 +380,11 @@ class SourceFeeder:
         # when the FIFO already exists.
         path = self._checked_fifo_path()
         loop = asyncio.get_running_loop()
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        # O_NOFOLLOW: `path` is already resolved, so its last component is not a symlink when the
+        # check runs. If something swaps one in between the check and this call, the open fails
+        # with ELOOP instead of following it out of FIFO_DIR. A FIFO opens the same with or without
+        # the flag.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
         pipe = os.fdopen(fd, "rb", buffering=0)
         reader = asyncio.StreamReader()
         protocol = asyncio.StreamReaderProtocol(reader)
