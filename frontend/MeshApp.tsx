@@ -540,17 +540,20 @@ export default function MeshApp(): React.ReactElement {
       // failure: this effect runs twice a second, and it must not POST twice a second.
       const backoff = browserRouteBackoffRef.current;
       if (!backoff.ready()) return;
-      backoff.begin();
+      const attempt = backoff.begin();
+      // The first misses are view lag and clear by themselves. A run of them is a real fault, and
+      // the tab plays nothing meanwhile — say so, once. An accepted route that the view never
+      // shows on target is a miss too: only the `reset()` above, on landing, clears the count.
+      // `applied` is false for an attempt from before a reset (the user stopped, or moved the
+      // player): that outcome belongs to no current session, and it reports nothing.
+      const settled = (applied: boolean, err: unknown) => {
+        if (applied && backoff.failures === BROWSER_ROUTE_FAILURES_TO_REPORT) {
+          reportError('Could not put this browser on the stream', err);
+        }
+      };
       service.routeClient(browserPlayerId, target).then(
-        () => backoff.succeed(),
-        (err) => {
-          backoff.fail();
-          // The first failures are view lag and clear by themselves. A run of them is a real
-          // fault, and the tab plays nothing meanwhile — say so, once.
-          if (backoff.failures === BROWSER_ROUTE_FAILURES_TO_REPORT) {
-            reportError('Could not put this browser on the stream', err);
-          }
-        },
+        () => settled(backoff.succeed(attempt), new Error('the unit accepted the route, but the player did not join')),
+        (err) => settled(backoff.fail(attempt), err),
       );
       return;
     }
