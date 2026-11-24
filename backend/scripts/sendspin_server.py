@@ -986,37 +986,62 @@ class PlumSendspinServer:
         return True
 
     async def stop(self) -> None:
+        """Shut everything down. Every step runs, whatever the steps before it did.
+
+        This was a plain chain of awaits, so one step that raised — a D-Bus call on a bus that had
+        already gone, a monitor whose socket was closed — skipped everything after it, and the last
+        steps are the ones that matter: `stop_server()` and `close()` release port 8927 and tell
+        every client we are going. Skipping them leaves the next start to fail on a bound port.
+        """
         self._stop_evt.set()
-        for remote in self._airplay_remotes.values():
-            await remote.close()
+        for source_id, remote in list(self._airplay_remotes.items()):
+            await self._stop_step(f"airplay remote {source_id}", remote.close())
         self._airplay_remotes.clear()
-        for monitor in self._spotify_monitors.values():
-            await monitor.stop()
+        for source_id, monitor in list(self._spotify_monitors.items()):
+            await self._stop_step(f"spotify monitor {source_id}", monitor.stop())
         self._spotify_monitors.clear()
-        for avrcp in self._bluetooth_avrcp.values():
-            await avrcp.stop()
+        for source_id, avrcp in list(self._bluetooth_avrcp.items()):
+            await self._stop_step(f"bluetooth avrcp {source_id}", avrcp.stop())
         self._bluetooth_avrcp.clear()
-        for cover_art in self._bluetooth_coverart.values():
-            await cover_art.stop()
+        for source_id, cover_art in list(self._bluetooth_coverart.items()):
+            await self._stop_step(f"bluetooth cover art {source_id}", cover_art.stop())
         self._bluetooth_coverart.clear()
-        for adapter in self._bluetooth_adapters.values():
-            await adapter.stop()
+        for source_id, adapter in list(self._bluetooth_adapters.items()):
+            await self._stop_step(f"bluetooth adapter {source_id}", adapter.stop())
         self._bluetooth_adapters.clear()
         self._source_remotes.clear()
-        for reader in self._metadata_readers.values():
-            await reader.stop()
+        for source_id, reader in list(self._metadata_readers.items()):
+            await self._stop_step(f"metadata reader {source_id}", reader.stop())
         self._metadata_readers.clear()
         for task in self._local_player_tasks:
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        for task in self._local_player_tasks:
+            await self._stop_step("local player task", self._reap(task))
         self._local_player_tasks.clear()
         for source_id in list(self.sources):
-            await self.stop_source(source_id)
+            await self._stop_step(f"source {source_id}", self.stop_source(source_id))
         if self.server:
-            await self.server.stop_server()
-            await self.server.close()
-            self.server = None
+            server, self.server = self.server, None
+            await self._stop_step("sendspin server stop", server.stop_server())
+            await self._stop_step("sendspin server close", server.close())
+
+    @staticmethod
+    async def _reap(task: asyncio.Task) -> None:
+        """Wait for a task we cancelled. Its own CancelledError is the expected end, not a fault."""
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    @staticmethod
+    async def _stop_step(what: str, step: Awaitable[object]) -> None:
+        """Await one shutdown step. Log a failure and return, so the next step still runs.
+
+        Catches `Exception` only: a CancelledError is the shutdown itself being cancelled, and that
+        must go through.
+        """
+        try:
+            await step
+        except Exception:  # noqa: BLE001 - see docstring
+            logger.exception("shutdown: %s failed; continuing", what)
 
     def start_source(
         self, source_id: str, fifo_path: str, fmt: AudioFormat = DEFAULT_FORMAT, *, name: str = ""

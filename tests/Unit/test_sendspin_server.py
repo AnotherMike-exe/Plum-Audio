@@ -1715,3 +1715,70 @@ def test_a_later_route_moves_the_remembered_source():
         assert unit._adopted == {SPEAKER_URL: None}
 
     run_scenario(scenario)
+
+
+# --- stop() -----------------------------------------------------------------
+#
+# A chain of awaits with no fault tolerance: one raising step skipped stop_server()/close(), which
+# are what release the port.
+
+
+class _Stoppable:
+    def __init__(self, log, name, error=None):
+        self.log, self.name, self.error = log, name, error
+
+    async def stop(self):
+        self.log.append(self.name)
+        if self.error is not None:
+            raise self.error
+
+    close = stop
+
+
+def test_stop_runs_every_step_when_one_of_them_raises(caplog):
+    async def scenario():
+        unit = make_unit("airplay-1")
+        log = []
+        server = unit.server
+
+        async def stop_server():
+            log.append("stop_server")
+            raise RuntimeError("stop_server blew up too")
+
+        async def close():
+            log.append("close")
+
+        server.stop_server, server.close = stop_server, close
+        unit._airplay_remotes["airplay-1"] = _Stoppable(log, "remote", RuntimeError("bus is gone"))
+        unit._spotify_monitors["spotify-1"] = _Stoppable(log, "monitor")
+        unit._bluetooth_adapters["bluetooth-1"] = _Stoppable(log, "adapter", OSError("no adapter"))
+        unit._metadata_readers["airplay-1"] = _Stoppable(log, "reader")
+
+        await unit.stop()
+
+        assert log == ["remote", "monitor", "adapter", "reader", "stop_server", "close"]
+        assert unit.sources == {}
+        assert unit.server is None
+
+    with caplog.at_level("ERROR", logger="plum.sendspin_server"):
+        run_scenario(scenario)
+    failed = [r.getMessage() for r in caplog.records if "shutdown:" in r.getMessage()]
+    assert len(failed) == 3
+    assert all(r.exc_info for r in caplog.records if "shutdown:" in r.getMessage())
+
+
+def test_stop_does_not_swallow_its_own_cancellation():
+    async def scenario():
+        unit = make_unit()
+
+        async def hang():
+            await asyncio.sleep(3600)
+
+        unit._spotify_monitors["spotify-1"] = type("M", (), {"stop": staticmethod(hang)})()
+        task = asyncio.ensure_future(unit.stop())
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    run_scenario(scenario)
